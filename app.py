@@ -187,6 +187,8 @@ def prepare_data(df):
     logger.info("Step 2: Preparing Features...")
     df['sma_3_close'] = df['close'].rolling(window=3).mean()
     df['sma_9_close'] = df['close'].rolling(window=9).mean()
+    df['sma_365_close'] = df['close'].rolling(window=365).mean()
+    df['distance_365_sma'] = (df['close'] - df['sma_365_close']) / df['sma_365_close']
     df['ema_3_volume'] = df['volume'].ewm(span=3).mean()
     
     ema_12 = df['close'].ewm(span=12).mean()
@@ -219,6 +221,7 @@ def prepare_data(df):
                     # Use actual values for each feature
                     feature.append(df['sma_3_close'].iloc[i - lookback])
                     feature.append(df['sma_9_close'].iloc[i - lookback])
+                    feature.append(df['distance_365_sma'].iloc[i - lookback])
                     feature.append(df['ema_3_volume'].iloc[i - lookback])
                     feature.append(df['macd_line'].iloc[i - lookback])
                     feature.append(df['signal_line'].iloc[i - lookback])
@@ -233,7 +236,7 @@ def prepare_data(df):
                             feature.append(0)
                 else:
                     # For days before the start of the sequence, use zeros
-                    feature.extend([0] * 10)
+                    feature.extend([0] * 11)
             features.append(feature)
             # Target is the 3-day SMA ending at position i (no future data)
             targets.append(df['close'].rolling(window=3).mean().iloc[i])
@@ -371,8 +374,8 @@ def run_training_task():
         y_test = targets_scaled[split_idx:]
         train_indices = list(range(40, 40 + split_idx))
         
-        X_train_reshaped = X_train.reshape(X_train.shape[0], 12, 10)
-        X_test_reshaped = X_test.reshape(X_test.shape[0], 12, 10)
+        X_train_reshaped = X_train.reshape(X_train.shape[0], 12, 11)
+        X_test_reshaped = X_test.reshape(X_test.shape[0], 12, 11)
         
         # INCREASED EPOCHS AND ADDED REGULARIZATION
         EPOCHS = 50
@@ -387,7 +390,7 @@ def run_training_task():
         
         # LSTM 1: L2 regularization added to the kernel weights
         model.add(LSTM(UNITS, activation='relu', return_sequences=True, 
-                       input_shape=(12, 10), kernel_regularizer=l2(REG_RATE)))
+                       input_shape=(12, 11), kernel_regularizer=l2(REG_RATE)))
         model.add(Dropout(0.5)) # Dropout to force redundancy
         
         # LSTM 2: L2 regularization added
