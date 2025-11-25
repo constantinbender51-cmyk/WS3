@@ -238,8 +238,11 @@ def prepare_data(df):
                     # For days before the start of the sequence, use zeros
                     feature.extend([0] * 11)
             features.append(feature)
-            # Target is the 3-day SMA ending at position i (no future data)
-            targets.append(df['close'].rolling(window=3).mean().iloc[i])
+            # Target is the 3-day SMA 1 year in the future to avoid lookahead bias
+            if i + 365 < len(df):
+                targets.append(df['close'].rolling(window=3).mean().iloc[i + 365])
+            else:
+                targets.append(np.nan)
     
     features = np.array(features)
     targets = np.array(targets)
