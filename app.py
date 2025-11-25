@@ -210,11 +210,11 @@ def prepare_data(df):
     
     features = []
     targets = []
-    # Start from index 40 to ensure we have enough lookback data
-    # and account for the 7-day SMA window
-    for i in range(40, len(df)):
-        # Check if we have enough data for the 7-day SMA target
-        if i >= 6:  # Need at least 7 days for SMA
+    # Start from index 365 to ensure we have enough data for the 365-day SMA feature
+    # and account for the lookback window
+    for i in range(365, len(df)):
+        # Check if we have enough data for the 3-day SMA target
+        if i >= 2:  # Need at least 3 days for SMA
             feature = []
             for lookback in range(1, 13):
                 if i - lookback >= 0:
