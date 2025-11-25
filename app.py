@@ -278,7 +278,8 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
     all_y_predicted = []
     
     # Add training data
-    train_dates = plot_df.index[train_indices - 365]  # Adjust indices to match plot_df
+    train_indices_array = np.array(train_indices)
+    train_dates = plot_df.index[train_indices_array - 365]  # Adjust indices to match plot_df
     sorted_train_indices = np.argsort(train_dates)
     sorted_train_dates = train_dates[sorted_train_indices]
     sorted_y_train = y_train[sorted_train_indices]
@@ -289,7 +290,8 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
     
     # Add test data if available
     if y_test is not None and test_predictions is not None and test_indices is not None:
-        test_dates = plot_df.index[test_indices - 365]  # Adjust indices to match plot_df
+        test_indices_array = np.array(test_indices)
+        test_dates = plot_df.index[test_indices_array - 365]  # Adjust indices to match plot_df
         sorted_test_indices = np.argsort(test_dates)
         sorted_test_dates = test_dates[sorted_test_indices]
         sorted_y_test = y_test[sorted_test_indices]
