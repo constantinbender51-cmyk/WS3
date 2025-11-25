@@ -234,8 +234,13 @@ def prepare_data(df):
                     # For days before the start of the sequence, use zeros
                     feature.extend([0] * 10)
             features.append(feature)
-            # Target is the derivative (percentage change) of price from previous day
-            targets.append((df['close'].iloc[i] - df['close'].iloc[i-1]) / df['close'].iloc[i-1])
+            # Target is the 2-day SMA of the derivative (percentage change) of price
+            if i >= 2:  # Need at least 3 days for derivative and SMA calculation
+                derivative = (df['close'].iloc[i] - df['close'].iloc[i-2]) / df['close'].iloc[i-2]
+                sma_2_derivative = (derivative + ((df['close'].iloc[i-1] - df['close'].iloc[i-2]) / df['close'].iloc[i-2])) / 2
+                targets.append(sma_2_derivative)
+            else:
+                targets.append(0)
     
     features = np.array(features)
     targets = np.array(targets)
