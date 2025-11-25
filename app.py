@@ -379,7 +379,7 @@ def run_training_task():
         
         # INCREASED EPOCHS AND ADDED REGULARIZATION
         EPOCHS = 50
-        UNITS = 12
+        UNITS = 24
         REG_RATE = 1e-4 # L2 Regularization rate
         
         with state_lock:
@@ -413,7 +413,7 @@ def run_training_task():
         
         early_stopping = EarlyStopping(
             monitor='val_loss',
-            patience=10,
+            patience=20,
             restore_best_weights=True,
             verbose=1
         )
