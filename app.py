@@ -137,7 +137,7 @@ def load_data():
             'Net_Transaction_Count': 'n-transactions',
             'Transaction_Volume_USD': 'estimated-transaction-volume-usd',
         }
-        START_DATE = '2024-01-01'
+        START_DATE = '2020-01-01'
         END_DATE = '2025-12-31'
         
         all_data = [df_price]
