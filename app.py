@@ -209,10 +209,9 @@ def prepare_data(df):
     features = []
     targets = []
     # Start from index 40 to ensure we have enough lookback data
-    # and account for the 7-day SMA window
     for i in range(40, len(df)):
-        # Check if we have enough data for the 7-day SMA target
-        if i >= 6:  # Need at least 7 days for SMA
+        # Check if we have enough data for the derivative target
+        if i >= 1:  # Need at least 2 days for derivative calculation
             feature = []
             for lookback in range(1, 13):
                 if i - lookback >= 0:
@@ -235,8 +234,8 @@ def prepare_data(df):
                     # For days before the start of the sequence, use zeros
                     feature.extend([0] * 10)
             features.append(feature)
-            # Target is the 7-day SMA ending at position i (no future data)
-            targets.append(df['close'].rolling(window=7).mean().iloc[i])
+            # Target is the derivative (percentage change) of price from previous day
+            targets.append((df['close'].iloc[i] - df['close'].iloc[i-1]) / df['close'].iloc[i-1])
     
     features = np.array(features)
     targets = np.array(targets)
