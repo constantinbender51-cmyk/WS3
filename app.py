@@ -375,8 +375,8 @@ def run_training_task():
         X_test_reshaped = X_test.reshape(X_test.shape[0], 12, 10)
         
         # INCREASED EPOCHS AND ADDED REGULARIZATION
-        EPOCHS = 1000
-        UNITS = 512
+        EPOCHS = 50
+        UNITS = 12
         REG_RATE = 1e-4 # L2 Regularization rate
         
         with state_lock:
@@ -410,7 +410,7 @@ def run_training_task():
         
         early_stopping = EarlyStopping(
             monitor='val_loss',
-            patience=1000,
+            patience=10,
             restore_best_weights=True,
             verbose=1
         )
