@@ -301,13 +301,9 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
     plt.plot(all_dates, all_y_predicted, label='Predicted Price', color='green', alpha=0.8)
     # Plot target line (3-day SMA)
     plt.plot(all_dates, all_y_actual, label='Target (3-day SMA)', color='red', alpha=0.8)
-    # Add BTC actual price for debugging
-    btc_price_dates = df.index
-    btc_prices = df['close']
-    # Align BTC price dates with the combined data dates
-    common_btc_dates = btc_price_dates.intersection(pd.DatetimeIndex(all_dates))
-    common_btc_prices = btc_prices.loc[common_btc_dates]
-    plt.plot(common_btc_dates, common_btc_prices, label='BTC Price (Debug)', color='blue', linestyle=':', alpha=0.6)
+    # Add BTC actual price for debugging, aligned with the same indices as predictions/targets
+    btc_prices_aligned = df['close'].iloc[np.concatenate([train_indices, test_indices]) if test_indices is not None else train_indices]
+    plt.plot(all_dates, btc_prices_aligned, label='BTC Price (Debug)', color='blue', linestyle=':', alpha=0.6)
     plt.title('Prediction vs Target with BTC Price (Training and Test Sets)')
     plt.legend()
     plt.xticks(rotation=45)
