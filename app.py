@@ -269,13 +269,16 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
 
     plt.figure(figsize=(10, 12))
     
-    # Combine training and test data for continuous timeline
+    # Create a single plot_df slice starting from index 365 to align with SMA warmup
+    plot_df = df.iloc[365:].copy()
+    
+    # Combine training and test data for continuous timeline using the aligned plot_df
     all_dates = []
     all_y_actual = []
     all_y_predicted = []
     
     # Add training data
-    train_dates = df.index[train_indices]
+    train_dates = plot_df.index[train_indices - 365]  # Adjust indices to match plot_df
     sorted_train_indices = np.argsort(train_dates)
     sorted_train_dates = train_dates[sorted_train_indices]
     sorted_y_train = y_train[sorted_train_indices]
@@ -286,7 +289,7 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
     
     # Add test data if available
     if y_test is not None and test_predictions is not None and test_indices is not None:
-        test_dates = df.index[test_indices]
+        test_dates = plot_df.index[test_indices - 365]  # Adjust indices to match plot_df
         sorted_test_indices = np.argsort(test_dates)
         sorted_test_dates = test_dates[sorted_test_indices]
         sorted_y_test = y_test[sorted_test_indices]
@@ -301,8 +304,8 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
     plt.plot(all_dates, all_y_predicted, label='Predicted Price', color='green', alpha=0.8)
     # Plot target line (3-day SMA)
     plt.plot(all_dates, all_y_actual, label='Target (3-day SMA)', color='red', alpha=0.8)
-    # Add BTC actual price for debugging, aligned with the same indices as predictions/targets
-    btc_prices_aligned = df['close'].iloc[np.concatenate([train_indices, test_indices]) if test_indices is not None else train_indices]
+    # Add BTC actual price for debugging, aligned with the same dates as predictions/targets
+    btc_prices_aligned = plot_df['close'].loc[all_dates]
     plt.plot(all_dates, btc_prices_aligned, label='BTC Price (Debug)', color='blue', linestyle=':', alpha=0.6)
     plt.title('Prediction vs Target with BTC Price (Training and Test Sets)')
     plt.legend()
