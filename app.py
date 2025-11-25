@@ -235,8 +235,8 @@ def prepare_data(df):
                     # For days before the start of the sequence, use zeros
                     feature.extend([0] * 10)
             features.append(feature)
-            # Target is the 3-day SMA ending at position i (no future data)
-            targets.append(df['close'].rolling(window=3).mean().iloc[i])
+            # Target is the 7-day SMA ending at position i (no future data)
+            targets.append(df['close'].rolling(window=7).mean().iloc[i])
     
     features = np.array(features)
     targets = np.array(targets)
