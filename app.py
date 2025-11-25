@@ -137,7 +137,7 @@ def load_data():
             'Net_Transaction_Count': 'n-transactions',
             'Transaction_Volume_USD': 'estimated-transaction-volume-usd',
         }
-        START_DATE = '2020-01-01'
+        START_DATE = '2024-01-01'
         END_DATE = '2025-12-31'
         
         all_data = [df_price]
@@ -187,8 +187,6 @@ def prepare_data(df):
     logger.info("Step 2: Preparing Features...")
     df['sma_3_close'] = df['close'].rolling(window=3).mean()
     df['sma_9_close'] = df['close'].rolling(window=9).mean()
-    df['sma_365_close'] = df['close'].rolling(window=365).mean()
-    df['distance_365_sma'] = (df['close'] - df['sma_365_close']) / df['sma_365_close']
     df['ema_3_volume'] = df['volume'].ewm(span=3).mean()
     
     ema_12 = df['close'].ewm(span=12).mean()
@@ -210,18 +208,17 @@ def prepare_data(df):
     
     features = []
     targets = []
-    # Start from index 365 to ensure we have enough data for the 365-day SMA feature
-    # and account for the lookback window
-    for i in range(365, len(df)):
-        # Check if we have enough data for the 3-day SMA target
-        if i >= 2:  # Need at least 3 days for SMA
+    # Start from index 40 to ensure we have enough lookback data
+    # and account for the 7-day SMA window
+    for i in range(40, len(df)):
+        # Check if we have enough data for the 7-day SMA target
+        if i >= 6:  # Need at least 7 days for SMA
             feature = []
             for lookback in range(1, 13):
                 if i - lookback >= 0:
                     # Use actual values for each feature
                     feature.append(df['sma_3_close'].iloc[i - lookback])
                     feature.append(df['sma_9_close'].iloc[i - lookback])
-                    feature.append(df['distance_365_sma'].iloc[i - lookback])
                     feature.append(df['ema_3_volume'].iloc[i - lookback])
                     feature.append(df['macd_line'].iloc[i - lookback])
                     feature.append(df['signal_line'].iloc[i - lookback])
@@ -236,10 +233,10 @@ def prepare_data(df):
                             feature.append(0)
                 else:
                     # For days before the start of the sequence, use zeros
-                    feature.extend([0] * 11)
+                    feature.extend([0] * 10)
             features.append(feature)
-            # Target is the current 3-day SMA
-            targets.append(df['sma_3_close'].iloc[i])
+            # Target is the 3-day SMA ending at position i (no future data)
+            targets.append(df['close'].rolling(window=3).mean().iloc[i])
     
     features = np.array(features)
     targets = np.array(targets)
@@ -269,17 +266,13 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
 
     plt.figure(figsize=(10, 12))
     
-    # Create a single plot_df slice starting from index 365 to align with SMA warmup
-    plot_df = df.iloc[365:].copy()
-    
-    # Combine training and test data for continuous timeline using the aligned plot_df
+    # Combine training and test data for continuous timeline
     all_dates = []
     all_y_actual = []
     all_y_predicted = []
     
     # Add training data
-    train_indices_array = np.array(train_indices)
-    train_dates = plot_df.index[train_indices_array - 365]  # Adjust indices to match plot_df
+    train_dates = df.index[train_indices]
     sorted_train_indices = np.argsort(train_dates)
     sorted_train_dates = train_dates[sorted_train_indices]
     sorted_y_train = y_train[sorted_train_indices]
@@ -290,8 +283,7 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
     
     # Add test data if available
     if y_test is not None and test_predictions is not None and test_indices is not None:
-        test_indices_array = np.array(test_indices)
-        test_dates = plot_df.index[test_indices_array - 365]  # Adjust indices to match plot_df
+        test_dates = df.index[test_indices]
         sorted_test_indices = np.argsort(test_dates)
         sorted_test_dates = test_dates[sorted_test_indices]
         sorted_y_test = y_test[sorted_test_indices]
@@ -306,9 +298,13 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
     plt.plot(all_dates, all_y_predicted, label='Predicted Price', color='green', alpha=0.8)
     # Plot target line (3-day SMA)
     plt.plot(all_dates, all_y_actual, label='Target (3-day SMA)', color='red', alpha=0.8)
-    # Add BTC actual price for debugging, aligned with the same dates as predictions/targets
-    btc_prices_aligned = plot_df['close'].loc[all_dates]
-    plt.plot(all_dates, btc_prices_aligned, label='BTC Price (Debug)', color='blue', linestyle=':', alpha=0.6)
+    # Add BTC actual price for debugging
+    btc_price_dates = df.index
+    btc_prices = df['close']
+    # Align BTC price dates with the combined data dates
+    common_btc_dates = btc_price_dates.intersection(pd.DatetimeIndex(all_dates))
+    common_btc_prices = btc_prices.loc[common_btc_dates]
+    plt.plot(common_btc_dates, common_btc_prices, label='BTC Price (Debug)', color='blue', linestyle=':', alpha=0.6)
     plt.title('Prediction vs Target with BTC Price (Training and Test Sets)')
     plt.legend()
     plt.xticks(rotation=45)
@@ -375,12 +371,12 @@ def run_training_task():
         y_test = targets_scaled[split_idx:]
         train_indices = list(range(40, 40 + split_idx))
         
-        X_train_reshaped = X_train.reshape(X_train.shape[0], 12, 11)
-        X_test_reshaped = X_test.reshape(X_test.shape[0], 12, 11)
+        X_train_reshaped = X_train.reshape(X_train.shape[0], 12, 10)
+        X_test_reshaped = X_test.reshape(X_test.shape[0], 12, 10)
         
         # INCREASED EPOCHS AND ADDED REGULARIZATION
         EPOCHS = 50
-        UNITS = 24
+        UNITS = 12
         REG_RATE = 1e-4 # L2 Regularization rate
         
         with state_lock:
@@ -391,7 +387,7 @@ def run_training_task():
         
         # LSTM 1: L2 regularization added to the kernel weights
         model.add(LSTM(UNITS, activation='relu', return_sequences=True, 
-                       input_shape=(12, 11), kernel_regularizer=l2(REG_RATE)))
+                       input_shape=(12, 10), kernel_regularizer=l2(REG_RATE)))
         model.add(Dropout(0.5)) # Dropout to force redundancy
         
         # LSTM 2: L2 regularization added
@@ -414,7 +410,7 @@ def run_training_task():
         
         early_stopping = EarlyStopping(
             monitor='val_loss',
-            patience=20,
+            patience=10,
             restore_best_weights=True,
             verbose=1
         )

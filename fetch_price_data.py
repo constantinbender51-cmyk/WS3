@@ -7,7 +7,7 @@ def fetch_btc_candles():
     base_url = 'https://api.binance.com/api/v3/klines'
     symbol = 'BTCUSDT'
     interval = '1d'
-    start_date = datetime(2020, 1, 1)
+    start_date = datetime(2024, 1, 1)
     end_date = datetime(2025, 12, 31)
     
     all_data = []
