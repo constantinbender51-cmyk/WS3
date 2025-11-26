@@ -234,11 +234,11 @@ def prepare_data(df):
                     # For days before the start of the sequence, use zeros
                     feature.extend([0] * 10)
             features.append(feature)
-            # Target is the 3-day SMA of the derivative (percentage change) of price
-            if i >= 3:  # Need at least 4 days for derivative and SMA calculation
-                derivative = (df['close'].iloc[i] - df['close'].iloc[i-3]) / df['close'].iloc[i-3]
-                sma_3_derivative = (derivative + ((df['close'].iloc[i-1] - df['close'].iloc[i-3]) / df['close'].iloc[i-3]) + ((df['close'].iloc[i-2] - df['close'].iloc[i-3]) / df['close'].iloc[i-3])) / 3
-                targets.append(sma_3_derivative)
+            # Target is the 2-day SMA of the derivative (percentage change) of price
+            if i >= 2:  # Need at least 3 days for derivative and SMA calculation
+                derivative = (df['close'].iloc[i] - df['close'].iloc[i-2]) / df['close'].iloc[i-2]
+                sma_2_derivative = (derivative + ((df['close'].iloc[i-1] - df['close'].iloc[i-2]) / df['close'].iloc[i-2])) / 2
+                targets.append(sma_2_derivative)
             else:
                 targets.append(0)
     
@@ -405,7 +405,7 @@ def run_training_task():
         
         early_stopping = EarlyStopping(
             monitor='val_loss',
-            patience=50,
+            patience=100,
             restore_best_weights=True,
             verbose=1
         )
