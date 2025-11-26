@@ -128,12 +128,17 @@ def generate_plots(df, train_predictions, test_predictions, test_start_idx):
     # Plot 2: Capital development
     capital = [1000]  # Start with 1000
     for i in range(len(test_predictions)):
-        if test_predictions[i] == 1 and df['Return'].iloc[test_start_idx + i] > 0:
-            capital.append(capital[-1] * (1 + df['Return'].iloc[test_start_idx + i]))
-        elif test_predictions[i] == 0 and df['Return'].iloc[test_start_idx + i] < 0:
-            capital.append(capital[-1] * (1 - df['Return'].iloc[test_start_idx + i]))
-        else:
-            capital.append(capital[-1])
+        actual_return = df['Return'].iloc[test_start_idx + i]
+        if test_predictions[i] == 1:  # Predicted up
+            if actual_return > 0:  # Actually went up - correct prediction
+                capital.append(capital[-1] * (1 + actual_return))
+            else:  # Actually went down - wrong prediction
+                capital.append(capital[-1] * (1 + actual_return))  # Follow the actual return
+        else:  # Predicted down
+            if actual_return < 0:  # Actually went down - correct prediction
+                capital.append(capital[-1])  # Stay out of market
+            else:  # Actually went up - wrong prediction
+                capital.append(capital[-1])  # Stay out of market
     
     ax2.plot(test_dates, capital[:-1], color='green', label='Capital')
     ax2.set_title('Capital Development Over Time')
@@ -156,6 +161,90 @@ def generate_plots(df, train_predictions, test_predictions, test_start_idx):
 
 @app.route('/')
 def index():
+    html = '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>LSTM Prediction Results</title>
+        <style>
+            .loading {
+                text-align: center;
+                padding: 50px;
+                font-size: 18px;
+            }
+            .spinner {
+                border: 8px solid #f3f3f3;
+                border-top: 8px solid #3498db;
+                border-radius: 50%;
+                width: 60px;
+                height: 60px;
+                animation: spin 2s linear infinite;
+                margin: 20px auto;
+            }
+            @keyframes spin {
+                0% { transform: rotate(0deg); }
+                100% { transform: rotate(360deg); }
+            }
+            .hidden { display: none; }
+            .button {
+                background-color: #3498db;
+                color: white;
+                padding: 15px 30px;
+                border: none;
+                border-radius: 5px;
+                font-size: 16px;
+                cursor: pointer;
+                margin: 20px;
+            }
+            .button:hover {
+                background-color: #2980b9;
+            }
+        </style>
+    </head>
+    <body>
+        <div id="loading" class="loading">
+            <h1>LSTM Model for Return Direction Prediction</h1>
+            <p>Click the button below to start model training and prediction</p>
+            <button class="button" onclick="startTraining()">Start Model Training</button>
+        </div>
+        <div id="results" class="hidden">
+            <h1>LSTM Model for Return Direction Prediction</h1>
+            <div id="accuracy"></div>
+            <div id="plot"></div>
+        </div>
+        
+        <script>
+            function startTraining() {
+                document.getElementById('loading').innerHTML = `
+                    <div class="spinner"></div>
+                    <p>Training LSTM model... This may take a few minutes</p>
+                    <p>Generating mock data, preparing features, and training neural network...</p>
+                `;
+                
+                fetch('/train')
+                    .then(response => response.json())
+                    .then(data => {
+                        document.getElementById('loading').classList.add('hidden');
+                        document.getElementById('results').classList.remove('hidden');
+                        document.getElementById('accuracy').innerHTML = `
+                            <p>Accuracy on Training Set: ${(data.train_accuracy * 100).toFixed(2)}%</p>
+                            <p>Accuracy on Test Set: ${(data.test_accuracy * 100).toFixed(2)}%</p>
+                        `;
+                        document.getElementById('plot').innerHTML = `<img src="data:image/png;base64,${data.plot_data}" alt="Plots">`;
+                    })
+                    .catch(error => {
+                        console.error('Error:', error);
+                        document.getElementById('loading').innerHTML = '<p>Error occurred during training. Please try again.</p>';
+                    });
+            }
+        </script>
+    </body>
+    </html>
+    '''
+    return render_template_string(html)
+
+@app.route('/train')
+def train():
     # Generate data
     df = generate_mock_data()
     
@@ -194,21 +283,11 @@ def index():
     y_test_actual = test_df['Return_Direction'].values
     test_accuracy = accuracy_score(y_test_actual, test_predictions)
     
-    html = f'''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>LSTM Prediction Results</title>
-    </head>
-    <body>
-        <h1>LSTM Model for Return Direction Prediction</h1>
-        <p>Accuracy on Training Set: {train_accuracy:.2%}</p>
-        <p>Accuracy on Test Set: {test_accuracy:.2%}</p>
-        <img src="data:image/png;base64,{plot_data}" alt="Plots">
-    </body>
-    </html>
-    '''
-    return render_template_string(html)
+    return {
+        'train_accuracy': float(train_accuracy),
+        'test_accuracy': float(test_accuracy),
+        'plot_data': plot_data
+    }
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=False)
