@@ -240,12 +240,13 @@ def prepare_data(df):
                     # For days before the start of the sequence, use zeros
                     feature.extend([0] * 10)
             features.append(feature)
-            # Target is the price movement 7 days in the future as percentage
+            # Target is the 7-day derivative (daily rate of change over 7 days)
             if i + 7 < len(df):  # Need to have data 7 days ahead
                 current_price = df['close'].iloc[i]
                 future_price = df['close'].iloc[i + 7]
-                future_movement = (future_price - current_price) / current_price
-                targets.append(future_movement)
+                # Calculate derivative as daily rate of change over 7-day period
+                derivative = (future_price - current_price) / (current_price * 7)
+                targets.append(derivative)
             else:
                 targets.append(0)
     
