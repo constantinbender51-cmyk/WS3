@@ -4,7 +4,7 @@ import numpy as np
 from flask import Flask, render_template_string
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.layers import LSTM, Dense, Input
 from sklearn.preprocessing import MinMaxScaler
 import os
 
@@ -61,7 +61,8 @@ y_train, y_test = target[:train_size], target[train_size:]
 
 # Build LSTM model
 model = Sequential([
-    LSTM(50, activation='relu', input_shape=(1, 1)),
+    Input(shape=(1, 1)),
+    LSTM(50, activation='relu'),
     Dense(3, activation='softmax')  # 3 classes: up, flat, down
 ])
 
@@ -76,29 +77,31 @@ predicted_classes = np.argmax(predictions, axis=1) - 1  # Convert back to -1,0,1
 
 # Calculate strategy returns
 initial_capital = 10000  # Starting capital
-capital = [initial_capital]
+capital = [initial_capital] * len(daily_data)  # Initialize capital list with same length
 position = 0  # 0 for no position, 1 for long
 for i in range(1, len(daily_data)):
     if predicted_classes[i-1] == 1:  # Predicted up
         if position == 0:
             # Buy at open
-            shares = capital[-1] / daily_data['open'].iloc[i]
+            shares = capital[i-1] / daily_data['open'].iloc[i]
             position = shares
-        # Hold if already long
+            capital[i] = capital[i-1]  # Capital unchanged when buying
+        else:
+            capital[i] = capital[i-1]  # Hold position
     elif predicted_classes[i-1] == -1:  # Predicted down
         if position > 0:
             # Sell at open
-            capital.append(position * daily_data['open'].iloc[i])
+            capital[i] = position * daily_data['open'].iloc[i]
             position = 0
         else:
-            capital.append(capital[-1])
+            capital[i] = capital[i-1]  # No position
     else:  # Predicted flat
         if position > 0:
             # Sell at open
-            capital.append(position * daily_data['open'].iloc[i])
+            capital[i] = position * daily_data['open'].iloc[i]
             position = 0
         else:
-            capital.append(capital[-1])
+            capital[i] = capital[i-1]  # No position
 
 # If position is held at the end, sell at last close
 if position > 0:
