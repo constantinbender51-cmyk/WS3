@@ -352,8 +352,8 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
             actual_derivative_yesterday = (btc_price_prev - btc_price_yesterday_prev) / btc_price_yesterday_prev
         else:
             actual_derivative_yesterday = 0
-        # Strategy: long if yesterday's actual derivative is above prediction, otherwise short
-        pos = 1 if actual_derivative_yesterday > all_y_predicted[i] else -1
+        # Strategy: long if prediction is above yesterday's actual derivative, otherwise short
+        pos = 1 if all_y_predicted[i] > actual_derivative_yesterday else -1
         capital.append(capital[-1] * (1 + (ret * pos * 1)))
         positions.append(pos)
     
