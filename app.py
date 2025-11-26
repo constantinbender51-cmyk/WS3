@@ -274,7 +274,7 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
     history_loss = [x if x is not None else 0 for x in history_loss]
     history_val_loss = [x if x is not None else 0 for x in history_val_loss]
 
-    plt.figure(figsize=(10, 12))
+    plt.figure(figsize=(10, 15))
     
     # Combine training and test data for continuous timeline
     all_dates = []
@@ -302,13 +302,27 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
         all_y_actual.extend(sorted_y_test)
         all_y_predicted.extend(sorted_test_predictions)
     
-    # Plot 1: Prediction vs Target (BTC price hidden)
-    plt.subplot(3, 1, 1)
-    # Plot prediction line
+    # Plot 1: Prediction vs Target (Full timeline)
+    plt.subplot(4, 1, 1)
     plt.plot(all_dates, all_y_predicted, label='Predicted Price', color='green', alpha=0.8)
-    # Plot target line (derivative of price)
     plt.plot(all_dates, all_y_actual, label='Target (Price Derivative)', color='red', alpha=0.8)
-    plt.title('Prediction vs Target (Training and Test Sets)')
+    plt.title('Prediction vs Target (Full Timeline)')
+    plt.legend()
+    plt.xticks(rotation=45)
+
+    # Plot 2: Prediction vs Target (Last month only)
+    plt.subplot(4, 1, 2)
+    # Filter data for the last month
+    if len(all_dates) > 0:
+        last_date = all_dates[-1]
+        one_month_ago = last_date - pd.Timedelta(days=30)
+        mask = [date >= one_month_ago for date in all_dates]
+        recent_dates = [all_dates[i] for i in range(len(all_dates)) if mask[i]]
+        recent_y_actual = [all_y_actual[i] for i in range(len(all_y_actual)) if mask[i]]
+        recent_y_predicted = [all_y_predicted[i] for i in range(len(all_y_predicted)) if mask[i]]
+        plt.plot(recent_dates, recent_y_predicted, label='Predicted Price', color='green', alpha=0.8)
+        plt.plot(recent_dates, recent_y_actual, label='Target (Price Derivative)', color='red', alpha=0.8)
+    plt.title('Prediction vs Target (Last Month Only)')
     plt.legend()
     plt.xticks(rotation=45)
 
@@ -320,12 +334,14 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
         btc_price_i = df.loc[all_dates[i], 'close']
         btc_price_prev = df.loc[all_dates[i-1], 'close']
         ret = (btc_price_i - btc_price_prev) / btc_price_prev
-        # Strategy: long if prediction is below yesterday's derivative, otherwise short
-        pos = 1 if all_y_predicted[i] < all_y_actual[i-1] else -1
+        # Strategy: long if derivative of prediction is positive, otherwise short
+        # Derivative of prediction is approximated as the difference from the previous prediction
+        pred_derivative = all_y_predicted[i] - all_y_predicted[i-1] if i >= 1 else 0
+        pos = 1 if pred_derivative > 0 else -1
         capital.append(capital[-1] * (1 + (ret * pos * 1)))
         positions.append(pos)
     
-    plt.subplot(3, 1, 2)
+    plt.subplot(4, 1, 3)
     plt.plot(all_dates, capital, color='purple')
     # Mark positions on each day: red for short (pos=-1), green for long (pos=1)
     for i in range(len(positions)):
@@ -335,8 +351,8 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
     plt.title('Strategy Capital (Long/Short based on Derivative of Prediction)')
     plt.xticks(rotation=45)
 
-    # Plot 3: Loss curves
-    plt.subplot(3, 1, 3)
+    # Plot 4: Loss curves
+    plt.subplot(4, 1, 4)
     plt.semilogy(history_loss, label='Train Loss', color='blue')
     plt.semilogy(history_val_loss, label='Test Loss (Val)', color='orange')
     plt.xlabel('Epochs')
