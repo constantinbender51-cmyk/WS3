@@ -78,6 +78,8 @@ try:
     hashrate_df['x'] = pd.to_datetime(hashrate_df['x'], unit='s')
     hashrate_df.set_index('x', inplace=True)
     hashrate_df.rename(columns={'y': 'hashrate'}, inplace=True)
+    # Filter for time period 2022 to September 2025
+    hashrate_df = hashrate_df.loc[start_date:end_date]
     # Resample to daily and merge
     hashrate_daily = hashrate_df.resample('1D').mean()
     df_daily = df_daily.merge(hashrate_daily, left_index=True, right_index=True, how='left')
@@ -94,6 +96,8 @@ try:
     active_addr_df['x'] = pd.to_datetime(active_addr_df['x'], unit='s')
     active_addr_df.set_index('x', inplace=True)
     active_addr_df.rename(columns={'y': 'active_addresses'}, inplace=True)
+    # Filter for time period 2022 to September 2025
+    active_addr_df = active_addr_df.loc[start_date:end_date]
     # Resample to daily and merge
     active_addr_daily = active_addr_df.resample('1D').mean()
     df_daily = df_daily.merge(active_addr_daily, left_index=True, right_index=True, how='left')
