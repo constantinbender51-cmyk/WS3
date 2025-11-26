@@ -1,0 +1,228 @@
+import pandas as pd
+import numpy as np
+import gdown
+from flask import Flask, render_template_string
+import matplotlib.pyplot as plt
+import io
+import base64
+import requests
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import accuracy_score
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+import warnings
+warnings.filterwarnings('ignore')
+
+# Download the CSV file from Google Drive
+file_id = '1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o'
+url = f'https://drive.google.com/uc?id={file_id}'
+output = 'ohlcv_data.csv'
+gdown.download(url, output, quiet=False)
+
+# Load the data
+df = pd.read_csv(output)
+
+# Ensure the timestamp column is parsed correctly (adjust column name if needed)
+if 'timestamp' in df.columns:
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df.set_index('timestamp', inplace=True)
+else:
+    # If no timestamp, assume first column is datetime; adjust as per actual data
+    df.iloc[:, 0] = pd.to_datetime(df.iloc[:, 0])
+    df.set_index(df.columns[0], inplace=True)
+
+# Resample to different timeframes
+ohlcv_dict = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+df_1h = df.resample('1H').apply(ohlcv_dict).dropna()
+df_4h = df.resample('4H').apply(ohlcv_dict).dropna()
+df_1d = df.resample('1D').apply(ohlcv_dict).dropna()
+df_1w = df.resample('1W').apply(ohlcv_dict).dropna()
+
+# Use daily data for model training and prediction
+df_daily = df_1d.copy()
+
+# Calculate SMAs for 7, 29, 365 days
+df_daily['sma_7'] = df_daily['close'].rolling(window=7).mean()
+df_daily['sma_29'] = df_daily['close'].rolling(window=29).mean()
+df_daily['sma_365'] = df_daily['close'].rolling(window=365).mean()
+
+# Calculate Bollinger Bands for 20-day period (standard)
+window = 20
+df_daily['bb_middle'] = df_daily['close'].rolling(window=window).mean()
+df_daily['bb_std'] = df_daily['close'].rolling(window=window).std()
+df_daily['bb_upper'] = df_daily['bb_middle'] + 2 * df_daily['bb_std']
+df_daily['bb_lower'] = df_daily['bb_middle'] - 2 * df_daily['bb_std']
+
+# Calculate MACD line and signal line for weekly data (using weekly close)
+# First, ensure we have weekly data; if not, approximate from daily
+df_weekly_for_macd = df_1w[['close']].copy() if not df_1w.empty else df_daily.resample('1W').last()[['close']]
+ema_12 = df_weekly_for_macd['close'].ewm(span=12).mean()
+ema_26 = df_weekly_for_macd['close'].ewm(span=26).mean()
+macd_line = ema_12 - ema_26
+signal_line = macd_line.ewm(span=9).mean()
+# Align MACD data to daily index by forward filling (since MACD is weekly)
+df_daily['macd_line'] = macd_line.reindex(df_daily.index, method='ffill')
+df_daily['signal_line'] = signal_line.reindex(df_daily.index, method='ffill')
+df_daily['macd_signal_diff'] = df_daily['macd_line'] - df_daily['signal_line']
+
+# Fetch hashrate from blockchain.com API (example endpoint; adjust if needed)
+try:
+    hashrate_response = requests.get('https://api.blockchain.info/charts/hash-rate?timespan=all&sampled=true&format=json')
+    hashrate_data = hashrate_response.json()
+    hashrate_df = pd.DataFrame(hashrate_data['values'])
+    hashrate_df['x'] = pd.to_datetime(hashrate_df['x'], unit='s')
+    hashrate_df.set_index('x', inplace=True)
+    hashrate_df.rename(columns={'y': 'hashrate'}, inplace=True)
+    # Resample to daily and merge
+    hashrate_daily = hashrate_df.resample('1D').mean()
+    df_daily = df_daily.merge(hashrate_daily, left_index=True, right_index=True, how='left')
+    df_daily['hashrate'].fillna(method='ffill', inplace=True)
+except Exception as e:
+    print(f"Error fetching hashrate: {e}")
+    df_daily['hashrate'] = np.nan
+
+# Fetch active addresses from blockchain.com API (example endpoint; adjust if needed)
+try:
+    active_addr_response = requests.get('https://api.blockchain.info/charts/n-unique-addresses?timespan=all&sampled=true&format=json')
+    active_addr_data = active_addr_response.json()
+    active_addr_df = pd.DataFrame(active_addr_data['values'])
+    active_addr_df['x'] = pd.to_datetime(active_addr_df['x'], unit='s')
+    active_addr_df.set_index('x', inplace=True)
+    active_addr_df.rename(columns={'y': 'active_addresses'}, inplace=True)
+    # Resample to daily and merge
+    active_addr_daily = active_addr_df.resample('1D').mean()
+    df_daily = df_daily.merge(active_addr_daily, left_index=True, right_index=True, how='left')
+    df_daily['active_addresses'].fillna(method='ffill', inplace=True)
+except Exception as e:
+    print(f"Error fetching active addresses: {e}")
+    df_daily['active_addresses'] = np.nan
+
+# Prepare features and target
+features = ['open', 'high', 'low', 'close', 'volume', 'sma_7', 'sma_29', 'sma_365', 'bb_upper', 'bb_lower', 'macd_signal_diff', 'hashrate', 'active_addresses']
+df_daily_clean = df_daily[features].dropna()
+
+# Define target: next day price change direction (1 for up, 0 for down)
+df_daily_clean['next_close'] = df_daily_clean['close'].shift(-1)
+df_daily_clean['target'] = (df_daily_clean['next_close'] > df_daily_clean['close']).astype(int)
+df_daily_clean = df_daily_clean.dropna()
+
+# Normalize features
+scaler = MinMaxScaler()
+scaled_features = scaler.fit_transform(df_daily_clean[features])
+
+# Prepare sequences for LSTM (using 60 days of history)
+sequence_length = 60
+X, y = [], []
+for i in range(sequence_length, len(scaled_features)):
+    X.append(scaled_features[i-sequence_length:i])
+    y.append(df_daily_clean['target'].iloc[i])
+X, y = np.array(X), np.array(y)
+
+# Split data: 80% train, 20% test
+split_idx = int(0.8 * len(X))
+X_train, X_test = X[:split_idx], X[split_idx:]
+y_train, y_test = y[:split_idx], y[split_idx:]
+
+# Build LSTM model
+model = Sequential([
+    LSTM(50, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])),
+    Dropout(0.2),
+    LSTM(50, return_sequences=False),
+    Dropout(0.2),
+    Dense(25, activation='relu'),
+    Dense(1, activation='sigmoid')
+])
+model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+
+# Train the model
+model.fit(X_train, y_train, batch_size=32, epochs=10, validation_data=(X_test, y_test), verbose=1)
+
+# Make predictions
+predictions = (model.predict(X_test) > 0.5).astype(int).flatten()
+
+# Calculate accuracy
+accuracy = accuracy_score(y_test, predictions)
+print(f"Model Accuracy: {accuracy:.2f}")
+
+# Prepare data for plotting
+test_dates = df_daily_clean.index[split_idx + sequence_length:]
+actual_changes = df_daily_clean['close'].pct_change().shift(-1).loc[test_dates]
+predicted_directions = predictions
+
+# Calculate capital development (start with 100 units)
+capital = 100
+capital_history = [capital]
+positions = []  # 1 for long, -1 for short, 0 for flat
+for i in range(len(predicted_directions)):
+    if i < len(actual_changes) - 1:
+        change = actual_changes.iloc[i + 1] if i + 1 < len(actual_changes) else 0
+        if predicted_directions[i] == 1:  # Predict up, go long
+            capital *= (1 + change)
+            positions.append(1)
+        elif predicted_directions[i] == 0:  # Predict down, go short
+            capital *= (1 - change)
+            positions.append(-1)
+        else:
+            positions.append(0)  # Flat, no change
+        capital_history.append(capital)
+
+# Start Flask web server
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    # Plot 1: Predictions vs Actual Price Changes
+    plt.figure(figsize=(12, 6))
+    plt.plot(test_dates, actual_changes.values, label='Actual Price Changes', alpha=0.7)
+    plt.scatter(test_dates, [0.01 if p == 1 else -0.01 for p in predicted_directions], 
+                color='red', label='Predicted Direction (Up/Down)', marker='o')
+    plt.title('Predictions vs Actual Price Changes')
+    plt.xlabel('Date')
+    plt.ylabel('Price Change')
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    
+    img1 = io.BytesIO()
+    plt.savefig(img1, format='png')
+    img1.seek(0)
+    plot_url1 = base64.b64encode(img1.getvalue()).decode()
+    plt.close()
+    
+    # Plot 2: Capital Development
+    plt.figure(figsize=(12, 6))
+    plt.plot(test_dates[:len(capital_history)-1], capital_history[:-1], label='Capital', color='green')
+    plt.title('Capital Development Based on Predictions')
+    plt.xlabel('Date')
+    plt.ylabel('Capital')
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    
+    img2 = io.BytesIO()
+    plt.savefig(img2, format='png')
+    img2.seek(0)
+    plot_url2 = base64.b64encode(img2.getvalue()).decode()
+    plt.close()
+    
+    # HTML template to display plots
+    html = f'''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>LSTM Prediction Results</title>
+    </head>
+    <body>
+        <h1>LSTM Model for Next-Day Price Direction Prediction</h1>
+        <p>Model Accuracy: {accuracy:.2f}</p>
+        <h2>Predictions vs Actual Price Changes</h2>
+        <img src="data:image/png;base64,{plot_url1}" alt="Predictions vs Actual">
+        <h2>Capital Development</h2>
+        <img src="data:image/png;base64,{plot_url2}" alt="Capital Development">
+    </body>
+    </html>
+    '''
+    return render_template_string(html)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080, debug=False)
