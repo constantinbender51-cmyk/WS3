@@ -444,6 +444,11 @@ def run_training_task():
         model.add(Dropout(0.5)) # Dropout to force redundancy
         
         # LSTM 3: L2 regularization added
+        model.add(LSTM(UNITS, activation='relu', return_sequences=True, 
+                       kernel_regularizer=l2(REG_RATE)))
+        model.add(Dropout(0.5)) # Dropout to force redundancy
+        
+        # LSTM 4: L2 regularization added
         model.add(LSTM(UNITS, activation='relu', kernel_regularizer=l2(REG_RATE)))
         model.add(Dropout(0.5)) # Dropout to force redundancy
         
