@@ -144,9 +144,13 @@ y_train, y_test = y[:split_idx], y[split_idx:]
 
 # Build LSTM model
 model = Sequential([
-    LSTM(50, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])),
-    Dropout(0.2),
-    LSTM(50, return_sequences=False),
+    LSTM(100, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])),
+    Dropout(0.3),
+    LSTM(100, return_sequences=True),
+    Dropout(0.3),
+    LSTM(100, return_sequences=False),
+    Dropout(0.3),
+    Dense(50, activation='relu'),
     Dropout(0.2),
     Dense(25, activation='relu'),
     Dense(1, activation='sigmoid')
@@ -154,7 +158,7 @@ model = Sequential([
 model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
 
 # Train the model
-model.fit(X_train, y_train, batch_size=32, epochs=10, validation_data=(X_test, y_test), verbose=1)
+model.fit(X_train, y_train, batch_size=32, epochs=30, validation_data=(X_test, y_test), verbose=1)
 
 # Make predictions
 predictions = (model.predict(X_test) > 0.5).astype(int).flatten()
