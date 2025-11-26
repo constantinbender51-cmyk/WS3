@@ -241,14 +241,29 @@ def prepare_data(df):
                     feature.extend([0] * 10)
             features.append(feature)
             # Target is the 7-day derivative (daily rate of change over 7 days)
+            # Only create target if we have enough future data
             if i + 7 < len(df):  # Need to have data 7 days ahead
                 current_price = df['close'].iloc[i]
                 future_price = df['close'].iloc[i + 7]
                 # Calculate derivative as daily rate of change over 7-day period
-                derivative = (future_price - current_price) / (current_price * 7)
-                targets.append(derivative)
+                if current_price > 0:  # Ensure valid price
+                    derivative = (future_price - current_price) / (current_price * 7)
+                    targets.append(derivative)
+                else:
+                    targets.append(0)
             else:
-                targets.append(0)
+                # For the last 7 days, use the most recent available derivative
+                # instead of setting to 0
+                if i + 1 < len(df):
+                    current_price = df['close'].iloc[i]
+                    next_price = df['close'].iloc[i + 1]
+                    if current_price > 0:
+                        derivative = (next_price - current_price) / current_price
+                        targets.append(derivative)
+                    else:
+                        targets.append(0)
+                else:
+                    targets.append(0)
     
     features = np.array(features)
     targets = np.array(targets)
