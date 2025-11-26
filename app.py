@@ -88,15 +88,15 @@ def train_model(X_train, y_train):
 def generate_plots(df, predictions, test_start_idx):
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
     
-    # Plot 1: Predictions vs Actual with background colors
+    # Plot 1: Predictions vs Actual Price with background colors
     dates_all = df['Date']
-    returns_all = df['Return']
+    prices_all = df['Price']
     
     # Training and testing phases
     train_dates = dates_all[:test_start_idx]
     test_dates = dates_all[test_start_idx:]
-    train_returns = returns_all[:test_start_idx]
-    test_returns = returns_all[test_start_idx:]
+    train_prices = prices_all[:test_start_idx]
+    test_prices = prices_all[test_start_idx:]
     
     # Background for predictions: blue for predicted up, orange for predicted down
     for i in range(len(predictions)):
@@ -105,10 +105,10 @@ def generate_plots(df, predictions, test_start_idx):
         else:
             ax1.axvspan(test_dates.iloc[i], test_dates.iloc[i] + timedelta(days=1), color='orange', alpha=0.3)
     
-    ax1.plot(dates_all, returns_all, color='black', label='Actual Return')
-    ax1.set_title('Predictions vs Actual Returns (Blue: Predicted Up, Orange: Predicted Down)')
+    ax1.plot(dates_all, prices_all, color='black', label='Actual Price')
+    ax1.set_title('Predictions vs Actual Price (Blue: Predicted Up, Orange: Predicted Down)')
     ax1.set_xlabel('Date')
-    ax1.set_ylabel('Return')
+    ax1.set_ylabel('Price')
     ax1.legend()
     ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
     ax1.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
@@ -117,10 +117,10 @@ def generate_plots(df, predictions, test_start_idx):
     # Plot 2: Capital development
     capital = [1000]  # Start with 1000
     for i in range(len(predictions)):
-        if predictions[i] == 1 and test_returns.iloc[i] > 0:
-            capital.append(capital[-1] * (1 + test_returns.iloc[i]))
-        elif predictions[i] == 0 and test_returns.iloc[i] < 0:
-            capital.append(capital[-1] * (1 - test_returns.iloc[i]))
+        if predictions[i] == 1 and df['Return'].iloc[test_start_idx + i] > 0:
+            capital.append(capital[-1] * (1 + df['Return'].iloc[test_start_idx + i]))
+        elif predictions[i] == 0 and df['Return'].iloc[test_start_idx + i] < 0:
+            capital.append(capital[-1] * (1 - df['Return'].iloc[test_start_idx + i]))
         else:
             capital.append(capital[-1])
     
