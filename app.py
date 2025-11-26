@@ -10,8 +10,12 @@ import matplotlib.dates as mdates
 from flask import Flask, render_template_string
 import io
 import base64
+import tensorflow as tf
 
 app = Flask(__name__)
+
+# Global variables to store training results
+train_results = None
 
 # Generate mock price data
 def generate_mock_data():
@@ -70,8 +74,8 @@ def prepare_data(df, lookback=60):
     
     return X, y, scaler
 
-# Train LSTM model
-def train_model(X_train, y_train):
+# Train LSTM model with progress tracking
+def train_model(X_train, y_train, progress_callback=None):
     model = Sequential([
         LSTM(128, return_sequences=True, input_shape=(X_train.shape[1], 1)),
         Dropout(0.3),
@@ -85,7 +89,14 @@ def train_model(X_train, y_train):
         Dense(1, activation='sigmoid')
     ])
     model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-    model.fit(X_train, y_train, batch_size=32, epochs=50, verbose=0)
+    
+    # Custom callback for progress updates
+    class ProgressCallback(tf.keras.callbacks.Callback):
+        def on_epoch_end(self, epoch, logs=None):
+            if progress_callback:
+                progress_callback(epoch + 1, 50)
+    
+    model.fit(X_train, y_train, batch_size=32, epochs=50, verbose=0, callbacks=[ProgressCallback()])
     return model
 
 # Generate plots
@@ -159,9 +170,63 @@ def generate_plots(df, train_predictions, test_predictions, test_start_idx):
     plt.close()
     return plot_data
 
+# Function to run training when script starts
+def run_training():
+    global train_results
+    # Generate data
+    df = generate_mock_data()
+    
+    # Split data: first 80% for training, last 20% for testing
+    split_idx = int(0.8 * len(df))
+    train_df = df[:split_idx]
+    test_df = df[split_idx:]
+    
+    # Prepare training data
+    X_train, y_train, scaler = prepare_data(train_df)
+    
+    # Train model with progress updates
+    def update_progress(epoch, total_epochs):
+        progress = (epoch / total_epochs) * 100
+        print(f"Training progress: Epoch {epoch}/{total_epochs} ({progress:.1f}%)")
+    
+    model = train_model(X_train, y_train, progress_callback=update_progress)
+    
+    # Prepare testing data
+    lookback = 60
+    full_scaled = scaler.transform(df[['Return']].values)
+    X_test = []
+    for i in range(split_idx, len(full_scaled)):
+        X_test.append(full_scaled[i-lookback:i, 0])
+    X_test = np.array(X_test)
+    X_test = X_test.reshape(X_test.shape[0], X_test.shape[1], 1)
+    
+    # Make predictions for testing data
+    test_predictions = (model.predict(X_test, verbose=0) > 0.5).astype(int).flatten()
+    
+    # Make predictions for training data
+    train_predictions = (model.predict(X_train, verbose=0) > 0.5).astype(int).flatten()
+    
+    # Generate plots
+    plot_data = generate_plots(df, train_predictions, test_predictions, split_idx)
+    
+    # Calculate accuracy for training and testing
+    y_train_actual = train_df['Return_Direction'].values[lookback:]
+    train_accuracy = accuracy_score(y_train_actual, train_predictions)
+    y_test_actual = test_df['Return_Direction'].values
+    test_accuracy = accuracy_score(y_test_actual, test_predictions)
+    
+    train_results = {
+        'train_accuracy': float(train_accuracy),
+        'test_accuracy': float(test_accuracy),
+        'plot_data': plot_data
+    }
+    print("Training completed. Results are ready.")
+
 @app.route('/')
 def index():
-    html = '''
+    # Check if training is complete
+    if train_results is None:
+        html = '''
     <!DOCTYPE html>
     <html>
     <head>
@@ -186,19 +251,6 @@ def index():
                 100% { transform: rotate(360deg); }
             }
             .hidden { display: none; }
-            .button {
-                background-color: #3498db;
-                color: white;
-                padding: 15px 30px;
-                border: none;
-                border-radius: 5px;
-                font-size: 16px;
-                cursor: pointer;
-                margin: 20px;
-            }
-            .button:hover {
-                background-color: #2980b9;
-            }
         </style>
     </head>
     <body>
@@ -212,85 +264,69 @@ def index():
             </div>
             <p id="epoch-info">Epoch: 0/50</p>
         </div>
-        <div id="results" class="hidden">
-            <h1>LSTM Model for Return Direction Prediction</h1>
-            <div id="accuracy"></div>
-            <div id="plot"></div>
-        </div>
         
         <script>
-            document.addEventListener('DOMContentLoaded', function() {
-                startTraining();
-            });
-
-            function startTraining() {
-                fetch('/train')
+            function checkTrainingStatus() {
+                fetch('/status')
                     .then(response => response.json())
                     .then(data => {
-                        document.getElementById('loading').classList.add('hidden');
-                        document.getElementById('results').classList.remove('hidden');
-                        document.getElementById('accuracy').innerHTML = `
-                            <p>Accuracy on Training Set: ${(data.train_accuracy * 100).toFixed(2)}%</p>
-                            <p>Accuracy on Test Set: ${(data.test_accuracy * 100).toFixed(2)}%</p>
-                        `;
-                        document.getElementById('plot').innerHTML = `<img src="data:image/png;base64,${data.plot_data}" alt="Plots">`;
+                        if (data.status === 'completed') {
+                            document.getElementById('loading').classList.add('hidden');
+                            document.getElementById('results').classList.remove('hidden');
+                            document.getElementById('accuracy').innerHTML = `
+                                <p>Accuracy on Training Set: ${(data.train_accuracy * 100).toFixed(2)}%</p>
+                                <p>Accuracy on Test Set: ${(data.test_accuracy * 100).toFixed(2)}%</p>
+                            `;
+                            document.getElementById('plot').innerHTML = `<img src="data:image/png;base64,${data.plot_data}" alt="Plots">`;
+                        } else {
+                            // Update progress bar based on epoch info (simulated for now)
+                            setTimeout(checkTrainingStatus, 1000);
+                        }
                     })
                     .catch(error => {
                         console.error('Error:', error);
-                        document.getElementById('loading').innerHTML = '<p>Error occurred during training. Please try again.</p>';
+                        document.getElementById('loading').innerHTML = '<p>Error occurred during training. Please refresh the page.</p>';
                     });
             }
+            
+            document.addEventListener('DOMContentLoaded', function() {
+                checkTrainingStatus();
+            });
         </script>
+    </body>
+    </html>
+    '''
+    else:
+        html = f'''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>LSTM Prediction Results</title>
+    </head>
+    <body>
+        <h1>LSTM Model for Return Direction Prediction</h1>
+        <div id="accuracy">
+            <p>Accuracy on Training Set: {(train_results['train_accuracy'] * 100).toFixed(2)}%</p>
+            <p>Accuracy on Test Set: {(train_results['test_accuracy'] * 100).toFixed(2)}%</p>
+        </div>
+        <div id="plot">
+            <img src="data:image/png;base64,{train_results['plot_data']}" alt="Plots">
+        </div>
     </body>
     </html>
     '''
     return render_template_string(html)
 
-@app.route('/train')
-def train():
-    # Generate data
-    df = generate_mock_data()
-    
-    # Split data: first 80% for training, last 20% for testing
-    split_idx = int(0.8 * len(df))
-    train_df = df[:split_idx]
-    test_df = df[split_idx:]
-    
-    # Prepare training data
-    X_train, y_train, scaler = prepare_data(train_df)
-    
-    # Train model
-    model = train_model(X_train, y_train)
-    
-    # Prepare testing data
-    full_scaled = scaler.transform(df[['Return']].values)
-    X_test = []
-    lookback = 60
-    for i in range(split_idx, len(full_scaled)):
-        X_test.append(full_scaled[i-lookback:i, 0])
-    X_test = np.array(X_test)
-    X_test = X_test.reshape(X_test.shape[0], X_test.shape[1], 1)
-    
-    # Make predictions for testing data
-    test_predictions = (model.predict(X_test, verbose=0) > 0.5).astype(int).flatten()
-    
-    # Make predictions for training data
-    train_predictions = (model.predict(X_train, verbose=0) > 0.5).astype(int).flatten()
-    
-    # Generate plots
-    plot_data = generate_plots(df, train_predictions, test_predictions, split_idx)
-    
-    # Calculate accuracy for training and testing
-    y_train_actual = train_df['Return_Direction'].values[lookback:]
-    train_accuracy = accuracy_score(y_train_actual, train_predictions)
-    y_test_actual = test_df['Return_Direction'].values
-    test_accuracy = accuracy_score(y_test_actual, test_predictions)
-    
-    return {
-        'train_accuracy': float(train_accuracy),
-        'test_accuracy': float(test_accuracy),
-        'plot_data': plot_data
-    }
+@app.route('/status')
+def status():
+    if train_results is None:
+        return {'status': 'training'}
+    else:
+        return {'status': 'completed', 'train_accuracy': train_results['train_accuracy'], 'test_accuracy': train_results['test_accuracy'], 'plot_data': train_results['plot_data']}
 
 if __name__ == '__main__':
+    # Start training when script runs
+    import threading
+    training_thread = threading.Thread(target=run_training)
+    training_thread.start()
     app.run(host='0.0.0.0', port=8080, debug=False)
