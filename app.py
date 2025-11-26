@@ -85,7 +85,7 @@ def train_model(X_train, y_train):
     return model
 
 # Generate plots
-def generate_plots(df, predictions, test_start_idx):
+def generate_plots(df, train_predictions, test_predictions, test_start_idx):
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
     
     # Plot 1: Predictions vs Actual Price with background colors
@@ -98,15 +98,22 @@ def generate_plots(df, predictions, test_start_idx):
     train_prices = prices_all[:test_start_idx]
     test_prices = prices_all[test_start_idx:]
     
-    # Background for predictions: blue for predicted up, orange for predicted down
-    for i in range(len(predictions)):
-        if predictions[i] == 1:
+    # Background for training predictions: light blue for predicted up, light orange for predicted down
+    for i in range(len(train_predictions)):
+        if train_predictions[i] == 1:
+            ax1.axvspan(train_dates.iloc[i], train_dates.iloc[i] + timedelta(days=1), color='lightblue', alpha=0.3)
+        else:
+            ax1.axvspan(train_dates.iloc[i], train_dates.iloc[i] + timedelta(days=1), color='bisque', alpha=0.3)
+    
+    # Background for testing predictions: blue for predicted up, orange for predicted down
+    for i in range(len(test_predictions)):
+        if test_predictions[i] == 1:
             ax1.axvspan(test_dates.iloc[i], test_dates.iloc[i] + timedelta(days=1), color='blue', alpha=0.3)
         else:
             ax1.axvspan(test_dates.iloc[i], test_dates.iloc[i] + timedelta(days=1), color='orange', alpha=0.3)
     
     ax1.plot(dates_all, prices_all, color='black', label='Actual Price')
-    ax1.set_title('Predictions vs Actual Price (Blue: Predicted Up, Orange: Predicted Down)')
+    ax1.set_title('Predictions vs Actual Price (Light Colors: Training, Dark Colors: Testing; Blue/Orange: Predicted Up/Down)')
     ax1.set_xlabel('Date')
     ax1.set_ylabel('Price')
     ax1.legend()
@@ -168,15 +175,20 @@ def index():
     X_test = np.array(X_test)
     X_test = X_test.reshape(X_test.shape[0], X_test.shape[1], 1)
     
-    # Make predictions
-    predictions = (model.predict(X_test, verbose=0) > 0.5).astype(int).flatten()
+    # Make predictions for testing data
+    test_predictions = (model.predict(X_test, verbose=0) > 0.5).astype(int).flatten()
+    
+    # Make predictions for training data
+    train_predictions = (model.predict(X_train, verbose=0) > 0.5).astype(int).flatten()
     
     # Generate plots
-    plot_data = generate_plots(df, predictions, split_idx)
+    plot_data = generate_plots(df, train_predictions, test_predictions, split_idx)
     
-    # Calculate accuracy
+    # Calculate accuracy for training and testing
+    y_train = train_df['Return_Direction'].values
+    train_accuracy = accuracy_score(y_train, train_predictions)
     y_test = test_df['Return_Direction'].values
-    accuracy = accuracy_score(y_test, predictions)
+    test_accuracy = accuracy_score(y_test, test_predictions)
     
     html = f'''
     <!DOCTYPE html>
@@ -186,7 +198,8 @@ def index():
     </head>
     <body>
         <h1>LSTM Model for Return Direction Prediction</h1>
-        <p>Accuracy on Test Set: {accuracy:.2%}</p>
+        <p>Accuracy on Training Set: {train_accuracy:.2%}</p>
+        <p>Accuracy on Test Set: {test_accuracy:.2%}</p>
         <img src="data:image/png;base64,{plot_data}" alt="Plots">
     </body>
     </html>
