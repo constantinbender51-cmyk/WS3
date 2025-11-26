@@ -320,8 +320,18 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
         recent_dates = [all_dates[i] for i in range(len(all_dates)) if mask[i]]
         recent_y_actual = [all_y_actual[i] for i in range(len(all_y_actual)) if mask[i]]
         recent_y_predicted = [all_y_predicted[i] for i in range(len(all_y_predicted)) if mask[i]]
+        # Calculate actual BTC price derivative for the last month
+        recent_btc_derivative = []
+        for date in recent_dates:
+            idx = df.index.get_loc(date)
+            if idx >= 1:
+                derivative = (df['close'].iloc[idx] - df['close'].iloc[idx-1]) / df['close'].iloc[idx-1]
+            else:
+                derivative = 0
+            recent_btc_derivative.append(derivative)
         plt.plot(recent_dates, recent_y_predicted, label='Predicted Price', color='green', alpha=0.8)
         plt.plot(recent_dates, recent_y_actual, label='Target (Price Derivative)', color='red', alpha=0.8)
+        plt.plot(recent_dates, recent_btc_derivative, label='Actual BTC Price Derivative', color='grey', alpha=0.8)
     plt.title('Prediction vs Target (Last Month Only)')
     plt.legend()
     plt.xticks(rotation=45)
