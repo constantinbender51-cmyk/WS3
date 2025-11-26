@@ -204,8 +204,13 @@ def index():
     <body>
         <div id="loading" class="loading">
             <h1>LSTM Model for Return Direction Prediction</h1>
-            <p>Click the button below to start model training and prediction</p>
-            <button class="button" onclick="startTraining()">Start Model Training</button>
+            <p>Training LSTM model... This may take a few minutes</p>
+            <div class="spinner"></div>
+            <p>Generating mock data, preparing features, and training neural network...</p>
+            <div id="progress-bar" style="width: 100%; background-color: #f0f0f0; border-radius: 5px; margin: 20px auto;">
+                <div id="progress" style="width: 0%; height: 20px; background-color: #3498db; border-radius: 5px; text-align: center; color: white; line-height: 20px;">0%</div>
+            </div>
+            <p id="epoch-info">Epoch: 0/50</p>
         </div>
         <div id="results" class="hidden">
             <h1>LSTM Model for Return Direction Prediction</h1>
@@ -214,13 +219,11 @@ def index():
         </div>
         
         <script>
+            document.addEventListener('DOMContentLoaded', function() {
+                startTraining();
+            });
+
             function startTraining() {
-                document.getElementById('loading').innerHTML = `
-                    <div class="spinner"></div>
-                    <p>Training LSTM model... This may take a few minutes</p>
-                    <p>Generating mock data, preparing features, and training neural network...</p>
-                `;
-                
                 fetch('/train')
                     .then(response => response.json())
                     .then(data => {
