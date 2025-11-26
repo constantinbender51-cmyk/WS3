@@ -1,0 +1,184 @@
+import gdown
+import pandas as pd
+import numpy as np
+from flask import Flask, render_template_string
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from sklearn.preprocessing import MinMaxScaler
+import os
+
+# Download the file from Google Drive
+file_id = '1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o'
+url = f'https://drive.google.com/uc?id={file_id}'
+output = 'data.csv'
+gdown.download(url, output, quiet=False)
+
+# Load the data
+data = pd.read_csv(output)
+
+# Assume the data has columns: timestamp, open, high, low, close, volume
+# Convert timestamp to datetime and set as index
+data['timestamp'] = pd.to_datetime(data['timestamp'])
+data.set_index('timestamp', inplace=True)
+
+# Resample to daily OHLCV
+daily_data = data.resample('D').agg({
+    'open': 'first',
+    'high': 'max',
+    'low': 'min',
+    'close': 'last',
+    'volume': 'sum'
+}).dropna()
+
+# Calculate 365-day SMA
+daily_data['sma_365'] = daily_data['close'].rolling(window=365).mean()
+
+# Define target: next day movement (1 for up, 0 for flat, -1 for down)
+daily_data['next_close'] = daily_data['close'].shift(-1)
+daily_data['movement'] = np.where(daily_data['next_close'] > daily_data['close'], 1, 
+                                  np.where(daily_data['next_close'] < daily_data['close'], -1, 0))
+
+# Drop rows with NaN values (due to SMA and shift)
+daily_data = daily_data.dropna()
+
+# Prepare features and target
+features = daily_data[['sma_365']].values
+target = daily_data['movement'].values
+
+# Normalize features
+scaler = MinMaxScaler()
+features_scaled = scaler.fit_transform(features)
+
+# Reshape for LSTM (samples, time steps, features)
+# Using a single time step for simplicity
+features_reshaped = features_scaled.reshape((features_scaled.shape[0], 1, features_scaled.shape[1]))
+
+# Split data into train and test (using 80-20 split)
+train_size = int(len(features_reshaped) * 0.8)
+X_train, X_test = features_reshaped[:train_size], features_reshaped[train_size:]
+y_train, y_test = target[:train_size], target[train_size:]
+
+# Build LSTM model
+model = Sequential([
+    LSTM(50, activation='relu', input_shape=(1, 1)),
+    Dense(3, activation='softmax')  # 3 classes: up, flat, down
+])
+
+model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+
+# Train the model
+model.fit(X_train, y_train + 1, epochs=10, batch_size=32, validation_data=(X_test, y_test + 1), verbose=1)  # Adjust labels to 0,1,2
+
+# Predict on the entire dataset
+predictions = model.predict(features_reshaped)
+predicted_classes = np.argmax(predictions, axis=1) - 1  # Convert back to -1,0,1
+
+# Calculate strategy returns
+initial_capital = 10000  # Starting capital
+capital = [initial_capital]
+position = 0  # 0 for no position, 1 for long
+for i in range(1, len(daily_data)):
+    if predicted_classes[i-1] == 1:  # Predicted up
+        if position == 0:
+            # Buy at open
+            shares = capital[-1] / daily_data['open'].iloc[i]
+            position = shares
+        # Hold if already long
+    elif predicted_classes[i-1] == -1:  # Predicted down
+        if position > 0:
+            # Sell at open
+            capital.append(position * daily_data['open'].iloc[i])
+            position = 0
+        else:
+            capital.append(capital[-1])
+    else:  # Predicted flat
+        if position > 0:
+            # Sell at open
+            capital.append(position * daily_data['open'].iloc[i])
+            position = 0
+        else:
+            capital.append(capital[-1])
+
+# If position is held at the end, sell at last close
+if position > 0:
+    capital[-1] = position * daily_data['close'].iloc[-1]
+
+# Prepare data for the web server
+daily_data['prediction'] = predicted_classes
+daily_data['actual'] = daily_data['movement']
+daily_data['capital'] = capital
+
+# Start Flask app
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    # Create HTML content to display predictions vs actual and capital development
+    html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>LSTM Prediction Results</title>
+        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    </head>
+    <body>
+        <h1>LSTM Model Predictions and Capital Development (2018-2025)</h1>
+        <div id="prediction-plot"></div>
+        <div id="capital-plot"></div>
+        <script>
+            var predictionData = [
+                {
+                    x: {{ dates | safe }},
+                    y: {{ predictions | safe }},
+                    type: 'scatter',
+                    mode: 'lines+markers',
+                    name: 'Predicted Movement',
+                    line: {color: 'blue'}
+                },
+                {
+                    x: {{ dates | safe }},
+                    y: {{ actuals | safe }},
+                    type: 'scatter',
+                    mode: 'lines+markers',
+                    name: 'Actual Movement',
+                    line: {color: 'red'}
+                }
+            ];
+            var predictionLayout = {
+                title: 'Predicted vs Actual Daily Movement',
+                xaxis: {title: 'Date'},
+                yaxis: {title: 'Movement (-1=Down, 0=Flat, 1=Up)'}
+            };
+            Plotly.newPlot('prediction-plot', predictionData, predictionLayout);
+
+            var capitalData = [
+                {
+                    x: {{ dates | safe }},
+                    y: {{ capital | safe }},
+                    type: 'scatter',
+                    mode: 'lines',
+                    name: 'Capital',
+                    line: {color: 'green'}
+                }
+            ];
+            var capitalLayout = {
+                title: 'Capital Development Over Time',
+                xaxis: {title: 'Date'},
+                yaxis: {title: 'Capital ($)'}
+            };
+            Plotly.newPlot('capital-plot', capitalData, capitalLayout);
+        </script>
+    </body>
+    </html>
+    """
+    
+    dates = daily_data.index.strftime('%Y-%m-%d').tolist()
+    predictions = daily_data['prediction'].tolist()
+    actuals = daily_data['actual'].tolist()
+    capital_vals = daily_data['capital'].tolist()
+    
+    return render_template_string(html_content, dates=dates, predictions=predictions, actuals=actuals, capital=capital_vals)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080, debug=False)
