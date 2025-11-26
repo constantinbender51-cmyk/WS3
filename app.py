@@ -52,34 +52,35 @@ for tf_name, tf in timeframes.items():
     resampled_data[tf_name] = resampled
 
 # Prepare data for linear regression models
+data_1h = resampled_data['1h'].copy()
 data_1d = resampled_data['1d'].copy()
 data_1w = resampled_data['1w'].copy()
 
 # Calculate features and targets for 1-day prediction
-# Features: 24 individual daily price changes (percent) - using data up to t-1
+# Features: 24 individual hourly price changes (percent) - using data up to t-1
 for i in range(1, 25):
-    data_1d[f'price_change_{i}d_pct'] = data_1d['close'].shift(i).pct_change(periods=1) * 100
+    data_1h[f'price_change_{i}h_pct'] = data_1h['close'].shift(i).pct_change(periods=1) * 100
 # Target: price change over next 1 day (percent)
 data_1d['target_1d_pct'] = data_1d['close'].pct_change(periods=-1) * 100
 
 # Calculate features and targets for 1-week prediction
-# Features: 7 individual weekly price changes (percent) - using data up to t-1
+# Features: 7 individual daily price changes (percent) - using data up to t-1
 for i in range(1, 8):
-    data_1w[f'price_change_{i}w_pct'] = data_1w['close'].shift(i).pct_change(periods=1) * 100
+    data_1d[f'price_change_{i}d_pct'] = data_1d['close'].shift(i).pct_change(periods=1) * 100
 # Target: price change over next 1 week (percent)
 data_1w['target_1w_pct'] = data_1w['close'].pct_change(periods=-1) * 100
 
 # Drop rows with NaN values (due to pct_change calculations)
-feature_cols_1d = [f'price_change_{i}d_pct' for i in range(1, 25)]
-data_1d_clean = data_1d.dropna(subset=feature_cols_1d + ['target_1d_pct'])
-feature_cols_1w = [f'price_change_{i}w_pct' for i in range(1, 8)]
-data_1w_clean = data_1w.dropna(subset=feature_cols_1w + ['target_1w_pct'])
+feature_cols_1d = [f'price_change_{i}h_pct' for i in range(1, 25)]
+data_1h_clean = data_1h.dropna(subset=feature_cols_1d + ['target_1d_pct'])
+feature_cols_1w = [f'price_change_{i}d_pct' for i in range(1, 8)]
+data_1d_clean = data_1d.dropna(subset=feature_cols_1w + ['target_1w_pct'])
 
 # Prepare features and targets for modeling
-X_1d = data_1d_clean[feature_cols_1d]
-y_1d = data_1d_clean['target_1d_pct']
-X_1w = data_1w_clean[feature_cols_1w]
-y_1w = data_1w_clean['target_1w_pct']
+X_1d = data_1h_clean[feature_cols_1d]
+y_1d = data_1h_clean['target_1d_pct']
+X_1w = data_1d_clean[feature_cols_1w]
+y_1w = data_1d_clean['target_1w_pct']
 
 # Split data into train and test sets (using 80% train, 20% test)
 X_1d_train, X_1d_test, y_1d_train, y_1d_test = train_test_split(X_1d, y_1d, test_size=0.2, random_state=42)
@@ -132,9 +133,9 @@ def generate_plot(data, title, model=None, feature_name=None, nn_model=None):
     if model is not None and feature_name is not None:
         # Calculate feature values for all data points using data up to t-1
         if feature_name == '1d':
-            feature_values = pd.DataFrame({f'price_change_{i}d_pct': data['close'].shift(i).pct_change(periods=1) * 100 for i in range(1, 25)})
+            feature_values = pd.DataFrame({f'price_change_{i}h_pct': data['close'].shift(i).pct_change(periods=1) * 100 for i in range(1, 25)})
         elif feature_name == '1w':
-            feature_values = pd.DataFrame({f'price_change_{i}w_pct': data['close'].shift(i).pct_change(periods=1) * 100 for i in range(1, 8)})
+            feature_values = pd.DataFrame({f'price_change_{i}d_pct': data['close'].shift(i).pct_change(periods=1) * 100 for i in range(1, 8)})
         else:
             feature_values = pd.DataFrame()
         
@@ -145,9 +146,9 @@ def generate_plot(data, title, model=None, feature_name=None, nn_model=None):
             predicted_pct_changes = model.predict(feature_values.loc[valid_indices])
             # Calculate predicted prices for the next period (shift indices forward)
             if feature_name == '1d':
-                predicted_indices = valid_indices + pd.Timedelta(days=1)
+                predicted_indices = valid_indices + pd.Timedelta(hours=24)
             elif feature_name == '1w':
-                predicted_indices = valid_indices + pd.Timedelta(weeks=1)
+                predicted_indices = valid_indices + pd.Timedelta(days=7)
             else:
                 predicted_indices = valid_indices
             predicted_prices = data.loc[valid_indices, 'close'] * (1 + predicted_pct_changes / 100)
@@ -190,7 +191,7 @@ def index():
         '1d': {
             'coefficients': model_1d.coef_.tolist(),
             'intercept': model_1d.intercept_,
-            'features': ['1-day price change (%)', '2-day price change (%)', '3-day price change (%)', '4-day price change (%)', '5-day price change (%)', '6-day price change (%)', '7-day price change (%)', '8-day price change (%)', '9-day price change (%)', '10-day price change (%)', '11-day price change (%)', '12-day price change (%)', '13-day price change (%)', '14-day price change (%)', '15-day price change (%)', '16-day price change (%)', '17-day price change (%)', '18-day price change (%)', '19-day price change (%)', '20-day price change (%)', '21-day price change (%)', '22-day price change (%)', '23-day price change (%)', '24-day price change (%)'],
+            'features': ['1-hour price change (%)', '2-hour price change (%)', '3-hour price change (%)', '4-hour price change (%)', '5-hour price change (%)', '6-hour price change (%)', '7-hour price change (%)', '8-hour price change (%)', '9-hour price change (%)', '10-hour price change (%)', '11-hour price change (%)', '12-hour price change (%)', '13-hour price change (%)', '14-hour price change (%)', '15-hour price change (%)', '16-hour price change (%)', '17-hour price change (%)', '18-hour price change (%)', '19-hour price change (%)', '20-hour price change (%)', '21-hour price change (%)', '22-hour price change (%)', '23-hour price change (%)', '24-hour price change (%)'],
             'target': '1-day price change (%)',
             'mae': mae_1d,
             'rmse': rmse_1d,
@@ -200,7 +201,7 @@ def index():
         '1w': {
             'coefficients': model_1w.coef_.tolist(),
             'intercept': model_1w.intercept_,
-            'features': ['1-week price change (%)', '2-week price change (%)', '3-week price change (%)', '4-week price change (%)', '5-week price change (%)', '6-week price change (%)', '7-week price change (%)'],
+            'features': ['1-day price change (%)', '2-day price change (%)', '3-day price change (%)', '4-day price change (%)', '5-day price change (%)', '6-day price change (%)', '7-day price change (%)'],
             'target': '1-week price change (%)',
             'mae': mae_1w,
             'rmse': rmse_1w,
@@ -208,7 +209,7 @@ def index():
             'prediction_distances': prediction_distances_1w
         },
         '1d_nn': {
-            'features': ['1-day price change (%)', '2-day price change (%)', '3-day price change (%)', '4-day price change (%)', '5-day price change (%)', '6-day price change (%)', '7-day price change (%)', '8-day price change (%)', '9-day price change (%)', '10-day price change (%)', '11-day price change (%)', '12-day price change (%)', '13-day price change (%)', '14-day price change (%)', '15-day price change (%)', '16-day price change (%)', '17-day price change (%)', '18-day price change (%)', '19-day price change (%)', '20-day price change (%)', '21-day price change (%)', '22-day price change (%)', '23-day price change (%)', '24-day price change (%)'],
+            'features': ['1-hour price change (%)', '2-hour price change (%)', '3-hour price change (%)', '4-hour price change (%)', '5-hour price change (%)', '6-hour price change (%)', '7-hour price change (%)', '8-hour price change (%)', '9-hour price change (%)', '10-hour price change (%)', '11-hour price change (%)', '12-hour price change (%)', '13-hour price change (%)', '14-hour price change (%)', '15-hour price change (%)', '16-hour price change (%)', '17-hour price change (%)', '18-hour price change (%)', '19-hour price change (%)', '20-hour price change (%)', '21-hour price change (%)', '22-hour price change (%)', '23-hour price change (%)', '24-hour price change (%)'],
             'target': '1-day price change (%)',
             'mae': mae_1d_nn,
             'rmse': rmse_1d_nn,
@@ -216,7 +217,7 @@ def index():
             'prediction_distances': prediction_distances_1d_nn
         },
         '1w_nn': {
-            'features': ['1-week price change (%)', '2-week price change (%)', '3-week price change (%)', '4-week price change (%)', '5-week price change (%)', '6-week price change (%)', '7-week price change (%)'],
+            'features': ['1-day price change (%)', '2-day price change (%)', '3-day price change (%)', '4-day price change (%)', '5-day price change (%)', '6-day price change (%)', '7-day price change (%)'],
             'target': '1-week price change (%)',
             'mae': mae_1w_nn,
             'rmse': rmse_1w_nn,
