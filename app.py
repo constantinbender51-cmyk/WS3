@@ -450,7 +450,7 @@ def run_training_task():
         model.add(Dense(1))
         
         # Use low learning rate and clipnorm for stability
-        optimizer = Adam(learning_rate=0.0001, clipnorm=1.0)
+        optimizer = Adam(learning_rate=0.001, clipnorm=1.0)
         model.compile(optimizer=optimizer, loss='mse')
         
         logger.info("Starting model.fit() ...")
