@@ -81,6 +81,12 @@ capital = [initial_capital]  # Initialize capital list with starting capital
 position = 0  # 0 for no position, positive for long shares, negative for short shares
 for i in range(1, len(daily_data)):
     current_capital = capital[-1]
+    # Update capital for unrealized gains/losses from open positions
+    if position > 0:  # Long position: capital changes with price increase
+        current_capital = position * daily_data['open'].iloc[i]
+    elif position < 0:  # Short position: capital changes with price decrease
+        current_capital = current_capital + (-position) * (daily_data['open'].iloc[i-1] - daily_data['open'].iloc[i])
+    # Handle position changes based on predictions
     if predicted_classes[i-1] == 1:  # Predicted up
         if position <= 0:  # Close short or open long
             if position < 0:  # Close short position
@@ -90,7 +96,6 @@ for i in range(1, len(daily_data)):
                 shares = current_capital / daily_data['open'].iloc[i]
                 position = shares
                 # Capital unchanged when opening position
-        # Hold long position: capital unchanged
     elif predicted_classes[i-1] == -1:  # Predicted down
         if position >= 0:  # Close long or open short
             if position > 0:  # Close long position
@@ -100,7 +105,6 @@ for i in range(1, len(daily_data)):
                 shares = current_capital / daily_data['open'].iloc[i]
                 position = -shares  # Negative for short
                 # Capital unchanged when opening position
-        # Hold short position: capital unchanged
     else:  # Predicted flat
         if position != 0:  # Close any position
             if position > 0:  # Close long
@@ -108,7 +112,6 @@ for i in range(1, len(daily_data)):
             else:  # Close short
                 current_capital = current_capital + (-position) * (daily_data['open'].iloc[i-1] - daily_data['open'].iloc[i])
             position = 0
-        # No position: capital unchanged
     capital.append(current_capital)
 
 # Close any remaining position at the last close price
