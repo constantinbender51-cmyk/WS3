@@ -6,6 +6,7 @@ from flask import Flask, render_template_string
 import io
 import base64
 from sklearn.linear_model import LinearRegression
+from sklearn.neural_network import MLPRegressor
 from sklearn.model_selection import train_test_split
 import numpy as np
 
@@ -91,17 +92,36 @@ model_1d.fit(X_1d_train, y_1d_train)
 model_1w = LinearRegression()
 model_1w.fit(X_1w_train, y_1w_train)
 
-# Calculate predictions and errors for 1-day model
+# Train neural network models
+nn_model_1d = MLPRegressor(hidden_layer_sizes=(50, 50), max_iter=1000, random_state=42)
+nn_model_1d.fit(X_1d_train, y_1d_train)
+
+nn_model_1w = MLPRegressor(hidden_layer_sizes=(50, 50), max_iter=1000, random_state=42)
+nn_model_1w.fit(X_1w_train, y_1w_train)
+
+# Calculate predictions and errors for 1-day linear model
 y_1d_pred = model_1d.predict(X_1d_test)
 mae_1d = np.mean(np.abs(y_1d_pred - y_1d_test))
 rmse_1d = np.sqrt(np.mean((y_1d_pred - y_1d_test) ** 2))
 prediction_distances_1d = np.abs(y_1d_pred - y_1d_test)
 
-# Calculate predictions and errors for 1-week model
+# Calculate predictions and errors for 1-week linear model
 y_1w_pred = model_1w.predict(X_1w_test)
 mae_1w = np.mean(np.abs(y_1w_pred - y_1w_test))
 rmse_1w = np.sqrt(np.mean((y_1w_pred - y_1w_test) ** 2))
 prediction_distances_1w = np.abs(y_1w_pred - y_1w_test)
+
+# Calculate predictions and errors for 1-day neural network model
+y_1d_nn_pred = nn_model_1d.predict(X_1d_test)
+mae_1d_nn = np.mean(np.abs(y_1d_nn_pred - y_1d_test))
+rmse_1d_nn = np.sqrt(np.mean((y_1d_nn_pred - y_1d_test) ** 2))
+prediction_distances_1d_nn = np.abs(y_1d_nn_pred - y_1d_test)
+
+# Calculate predictions and errors for 1-week neural network model
+y_1w_nn_pred = nn_model_1w.predict(X_1w_test)
+mae_1w_nn = np.mean(np.abs(y_1w_nn_pred - y_1w_test))
+rmse_1w_nn = np.sqrt(np.mean((y_1w_nn_pred - y_1w_test) ** 2))
+prediction_distances_1w_nn = np.abs(y_1w_nn_pred - y_1w_test)
 
 # Function to generate plot as base64 image
 def generate_plot(data, title, model=None, feature_name=None):
@@ -182,6 +202,22 @@ def index():
             'rmse': rmse_1w,
             'test_set_size': len(y_1w_test),
             'prediction_distances': prediction_distances_1w
+        },
+        '1d_nn': {
+            'features': ['1-hour price change (%)', '2-hour price change (%)', '3-hour price change (%)', '4-hour price change (%)', '5-hour price change (%)', '6-hour price change (%)', '7-hour price change (%)', '8-hour price change (%)', '9-hour price change (%)', '10-hour price change (%)', '11-hour price change (%)', '12-hour price change (%)', '13-hour price change (%)', '14-hour price change (%)', '15-hour price change (%)', '16-hour price change (%)', '17-hour price change (%)', '18-hour price change (%)', '19-hour price change (%)', '20-hour price change (%)', '21-hour price change (%)', '22-hour price change (%)', '23-hour price change (%)', '24-hour price change (%)'],
+            'target': '1-day price change (%)',
+            'mae': mae_1d_nn,
+            'rmse': rmse_1d_nn,
+            'test_set_size': len(y_1d_test),
+            'prediction_distances': prediction_distances_1d_nn
+        },
+        '1w_nn': {
+            'features': ['1-day price change (%)', '2-day price change (%)', '3-day price change (%)', '4-day price change (%)', '5-day price change (%)', '6-day price change (%)', '7-day price change (%)'],
+            'target': '1-week price change (%)',
+            'mae': mae_1w_nn,
+            'rmse': rmse_1w_nn,
+            'test_set_size': len(y_1w_test),
+            'prediction_distances': prediction_distances_1w_nn
         }
     }
     
@@ -198,8 +234,8 @@ def index():
             <img src="data:image/png;base64,{{ img }}" alt="{{ tf }} Plot">
         {% endfor %}
         <h1>Linear Regression Models for Price Prediction</h1>
-        {% for model_name, info in model_info.items() %}
-            <h2>Model for {{ model_name }} Prediction</h2>
+        {% for model_name, info in model_info.items() if 'nn' not in model_name %}
+            <h2>Linear Regression Model for {{ model_name }} Prediction</h2>
             <p>Features: {{ info.features | join(', ') }}</p>
             <p>Target: {{ info.target }}</p>
             <p>Coefficients: {% for coef in info.coefficients %}{{ "%.6f"|format(coef) }}{% if not loop.last %}, {% endif %}{% endfor %}</p>
@@ -210,16 +246,36 @@ def index():
             <p>Test Set Size: {{ info.test_set_size }} samples</p>
         {% endfor %}
         
+        <h1>Neural Network Models for Price Prediction</h1>
+        {% for model_name, info in model_info.items() if 'nn' in model_name %}
+            <h2>Neural Network Model for {{ model_name[:-3] }} Prediction</h2>
+            <p>Features: {{ info.features | join(', ') }}</p>
+            <p>Target: {{ info.target }}</p>
+            <p>Mean Absolute Error (MAE): {{ "%.4f"|format(info.mae) }}%</p>
+            <p>Root Mean Squared Error (RMSE): {{ "%.4f"|format(info.rmse) }}%</p>
+            <p>Test Set Size: {{ info.test_set_size }} samples</p>
+        {% endfor %}
+        
         <h1>Prediction Distance Analysis</h1>
-        <h2>1-Day Model Prediction Distances</h2>
+        <h2>1-Day Linear Model Prediction Distances</h2>
         <p>Average distance between predicted and actual: {{ "%.4f"|format(model_info['1d'].mae) }}%</p>
         <p>Maximum distance: {{ "%.4f"|format(model_info['1d'].prediction_distances.max()) }}%</p>
         <p>Minimum distance: {{ "%.4f"|format(model_info['1d'].prediction_distances.min()) }}%</p>
         
-        <h2>1-Week Model Prediction Distances</h2>
+        <h2>1-Week Linear Model Prediction Distances</h2>
         <p>Average distance between predicted and actual: {{ "%.4f"|format(model_info['1w'].mae) }}%</p>
         <p>Maximum distance: {{ "%.4f"|format(model_info['1w'].prediction_distances.max()) }}%</p>
         <p>Minimum distance: {{ "%.4f"|format(model_info['1w'].prediction_distances.min()) }}%</p>
+        
+        <h2>1-Day Neural Network Model Prediction Distances</h2>
+        <p>Average distance between predicted and actual: {{ "%.4f"|format(model_info['1d_nn'].mae) }}%</p>
+        <p>Maximum distance: {{ "%.4f"|format(model_info['1d_nn'].prediction_distances.max()) }}%</p>
+        <p>Minimum distance: {{ "%.4f"|format(model_info['1d_nn'].prediction_distances.min()) }}%</p>
+        
+        <h2>1-Week Neural Network Model Prediction Distances</h2>
+        <p>Average distance between predicted and actual: {{ "%.4f"|format(model_info['1w_nn'].mae) }}%</p>
+        <p>Maximum distance: {{ "%.4f"|format(model_info['1w_nn'].prediction_distances.max()) }}%</p>
+        <p>Minimum distance: {{ "%.4f"|format(model_info['1w_nn'].prediction_distances.min()) }}%</p>
     </body>
     </html>
     '''
