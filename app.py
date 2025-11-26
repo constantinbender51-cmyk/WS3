@@ -23,6 +23,9 @@ df = pd.read_csv(output)
 df['timestamp'] = pd.to_datetime(df['timestamp'])
 df.set_index('timestamp', inplace=True)
 
+# Filter data to start from 2022
+df = df[df.index >= '2022-01-01']
+
 # Resample to different timeframes
 timeframes = {
     '15min': '15T',
