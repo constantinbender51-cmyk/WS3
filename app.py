@@ -69,7 +69,7 @@ model = Sequential([
 model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
 
 # Train the model
-model.fit(X_train, y_train + 1, epochs=50, batch_size=32, validation_data=(X_test, y_test + 1), verbose=1)  # Adjust labels to 0,1,2
+model.fit(X_train, y_train + 1, epochs=100, batch_size=32, validation_data=(X_test, y_test + 1), verbose=1)  # Adjust labels to 0,1,2
 
 # Predict on the entire dataset
 predictions = model.predict(features_reshaped)
@@ -138,6 +138,14 @@ def index():
                     mode: 'lines',
                     name: 'BTC Close Price',
                     line: {color: 'black', width: 2}
+                },
+                {
+                    x: {{ dates | safe }},
+                    y: {{ sma_365 | safe }},
+                    type: 'scatter',
+                    mode: 'lines',
+                    name: 'SMA 365',
+                    line: {color: 'blue', width: 1}
                 }
             ];
             
@@ -203,9 +211,10 @@ def index():
     dates = daily_data.index.strftime('%Y-%m-%d').tolist()
     predictions = daily_data['prediction'].tolist()
     prices = daily_data['close'].tolist()
+    sma_365 = daily_data['sma_365'].tolist()
     capital_vals = daily_data['capital'].tolist()
     
-    return render_template_string(html_content, dates=dates, predictions=predictions, prices=prices, capital=capital_vals)
+    return render_template_string(html_content, dates=dates, predictions=predictions, prices=prices, sma_365=sma_365, capital=capital_vals)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=False)
