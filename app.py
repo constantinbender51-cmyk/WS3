@@ -77,46 +77,45 @@ predicted_classes = np.argmax(predictions, axis=1) - 1  # Convert back to -1,0,1
 
 # Calculate strategy returns
 initial_capital = 10000  # Starting capital
-capital = [initial_capital] * len(daily_data)  # Initialize capital list with same length
+capital = [initial_capital]  # Initialize capital list with starting capital
 position = 0  # 0 for no position, positive for long shares, negative for short shares
 for i in range(1, len(daily_data)):
+    current_capital = capital[-1]
     if predicted_classes[i-1] == 1:  # Predicted up
         if position <= 0:  # Close short or open long
             if position < 0:  # Close short position
-                capital[i] = capital[i-1] + (-position) * (daily_data['open'].iloc[i-1] - daily_data['open'].iloc[i])
+                current_capital = current_capital + (-position) * (daily_data['open'].iloc[i-1] - daily_data['open'].iloc[i])
                 position = 0
             if position == 0:  # Open long position
-                shares = capital[i-1] / daily_data['open'].iloc[i]
+                shares = current_capital / daily_data['open'].iloc[i]
                 position = shares
-                capital[i] = capital[i-1]  # Capital unchanged when opening position
-        else:  # Hold long position
-            capital[i] = capital[i-1]
+                # Capital unchanged when opening position
+        # Hold long position: capital unchanged
     elif predicted_classes[i-1] == -1:  # Predicted down
         if position >= 0:  # Close long or open short
             if position > 0:  # Close long position
-                capital[i] = position * daily_data['open'].iloc[i]
+                current_capital = position * daily_data['open'].iloc[i]
                 position = 0
             if position == 0:  # Open short position
-                shares = capital[i-1] / daily_data['open'].iloc[i]
+                shares = current_capital / daily_data['open'].iloc[i]
                 position = -shares  # Negative for short
-                capital[i] = capital[i-1]  # Capital unchanged when opening position
-        else:  # Hold short position
-            capital[i] = capital[i-1]
+                # Capital unchanged when opening position
+        # Hold short position: capital unchanged
     else:  # Predicted flat
         if position != 0:  # Close any position
             if position > 0:  # Close long
-                capital[i] = position * daily_data['open'].iloc[i]
+                current_capital = position * daily_data['open'].iloc[i]
             else:  # Close short
-                capital[i] = capital[i-1] + (-position) * (daily_data['open'].iloc[i-1] - daily_data['open'].iloc[i])
+                current_capital = current_capital + (-position) * (daily_data['open'].iloc[i-1] - daily_data['open'].iloc[i])
             position = 0
-        else:  # No position
-            capital[i] = capital[i-1]
+        # No position: capital unchanged
+    capital.append(current_capital)
 
 # Close any remaining position at the last close price
 if position > 0:  # Close long
     capital[-1] = position * daily_data['close'].iloc[-1]
 elif position < 0:  # Close short
-    capital[-1] = capital[-2] + (-position) * (daily_data['open'].iloc[-2] - daily_data['close'].iloc[-1])
+    capital[-1] = capital[-1] + (-position) * (daily_data['open'].iloc[-1] - daily_data['close'].iloc[-1])
 
 # Prepare data for the web server
 daily_data['prediction'] = predicted_classes
