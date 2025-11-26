@@ -124,11 +124,11 @@ rmse_1w_nn = np.sqrt(np.mean((y_1w_nn_pred - y_1w_test) ** 2))
 prediction_distances_1w_nn = np.abs(y_1w_nn_pred - y_1w_test)
 
 # Function to generate plot as base64 image
-def generate_plot(data, title, model=None, feature_name=None):
+def generate_plot(data, title, model=None, feature_name=None, nn_model=None):
     plt.figure(figsize=(10, 6))
     plt.plot(data.index, data['close'], label='Close Price')
     
-    # Add prediction line if model and feature are provided
+    # Add prediction lines if models and feature are provided
     if model is not None and feature_name is not None:
         # Calculate feature values for all data points using data up to t-1
         if feature_name == '1d':
@@ -141,19 +141,23 @@ def generate_plot(data, title, model=None, feature_name=None):
         # Predict percentage changes for all data points with non-NaN features
         valid_indices = feature_values.dropna().index
         if len(valid_indices) > 0:
+            # Linear regression predictions
             predicted_pct_changes = model.predict(feature_values.loc[valid_indices])
             # Calculate predicted prices for the next period (shift indices forward)
-            # For 1-day prediction, shift by 1 day; for 1-week, shift by 1 week
             if feature_name == '1d':
                 predicted_indices = valid_indices + pd.Timedelta(days=1)
             elif feature_name == '1w':
                 predicted_indices = valid_indices + pd.Timedelta(weeks=1)
             else:
                 predicted_indices = valid_indices
-            # Use the current close price to predict the next period's price
             predicted_prices = data.loc[valid_indices, 'close'] * (1 + predicted_pct_changes / 100)
-            # Plot the predicted prices at the shifted indices
-            plt.plot(predicted_indices, predicted_prices, color='red', linestyle='--', label='Predicted Price')
+            plt.plot(predicted_indices, predicted_prices, color='red', linestyle='--', label='Linear Regression Prediction')
+            
+            # Neural network predictions if model provided
+            if nn_model is not None:
+                nn_predicted_pct_changes = nn_model.predict(feature_values.loc[valid_indices])
+                nn_predicted_prices = data.loc[valid_indices, 'close'] * (1 + nn_predicted_pct_changes / 100)
+                plt.plot(predicted_indices, nn_predicted_prices, color='green', linestyle='--', label='Neural Network Prediction')
     
     plt.title(title)
     plt.xlabel('Time')
@@ -175,9 +179,9 @@ def index():
     for tf_name, data in resampled_data.items():
         # For 1d and 1w timeframes, include predictions
         if tf_name == '1d':
-            plots[tf_name] = generate_plot(data, f'BTC OHLCV - {tf_name} with Prediction', model=model_1d, feature_name='1d')
+            plots[tf_name] = generate_plot(data, f'BTC OHLCV - {tf_name} with Predictions', model=model_1d, feature_name='1d', nn_model=nn_model_1d)
         elif tf_name == '1w':
-            plots[tf_name] = generate_plot(data, f'BTC OHLCV - {tf_name} with Prediction', model=model_1w, feature_name='1w')
+            plots[tf_name] = generate_plot(data, f'BTC OHLCV - {tf_name} with Predictions', model=model_1w, feature_name='1w', nn_model=nn_model_1w)
         else:
             plots[tf_name] = generate_plot(data, f'BTC OHLCV - {tf_name}')
     
