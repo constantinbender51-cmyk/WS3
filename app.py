@@ -69,7 +69,7 @@ model = Sequential([
 model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
 
 # Train the model
-model.fit(X_train, y_train + 1, epochs=10, batch_size=32, validation_data=(X_test, y_test + 1), verbose=1)  # Adjust labels to 0,1,2
+model.fit(X_train, y_train + 1, epochs=50, batch_size=32, validation_data=(X_test, y_test + 1), verbose=1)  # Adjust labels to 0,1,2
 
 # Predict on the entire dataset
 predictions = model.predict(features_reshaped)
