@@ -87,6 +87,18 @@ model_1d.fit(X_1d_train, y_1d_train)
 model_1w = LinearRegression()
 model_1w.fit(X_1w_train, y_1w_train)
 
+# Calculate predictions and errors for 1-day model
+y_1d_pred = model_1d.predict(X_1d_test)
+mae_1d = np.mean(np.abs(y_1d_pred - y_1d_test))
+rmse_1d = np.sqrt(np.mean((y_1d_pred - y_1d_test) ** 2))
+prediction_distances_1d = np.abs(y_1d_pred - y_1d_test)
+
+# Calculate predictions and errors for 1-week model
+y_1w_pred = model_1w.predict(X_1w_test)
+mae_1w = np.mean(np.abs(y_1w_pred - y_1w_test))
+rmse_1w = np.sqrt(np.mean((y_1w_pred - y_1w_test) ** 2))
+prediction_distances_1w = np.abs(y_1w_pred - y_1w_test)
+
 # Function to generate plot as base64 image
 def generate_plot(data, title, model=None, feature_name=None):
     plt.figure(figsize=(10, 6))
