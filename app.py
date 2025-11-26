@@ -88,9 +88,30 @@ model_1w = LinearRegression()
 model_1w.fit(X_1w_train, y_1w_train)
 
 # Function to generate plot as base64 image
-def generate_plot(data, title):
+def generate_plot(data, title, model=None, feature_name=None):
     plt.figure(figsize=(10, 6))
     plt.plot(data.index, data['close'], label='Close Price')
+    
+    # Add prediction line if model and feature are provided
+    if model is not None and feature_name is not None:
+        # Get the last close price
+        last_close = data['close'].iloc[-1]
+        # Calculate the feature value (price change percentage)
+        if feature_name == 'price_change_24h_pct':
+            feature_value = data['close'].pct_change(periods=1).iloc[-1] * 100
+        elif feature_name == 'price_change_7d_pct':
+            feature_value = data['close'].pct_change(periods=1).iloc[-1] * 100
+        else:
+            feature_value = 0
+        
+        # Predict the percentage change
+        predicted_pct_change = model.predict([[feature_value]])[0]
+        # Calculate predicted price
+        predicted_price = last_close * (1 + predicted_pct_change / 100)
+        
+        # Plot the predicted price as a horizontal line from the last data point
+        plt.axhline(y=predicted_price, color='red', linestyle='--', label='Predicted Price')
+    
     plt.title(title)
     plt.xlabel('Time')
     plt.ylabel('Price')
@@ -109,7 +130,13 @@ def generate_plot(data, title):
 def index():
     plots = {}
     for tf_name, data in resampled_data.items():
-        plots[tf_name] = generate_plot(data, f'BTC OHLCV - {tf_name}')
+        # For 1d and 1w timeframes, include predictions
+        if tf_name == '1d':
+            plots[tf_name] = generate_plot(data, f'BTC OHLCV - {tf_name} with Prediction', model=model_1d, feature_name='price_change_24h_pct')
+        elif tf_name == '1w':
+            plots[tf_name] = generate_plot(data, f'BTC OHLCV - {tf_name} with Prediction', model=model_1w, feature_name='price_change_7d_pct')
+        else:
+            plots[tf_name] = generate_plot(data, f'BTC OHLCV - {tf_name}')
     
     # Prepare model info for display
     model_info = {
