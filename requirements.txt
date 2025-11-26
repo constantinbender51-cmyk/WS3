@@ -1,9 +1,0 @@
-Flask
-pandas
-numpy
-scikit-learn
-matplotlib
-requests
-gunicorn
-setuptools
-tensorflow
