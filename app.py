@@ -112,10 +112,26 @@ except Exception as e:
 features = ['open', 'high', 'low', 'close', 'volume', 'sma_7', 'sma_29', 'sma_365', 'bb_upper', 'bb_lower', 'macd_signal_diff', 'hashrate', 'active_addresses']
 df_daily_clean = df_daily[features].dropna()
 
-# Define target: next day price change direction (1 for up, 0 for down)
+# Define target: next day price change direction with meaningful threshold
+# Use percentage change to avoid simple up/down bias
 df_daily_clean['next_close'] = df_daily_clean['close'].shift(-1)
-df_daily_clean['target'] = (df_daily_clean['next_close'] > df_daily_clean['close']).astype(int)
+df_daily_clean['price_change_pct'] = (df_daily_clean['next_close'] - df_daily_clean['close']) / df_daily_clean['close']
+
+# Use a threshold to define meaningful up/down movements (e.g., >0.5% change)
+threshold = 0.005  # 0.5%
+df_daily_clean['target'] = np.where(
+    df_daily_clean['price_change_pct'] > threshold, 1,  # Significant up
+    np.where(df_daily_clean['price_change_pct'] < -threshold, 0, 2)  # Significant down or neutral
+)
+
+# Remove neutral cases for binary classification
+df_daily_clean = df_daily_clean[df_daily_clean['target'] != 2]
 df_daily_clean = df_daily_clean.dropna()
+
+# Check class distribution
+class_counts = df_daily_clean['target'].value_counts()
+print(f"Class distribution - Up: {class_counts.get(1, 0)}, Down: {class_counts.get(0, 0)}")
+print(f"Class imbalance ratio: {class_counts.get(1, 1) / class_counts.get(0, 1):.2f}")
 
 # Skip Boruta feature selection and use all features
 print("Skipping Boruta feature selection - using all available features")
@@ -142,7 +158,18 @@ split_idx = int(0.8 * len(X))
 X_train, X_test = X[:split_idx], X[split_idx:]
 y_train, y_test = y[:split_idx], y[split_idx:]
 
-# Build LSTM model
+# Build LSTM model with class weighting
+from sklearn.utils.class_weight import compute_class_weight
+
+# Calculate class weights to handle imbalance
+class_weights = compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(y_train),
+    y=y_train
+)
+class_weight_dict = dict(enumerate(class_weights))
+print(f"Class weights: {class_weight_dict}")
+
 model = Sequential([
     LSTM(100, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])),
     Dropout(0.3),
@@ -157,15 +184,26 @@ model = Sequential([
 ])
 model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
 
-# Train the model
-model.fit(X_train, y_train, batch_size=32, epochs=30, validation_data=(X_test, y_test), verbose=1)
+# Train the model with class weights
+model.fit(X_train, y_train, batch_size=32, epochs=30, validation_data=(X_test, y_test), verbose=1, class_weight=class_weight_dict)
 
-# Make predictions
-predictions = (model.predict(X_test) > 0.5).astype(int).flatten()
+# Make predictions and analyze prediction distribution
+pred_probs = model.predict(X_test).flatten()
+predictions = (pred_probs > 0.5).astype(int)
 
-# Calculate accuracy
+# Analyze prediction distribution
+print(f"Prediction distribution - Up: {np.sum(predictions == 1)}, Down: {np.sum(predictions == 0)}")
+print(f"Prediction probabilities - Mean: {np.mean(pred_probs):.3f}, Std: {np.std(pred_probs):.3f}")
+
+# Calculate accuracy and additional metrics
+from sklearn.metrics import classification_report, confusion_matrix
+
 accuracy = accuracy_score(y_test, predictions)
 print(f"Model Accuracy: {accuracy:.2f}")
+print("\nClassification Report:")
+print(classification_report(y_test, predictions, target_names=['Down', 'Up']))
+print("\nConfusion Matrix:")
+print(confusion_matrix(y_test, predictions))
 
 # Prepare data for plotting
 test_dates = df_daily_clean_selected.index[split_idx + sequence_length:]
@@ -176,9 +214,11 @@ predicted_directions = predictions
 capital = 100
 capital_history = [capital]
 positions = []  # 1 for long, -1 for short, 0 for flat
+
+# Use actual price changes for capital calculation
 for i in range(len(predicted_directions)):
-    if i < len(actual_changes) - 1:
-        change = actual_changes.iloc[i + 1] if i + 1 < len(actual_changes) else 0
+    if i < len(actual_changes):
+        change = actual_changes.iloc[i] if i < len(actual_changes) else 0
         if predicted_directions[i] == 1:  # Predict up, go long
             capital *= (1 + change)
             positions.append(1)
@@ -188,6 +228,9 @@ for i in range(len(predicted_directions)):
         else:
             positions.append(0)  # Flat, no change
         capital_history.append(capital)
+
+print(f"Final capital: {capital:.2f}")
+print(f"Positions taken - Long: {positions.count(1)}, Short: {positions.count(-1)}, Flat: {positions.count(0)}")
 
 # Prepare data for full time period visualization
 train_dates = df_daily_clean_selected.index[sequence_length:split_idx + sequence_length]
