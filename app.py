@@ -158,7 +158,8 @@ def index():
             'target': '1-day price change (%)',
             'mae': mae_1d,
             'rmse': rmse_1d,
-            'test_set_size': len(y_1d_test)
+            'test_set_size': len(y_1d_test),
+            'prediction_distances': prediction_distances_1d
         },
         '1w': {
             'coefficient': model_1w.coef_[0],
@@ -167,7 +168,8 @@ def index():
             'target': '1-week price change (%)',
             'mae': mae_1w,
             'rmse': rmse_1w,
-            'test_set_size': len(y_1w_test)
+            'test_set_size': len(y_1w_test),
+            'prediction_distances': prediction_distances_1w
         }
     }
     
@@ -199,13 +201,13 @@ def index():
         <h1>Prediction Distance Analysis</h1>
         <h2>1-Day Model Prediction Distances</h2>
         <p>Average distance between predicted and actual: {{ "%.4f"|format(model_info['1d'].mae) }}%</p>
-        <p>Maximum distance: {{ "%.4f"|format(prediction_distances_1d.max()) }}%</p>
-        <p>Minimum distance: {{ "%.4f"|format(prediction_distances_1d.min()) }}%</p>
+        <p>Maximum distance: {{ "%.4f"|format(model_info['1d'].prediction_distances.max()) }}%</p>
+        <p>Minimum distance: {{ "%.4f"|format(model_info['1d'].prediction_distances.min()) }}%</p>
         
         <h2>1-Week Model Prediction Distances</h2>
         <p>Average distance between predicted and actual: {{ "%.4f"|format(model_info['1w'].mae) }}%</p>
-        <p>Maximum distance: {{ "%.4f"|format(prediction_distances_1w.max()) }}%</p>
-        <p>Minimum distance: {{ "%.4f"|format(prediction_distances_1w.min()) }}%</p>
+        <p>Maximum distance: {{ "%.4f"|format(model_info['1w'].prediction_distances.max()) }}%</p>
+        <p>Minimum distance: {{ "%.4f"|format(model_info['1w'].prediction_distances.min()) }}%</p>
     </body>
     </html>
     '''
