@@ -123,10 +123,10 @@ def generate_plots(df, train_predictions, test_predictions, test_start_idx):
     
     # Plot 2: Capital development
     capital = [1000]  # Start with 1000
-    for i in range(len(predictions)):
-        if predictions[i] == 1 and df['Return'].iloc[test_start_idx + i] > 0:
+    for i in range(len(test_predictions)):
+        if test_predictions[i] == 1 and df['Return'].iloc[test_start_idx + i] > 0:
             capital.append(capital[-1] * (1 + df['Return'].iloc[test_start_idx + i]))
-        elif predictions[i] == 0 and df['Return'].iloc[test_start_idx + i] < 0:
+        elif test_predictions[i] == 0 and df['Return'].iloc[test_start_idx + i] < 0:
             capital.append(capital[-1] * (1 - df['Return'].iloc[test_start_idx + i]))
         else:
             capital.append(capital[-1])
