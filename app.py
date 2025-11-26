@@ -8,6 +8,8 @@ import base64
 import requests
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import accuracy_score
+from sklearn.ensemble import RandomForestClassifier
+from boruta import BorutaPy
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 import warnings
@@ -115,16 +117,33 @@ df_daily_clean['next_close'] = df_daily_clean['close'].shift(-1)
 df_daily_clean['target'] = (df_daily_clean['next_close'] > df_daily_clean['close']).astype(int)
 df_daily_clean = df_daily_clean.dropna()
 
+# Apply Boruta feature selection
+print("Applying Boruta feature selection...")
+X_boruta = df_daily_clean[features].values
+y_boruta = df_daily_clean['target'].values
+
+# Initialize Random Forest classifier for Boruta
+rf = RandomForestClassifier(n_jobs=-1, max_depth=5)
+boruta_selector = BorutaPy(rf, n_estimators='auto', verbose=2, random_state=42)
+boruta_selector.fit(X_boruta, y_boruta)
+
+# Get selected features
+selected_features = [features[i] for i in range(len(features)) if boruta_selector.support_[i]]
+print(f"Selected features: {selected_features}")
+
+# Use only selected features for model training
+df_daily_clean_selected = df_daily_clean[selected_features + ['target']]
+
 # Normalize features
 scaler = MinMaxScaler()
-scaled_features = scaler.fit_transform(df_daily_clean[features])
+scaled_features = scaler.fit_transform(df_daily_clean_selected[selected_features])
 
 # Prepare sequences for LSTM (using 60 days of history)
 sequence_length = 60
 X, y = [], []
 for i in range(sequence_length, len(scaled_features)):
     X.append(scaled_features[i-sequence_length:i])
-    y.append(df_daily_clean['target'].iloc[i])
+    y.append(df_daily_clean_selected['target'].iloc[i])
 X, y = np.array(X), np.array(y)
 
 # Split data: 80% train, 20% test
@@ -154,7 +173,7 @@ accuracy = accuracy_score(y_test, predictions)
 print(f"Model Accuracy: {accuracy:.2f}")
 
 # Prepare data for plotting
-test_dates = df_daily_clean.index[split_idx + sequence_length:]
+test_dates = df_daily_clean_selected.index[split_idx + sequence_length:]
 actual_changes = df_daily_clean['close'].pct_change().shift(-1).loc[test_dates]
 predicted_directions = predictions
 
@@ -224,6 +243,7 @@ def index():
     <body>
         <h1>LSTM Model for Next-Day Price Direction Prediction</h1>
         <p>Model Accuracy: {accuracy:.2f}</p>
+        <p>Selected Features: {', '.join(selected_features)}</p>
         <h2>Predictions vs Actual Price Changes</h2>
         <img src="data:image/png;base64,{plot_url1}" alt="Predictions vs Actual">
         <h2>Capital Development</h2>
