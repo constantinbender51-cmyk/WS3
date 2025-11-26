@@ -94,23 +94,22 @@ def generate_plot(data, title, model=None, feature_name=None):
     
     # Add prediction line if model and feature are provided
     if model is not None and feature_name is not None:
-        # Get the last close price
-        last_close = data['close'].iloc[-1]
-        # Calculate the feature value (price change percentage)
+        # Calculate feature values for all data points
         if feature_name == 'price_change_24h_pct':
-            feature_value = data['close'].pct_change(periods=1).iloc[-1] * 100
+            feature_values = data['close'].pct_change(periods=1) * 100
         elif feature_name == 'price_change_7d_pct':
-            feature_value = data['close'].pct_change(periods=1).iloc[-1] * 100
+            feature_values = data['close'].pct_change(periods=1) * 100
         else:
-            feature_value = 0
+            feature_values = pd.Series([0] * len(data), index=data.index)
         
-        # Predict the percentage change
-        predicted_pct_change = model.predict([[feature_value]])[0]
-        # Calculate predicted price
-        predicted_price = last_close * (1 + predicted_pct_change / 100)
-        
-        # Plot the predicted price as a horizontal line from the last data point
-        plt.axhline(y=predicted_price, color='red', linestyle='--', label='Predicted Price')
+        # Predict percentage changes for all data points with non-NaN features
+        valid_indices = feature_values.dropna().index
+        if len(valid_indices) > 0:
+            predicted_pct_changes = model.predict(feature_values.loc[valid_indices].values.reshape(-1, 1))
+            # Calculate predicted prices
+            predicted_prices = data.loc[valid_indices, 'close'] * (1 + predicted_pct_changes / 100)
+            # Plot the predicted prices as a line
+            plt.plot(valid_indices, predicted_prices, color='red', linestyle='--', label='Predicted Price')
     
     plt.title(title)
     plt.xlabel('Time')
