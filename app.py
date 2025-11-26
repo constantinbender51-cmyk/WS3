@@ -143,13 +143,19 @@ def index():
             'coefficient': model_1d.coef_[0],
             'intercept': model_1d.intercept_,
             'feature': '24-hour price change (%)',
-            'target': '1-day price change (%)'
+            'target': '1-day price change (%)',
+            'mae': mae_1d,
+            'rmse': rmse_1d,
+            'test_set_size': len(y_1d_test)
         },
         '1w': {
             'coefficient': model_1w.coef_[0],
             'intercept': model_1w.intercept_,
             'feature': '7-day price change (%)',
-            'target': '1-week price change (%)'
+            'target': '1-week price change (%)',
+            'mae': mae_1w,
+            'rmse': rmse_1w,
+            'test_set_size': len(y_1w_test)
         }
     }
     
@@ -173,7 +179,21 @@ def index():
             <p>Coefficient: {{ "%.6f"|format(info.coefficient) }}</p>
             <p>Intercept: {{ "%.6f"|format(info.intercept) }}</p>
             <p>Equation: Target = {{ "%.6f"|format(info.coefficient) }} * Feature + {{ "%.6f"|format(info.intercept) }}</p>
+            <p>Mean Absolute Error (MAE): {{ "%.4f"|format(info.mae) }}%</p>
+            <p>Root Mean Squared Error (RMSE): {{ "%.4f"|format(info.rmse) }}%</p>
+            <p>Test Set Size: {{ info.test_set_size }} samples</p>
         {% endfor %}
+        
+        <h1>Prediction Distance Analysis</h1>
+        <h2>1-Day Model Prediction Distances</h2>
+        <p>Average distance between predicted and actual: {{ "%.4f"|format(model_info['1d'].mae) }}%</p>
+        <p>Maximum distance: {{ "%.4f"|format(prediction_distances_1d.max()) }}%</p>
+        <p>Minimum distance: {{ "%.4f"|format(prediction_distances_1d.min()) }}%</p>
+        
+        <h2>1-Week Model Prediction Distances</h2>
+        <p>Average distance between predicted and actual: {{ "%.4f"|format(model_info['1w'].mae) }}%</p>
+        <p>Maximum distance: {{ "%.4f"|format(prediction_distances_1w.max()) }}%</p>
+        <p>Minimum distance: {{ "%.4f"|format(prediction_distances_1w.min()) }}%</p>
     </body>
     </html>
     '''
