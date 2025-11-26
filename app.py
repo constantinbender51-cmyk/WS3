@@ -117,43 +117,67 @@ app = Flask(__name__)
 
 @app.route('/')
 def index():
-    # Create HTML content to display predictions vs actual and capital development
+    # Create HTML content to display BTC price with prediction-based background colors
     html_content = """
     <!DOCTYPE html>
     <html>
     <head>
-        <title>LSTM Prediction Results</title>
+        <title>BTC Price with Prediction Background</title>
         <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     </head>
     <body>
-        <h1>LSTM Model Predictions and Capital Development (2018-2025)</h1>
-        <div id="prediction-plot"></div>
+        <h1>BTC Price with Prediction-Based Background Colors</h1>
+        <div id="price-plot"></div>
         <div id="capital-plot"></div>
         <script>
-            var predictionData = [
+            var priceData = [
                 {
                     x: {{ dates | safe }},
-                    y: {{ predictions | safe }},
+                    y: {{ prices | safe }},
                     type: 'scatter',
-                    mode: 'lines+markers',
-                    name: 'Predicted Movement',
-                    line: {color: 'blue'}
-                },
-                {
-                    x: {{ dates | safe }},
-                    y: {{ actuals | safe }},
-                    type: 'scatter',
-                    mode: 'lines+markers',
-                    name: 'Actual Movement',
-                    line: {color: 'red'}
+                    mode: 'lines',
+                    name: 'BTC Close Price',
+                    line: {color: 'black', width: 2}
                 }
             ];
-            var predictionLayout = {
-                title: 'Predicted vs Actual Daily Movement',
+            
+            // Add background shapes based on predictions
+            var shapes = [];
+            var predictions = {{ predictions | safe }};
+            var dates = {{ dates | safe }};
+            
+            for (var i = 0; i < predictions.length; i++) {
+                var color;
+                if (predictions[i] === 1) {
+                    color = 'rgba(0, 255, 0, 0.2)';  // Green for up prediction
+                } else if (predictions[i] === -1) {
+                    color = 'rgba(255, 0, 0, 0.2)';  // Red for down prediction
+                } else {
+                    color = 'rgba(255, 255, 0, 0.2)';  // Yellow for flat prediction
+                }
+                
+                shapes.push({
+                    type: 'rect',
+                    xref: 'x',
+                    yref: 'paper',
+                    x0: dates[i],
+                    x1: i < predictions.length - 1 ? dates[i + 1] : dates[i],
+                    y0: 0,
+                    y1: 1,
+                    fillcolor: color,
+                    line: {width: 0},
+                    layer: 'below'
+                });
+            }
+            
+            var priceLayout = {
+                title: 'BTC Close Price with Prediction Background Colors',
                 xaxis: {title: 'Date'},
-                yaxis: {title: 'Movement (-1=Down, 0=Flat, 1=Up)'}
+                yaxis: {title: 'Price ($)'},
+                shapes: shapes,
+                showlegend: true
             };
-            Plotly.newPlot('prediction-plot', predictionData, predictionLayout);
+            Plotly.newPlot('price-plot', priceData, priceLayout);
 
             var capitalData = [
                 {
@@ -178,10 +202,10 @@ def index():
     
     dates = daily_data.index.strftime('%Y-%m-%d').tolist()
     predictions = daily_data['prediction'].tolist()
-    actuals = daily_data['actual'].tolist()
+    prices = daily_data['close'].tolist()
     capital_vals = daily_data['capital'].tolist()
     
-    return render_template_string(html_content, dates=dates, predictions=predictions, actuals=actuals, capital=capital_vals)
+    return render_template_string(html_content, dates=dates, predictions=predictions, prices=prices, capital=capital_vals)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=False)
