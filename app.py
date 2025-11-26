@@ -55,25 +55,29 @@ data_1d = resampled_data['1d'].copy()
 data_1w = resampled_data['1w'].copy()
 
 # Calculate features and targets for 1-day prediction
-# Feature: price change over last 24 hours (percent) - using data up to t-1
-data_1d['price_change_24h_pct'] = data_1d['close'].shift(1).pct_change(periods=1) * 100
+# Features: 24 individual hourly price changes (percent) - using data up to t-1
+for i in range(1, 25):
+    data_1d[f'price_change_{i}h_pct'] = data_1d['close'].shift(i).pct_change(periods=1) * 100
 # Target: price change over next 1 day (percent)
 data_1d['target_1d_pct'] = data_1d['close'].pct_change(periods=-1) * 100
 
 # Calculate features and targets for 1-week prediction
-# Feature: price change over last 7 days (percent) - using data up to t-1
-data_1w['price_change_7d_pct'] = data_1w['close'].shift(1).pct_change(periods=1) * 100
+# Features: 7 individual daily price changes (percent) - using data up to t-1
+for i in range(1, 8):
+    data_1w[f'price_change_{i}d_pct'] = data_1w['close'].shift(i).pct_change(periods=1) * 100
 # Target: price change over next 1 week (percent)
 data_1w['target_1w_pct'] = data_1w['close'].pct_change(periods=-1) * 100
 
 # Drop rows with NaN values (due to pct_change calculations)
-data_1d_clean = data_1d.dropna(subset=['price_change_24h_pct', 'target_1d_pct'])
-data_1w_clean = data_1w.dropna(subset=['price_change_7d_pct', 'target_1w_pct'])
+feature_cols_1d = [f'price_change_{i}h_pct' for i in range(1, 25)]
+data_1d_clean = data_1d.dropna(subset=feature_cols_1d + ['target_1d_pct'])
+feature_cols_1w = [f'price_change_{i}d_pct' for i in range(1, 8)]
+data_1w_clean = data_1w.dropna(subset=feature_cols_1w + ['target_1w_pct'])
 
 # Prepare features and targets for modeling
-X_1d = data_1d_clean[['price_change_24h_pct']]
+X_1d = data_1d_clean[feature_cols_1d]
 y_1d = data_1d_clean['target_1d_pct']
-X_1w = data_1w_clean[['price_change_7d_pct']]
+X_1w = data_1w_clean[feature_cols_1w]
 y_1w = data_1w_clean['target_1w_pct']
 
 # Split data into train and test sets (using 80% train, 20% test)
@@ -107,22 +111,22 @@ def generate_plot(data, title, model=None, feature_name=None):
     # Add prediction line if model and feature are provided
     if model is not None and feature_name is not None:
         # Calculate feature values for all data points using data up to t-1
-        if feature_name == 'price_change_24h_pct':
-            feature_values = data['close'].shift(1).pct_change(periods=1) * 100
-        elif feature_name == 'price_change_7d_pct':
-            feature_values = data['close'].shift(1).pct_change(periods=1) * 100
+        if feature_name == '1d':
+            feature_values = pd.DataFrame({f'price_change_{i}h_pct': data['close'].shift(i).pct_change(periods=1) * 100 for i in range(1, 25)})
+        elif feature_name == '1w':
+            feature_values = pd.DataFrame({f'price_change_{i}d_pct': data['close'].shift(i).pct_change(periods=1) * 100 for i in range(1, 8)})
         else:
-            feature_values = pd.Series([0] * len(data), index=data.index)
+            feature_values = pd.DataFrame()
         
         # Predict percentage changes for all data points with non-NaN features
         valid_indices = feature_values.dropna().index
         if len(valid_indices) > 0:
-            predicted_pct_changes = model.predict(feature_values.loc[valid_indices].values.reshape(-1, 1))
+            predicted_pct_changes = model.predict(feature_values.loc[valid_indices])
             # Calculate predicted prices for the next period (shift indices forward)
             # For 1-day prediction, shift by 1 day; for 1-week, shift by 1 week
-            if feature_name == 'price_change_24h_pct':
+            if feature_name == '1d':
                 predicted_indices = valid_indices + pd.Timedelta(days=1)
-            elif feature_name == 'price_change_7d_pct':
+            elif feature_name == '1w':
                 predicted_indices = valid_indices + pd.Timedelta(weeks=1)
             else:
                 predicted_indices = valid_indices
@@ -151,18 +155,18 @@ def index():
     for tf_name, data in resampled_data.items():
         # For 1d and 1w timeframes, include predictions
         if tf_name == '1d':
-            plots[tf_name] = generate_plot(data, f'BTC OHLCV - {tf_name} with Prediction', model=model_1d, feature_name='price_change_24h_pct')
+            plots[tf_name] = generate_plot(data, f'BTC OHLCV - {tf_name} with Prediction', model=model_1d, feature_name='1d')
         elif tf_name == '1w':
-            plots[tf_name] = generate_plot(data, f'BTC OHLCV - {tf_name} with Prediction', model=model_1w, feature_name='price_change_7d_pct')
+            plots[tf_name] = generate_plot(data, f'BTC OHLCV - {tf_name} with Prediction', model=model_1w, feature_name='1w')
         else:
             plots[tf_name] = generate_plot(data, f'BTC OHLCV - {tf_name}')
     
     # Prepare model info for display
     model_info = {
         '1d': {
-            'coefficient': model_1d.coef_[0],
+            'coefficients': model_1d.coef_.tolist(),
             'intercept': model_1d.intercept_,
-            'feature': '24-hour price change (%)',
+            'features': ['1-hour price change (%)', '2-hour price change (%)', '3-hour price change (%)', '4-hour price change (%)', '5-hour price change (%)', '6-hour price change (%)', '7-hour price change (%)', '8-hour price change (%)', '9-hour price change (%)', '10-hour price change (%)', '11-hour price change (%)', '12-hour price change (%)', '13-hour price change (%)', '14-hour price change (%)', '15-hour price change (%)', '16-hour price change (%)', '17-hour price change (%)', '18-hour price change (%)', '19-hour price change (%)', '20-hour price change (%)', '21-hour price change (%)', '22-hour price change (%)', '23-hour price change (%)', '24-hour price change (%)'],
             'target': '1-day price change (%)',
             'mae': mae_1d,
             'rmse': rmse_1d,
@@ -170,9 +174,9 @@ def index():
             'prediction_distances': prediction_distances_1d
         },
         '1w': {
-            'coefficient': model_1w.coef_[0],
+            'coefficients': model_1w.coef_.tolist(),
             'intercept': model_1w.intercept_,
-            'feature': '7-day price change (%)',
+            'features': ['1-day price change (%)', '2-day price change (%)', '3-day price change (%)', '4-day price change (%)', '5-day price change (%)', '6-day price change (%)', '7-day price change (%)'],
             'target': '1-week price change (%)',
             'mae': mae_1w,
             'rmse': rmse_1w,
@@ -196,11 +200,11 @@ def index():
         <h1>Linear Regression Models for Price Prediction</h1>
         {% for model_name, info in model_info.items() %}
             <h2>Model for {{ model_name }} Prediction</h2>
-            <p>Feature: {{ info.feature }}</p>
+            <p>Features: {{ info.features | join(', ') }}</p>
             <p>Target: {{ info.target }}</p>
-            <p>Coefficient: {{ "%.6f"|format(info.coefficient) }}</p>
+            <p>Coefficients: {% for coef in info.coefficients %}{{ "%.6f"|format(coef) }}{% if not loop.last %}, {% endif %}{% endfor %}</p>
             <p>Intercept: {{ "%.6f"|format(info.intercept) }}</p>
-            <p>Equation: Target = {{ "%.6f"|format(info.coefficient) }} * Feature + {{ "%.6f"|format(info.intercept) }}</p>
+            <p>Equation: Target = {% for coef in info.coefficients %}{{ "%.6f"|format(coef) }} * Feature_{{ loop.index }}{% if not loop.last %} + {% endif %}{% endfor %} + {{ "%.6f"|format(info.intercept) }}</p>
             <p>Mean Absolute Error (MAE): {{ "%.4f"|format(info.mae) }}%</p>
             <p>Root Mean Squared Error (RMSE): {{ "%.4f"|format(info.rmse) }}%</p>
             <p>Test Set Size: {{ info.test_set_size }} samples</p>
