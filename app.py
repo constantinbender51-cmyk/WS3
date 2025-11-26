@@ -117,36 +117,12 @@ df_daily_clean['next_close'] = df_daily_clean['close'].shift(-1)
 df_daily_clean['target'] = (df_daily_clean['next_close'] > df_daily_clean['close']).astype(int)
 df_daily_clean = df_daily_clean.dropna()
 
-# Apply Boruta feature selection
-print("Applying Boruta feature selection...")
-X_boruta = df_daily_clean[features].values
-y_boruta = df_daily_clean['target'].values
+# Skip Boruta feature selection and use all features
+print("Skipping Boruta feature selection - using all available features")
+selected_features = features.copy()
+print(f"Using all features: {selected_features}")
 
-# Debug: Check data shape and target distribution
-print(f"Data shape: {X_boruta.shape}")
-print(f"Target distribution: {pd.Series(y_boruta).value_counts()}")
-
-# Initialize Random Forest classifier for Boruta with more flexible parameters
-rf = RandomForestClassifier(n_jobs=-1, max_depth=10, n_estimators=100, random_state=42)
-boruta_selector = BorutaPy(rf, n_estimators='auto', verbose=2, random_state=42, max_iter=100)
-boruta_selector.fit(X_boruta, y_boruta)
-
-# Get selected features and debug information
-selected_features = [features[i] for i in range(len(features)) if boruta_selector.support_[i]]
-print(f"Selected features: {selected_features}")
-print(f"Number of selected features: {len(selected_features)}")
-print(f"Boruta support array: {boruta_selector.support_}")
-
-# If no features are selected, use all features with a warning
-if len(selected_features) == 0:
-    print("WARNING: Boruta selected no features. Using all features with correlation-based selection.")
-    # Fallback: Use correlation with target to select top features
-    corr_with_target = df_daily_clean[features].corrwith(df_daily_clean['target']).abs()
-    top_features = corr_with_target.nlargest(min(5, len(features))).index.tolist()
-    selected_features = top_features
-    print(f"Using fallback features based on correlation: {selected_features}")
-
-# Use only selected features for model training
+# Use all features for model training
 df_daily_clean_selected = df_daily_clean[selected_features + ['target']]
 
 # Normalize features
