@@ -185,19 +185,28 @@ for i in range(len(predicted_directions)):
             positions.append(0)  # Flat, no change
         capital_history.append(capital)
 
+# Prepare data for full time period visualization
+train_dates = df_daily_clean_selected.index[sequence_length:split_idx + sequence_length]
+full_dates = df_daily_clean_selected.index[sequence_length:]
+full_close_prices = df_daily_clean['close'].loc[full_dates]
+train_close_prices = df_daily_clean['close'].loc[train_dates]
+
 # Start Flask web server
 app = Flask(__name__)
 
 @app.route('/')
 def index():
-    # Plot 1: Predictions vs Actual Price Changes
-    plt.figure(figsize=(12, 6))
-    plt.plot(test_dates, actual_changes.values, label='Actual Price Changes', alpha=0.7)
-    plt.scatter(test_dates, [0.01 if p == 1 else -0.01 for p in predicted_directions], 
-                color='red', label='Predicted Direction (Up/Down)', marker='o')
-    plt.title('Predictions vs Actual Price Changes')
+    # Plot 1: Full Time Period Price Data
+    plt.figure(figsize=(14, 8))
+    plt.plot(full_dates, full_close_prices, label='Close Price', color='blue', alpha=0.7)
+    plt.axvline(x=train_dates[-1], color='red', linestyle='--', label='Train/Test Split')
+    plt.fill_betweenx(y=[full_close_prices.min(), full_close_prices.max()], 
+                     x1=full_dates[0], x2=train_dates[-1], alpha=0.2, color='green', label='Training Period')
+    plt.fill_betweenx(y=[full_close_prices.min(), full_close_prices.max()], 
+                     x1=train_dates[-1], x2=full_dates[-1], alpha=0.2, color='orange', label='Test Period')
+    plt.title('Full Time Period: Close Prices with Training/Test Split')
     plt.xlabel('Date')
-    plt.ylabel('Price Change')
+    plt.ylabel('Close Price')
     plt.legend()
     plt.xticks(rotation=45)
     plt.tight_layout()
@@ -208,7 +217,25 @@ def index():
     plot_url1 = base64.b64encode(img1.getvalue()).decode()
     plt.close()
     
-    # Plot 2: Capital Development
+    # Plot 2: Predictions vs Actual Price Changes
+    plt.figure(figsize=(12, 6))
+    plt.plot(test_dates, actual_changes.values, label='Actual Price Changes', alpha=0.7)
+    plt.scatter(test_dates, [0.01 if p == 1 else -0.01 for p in predicted_directions], 
+                color='red', label='Predicted Direction (Up/Down)', marker='o')
+    plt.title('Predictions vs Actual Price Changes (Test Period Only)')
+    plt.xlabel('Date')
+    plt.ylabel('Price Change')
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    
+    img2 = io.BytesIO()
+    plt.savefig(img2, format='png')
+    img2.seek(0)
+    plot_url2 = base64.b64encode(img2.getvalue()).decode()
+    plt.close()
+    
+    # Plot 3: Capital Development
     plt.figure(figsize=(12, 6))
     plt.plot(test_dates[:len(capital_history)-1], capital_history[:-1], label='Capital', color='green')
     plt.title('Capital Development Based on Predictions')
@@ -218,10 +245,10 @@ def index():
     plt.xticks(rotation=45)
     plt.tight_layout()
     
-    img2 = io.BytesIO()
-    plt.savefig(img2, format='png')
-    img2.seek(0)
-    plot_url2 = base64.b64encode(img2.getvalue()).decode()
+    img3 = io.BytesIO()
+    plt.savefig(img3, format='png')
+    img3.seek(0)
+    plot_url3 = base64.b64encode(img3.getvalue()).decode()
     plt.close()
     
     # HTML template to display plots
@@ -235,10 +262,14 @@ def index():
         <h1>LSTM Model for Next-Day Price Direction Prediction</h1>
         <p>Model Accuracy: {accuracy:.2f}</p>
         <p>Selected Features: {', '.join(selected_features)}</p>
-        <h2>Predictions vs Actual Price Changes</h2>
-        <img src="data:image/png;base64,{plot_url1}" alt="Predictions vs Actual">
+        <p>Training Period: {train_dates[0].strftime('%Y-%m-%d')} to {train_dates[-1].strftime('%Y-%m-%d')}</p>
+        <p>Test Period: {test_dates[0].strftime('%Y-%m-%d')} to {test_dates[-1].strftime('%Y-%m-%d')}</p>
+        <h2>Full Time Period: Close Prices with Training/Test Split</h2>
+        <img src="data:image/png;base64,{plot_url1}" alt="Full Time Period">
+        <h2>Predictions vs Actual Price Changes (Test Period Only)</h2>
+        <img src="data:image/png;base64,{plot_url2}" alt="Predictions vs Actual">
         <h2>Capital Development</h2>
-        <img src="data:image/png;base64,{plot_url2}" alt="Capital Development">
+        <img src="data:image/png;base64,{plot_url3}" alt="Capital Development">
     </body>
     </html>
     '''
