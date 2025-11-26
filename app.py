@@ -118,10 +118,18 @@ def generate_plot(data, title, model=None, feature_name=None):
         valid_indices = feature_values.dropna().index
         if len(valid_indices) > 0:
             predicted_pct_changes = model.predict(feature_values.loc[valid_indices].values.reshape(-1, 1))
-            # Calculate predicted prices
+            # Calculate predicted prices for the next period (shift indices forward)
+            # For 1-day prediction, shift by 1 day; for 1-week, shift by 1 week
+            if feature_name == 'price_change_24h_pct':
+                predicted_indices = valid_indices + pd.Timedelta(days=1)
+            elif feature_name == 'price_change_7d_pct':
+                predicted_indices = valid_indices + pd.Timedelta(weeks=1)
+            else:
+                predicted_indices = valid_indices
+            # Use the current close price to predict the next period's price
             predicted_prices = data.loc[valid_indices, 'close'] * (1 + predicted_pct_changes / 100)
-            # Plot the predicted prices as a line
-            plt.plot(valid_indices, predicted_prices, color='red', linestyle='--', label='Predicted Price')
+            # Plot the predicted prices at the shifted indices
+            plt.plot(predicted_indices, predicted_prices, color='red', linestyle='--', label='Predicted Price')
     
     plt.title(title)
     plt.xlabel('Time')
