@@ -344,10 +344,10 @@ def create_plot(df, y_train, predictions, train_indices, history_loss, history_v
         btc_price_i = df.loc[all_dates[i], 'close']
         btc_price_prev = df.loc[all_dates[i-1], 'close']
         ret = (btc_price_i - btc_price_prev) / btc_price_prev
-        # Strategy: long if derivative of prediction is positive, otherwise short
-        # Derivative of prediction is approximated as the difference from the previous prediction
-        pred_derivative = all_y_predicted[i] - all_y_predicted[i-1] if i >= 1 else 0
-        pos = 1 if pred_derivative > 0 else -1
+        # Calculate actual BTC price derivative for this day
+        actual_derivative = (btc_price_i - btc_price_prev) / btc_price_prev
+        # Strategy: long if actual derivative is above prediction, otherwise short
+        pos = 1 if actual_derivative > all_y_predicted[i] else -1
         capital.append(capital[-1] * (1 + (ret * pos * 1)))
         positions.append(pos)
     
