@@ -60,15 +60,15 @@ data_1w = resampled_data['1w'].copy()
 # Features: 24 individual hourly price changes (percent) - using data up to t-1
 for i in range(1, 25):
     data_1h[f'price_change_{i}h_pct'] = data_1h['close'].shift(i).pct_change(periods=1) * 100
-# Target: price change over next 1 day (percent)
-data_1d['target_1d_pct'] = data_1d['close'].pct_change(periods=-1) * 100
+# Target: price change over next 1 day (percent) - calculated from hourly data
+data_1h['target_1d_pct'] = (data_1h['close'].shift(-24) / data_1h['close'] - 1) * 100
 
 # Calculate features and targets for 1-week prediction
 # Features: 7 individual daily price changes (percent) - using data up to t-1
 for i in range(1, 8):
     data_1d[f'price_change_{i}d_pct'] = data_1d['close'].shift(i).pct_change(periods=1) * 100
-# Target: price change over next 1 week (percent)
-data_1w['target_1w_pct'] = data_1w['close'].pct_change(periods=-1) * 100
+# Target: price change over next 1 week (percent) - calculated from daily data
+data_1d['target_1w_pct'] = (data_1d['close'].shift(-7) / data_1d['close'] - 1) * 100
 
 # Drop rows with NaN values (due to pct_change calculations)
 feature_cols_1d = [f'price_change_{i}h_pct' for i in range(1, 25)]
