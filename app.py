@@ -55,14 +55,14 @@ data_1d = resampled_data['1d'].copy()
 data_1w = resampled_data['1w'].copy()
 
 # Calculate features and targets for 1-day prediction
-# Feature: price change over last 24 hours (percent)
-data_1d['price_change_24h_pct'] = data_1d['close'].pct_change(periods=1) * 100
+# Feature: price change over last 24 hours (percent) - using data up to t-1
+data_1d['price_change_24h_pct'] = data_1d['close'].shift(1).pct_change(periods=1) * 100
 # Target: price change over next 1 day (percent)
 data_1d['target_1d_pct'] = data_1d['close'].pct_change(periods=-1) * 100
 
 # Calculate features and targets for 1-week prediction
-# Feature: price change over last 7 days (percent)
-data_1w['price_change_7d_pct'] = data_1w['close'].pct_change(periods=1) * 100
+# Feature: price change over last 7 days (percent) - using data up to t-1
+data_1w['price_change_7d_pct'] = data_1w['close'].shift(1).pct_change(periods=1) * 100
 # Target: price change over next 1 week (percent)
 data_1w['target_1w_pct'] = data_1w['close'].pct_change(periods=-1) * 100
 
@@ -94,11 +94,11 @@ def generate_plot(data, title, model=None, feature_name=None):
     
     # Add prediction line if model and feature are provided
     if model is not None and feature_name is not None:
-        # Calculate feature values for all data points
+        # Calculate feature values for all data points using data up to t-1
         if feature_name == 'price_change_24h_pct':
-            feature_values = data['close'].pct_change(periods=1) * 100
+            feature_values = data['close'].shift(1).pct_change(periods=1) * 100
         elif feature_name == 'price_change_7d_pct':
-            feature_values = data['close'].pct_change(periods=1) * 100
+            feature_values = data['close'].shift(1).pct_change(periods=1) * 100
         else:
             feature_values = pd.Series([0] * len(data), index=data.index)
         
