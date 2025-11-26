@@ -185,14 +185,20 @@ def load_data():
 
 def prepare_data(df):
     logger.info("Step 2: Preparing Features...")
-    df['sma_3_close'] = df['close'].rolling(window=3).mean()
-    df['sma_9_close'] = df['close'].rolling(window=9).mean()
-    df['ema_3_volume'] = df['volume'].ewm(span=3).mean()
+    # Calculate derivative of price (percentage change from previous day)
+    df['price_derivative'] = df['close'].pct_change()
+    # Replace 3-day SMA of close with derivative of price
+    df['sma_3_close'] = df['price_derivative']
+    # Replace 9-day SMA of close with 7-day SMA of derivative of price
+    df['sma_9_close'] = df['price_derivative'].rolling(window=7).mean()
+    # Replace 3-day EMA of volume with raw volume
+    df['ema_3_volume'] = df['volume']
     
     ema_12 = df['close'].ewm(span=12).mean()
     ema_26 = df['close'].ewm(span=26).mean()
+    # Replace MACD and signal lines with their difference
     df['macd_line'] = ema_12 - ema_26
-    df['signal_line'] = df['macd_line'].ewm(span=9).mean()
+    df['signal_line'] = df['macd_line'] - df['macd_line'].ewm(span=9).mean()
     
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
@@ -213,7 +219,7 @@ def prepare_data(df):
         # Check if we have enough data for the derivative target
         if i >= 1:  # Need at least 2 days for derivative calculation
             feature = []
-            for lookback in range(1, 13):
+            for lookback in range(1, 8):  # Changed lookback period from 12 to 7
                 if i - lookback >= 0:
                     # Use actual values for each feature
                     feature.append(df['sma_3_close'].iloc[i - lookback])
@@ -366,8 +372,8 @@ def run_training_task():
         y_test = targets_scaled[split_idx:]
         train_indices = list(range(40, 40 + split_idx))
         
-        X_train_reshaped = X_train.reshape(X_train.shape[0], 12, 10)
-        X_test_reshaped = X_test.reshape(X_test.shape[0], 12, 10)
+        X_train_reshaped = X_train.reshape(X_train.shape[0], 7, 10)
+        X_test_reshaped = X_test.reshape(X_test.shape[0], 7, 10)
         
         # INCREASED EPOCHS AND ADDED REGULARIZATION
         EPOCHS = 600
@@ -382,7 +388,7 @@ def run_training_task():
         
         # LSTM 1: L2 regularization added to the kernel weights
         model.add(LSTM(UNITS, activation='relu', return_sequences=True, 
-                       input_shape=(12, 10), kernel_regularizer=l2(REG_RATE)))
+                       input_shape=(7, 10), kernel_regularizer=l2(REG_RATE)))
         model.add(Dropout(0.5)) # Dropout to force redundancy
         
         # LSTM 2: L2 regularization added
