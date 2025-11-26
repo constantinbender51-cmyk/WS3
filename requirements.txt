@@ -1,6 +1,0 @@
-gdown
-pandas
-numpy
-flask
-tensorflow
-scikit-learn
