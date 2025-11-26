@@ -238,6 +238,47 @@ full_dates = df_daily_clean_selected.index[sequence_length:]
 full_close_prices = df_daily_clean['close'].loc[full_dates]
 train_close_prices = df_daily_clean['close'].loc[train_dates]
 
+# Calculate squared returns for volatility prediction
+df_daily_clean['squared_returns'] = df_daily_clean['close'].pct_change() ** 2
+df_daily_clean['volatility_target'] = df_daily_clean['squared_returns'].shift(-1)  # Predict next day volatility
+
+# Prepare data for volatility LSTM model
+df_vol_clean = df_daily_clean[selected_features + ['volatility_target']].dropna()
+scaled_features_vol = scaler.transform(df_vol_clean[selected_features])  # Use same scaler
+
+# Prepare sequences for volatility LSTM
+X_vol, y_vol = [], []
+for i in range(sequence_length, len(scaled_features_vol)):
+    X_vol.append(scaled_features_vol[i-sequence_length:i])
+    y_vol.append(df_vol_clean['volatility_target'].iloc[i])
+X_vol, y_vol = np.array(X_vol), np.array(y_vol)
+
+# Split data for volatility model
+split_idx_vol = int(0.8 * len(X_vol))
+X_train_vol, X_test_vol = X_vol[:split_idx_vol], X_vol[split_idx_vol:]
+y_train_vol, y_test_vol = y_vol[:split_idx_vol], y_vol[split_idx_vol:]
+
+# Build and train volatility LSTM model
+model_vol = Sequential([
+    LSTM(100, return_sequences=True, input_shape=(X_train_vol.shape[1], X_train_vol.shape[2])),
+    Dropout(0.3),
+    LSTM(100, return_sequences=True),
+    Dropout(0.3),
+    LSTM(100, return_sequences=False),
+    Dropout(0.3),
+    Dense(50, activation='relu'),
+    Dropout(0.2),
+    Dense(25, activation='relu'),
+    Dense(1, activation='linear')  # Linear for regression
+])
+model_vol.compile(optimizer='adam', loss='mean_squared_error', metrics=['mae'])
+model_vol.fit(X_train_vol, y_train_vol, batch_size=32, epochs=30, validation_data=(X_test_vol, y_test_vol), verbose=1)
+
+# Make volatility predictions
+vol_preds = model_vol.predict(X_test_vol).flatten()
+vol_test_dates = df_vol_clean.index[split_idx_vol + sequence_length:]
+actual_vol = df_vol_clean['volatility_target'].loc[vol_test_dates]
+
 # Start Flask web server
 app = Flask(__name__)
 
@@ -297,6 +338,23 @@ def index():
     img3.seek(0)
     plot_url3 = base64.b64encode(img3.getvalue()).decode()
     plt.close()
+
+    # Plot 4: Volatility Predictions
+    plt.figure(figsize=(12, 6))
+    plt.plot(vol_test_dates, actual_vol.values, label='Actual Volatility (Squared Returns)', alpha=0.7)
+    plt.plot(vol_test_dates, vol_preds, label='Predicted Volatility', alpha=0.7)
+    plt.title('Volatility Predictions vs Actual (Test Period Only)')
+    plt.xlabel('Date')
+    plt.ylabel('Volatility (Squared Returns)')
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    
+    img4 = io.BytesIO()
+    plt.savefig(img4, format='png')
+    img4.seek(0)
+    plot_url4 = base64.b64encode(img4.getvalue()).decode()
+    plt.close()
     
     # HTML template to display plots
     html = f'''
@@ -317,6 +375,8 @@ def index():
         <img src="data:image/png;base64,{plot_url2}" alt="Predictions vs Actual">
         <h2>Capital Development</h2>
         <img src="data:image/png;base64,{plot_url3}" alt="Capital Development">
+        <h2>Volatility Predictions</h2>
+        <img src="data:image/png;base64,{plot_url4}" alt="Volatility Predictions">
     </body>
     </html>
     '''
