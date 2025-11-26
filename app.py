@@ -73,15 +73,19 @@ def prepare_data(df, lookback=60):
 # Train LSTM model
 def train_model(X_train, y_train):
     model = Sequential([
-        LSTM(50, return_sequences=True, input_shape=(X_train.shape[1], 1)),
+        LSTM(128, return_sequences=True, input_shape=(X_train.shape[1], 1)),
+        Dropout(0.3),
+        LSTM(64, return_sequences=True),
+        Dropout(0.3),
+        LSTM(32, return_sequences=False),
         Dropout(0.2),
-        LSTM(50, return_sequences=False),
+        Dense(64, activation='relu'),
         Dropout(0.2),
-        Dense(25, activation='relu'),
+        Dense(32, activation='relu'),
         Dense(1, activation='sigmoid')
     ])
     model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-    model.fit(X_train, y_train, batch_size=32, epochs=10, verbose=0)
+    model.fit(X_train, y_train, batch_size=32, epochs=50, verbose=0)
     return model
 
 # Generate plots
@@ -185,10 +189,10 @@ def index():
     plot_data = generate_plots(df, train_predictions, test_predictions, split_idx)
     
     # Calculate accuracy for training and testing
-    y_train = train_df['Return_Direction'].values[lookback:]
-    train_accuracy = accuracy_score(y_train, train_predictions)
-    y_test = test_df['Return_Direction'].values
-    test_accuracy = accuracy_score(y_test, test_predictions)
+    y_train_actual = train_df['Return_Direction'].values[lookback:]
+    train_accuracy = accuracy_score(y_train_actual, train_predictions)
+    y_test_actual = test_df['Return_Direction'].values
+    test_accuracy = accuracy_score(y_test_actual, test_predictions)
     
     html = f'''
     <!DOCTYPE html>
