@@ -185,7 +185,7 @@ def index():
     plot_data = generate_plots(df, train_predictions, test_predictions, split_idx)
     
     # Calculate accuracy for training and testing
-    y_train = train_df['Return_Direction'].values
+    y_train = train_df['Return_Direction'].values[lookback:]
     train_accuracy = accuracy_score(y_train, train_predictions)
     y_test = test_df['Return_Direction'].values
     test_accuracy = accuracy_score(y_test, test_predictions)
