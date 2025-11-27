@@ -350,7 +350,8 @@
 
         // Initialize with automatic analysis after page load
         window.addEventListener('DOMContentLoaded', function() {
-            setTimeout(analyzeStrategy, 100);
+            // Wait a bit longer to ensure data is downloaded
+            setTimeout(analyzeStrategy, 2000);
         });
     </script>
 </body>
