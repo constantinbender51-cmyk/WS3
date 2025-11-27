@@ -83,10 +83,13 @@ def fetch_data_from_url(url):
             df = pd.read_csv(output_path)
             print(f"DEBUG: CSV loaded. Shape: {df.shape}")
             
-            # Clean up temporary file
+            # Clean up temporary file if it exists
             import os
-            os.remove(output_path)
-            print("DEBUG: Temporary file cleaned up")
+            if os.path.exists(output_path):
+                os.remove(output_path)
+                print("DEBUG: Temporary file cleaned up")
+            else:
+                print("DEBUG: Temporary file not found, skipping removal")
         else:
             # Regular URL
             print("DEBUG: Using regular URL download")
@@ -111,31 +114,9 @@ def fetch_data_from_url(url):
         print(f"ERROR: Failed to fetch data from URL: {str(e)}")
         import traceback
         print(f"ERROR: Traceback: {traceback.format_exc()}")
-        print("DEBUG: Falling back to sample data generation")
-        # Generate sample data as fallback
-        return generate_sample_data()
+        raise e  # Re-raise the exception to prevent fallback to sample data
 
-def generate_sample_data():
-    """Generate sample OHLCV data for testing"""
-    print("DEBUG: Generating sample data")
-    np.random.seed(42)
-    n_samples = 1000
-    dates = pd.date_range('2024-01-01', periods=n_samples, freq='1min')
-    
-    # Generate random walk prices
-    returns = np.random.normal(0, 0.001, n_samples)
-    prices = 100 * np.cumprod(1 + returns)
-    
-    df = pd.DataFrame({
-        'timestamp': dates,
-        'open': prices,
-        'high': prices * (1 + np.abs(np.random.normal(0, 0.002, n_samples))),
-        'low': prices * (1 - np.abs(np.random.normal(0, 0.002, n_samples))),
-        'close': prices,
-        'volume': np.random.randint(1000, 10000, n_samples)
-    })
-    print(f"DEBUG: Sample data generated. Shape: {df.shape}")
-    return df
+
 
 def prepare_chart_data(result_df):
     """Prepare data for chart visualization"""
