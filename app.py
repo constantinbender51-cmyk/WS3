@@ -1,18 +1,13 @@
 import gdown
 import pandas as pd
 import numpy as np
-from flask import Flask, render_template_string
+from flask import Flask
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime
 
 # Configuration
-TRANSACTION_FEE = 0.002  # 0.2%
-SLIPPAGE_MINUTES = 1
+TRANSACTION_FEE = 0.002  # 0.2% per trade leg
 INITIAL_CAPITAL = 10000
-POSITION_FLAT = 0
-POSITION_LONG = 1
-POSITION_SHORT = 2
 
 app = Flask(__name__)
 
@@ -22,232 +17,299 @@ class OptimalTradingFinder:
         self.prices = df['close'].values
         self.n = len(self.prices)
         self.trades = []
-        self.capital_history = []
-        self.position_history = []
+        self.best_path = []
+        self.best_capital = INITIAL_CAPITAL
         
-    def find_optimal_trades(self):
-        """Dynamic Programming to find optimal trade sequence"""
-        print(f"Processing {self.n} data points...")
-        print("Running DP optimization (this may take a few minutes)...")
+    def find_optimal_trades_dp(self):
+        """Simple DP: at each day, track best capital for FLAT/LONG/SHORT"""
+        print(f"Processing {self.n} daily data points...")
+        print("Running DP optimization...")
         
-        # DP state: dp[t][position] = (capital, entry_price, entry_capital)
-        # capital: current capital value
-        # entry_price: price at which current position was entered (if holding)
-        # entry_capital: capital when position was entered (for P&L calc)
+        # State: position (0=FLAT, 1=LONG, 2=SHORT)
+        # dp[day][position] = (capital, entry_day, entry_price)
+        INF = -1e18
+        dp = np.full((self.n, 3, 3), INF, dtype=np.float64)
+        # dp[day][position] = [capital, entry_day, entry_price]
         
-        dp_capital = np.ones((self.n, 3)) * -np.inf
-        dp_entry_price = np.zeros((self.n, 3))
-        dp_entry_capital = np.zeros((self.n, 3))
-        backpointer = np.zeros((self.n, 3, 2), dtype=np.int32)  # [t][pos] = (prev_pos, prev_t)
+        # Initial state: FLAT with initial capital
+        dp[0][0] = [INITIAL_CAPITAL, -1, 0]
         
-        # Initial state: start FLAT with initial capital
-        dp_capital[0][POSITION_FLAT] = INITIAL_CAPITAL
-        
-        # Forward pass
-        for t in range(self.n - 1):
-            if t % 100000 == 0:
-                print(f"Progress: {t}/{self.n} ({100*t/self.n:.1f}%)")
+        for day in range(self.n - 1):
+            if day % 100 == 0:
+                print(f"Progress: {day}/{self.n}")
             
-            next_price = self.prices[t + 1]  # Execution price due to slippage
+            price_today = self.prices[day]
+            price_next = self.prices[day + 1]
             
-            # From FLAT
-            if dp_capital[t][POSITION_FLAT] > 0:
-                capital_flat = dp_capital[t][POSITION_FLAT]
+            # FROM FLAT
+            if dp[day][0][0] > 0:
+                capital = dp[day][0][0]
                 
                 # Stay FLAT
-                if capital_flat > dp_capital[t+1][POSITION_FLAT]:
-                    dp_capital[t+1][POSITION_FLAT] = capital_flat
-                    backpointer[t+1][POSITION_FLAT] = [POSITION_FLAT, t]
+                if capital > dp[day+1][0][0]:
+                    dp[day+1][0] = [capital, -1, 0]
                 
-                # Enter LONG (pay fee, execute at next_price)
-                capital_after_fee = capital_flat * (1 - TRANSACTION_FEE)
-                if capital_after_fee > dp_capital[t+1][POSITION_LONG]:
-                    dp_capital[t+1][POSITION_LONG] = capital_after_fee
-                    dp_entry_price[t+1][POSITION_LONG] = next_price
-                    dp_entry_capital[t+1][POSITION_LONG] = capital_after_fee
-                    backpointer[t+1][POSITION_LONG] = [POSITION_FLAT, t]
+                # Enter LONG (pay entry fee)
+                capital_after_fee = capital * (1 - TRANSACTION_FEE)
+                if capital_after_fee > dp[day+1][1][0]:
+                    dp[day+1][1] = [capital_after_fee, day+1, price_next]
                 
-                # Enter SHORT (pay fee, execute at next_price)
-                capital_after_fee = capital_flat * (1 - TRANSACTION_FEE)
-                if capital_after_fee > dp_capital[t+1][POSITION_SHORT]:
-                    dp_capital[t+1][POSITION_SHORT] = capital_after_fee
-                    dp_entry_price[t+1][POSITION_SHORT] = next_price
-                    dp_entry_capital[t+1][POSITION_SHORT] = capital_after_fee
-                    backpointer[t+1][POSITION_SHORT] = [POSITION_FLAT, t]
+                # Enter SHORT (pay entry fee)
+                if capital_after_fee > dp[day+1][2][0]:
+                    dp[day+1][2] = [capital_after_fee, day+1, price_next]
             
-            # From LONG
-            if dp_capital[t][POSITION_LONG] > 0:
-                entry_price = dp_entry_price[t][POSITION_LONG]
-                entry_capital = dp_entry_capital[t][POSITION_LONG]
+            # FROM LONG
+            if dp[day][1][0] > 0:
+                entry_capital = dp[day][1][0]
+                entry_day = int(dp[day][1][1])
+                entry_price = dp[day][1][2]
                 
-                if entry_price > 0:  # Valid entry
-                    # Calculate current position value
-                    # Long: if price goes up 10%, capital goes up 10%
-                    price_change_pct = (next_price - entry_price) / entry_price
-                    current_value = entry_capital * (1 + price_change_pct)
+                if entry_price > 0:
+                    # Calculate current value
+                    price_change = (price_next - entry_price) / entry_price
+                    current_value = entry_capital * (1 + price_change)
                     
                     # Hold LONG
-                    if current_value > dp_capital[t+1][POSITION_LONG]:
-                        dp_capital[t+1][POSITION_LONG] = current_value
-                        dp_entry_price[t+1][POSITION_LONG] = entry_price
-                        dp_entry_capital[t+1][POSITION_LONG] = entry_capital
-                        backpointer[t+1][POSITION_LONG] = [POSITION_LONG, t]
+                    if current_value > dp[day+1][1][0]:
+                        dp[day+1][1] = [current_value, entry_day, entry_price]
                     
-                    # Exit to FLAT (pay fee on current value)
-                    capital_after_exit = current_value * (1 - TRANSACTION_FEE)
-                    if capital_after_exit > dp_capital[t+1][POSITION_FLAT]:
-                        dp_capital[t+1][POSITION_FLAT] = capital_after_exit
-                        backpointer[t+1][POSITION_FLAT] = [POSITION_LONG, t]
+                    # Exit to FLAT (pay exit fee)
+                    exit_capital = current_value * (1 - TRANSACTION_FEE)
+                    if exit_capital > dp[day+1][0][0]:
+                        dp[day+1][0] = [exit_capital, -1, 0]
                     
-                    # Reverse to SHORT (exit + enter, pay 2 fees)
-                    capital_after_reverse = current_value * (1 - TRANSACTION_FEE) * (1 - TRANSACTION_FEE)
-                    if capital_after_reverse > dp_capital[t+1][POSITION_SHORT]:
-                        dp_capital[t+1][POSITION_SHORT] = capital_after_reverse
-                        dp_entry_price[t+1][POSITION_SHORT] = next_price
-                        dp_entry_capital[t+1][POSITION_SHORT] = capital_after_reverse
-                        backpointer[t+1][POSITION_SHORT] = [POSITION_LONG, t]
+                    # Reverse to SHORT (pay exit + entry fees)
+                    reverse_capital = current_value * (1 - TRANSACTION_FEE) * (1 - TRANSACTION_FEE)
+                    if reverse_capital > dp[day+1][2][0]:
+                        dp[day+1][2] = [reverse_capital, day+1, price_next]
             
-            # From SHORT
-            if dp_capital[t][POSITION_SHORT] > 0:
-                entry_price = dp_entry_price[t][POSITION_SHORT]
-                entry_capital = dp_entry_capital[t][POSITION_SHORT]
+            # FROM SHORT
+            if dp[day][2][0] > 0:
+                entry_capital = dp[day][2][0]
+                entry_day = int(dp[day][2][1])
+                entry_price = dp[day][2][2]
                 
-                if entry_price > 0:  # Valid entry
-                    # Calculate current position value
-                    # Short: if price goes down 10%, capital goes up 10%
-                    # Short: if price goes up 10%, capital goes down 10%
-                    price_change_pct = (next_price - entry_price) / entry_price
-                    current_value = entry_capital * (1 - price_change_pct)
+                if entry_price > 0:
+                    # Calculate current value (inverse of price movement)
+                    price_change = (price_next - entry_price) / entry_price
+                    current_value = entry_capital * (1 - price_change)
                     
-                    # Prevent negative capital from short positions
-                    if current_value <= 0:
-                        current_value = 0.01  # Margin call / liquidation
+                    # Prevent going negative (margin call)
+                    current_value = max(current_value, 0.01)
                     
                     # Hold SHORT
-                    if current_value > dp_capital[t+1][POSITION_SHORT]:
-                        dp_capital[t+1][POSITION_SHORT] = current_value
-                        dp_entry_price[t+1][POSITION_SHORT] = entry_price
-                        dp_entry_capital[t+1][POSITION_SHORT] = entry_capital
-                        backpointer[t+1][POSITION_SHORT] = [POSITION_SHORT, t]
+                    if current_value > dp[day+1][2][0]:
+                        dp[day+1][2] = [current_value, entry_day, entry_price]
                     
-                    # Exit to FLAT (pay fee on current value)
-                    capital_after_exit = current_value * (1 - TRANSACTION_FEE)
-                    if capital_after_exit > dp_capital[t+1][POSITION_FLAT]:
-                        dp_capital[t+1][POSITION_FLAT] = capital_after_exit
-                        backpointer[t+1][POSITION_FLAT] = [POSITION_SHORT, t]
+                    # Exit to FLAT (pay exit fee)
+                    exit_capital = current_value * (1 - TRANSACTION_FEE)
+                    if exit_capital > dp[day+1][0][0]:
+                        dp[day+1][0] = [exit_capital, -1, 0]
                     
-                    # Reverse to LONG (exit + enter, pay 2 fees)
-                    capital_after_reverse = current_value * (1 - TRANSACTION_FEE) * (1 - TRANSACTION_FEE)
-                    if capital_after_reverse > dp_capital[t+1][POSITION_LONG]:
-                        dp_capital[t+1][POSITION_LONG] = capital_after_reverse
-                        dp_entry_price[t+1][POSITION_LONG] = next_price
-                        dp_entry_capital[t+1][POSITION_LONG] = capital_after_reverse
-                        backpointer[t+1][POSITION_LONG] = [POSITION_SHORT, t]
+                    # Reverse to LONG (pay exit + entry fees)
+                    reverse_capital = current_value * (1 - TRANSACTION_FEE) * (1 - TRANSACTION_FEE)
+                    if reverse_capital > dp[day+1][1][0]:
+                        dp[day+1][1] = [reverse_capital, day+1, price_next]
         
         # Find best final position
-        final_capitals = dp_capital[self.n-1]
-        best_final_pos = np.argmax(final_capitals)
-        final_capital = final_capitals[best_final_pos]
+        final_capitals = dp[self.n-1, :, 0]
+        best_pos = np.argmax(final_capitals)
+        final_capital = final_capitals[best_pos]
         
         print(f"\nOptimization complete!")
         print(f"Final capital: ${final_capital:,.2f}")
         print(f"Return: {(final_capital/INITIAL_CAPITAL - 1)*100:.2f}%")
         
-        # Backtrack to reconstruct trades
-        self._backtrack(dp_capital, dp_entry_price, backpointer, best_final_pos)
+        # Reconstruct trades
+        self._reconstruct_trades_from_dp(dp, best_pos)
         
         return final_capital
     
-    def _backtrack(self, dp_capital, dp_entry_price, backpointer, final_pos):
-        """Reconstruct optimal trades from backpointers"""
-        print("\nReconstructing optimal trade sequence...")
+    def _reconstruct_trades_from_dp(self, dp, final_pos):
+        """Reconstruct the optimal path and extract trades"""
+        print("\nReconstructing trades...")
         
-        trades = []
-        capital_hist = []
-        position_hist = []
+        # Work backwards to find the path
+        path = []  # (day, position, capital, entry_day, entry_price)
+        day = self.n - 1
+        pos = final_pos
         
-        # Backtrack from end to start to build path
-        t = self.n - 1
-        current_pos = final_pos
-        path = [(t, current_pos)]
+        path.append((day, pos, dp[day][pos][0], int(dp[day][pos][1]), dp[day][pos][2]))
         
-        while t > 0:
-            prev_pos, prev_t = backpointer[t][current_pos]
-            path.append((prev_t, prev_pos))
-            t = prev_t
-            current_pos = prev_pos
+        # Backtrack by finding which previous state led to current state
+        while day > 0:
+            current_capital = dp[day][pos][0]
+            current_entry_day = int(dp[day][pos][1])
+            current_entry_price = dp[day][pos][2]
+            
+            found = False
+            # Check previous day for matching state
+            for prev_pos in range(3):
+                if dp[day-1][prev_pos][0] <= 0:
+                    continue
+                
+                # Simulate transition from prev_pos to pos
+                prev_capital = dp[day-1][prev_pos][0]
+                prev_entry_day = int(dp[day-1][prev_pos][1])
+                prev_entry_price = dp[day-1][prev_pos][2]
+                
+                price_today = self.prices[day-1]
+                price_next = self.prices[day]
+                
+                expected_capital = None
+                expected_entry_day = current_entry_day
+                expected_entry_price = current_entry_price
+                
+                # Check if this transition makes sense
+                if prev_pos == pos and pos != 0:  # Holding position
+                    if prev_entry_day == current_entry_day and abs(prev_entry_price - current_entry_price) < 1e-6:
+                        price_change = (price_next - prev_entry_price) / prev_entry_price
+                        if pos == 1:  # LONG
+                            expected_capital = prev_capital * (1 + price_change)
+                        else:  # SHORT
+                            expected_capital = max(prev_capital * (1 - price_change), 0.01)
+                        
+                        if abs(expected_capital - current_capital) < 1e-6:
+                            found = True
+                            day = day - 1
+                            pos = prev_pos
+                            path.append((day, pos, prev_capital, prev_entry_day, prev_entry_price))
+                            break
+                
+                elif prev_pos == 0 and pos == 0:  # Staying FLAT
+                    if abs(prev_capital - current_capital) < 1e-6:
+                        found = True
+                        day = day - 1
+                        pos = prev_pos
+                        path.append((day, pos, prev_capital, -1, 0))
+                        break
+                
+                elif prev_pos == 0 and pos != 0:  # Entering position from FLAT
+                    expected_capital = prev_capital * (1 - TRANSACTION_FEE)
+                    if abs(expected_capital - current_capital) < 1e-6 and current_entry_day == day:
+                        found = True
+                        day = day - 1
+                        pos = prev_pos
+                        path.append((day, pos, prev_capital, -1, 0))
+                        break
+                
+                elif prev_pos != 0 and pos == 0:  # Exiting to FLAT
+                    # Calculate what prev position value should be
+                    implied_prev_value = current_capital / (1 - TRANSACTION_FEE)
+                    
+                    if prev_entry_price > 0:
+                        price_change = (price_next - prev_entry_price) / prev_entry_price
+                        if prev_pos == 1:  # Was LONG
+                            expected_prev_capital = prev_capital * (1 + price_change)
+                        else:  # Was SHORT
+                            expected_prev_capital = max(prev_capital * (1 - price_change), 0.01)
+                        
+                        if abs(expected_prev_capital - implied_prev_value) < 1e-2:
+                            found = True
+                            day = day - 1
+                            pos = prev_pos
+                            path.append((day, pos, prev_capital, prev_entry_day, prev_entry_price))
+                            break
+                
+                elif prev_pos != 0 and pos != 0 and prev_pos != pos:  # Reversal
+                    implied_value = current_capital / ((1 - TRANSACTION_FEE) * (1 - TRANSACTION_FEE))
+                    
+                    if prev_entry_price > 0:
+                        price_change = (price_next - prev_entry_price) / prev_entry_price
+                        if prev_pos == 1:  # Was LONG
+                            expected_prev_capital = prev_capital * (1 + price_change)
+                        else:  # Was SHORT
+                            expected_prev_capital = max(prev_capital * (1 - price_change), 0.01)
+                        
+                        if abs(expected_prev_capital - implied_value) < 1e-2 and current_entry_day == day:
+                            found = True
+                            day = day - 1
+                            pos = prev_pos
+                            path.append((day, pos, prev_capital, prev_entry_day, prev_entry_price))
+                            break
+            
+            if not found:
+                print(f"Warning: Could not backtrack from day {day+1}, breaking")
+                break
         
         path.reverse()
         
-        # Forward pass to build trade list and history
-        current_position = POSITION_FLAT
-        entry_index = -1
+        # Extract trades from path
+        trades = []
+        current_pos = 0  # Start FLAT
+        entry_day = -1
         entry_price = 0
         entry_capital = INITIAL_CAPITAL
         
         for i in range(len(path)):
-            t, pos = path[i]
-            capital = dp_capital[t][pos]
+            day, pos, capital, e_day, e_price = path[i]
             
-            capital_hist.append(capital)
-            position_hist.append(pos)
-            
-            # Detect position changes
-            if pos != current_position:
-                # Record exit of previous position
-                if current_position != POSITION_FLAT and entry_index >= 0:
-                    # Find the actual exit point (when we transitioned to FLAT or reversed)
-                    exit_price = self.prices[t]
-                    exit_capital = capital if pos == POSITION_FLAT else dp_capital[t-1][current_position] if t > 0 else capital
+            if pos != current_pos:
+                # Exit previous position
+                if current_pos != 0 and entry_day >= 0:
+                    exit_price = self.prices[day]
+                    exit_capital = capital if pos == 0 else None  # Calculate properly
+                    
+                    # For exit capital, need to find the value just before exit
+                    if i > 0:
+                        prev_day, prev_pos, prev_capital, _, _ = path[i-1]
+                        if prev_pos == current_pos:
+                            # Calculate value at current day before exit
+                            price_change = (self.prices[day] - entry_price) / entry_price
+                            if current_pos == 1:  # LONG
+                                value_before_exit = prev_capital * (1 + price_change)
+                            else:  # SHORT
+                                value_before_exit = max(prev_capital * (1 - price_change), 0.01)
+                            exit_capital = value_before_exit * (1 - TRANSACTION_FEE)
+                    
+                    if exit_capital is None:
+                        exit_capital = capital
                     
                     trades.append({
-                        'entry_index': entry_index,
-                        'exit_index': t,
-                        'entry_time': self.df.index[entry_index],
-                        'exit_time': self.df.index[t],
+                        'entry_day': entry_day,
+                        'exit_day': day,
+                        'entry_time': self.df.index[entry_day],
+                        'exit_time': self.df.index[day],
                         'entry_price': entry_price,
                         'exit_price': exit_price,
-                        'position': 'LONG' if current_position == POSITION_LONG else 'SHORT',
+                        'position': 'LONG' if current_pos == 1 else 'SHORT',
                         'entry_capital': entry_capital,
                         'exit_capital': exit_capital
                     })
                 
-                # Record entry of new position
-                if pos != POSITION_FLAT:
-                    entry_index = t
-                    entry_price = dp_entry_price[t][pos]
+                # Enter new position
+                if pos != 0:
+                    entry_day = e_day
+                    entry_price = e_price
                     entry_capital = capital
                 
-                current_position = pos
+                current_pos = pos
         
-        # Handle final open position if any
-        if current_position != POSITION_FLAT and entry_index >= 0:
-            t = self.n - 1
-            exit_price = self.prices[t]
-            exit_capital = dp_capital[t][current_position]
+        # Handle final position if still open
+        if current_pos != 0 and entry_day >= 0:
+            day = self.n - 1
+            exit_price = self.prices[day]
+            exit_capital = path[-1][2]
             
             trades.append({
-                'entry_index': entry_index,
-                'exit_index': t,
-                'entry_time': self.df.index[entry_index],
-                'exit_time': self.df.index[t],
+                'entry_day': entry_day,
+                'exit_day': day,
+                'entry_time': self.df.index[entry_day],
+                'exit_time': self.df.index[day],
                 'entry_price': entry_price,
                 'exit_price': exit_price,
-                'position': 'LONG' if current_position == POSITION_LONG else 'SHORT',
+                'position': 'LONG' if current_pos == 1 else 'SHORT',
                 'entry_capital': entry_capital,
                 'exit_capital': exit_capital
             })
         
         self.trades = trades
-        self.capital_history = capital_hist
-        self.position_history = position_hist
+        self.best_path = path
         
-        print(f"Total trades: {len(trades)}")
-        
-        # Debug: show first few trades
-        for i, trade in enumerate(trades[:5]):
+        print(f"Extracted {len(trades)} trades")
+        for i, trade in enumerate(trades[:10]):
             ret = (trade['exit_capital'] / trade['entry_capital'] - 1) * 100
-            print(f"Trade {i+1}: {trade['position']} @ ${trade['entry_price']:.2f} -> ${trade['exit_price']:.2f}, Return: {ret:.2f}%")
+            print(f"  Trade {i+1}: {trade['position']} @ ${trade['entry_price']:.2f} -> ${trade['exit_price']:.2f}, Return: {ret:.2f}%")
     
     def create_visualization(self):
         """Create interactive Plotly visualization"""
@@ -258,17 +320,13 @@ class OptimalTradingFinder:
             row_heights=[0.6, 0.4]
         )
         
-        # Subsample for visualization if too many points
-        sample_rate = max(1, self.n // 10000)
-        plot_indices = range(0, self.n, sample_rate)
-        
         # Price chart
         fig.add_trace(
             go.Scatter(
-                x=self.df.index[plot_indices],
-                y=self.prices[plot_indices],
+                x=self.df.index,
+                y=self.prices,
                 name='Price',
-                line=dict(color='gray', width=1)
+                line=dict(color='lightgray', width=1)
             ),
             row=1, col=1
         )
@@ -291,79 +349,34 @@ class OptimalTradingFinder:
                 short_exits_x.append(trade['exit_time'])
                 short_exits_y.append(trade['exit_price'])
         
-        # Long entries
         if long_entries_x:
-            fig.add_trace(
-                go.Scatter(
-                    x=long_entries_x, y=long_entries_y,
-                    mode='markers',
-                    marker=dict(color='green', size=10, symbol='triangle-up'),
-                    name='Long Entry'
-                ),
-                row=1, col=1
-            )
+            fig.add_trace(go.Scatter(x=long_entries_x, y=long_entries_y, mode='markers',
+                marker=dict(color='green', size=12, symbol='triangle-up'), name='Long Entry'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=long_exits_x, y=long_exits_y, mode='markers',
+                marker=dict(color='lightgreen', size=12, symbol='triangle-down'), name='Long Exit'), row=1, col=1)
         
-        # Long exits
-        if long_exits_x:
-            fig.add_trace(
-                go.Scatter(
-                    x=long_exits_x, y=long_exits_y,
-                    mode='markers',
-                    marker=dict(color='lightgreen', size=10, symbol='triangle-down'),
-                    name='Long Exit'
-                ),
-                row=1, col=1
-            )
-        
-        # Short entries
         if short_entries_x:
-            fig.add_trace(
-                go.Scatter(
-                    x=short_entries_x, y=short_entries_y,
-                    mode='markers',
-                    marker=dict(color='red', size=10, symbol='triangle-down'),
-                    name='Short Entry'
-                ),
-                row=1, col=1
-            )
+            fig.add_trace(go.Scatter(x=short_entries_x, y=short_entries_y, mode='markers',
+                marker=dict(color='red', size=12, symbol='triangle-down'), name='Short Entry'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=short_exits_x, y=short_exits_y, mode='markers',
+                marker=dict(color='pink', size=12, symbol='triangle-up'), name='Short Exit'), row=1, col=1)
         
-        # Short exits
-        if short_exits_x:
-            fig.add_trace(
-                go.Scatter(
-                    x=short_exits_x, y=short_exits_y,
-                    mode='markers',
-                    marker=dict(color='pink', size=10, symbol='triangle-up'),
-                    name='Short Exit'
-                ),
-                row=1, col=1
-            )
+        # Capital curve from path
+        capital_curve_x = []
+        capital_curve_y = []
+        for day, pos, capital, _, _ in self.best_path:
+            capital_curve_x.append(self.df.index[day])
+            capital_curve_y.append(capital)
         
-        # Capital curve
-        if len(self.capital_history) > 0:
-            capital_sample = range(0, len(self.capital_history), max(1, len(self.capital_history) // 10000))
-            capital_times = []
-            for i in capital_sample:
-                if i < len(self.df.index):
-                    # Need to map capital_history index to dataframe index
-                    # Capital history follows the path, not 1:1 with df
-                    capital_times.append(self.df.index[min(i * (self.n // len(self.capital_history)), self.n-1)])
-            
-            fig.add_trace(
-                go.Scatter(
-                    x=capital_times,
-                    y=[self.capital_history[i] for i in capital_sample],
-                    name='Capital',
-                    line=dict(color='blue', width=2)
-                ),
-                row=2, col=1
-            )
+        if capital_curve_x:
+            fig.add_trace(go.Scatter(x=capital_curve_x, y=capital_curve_y, name='Capital',
+                line=dict(color='blue', width=2)), row=2, col=1)
         
-        fig.update_xaxes(title_text="Time", row=2, col=1)
+        fig.update_xaxes(title_text="Date", row=2, col=1)
         fig.update_yaxes(title_text="Price", row=1, col=1)
         fig.update_yaxes(title_text="Capital ($)", row=2, col=1, type='log')
         
-        fig.update_layout(height=800, showlegend=True, title_text="Optimal Trading Strategy")
+        fig.update_layout(height=900, showlegend=True, title_text="Optimal Trading Strategy (Daily Data)")
         
         return fig.to_html(full_html=False)
 
@@ -383,11 +396,10 @@ def load_and_process_data():
     print("Loading CSV...")
     df = pd.read_csv(output)
     
+    print(f"Original shape: {df.shape}")
     print(f"Columns: {df.columns.tolist()}")
-    print(f"First few rows:\n{df.head()}")
     
-    # Assuming CSV has timestamp and OHLCV columns
-    # Adjust column names based on actual CSV structure
+    # Parse timestamp
     if 'timestamp' in df.columns:
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df.set_index('timestamp', inplace=True)
@@ -398,18 +410,29 @@ def load_and_process_data():
         df['time'] = pd.to_datetime(df['time'])
         df.set_index('time', inplace=True)
     else:
-        # Use first column as index if it looks like a timestamp
         df.iloc[:, 0] = pd.to_datetime(df.iloc[:, 0])
         df.set_index(df.columns[0], inplace=True)
     
-    print(f"Loaded {len(df)} rows")
     print(f"Date range: {df.index[0]} to {df.index[-1]}")
     
-    # Initialize finder
-    finder = OptimalTradingFinder(df)
+    # Resample to daily
+    print("Resampling to daily data...")
+    df_daily = df.resample('D').agg({
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'volume': 'sum'
+    }).dropna()
+    
+    print(f"Daily data shape: {df_daily.shape}")
+    print(f"Daily date range: {df_daily.index[0]} to {df_daily.index[-1]}")
+    
+    # Initialize finder with daily data
+    finder = OptimalTradingFinder(df_daily)
     
     # Find optimal trades
-    final_capital = finder.find_optimal_trades()
+    final_capital = finder.find_optimal_trades_dp()
     
     # Create visualization
     print("Creating visualization...")
@@ -422,47 +445,50 @@ def index():
     if finder is None:
         return "<h1>Processing data, please wait...</h1>"
     
-    # Generate trade table HTML
+    # Generate trade table
     trades_html = "<table border='1' style='border-collapse: collapse; width: 100%; margin-top: 20px;'>"
-    trades_html += "<tr style='background: #333; color: white;'><th>Entry Time</th><th>Exit Time</th><th>Position</th><th>Entry Price</th><th>Exit Price</th><th>Entry Capital</th><th>Exit Capital</th><th>Return %</th><th>Duration</th></tr>"
+    trades_html += "<tr style='background: #333; color: white;'><th>#</th><th>Entry Date</th><th>Exit Date</th><th>Position</th><th>Entry Price</th><th>Exit Price</th><th>Entry Capital</th><th>Exit Capital</th><th>Return %</th><th>Days Held</th></tr>"
     
-    for i, trade in enumerate(finder.trades[:100]):  # Show first 100 trades
+    for i, trade in enumerate(finder.trades):
         ret = (trade['exit_capital'] / trade['entry_capital'] - 1) * 100
-        duration = trade['exit_index'] - trade['entry_index']
+        duration = trade['exit_day'] - trade['entry_day']
         bg = '#f9f9f9' if i % 2 == 0 else 'white'
-        trades_html += f"<tr style='background: {bg};'><td>{trade['entry_time']}</td><td>{trade['exit_time']}</td><td>{trade['position']}</td>"
+        trades_html += f"<tr style='background: {bg};'><td>{i+1}</td><td>{trade['entry_time'].date()}</td><td>{trade['exit_time'].date()}</td><td><strong>{trade['position']}</strong></td>"
         trades_html += f"<td>${trade['entry_price']:.4f}</td><td>${trade['exit_price']:.4f}</td>"
         trades_html += f"<td>${trade['entry_capital']:.2f}</td><td>${trade['exit_capital']:.2f}</td>"
         trades_html += f"<td style='color: {'green' if ret > 0 else 'red'}; font-weight: bold;'>{ret:.2f}%</td>"
-        trades_html += f"<td>{duration} min</td></tr>"
+        trades_html += f"<td>{duration} days</td></tr>"
     
     trades_html += "</table>"
     
-    final_capital = finder.capital_history[-1] if finder.capital_history else INITIAL_CAPITAL
+    final_capital = finder.best_path[-1][2] if finder.best_path else INITIAL_CAPITAL
     total_return = (final_capital / INITIAL_CAPITAL - 1) * 100
     
-    # Calculate win rate
     winning_trades = sum(1 for t in finder.trades if t['exit_capital'] > t['entry_capital'])
     win_rate = (winning_trades / len(finder.trades) * 100) if finder.trades else 0
+    
+    avg_return = sum((t['exit_capital']/t['entry_capital']-1)*100 for t in finder.trades) / len(finder.trades) if finder.trades else 0
     
     html = f"""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Optimal Trading Strategy</title>
+        <title>Optimal Trading Strategy - Daily</title>
         <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
         <style>
             body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
             .summary {{ background: white; padding: 20px; margin-bottom: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-            .metric {{ display: inline-block; margin-right: 30px; }}
+            .metric {{ display: inline-block; margin: 10px 30px 10px 0; }}
             .metric-label {{ color: #666; font-size: 14px; }}
             .metric-value {{ font-size: 24px; font-weight: bold; color: #333; }}
             .positive {{ color: #00a000; }}
-            .negative {{ color: #d00; }}
+            table {{ font-size: 14px; }}
+            th {{ padding: 10px; }}
+            td {{ padding: 8px; }}
         </style>
     </head>
     <body>
-        <h1>Optimal Trading Strategy Results</h1>
+        <h1>Optimal Trading Strategy Results (Daily Data)</h1>
         <div class="summary">
             <h2>Summary Statistics</h2>
             <div class="metric">
@@ -485,21 +511,26 @@ def index():
                 <div class="metric-label">Win Rate</div>
                 <div class="metric-value">{win_rate:.1f}%</div>
             </div>
+            <div class="metric">
+                <div class="metric-label">Avg Return/Trade</div>
+                <div class="metric-value">{avg_return:.2f}%</div>
+            </div>
             <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid #ddd;">
                 <p style="margin: 5px 0;"><strong>Transaction Fee:</strong> {TRANSACTION_FEE*100}% per trade leg (0.4% round-trip)</p>
-                <p style="margin: 5px 0;"><strong>Slippage:</strong> {SLIPPAGE_MINUTES} minute execution delay</p>
+                <p style="margin: 5px 0;"><strong>Time Frame:</strong> Daily (no slippage)</p>
+                <p style="margin: 5px 0;"><strong>Data Points:</strong> {finder.n} days</p>
             </div>
         </div>
         
         {chart_html}
         
-        <h2 style="margin-top: 30px;">Trade Details (First 100)</h2>
+        <h2 style="margin-top: 30px;">All Trades</h2>
         {trades_html}
         
-        <div style="margin-top: 20px; padding: 15px; background: #ffffcc; border-radius: 5px;">
-            <strong>Note:</strong> This shows the theoretically optimal trading sequence given perfect hindsight. 
-            The algorithm found the sequence of long/short positions that maximizes final capital while accounting for 
-            transaction fees and execution slippage.
+        <div style="margin: 30px 0; padding: 15px; background: #ffffcc; border-radius: 5px;">
+            <strong>Note:</strong> This algorithm uses dynamic programming to find the theoretically optimal 
+            sequence of long/short positions that maximizes final capital with perfect hindsight. 
+            Transaction fees (0.4% round-trip) are fully accounted for.
         </div>
     </body>
     </html>
@@ -507,9 +538,6 @@ def index():
     return html
 
 if __name__ == '__main__':
-    # Load and process data first
     load_and_process_data()
-    
-    # Start web server
     print("\nStarting web server on http://0.0.0.0:8080")
     app.run(host='0.0.0.0', port=8080, debug=False)
