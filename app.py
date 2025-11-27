@@ -61,10 +61,11 @@ def download_data_at_startup():
         print(f"ERROR: Traceback: {traceback.format_exc()}")
         raise e
 
-# Download data when the script starts
-print("DEBUG: Starting application - downloading data at startup...")
-download_data_at_startup()
-print("DEBUG: Data download completed at startup")
+# Download data when the script starts (only if not in debug mode reload)
+if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
+    print("DEBUG: Starting application - downloading data at startup...")
+    download_data_at_startup()
+    print("DEBUG: Data download completed at startup")
 
 @app.route('/')
 def index():
