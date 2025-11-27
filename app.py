@@ -81,9 +81,7 @@ except Exception as e:
 
 @app.route('/')
 def index():
-    # Check if analysis result is available and prepare chart data
-    chart_data = None
-    summary = None
+    # Always use pre-computed analysis result from startup
     if analysis_result is not None:
         chart_data = prepare_chart_data(analysis_result)
         summary = {
@@ -92,57 +90,18 @@ def index():
             'long_trades': int((analysis_result['optimal_action'] == 'buy_long').sum()),
             'short_trades': int((analysis_result['optimal_action'] == 'sell_short').sum())
         }
+        return render_template('index.html', chart_data=chart_data, summary=summary)
     else:
-        print("DEBUG: Analysis result is None, data may not be ready")
-    return render_template('index.html', chart_data=chart_data, summary=summary)
+        print("ERROR: Analysis result not available; startup may have failed")
+        return render_template('index.html', chart_data=None, summary=None)
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
-    try:
-        # Get parameters from request
-        data = request.get_json()
-        fee_rate = float(data.get('fee_rate', 0.002))
-        print(f"DEBUG: Starting analysis with fee_rate={fee_rate}")
-        
-        # Use pre-downloaded data
-        if downloaded_data is None:
-            raise ValueError("Data not available. Please restart the application.")
-        df = downloaded_data
-        print(f"DEBUG: Using pre-downloaded data. Shape: {df.shape}, Columns: {list(df.columns)}")
-        print(f"DEBUG: First few rows:\n{df.head()}")
-        
-        # Calculate optimal strategy
-        print("DEBUG: Starting optimal strategy calculation...")
-        strategy = OptimalTradingStrategy(fee_rate=fee_rate)
-        result = strategy.calculate_optimal_trades(df)
-        print(f"DEBUG: Strategy calculation completed. Result shape: {result.shape}")
-        print(f"DEBUG: Result columns: {list(result.columns)}")
-        print(f"DEBUG: Optimal actions distribution: {result['optimal_action'].value_counts().to_dict()}")
-        
-        # Prepare data for visualization
-        print("DEBUG: Preparing chart data...")
-        chart_data = prepare_chart_data(result)
-        print(f"DEBUG: Chart data prepared. Timestamps: {len(chart_data['timestamps'])}, Prices: {len(chart_data['prices'])}, Trade markers: {len(chart_data['trade_markers'])}")
-        
-        return jsonify({
-            'success': True,
-            'chart_data': chart_data,
-            'summary': {
-                'final_capital': float(result['optimal_capital'].iloc[-1]),
-                'total_trades': int((result['optimal_action'] != 'hold').sum()),
-                'long_trades': int((result['optimal_action'] == 'buy_long').sum()),
-                'short_trades': int((result['optimal_action'] == 'sell_short').sum())
-            }
-        })
-        
-    except Exception as e:
-        print(f"ERROR: Exception in analyze route: {str(e)}")
-        import traceback
-        print(f"ERROR: Traceback: {traceback.format_exc()}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        })
+    # Disable re-analysis; only pre-computed results are available
+    return jsonify({
+        'success': False,
+        'error': 'Analysis is only performed at startup. Please restart the application to change parameters.'
+    })
 
 
 
