@@ -107,7 +107,9 @@ def fetch_data_from_url(url):
         
         return df
     except Exception as e:
-        raise ValueError(f"Failed to fetch data from URL: {str(e)}")def prepare_chart_data(result_df):
+        raise ValueError(f"Failed to fetch data from URL: {str(e)}")
+
+def prepare_chart_data(result_df):
     """Prepare data for chart visualization"""
     # Convert to list format for JSON serialization
     timestamps = result_df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist()
