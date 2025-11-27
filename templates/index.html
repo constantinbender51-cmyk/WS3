@@ -106,11 +106,7 @@
                 <input type="number" id="feeRate" step="0.001" min="0" max="0.1" value="0.002">
                 <span>(e.g., 0.002 for 0.2%)</span>
             </div>
-            <div class="control-group">
-                <label for="dataUrl">Data URL (optional):</label>
-                <input type="text" id="dataUrl" placeholder="https://example.com/data.csv" style="width: 300px;">
-                <span>Leave empty to use default Google Drive data</span>
-            </div>
+
             <button onclick="analyzeStrategy()">Calculate Optimal Strategy</button>
         </div>
 
@@ -163,16 +159,13 @@
             document.getElementById('results').style.display = 'none';
 
             try {
-                const dataUrl = document.getElementById('dataUrl').value;
-                
                 const response = await fetch('/analyze', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                     },
                     body: JSON.stringify({
-                        fee_rate: feeRate,
-                        data_url: dataUrl
+                        fee_rate: feeRate
                     })
                 });
 
