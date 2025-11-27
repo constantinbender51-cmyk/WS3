@@ -9,8 +9,9 @@ import gdown
 
 app = Flask(__name__)
 
-# Global variable to store downloaded data
+# Global variables to store downloaded data and analysis result
 downloaded_data = None
+analysis_result = None
 
 def download_data_at_startup():
     """Download data automatically at script startup"""
@@ -61,15 +62,37 @@ def download_data_at_startup():
         print(f"ERROR: Traceback: {traceback.format_exc()}")
         raise e
 
-# Download data when the script starts (only if not in debug mode reload)
+# Download data and start analysis when the script starts (only if not in debug mode reload)
 if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
     print("DEBUG: Starting application - downloading data at startup...")
     download_data_at_startup()
     print("DEBUG: Data download completed at startup")
+    # Start analysis immediately after data download
+    print("DEBUG: Starting automatic analysis at startup...")
+    try:
+        strategy = OptimalTradingStrategy(fee_rate=0.002)
+        global analysis_result
+        analysis_result = strategy.calculate_optimal_trades(downloaded_data)
+        print("DEBUG: Automatic analysis completed at startup")
+    except Exception as e:
+        print(f"ERROR: Failed to run automatic analysis at startup: {str(e)}")
+        import traceback
+        print(f"ERROR: Traceback: {traceback.format_exc()}")
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    # Check if analysis result is available and prepare chart data
+    chart_data = None
+    summary = None
+    if analysis_result is not None:
+        chart_data = prepare_chart_data(analysis_result)
+        summary = {
+            'final_capital': float(analysis_result['optimal_capital'].iloc[-1]),
+            'total_trades': int((analysis_result['optimal_action'] != 'hold').sum()),
+            'long_trades': int((analysis_result['optimal_action'] == 'buy_long').sum()),
+            'short_trades': int((analysis_result['optimal_action'] == 'sell_short').sum())
+        }
+    return render_template('index.html', chart_data=chart_data, summary=summary)
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
