@@ -88,19 +88,21 @@ if __name__ == '__main__':
 
         @app.route('/')
         def display_results():
-            return f"""
-            <h1>Optimal Trading Strategy Results</h1>
-            <p>Final Capital: {final_capital:.4f}</p>
-            <p>Total Trades: {total_trades}</p>
-            <p>Long Trades: {long_trades}</p>
-            <p>Short Trades: {short_trades}</p>
-            <p><a href="/plot">View Plot of Price Entries, Exits, and Capital</a></p>
-            """
-
-        @app.route('/plot')
-        def display_plot():
-            # Create plot
+            # Create plot with background colors for entries and exits
             fig, ax1 = plt.subplots(figsize=(12, 8))
+            
+            # Add background colors based on position state
+            position_state = analysis_result['position_state'].values
+            for i in range(len(position_state)):
+                if position_state[i] == 1:  # Long position
+                    ax1.axvspan(analysis_result['timestamp'].iloc[i], analysis_result['timestamp'].iloc[i], 
+                                ymin=0, ymax=1, color='green', alpha=0.3)
+                elif position_state[i] == 2:  # Short position
+                    ax1.axvspan(analysis_result['timestamp'].iloc[i], analysis_result['timestamp'].iloc[i], 
+                                ymin=0, ymax=1, color='red', alpha=0.3)
+                else:  # Flat position
+                    ax1.axvspan(analysis_result['timestamp'].iloc[i], analysis_result['timestamp'].iloc[i], 
+                                ymin=0, ymax=1, color='gray', alpha=0.1)
             
             # Plot price data
             ax1.plot(analysis_result['timestamp'], analysis_result['close'], label='Close Price', color='black', linewidth=1)
@@ -141,9 +143,13 @@ if __name__ == '__main__':
             plt.close(fig)
             
             return f"""
-            <h1>Plot: Price Entries, Exits, and Capital</h1>
+            <h1>Optimal Trading Strategy Results</h1>
+            <p>Final Capital: {final_capital:.4f}</p>
+            <p>Total Trades: {total_trades}</p>
+            <p>Long Trades: {long_trades}</p>
+            <p>Short Trades: {short_trades}</p>
+            <h2>Plot: Price Entries, Exits, and Capital</h2>
             <img src="data:image/png;base64,{plot_data}" alt="Trading Plot">
-            <p><a href="/">Back to Results</a></p>
             """
 
         print("Starting web server on port 8080 at 0.0.0.0...")
