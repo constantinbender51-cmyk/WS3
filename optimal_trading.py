@@ -20,6 +20,7 @@ class OptimalTradingStrategy:
     def calculate_optimal_trades(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Calculate optimal trading strategy for given OHLCV data.
+        Accounts for 1-minute slippage by executing at next period's open price.
         
         Args:
             df: DataFrame with columns ['timestamp', 'open', 'high', 'low', 'close', 'volume']
@@ -44,32 +45,33 @@ class OptimalTradingStrategy:
         capital_long[0] = -np.inf  # Cannot start in long position
         capital_short[0] = -np.inf  # Cannot start in short position
         
-        # Calculate price changes (using next period's open for execution)
-        # Assuming we execute at current close for entry, next open for exit
-        prices = df['close'].values
-        next_prices = df['open'].shift(-1).fillna(prices[-1]).values
+        # Calculate price changes with 1-minute slippage
+        # Entry: current close price + fee
+        # Exit: next period's open price - fee (1-minute slippage)
+        entry_prices = df['close'].values
+        exit_prices = df['open'].shift(-1).fillna(df['close'].iloc[-1]).values
         
         for i in range(1, n):
             # From FLAT state:
             # Option 1: Stay flat
             flat_from_flat = capital_flat[i-1]
-            # Option 2: Enter long from flat
-            long_entry_cost = prices[i] * (1 + self.fee_rate)  # Buy at current close + fee
+            # Option 2: Enter long from flat (execute at current close with fee)
+            long_entry_cost = entry_prices[i] * (1 + self.fee_rate)
             long_from_flat = (capital_flat[i-1] / long_entry_cost) if long_entry_cost > 0 else -np.inf
-            # Option 3: Enter short from flat  
-            short_from_flat = capital_flat[i-1] * (1 - self.fee_rate)  # Receive cash from short sale minus fee
+            # Option 3: Enter short from flat (execute at current close with fee)
+            short_from_flat = capital_flat[i-1] * (1 - self.fee_rate)
             
             # From LONG state:
             # Option 1: Stay in long
             long_from_long = capital_long[i-1]
-            # Option 2: Exit long to flat
-            long_exit_value = capital_long[i-1] * next_prices[i] * (1 - self.fee_rate)
+            # Option 2: Exit long to flat (execute at next open with 1-minute slippage and fee)
+            long_exit_value = capital_long[i-1] * exit_prices[i] * (1 - self.fee_rate)
             
             # From SHORT state:
             # Option 1: Stay in short
             short_from_short = capital_short[i-1]
-            # Option 2: Exit short to flat
-            short_exit_value = capital_short[i-1] / next_prices[i] * (1 - self.fee_rate)
+            # Option 2: Exit short to flat (execute at next open with 1-minute slippage and fee)
+            short_exit_value = capital_short[i-1] / exit_prices[i] * (1 - self.fee_rate)
             
             # Update current states
             # FLAT state: can come from previous flat or exiting positions
