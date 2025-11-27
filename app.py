@@ -40,49 +40,53 @@ class OptimalTradingFinder:
         return net_multiplier
     
     def find_all_profitable_trades(self):
-        """Find all profitable long and short trades"""
+        """Find all profitable long and short trades using peak/trough detection"""
         print(f"Finding all profitable trades from {self.n} days...")
+        
+        # Find local minima (good for LONG entries) and maxima (good for SHORT entries)
+        print("Detecting peaks and troughs...")
         
         profitable_trades = []
         
-        # Find all LONG trades
-        print("Scanning for profitable LONG trades...")
+        # Simple approach: for each day, find best future exit
+        print("Finding best trades from each day...")
+        
         for entry in range(self.n - 1):
-            if entry % 100 == 0:
-                print(f"  Long scan: {entry}/{self.n}")
+            if entry % 50 == 0:
+                print(f"  Progress: {entry}/{self.n} - Found {len(profitable_trades)} trades so far")
             
-            for exit in range(entry + 1, self.n):
-                multiplier = self.calculate_trade_return(entry, exit, 'LONG')
+            entry_price = self.prices[entry]
+            
+            # Find best LONG exit (highest future price)
+            future_prices = self.prices[entry+1:]
+            if len(future_prices) > 0:
+                max_future_idx = np.argmax(future_prices)
+                exit_idx = entry + 1 + max_future_idx
                 
-                # Only keep if profitable after fees
+                multiplier = self.calculate_trade_return(entry, exit_idx, 'LONG')
                 if multiplier > 1.0:
                     profitable_trades.append({
                         'entry': entry,
-                        'exit': exit,
+                        'exit': exit_idx,
                         'type': 'LONG',
                         'multiplier': multiplier,
-                        'entry_price': self.prices[entry],
-                        'exit_price': self.prices[exit]
+                        'entry_price': entry_price,
+                        'exit_price': self.prices[exit_idx]
                     })
-        
-        # Find all SHORT trades
-        print("Scanning for profitable SHORT trades...")
-        for entry in range(self.n - 1):
-            if entry % 100 == 0:
-                print(f"  Short scan: {entry}/{self.n}")
-            
-            for exit in range(entry + 1, self.n):
-                multiplier = self.calculate_trade_return(entry, exit, 'SHORT')
                 
-                # Only keep if profitable after fees
+                # Find best SHORT exit (lowest future price)
+                min_future_idx = np.argmin(future_prices)
+                exit_idx = entry + 1 + min_future_idx
+                
+                multiplier = self.calculate_trade_return(entry, exit_idx, 'SHORT')
                 if multiplier > 1.0:
                     profitable_trades.append({
                         'entry': entry,
-                        'exit': exit,
+                        'exit': exit_idx,
                         'type': 'SHORT',
                         'multiplier': multiplier,
-                        'entry_price': self.prices[entry],
-                        'exit_price': self.prices[exit]
+                        'entry_price': entry_price,
+                        'exit_price': self.prices[exit_idx]
                     })
         
         print(f"Found {len(profitable_trades)} profitable trades")
@@ -91,72 +95,41 @@ class OptimalTradingFinder:
         return profitable_trades
     
     def select_optimal_sequence(self):
-        """Select non-overlapping trades that maximize compounded return"""
+        """Select non-overlapping trades that maximize compounded return - Greedy approach"""
         print("\nSelecting optimal non-overlapping sequence...")
         
         if not self.all_trades:
             print("No profitable trades found!")
             return []
         
-        # Sort trades by exit day
-        sorted_trades = sorted(self.all_trades, key=lambda x: x['exit'])
+        # Sort trades by multiplier (best returns first)
+        sorted_trades = sorted(self.all_trades, key=lambda x: x['multiplier'], reverse=True)
         
-        # Dynamic programming to find best sequence
-        # dp[i] = (best_capital, list of selected trade indices)
-        n_trades = len(sorted_trades)
-        dp = [(INITIAL_CAPITAL, [])] * n_trades
+        print(f"Selecting from {len(sorted_trades)} profitable trades...")
         
-        print(f"Running DP on {n_trades} trades...")
+        # Greedy: take best trades that don't overlap
+        selected = []
+        occupied_days = set()
         
-        for i in range(n_trades):
-            if i % 1000 == 0:
-                print(f"  DP progress: {i}/{n_trades}")
+        for trade in sorted_trades:
+            # Check if this trade overlaps with any selected trade
+            trade_days = set(range(trade['entry'], trade['exit'] + 1))
             
-            trade = sorted_trades[i]
-            
-            # Option 1: Don't take this trade - inherit best from previous
-            if i > 0:
-                best_capital, best_sequence = dp[i-1]
-            else:
-                best_capital = INITIAL_CAPITAL
-                best_sequence = []
-            
-            # Option 2: Take this trade
-            # Find the most recent non-overlapping trade
-            last_compatible_idx = -1
-            for j in range(i - 1, -1, -1):
-                if sorted_trades[j]['exit'] < trade['entry']:
-                    last_compatible_idx = j
-                    break
-            
-            if last_compatible_idx >= 0:
-                prev_capital, prev_sequence = dp[last_compatible_idx]
-            else:
-                prev_capital = INITIAL_CAPITAL
-                prev_sequence = []
-            
-            new_capital = prev_capital * trade['multiplier']
-            
-            # Choose better option
-            if new_capital > best_capital:
-                dp[i] = (new_capital, prev_sequence + [i])
-            else:
-                dp[i] = (best_capital, best_sequence)
+            if not trade_days.intersection(occupied_days):
+                # No overlap, take this trade
+                selected.append(trade)
+                occupied_days.update(trade_days)
         
-        # Get best result
-        final_capital, selected_indices = dp[-1]
+        print(f"Selected {len(selected)} non-overlapping trades")
         
-        print(f"\nOptimization complete!")
-        print(f"Selected {len(selected_indices)} trades")
-        print(f"Final capital: ${final_capital:,.2f}")
-        print(f"Total return: {(final_capital/INITIAL_CAPITAL - 1)*100:.2f}%")
+        # Sort selected trades by entry time
+        selected.sort(key=lambda x: x['entry'])
         
-        # Build selected trades list
+        # Build trades list with capital tracking
         self.selected_trades = []
         running_capital = INITIAL_CAPITAL
         
-        for idx in selected_indices:
-            trade = sorted_trades[idx]
+        for trade in selected:
             entry_capital = running_capital
             exit_capital = entry_capital * trade['multiplier']
             
@@ -175,7 +148,10 @@ class OptimalTradingFinder:
             
             running_capital = exit_capital
         
-        self.best_capital = final_capital
+        self.best_capital = running_capital
+        
+        print(f"Final capital: ${self.best_capital:,.2f}")
+        print(f"Total return: {(self.best_capital/INITIAL_CAPITAL - 1)*100:.2f}%")
         
         # Show first few trades
         print("\nFirst 10 selected trades:")
@@ -287,13 +263,14 @@ def load_and_process_data():
     output = "ohlcv_data.csv"
     gdown.download(url, output, quiet=False)
     
-    print("Loading CSV...")
+    print("\nLoading CSV (this may take a moment for large files)...")
     df = pd.read_csv(output)
     
     print(f"Original shape: {df.shape}")
     print(f"Columns: {df.columns.tolist()}")
     
     # Parse timestamp
+    print("Parsing timestamps...")
     if 'timestamp' in df.columns:
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df.set_index('timestamp', inplace=True)
@@ -307,10 +284,10 @@ def load_and_process_data():
         df.iloc[:, 0] = pd.to_datetime(df.iloc[:, 0])
         df.set_index(df.columns[0], inplace=True)
     
-    print(f"Date range: {df.index[0]} to {df.index[-1]}")
+    print(f"Original date range: {df.index[0]} to {df.index[-1]}")
     
-    # Resample to daily
-    print("Resampling to daily data...")
+    # Resample to daily BEFORE doing anything else
+    print("\n*** Resampling to daily data (converting 4M rows to ~3K rows) ***")
     df_daily = df.resample('D').agg({
         'open': 'first',
         'high': 'max',
@@ -319,23 +296,35 @@ def load_and_process_data():
         'volume': 'sum'
     }).dropna()
     
-    print(f"Daily data shape: {df_daily.shape}")
+    print(f"Daily data shape: {df_daily.shape} ← Working with this from now on!")
     print(f"Daily date range: {df_daily.index[0]} to {df_daily.index[-1]}")
     
-    # Initialize finder with daily data
+    # Free up memory from original data
+    del df
+    
+    # Initialize finder with ONLY daily data
+    print(f"\nInitializing optimizer with {len(df_daily)} daily bars...")
     finder = OptimalTradingFinder(df_daily)
     
-    # Find all profitable trades
+    # Find all profitable trades (on daily data only)
+    print("\n" + "="*60)
+    print("STEP 1: Finding profitable trades")
+    print("="*60)
     finder.find_all_profitable_trades()
     
     # Select optimal sequence
+    print("\n" + "="*60)
+    print("STEP 2: Selecting optimal non-overlapping sequence")
+    print("="*60)
     finder.select_optimal_sequence()
     
     # Create visualization
-    print("\nCreating visualization...")
+    print("\n" + "="*60)
+    print("STEP 3: Creating visualization")
+    print("="*60)
     chart_html = finder.create_visualization()
     
-    print("Ready to serve web interface!")
+    print("\n✅ Ready to serve web interface!")
 
 @app.route('/')
 def index():
