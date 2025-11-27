@@ -101,13 +101,7 @@
         <h1>Optimal Trading Strategy Visualizer</h1>
         
         <div class="controls">
-            <div class="control-group">
-                <label for="feeRate">Transaction Fee Rate:</label>
-                <input type="number" id="feeRate" step="0.001" min="0" max="0.1" value="0.002">
-                <span>(e.g., 0.002 for 0.2%)</span>
-            </div>
-
-            <button onclick="analyzeStrategy()">Calculate Optimal Strategy</button>
+            <p>Analysis started automatically at startup. Results will display once ready.</p>
         </div>
 
         <div id="loading" class="loading">
@@ -348,10 +342,18 @@
             console.log('DEBUG: Capital chart created');
         }
 
-        // Initialize with automatic analysis after page load
+        // Display results if available from server-side rendering
         window.addEventListener('DOMContentLoaded', function() {
-            // Wait a bit longer to ensure data is downloaded
-            setTimeout(analyzeStrategy, 2000);
+            const chartData = {{ chart_data | tojson | safe }};
+            const summary = {{ summary | tojson | safe }};
+            if (chartData && summary) {
+                console.log('DEBUG: Displaying pre-computed results from server');
+                displayResults({ success: true, chart_data: chartData, summary: summary });
+            } else {
+                console.log('DEBUG: No pre-computed results available, data may still be downloading');
+                document.getElementById('loading').style.display = 'block';
+                // Optionally, you could add a retry mechanism here if needed
+            }
         });
     </script>
 </body>
