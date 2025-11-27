@@ -3,6 +3,7 @@ import numpy as np
 from optimal_trading import OptimalTradingStrategy
 import os
 import gdown
+from flask import Flask
 
 def download_data_at_startup():
     """Download data automatically at script startup"""
@@ -76,6 +77,22 @@ if __name__ == '__main__':
         print(f"Long Trades: {long_trades}")
         print(f"Short Trades: {short_trades}")
         print("=== End of Results ===")
+
+        # Start web server to display results
+        app = Flask(__name__)
+
+        @app.route('/')
+        def display_results():
+            return f"""
+            <h1>Optimal Trading Strategy Results</h1>
+            <p>Final Capital: {final_capital:.4f}</p>
+            <p>Total Trades: {total_trades}</p>
+            <p>Long Trades: {long_trades}</p>
+            <p>Short Trades: {short_trades}</p>
+            """
+
+        print("Starting web server on port 8080 at 0.0.0.0...")
+        app.run(host='0.0.0.0', port=8080)
         
     except Exception as e:
         print(f"ERROR: Failed to run automatic analysis at startup: {str(e)}")
