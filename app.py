@@ -79,7 +79,10 @@ if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
         import traceback
         print(f"ERROR: Traceback: {traceback.format_exc()}")
 else:
-    # In debug reload, ensure analysis_result is initialized if data is available
+    # In debug reload, ensure data and analysis are re-initialized if needed
+    if downloaded_data is None:
+        print("DEBUG: Re-downloading data after reload...")
+        download_data_at_startup()
     if downloaded_data is not None and analysis_result is None:
         print("DEBUG: Re-running analysis after reload...")
         try:
