@@ -19,13 +19,12 @@ def analyze():
         fee_rate = float(data.get('fee_rate', 0.002))
         
         # Generate sample data, fetch from URL, or use uploaded data
-        if data.get('use_sample_data', True):
-            df = generate_sample_data()
-        elif data.get('data_url'):
+        if data.get('data_url'):
             df = fetch_data_from_url(data['data_url'])
         else:
-            # In a real implementation, handle file upload
-            df = generate_sample_data()
+            # Use the specific Google Drive URL by default
+            default_url = 'https://drive.google.com/file/d/1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o/view?usp=drivesdk'
+            df = fetch_data_from_url(default_url)
         
         # Calculate optimal strategy
         strategy = OptimalTradingStrategy(fee_rate=fee_rate)
@@ -76,8 +75,25 @@ def generate_sample_data(n_samples=1000):
 def fetch_data_from_url(url):
     """Fetch OHLCV data from a URL (CSV format expected)"""
     try:
-        # Attempt to fetch data from URL
-        df = pd.read_csv(url)
+        # Handle Google Drive URLs with gdown
+        if 'drive.google.com' in url:
+            import gdown
+            # Extract file ID from Google Drive URL
+            file_id = url.split('/d/')[1].split('/')[0]
+            download_url = f'https://drive.google.com/uc?id={file_id}'
+            
+            # Download file temporarily
+            output_path = 'temp_data.csv'
+            gdown.download(download_url, output_path, quiet=False)
+            
+            df = pd.read_csv(output_path)
+            
+            # Clean up temporary file
+            import os
+            os.remove(output_path)
+        else:
+            # Regular URL
+            df = pd.read_csv(url)
         
         # Validate required columns
         required_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
