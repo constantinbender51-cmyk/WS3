@@ -62,7 +62,9 @@ def download_data_at_startup():
         raise e
 
 # Download data when the script starts
+print("DEBUG: Starting application - downloading data at startup...")
 download_data_at_startup()
+print("DEBUG: Data download completed at startup")
 
 @app.route('/')
 def index():
