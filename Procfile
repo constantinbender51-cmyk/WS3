@@ -1,1 +1,1 @@
-web: python optimal_trading.py
+web: python app.py
