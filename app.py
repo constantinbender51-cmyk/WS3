@@ -1,22 +1,11 @@
-from flask import Flask, render_template, request, jsonify
 import pandas as pd
 import numpy as np
-import json
-from datetime import datetime
 from optimal_trading import OptimalTradingStrategy
 import os
 import gdown
 
-app = Flask(__name__)
-
-# Global variables to store downloaded data and analysis result
-downloaded_data = None
-analysis_result = None
-
 def download_data_at_startup():
     """Download data automatically at script startup"""
-    global downloaded_data
-    global analysis_result
     try:
         data_url = 'https://drive.google.com/file/d/1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o/view?usp=drivesdk'
         print("DEBUG: Starting automatic data download at startup...")
@@ -54,8 +43,8 @@ def download_data_at_startup():
             df['timestamp'] = pd.to_datetime(df['timestamp'])
         print(f"DEBUG: Timestamp dtype: {df['timestamp'].dtype}")
         
-        downloaded_data = df
         print("DEBUG: Data downloaded and stored successfully at startup")
+        return df
         
     except Exception as e:
         print(f"ERROR: Failed to download data at startup: {str(e)}")
@@ -63,91 +52,33 @@ def download_data_at_startup():
         print(f"ERROR: Traceback: {traceback.format_exc()}")
         raise e
 
-# Download data and start analysis when the script starts
-print("DEBUG: Starting application - downloading data at startup...")
-download_data_at_startup()
-print("DEBUG: Data download completed at startup")
-# Start analysis immediately after data download
-print("DEBUG: Starting automatic analysis at startup...")
-try:
-    strategy = OptimalTradingStrategy(fee_rate=0.002)
-    analysis_result = strategy.calculate_optimal_trades(downloaded_data)
-    print("DEBUG: Automatic analysis completed at startup")
-except Exception as e:
-    print(f"ERROR: Failed to run automatic analysis at startup: {str(e)}")
-    import traceback
-    print(f"ERROR: Traceback: {traceback.format_exc()}")
-    raise e  # Re-raise to prevent server start if analysis fails
-
-@app.route('/')
-def index():
-    # Always use pre-computed analysis result from startup
-    if analysis_result is not None:
-        chart_data = prepare_chart_data(analysis_result)
-        summary = {
-            'final_capital': float(analysis_result['optimal_capital'].iloc[-1]),
-            'total_trades': int((analysis_result['optimal_action'] != 'hold').sum()),
-            'long_trades': int((analysis_result['optimal_action'] == 'buy_long').sum()),
-            'short_trades': int((analysis_result['optimal_action'] == 'sell_short').sum())
-        }
-        return render_template('index.html', chart_data=chart_data, summary=summary)
-    else:
-        print("ERROR: Analysis result not available; startup may have failed")
-        return render_template('index.html', chart_data=None, summary=None)
-
-@app.route('/analyze', methods=['POST'])
-def analyze():
-    # Disable re-analysis; only pre-computed results are available
-    return jsonify({
-        'success': False,
-        'error': 'Analysis is only performed at startup. Please restart the application to change parameters.'
-    })
-
-
-
-
-
-
-
-
-
-def prepare_chart_data(result_df):
-    """Prepare data for chart visualization"""
-    print(f"DEBUG: Preparing chart data from result_df with shape: {result_df.shape}")
-    
-    # Convert to list format for JSON serialization
-    timestamps = result_df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist()
-    prices = result_df['close'].tolist()
-    capital = result_df['optimal_capital'].tolist()
-    actions = result_df['optimal_action'].tolist()
-    
-    print(f"DEBUG: Converted {len(timestamps)} timestamps, {len(prices)} prices, {len(capital)} capital values")
-    
-    # Prepare trade markers
-    trade_markers = []
-    for i, action in enumerate(actions):
-        if action != 'hold':
-            trade_markers.append({
-                'x': timestamps[i],
-                'y': prices[i],
-                'action': action,
-                'color': 'green' if 'buy' in action else 'red'
-            })
-    
-    print(f"DEBUG: Created {len(trade_markers)} trade markers")
-    
-    chart_data = {
-        'timestamps': timestamps,
-        'prices': prices,
-        'capital': capital,
-        'trade_markers': trade_markers,
-        'actions': actions
-    }
-    
-    print(f"DEBUG: Chart data keys: {list(chart_data.keys())}")
-    return chart_data
-
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080))
-    print("DEBUG: Starting Flask server after analysis completion...")
-    app.run(debug=True, host='0.0.0.0', port=port)
+    # Download data and run analysis
+    print("DEBUG: Starting application - downloading data at startup...")
+    downloaded_data = download_data_at_startup()
+    print("DEBUG: Data download completed at startup")
+    
+    print("DEBUG: Starting automatic analysis at startup...")
+    try:
+        strategy = OptimalTradingStrategy(fee_rate=0.002)
+        analysis_result = strategy.calculate_optimal_trades(downloaded_data)
+        print("DEBUG: Automatic analysis completed at startup")
+        
+        # Display results
+        final_capital = float(analysis_result['optimal_capital'].iloc[-1])
+        total_trades = int((analysis_result['optimal_action'] != 'hold').sum())
+        long_trades = int((analysis_result['optimal_action'] == 'buy_long').sum())
+        short_trades = int((analysis_result['optimal_action'] == 'sell_short').sum())
+        
+        print("\n=== Analysis Results ===")
+        print(f"Final Capital: {final_capital:.4f}")
+        print(f"Total Trades: {total_trades}")
+        print(f"Long Trades: {long_trades}")
+        print(f"Short Trades: {short_trades}")
+        print("=== End of Results ===")
+        
+    except Exception as e:
+        print(f"ERROR: Failed to run automatic analysis at startup: {str(e)}")
+        import traceback
+        print(f"ERROR: Traceback: {traceback.format_exc()}")
+        raise e
