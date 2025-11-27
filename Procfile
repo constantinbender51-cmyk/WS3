@@ -1,0 +1,1 @@
+web: python lstm_training.py
