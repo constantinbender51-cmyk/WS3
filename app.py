@@ -10,6 +10,9 @@ import matplotlib.pyplot as plt
 import io
 import base64
 
+# Create Flask app instance
+app = Flask(__name__)
+
 def download_data_at_startup():
     """Download data automatically at script startup"""
     try:
@@ -83,9 +86,7 @@ if __name__ == '__main__':
         print(f"Short Trades: {short_trades}")
         print("=== End of Results ===")
 
-        # Start web server to display results
-        app = Flask(__name__)
-
+        # Define route for displaying results
         @app.route('/')
         def display_results():
             # Create plot with background colors for entries and exits
@@ -154,6 +155,40 @@ if __name__ == '__main__':
 
         print("Starting web server on port 8080 at 0.0.0.0...")
         app.run(host='0.0.0.0', port=8080)
+# Run the app when executed directly
+if __name__ == '__main__':
+    # Download data and run analysis
+    print("DEBUG: Starting application - downloading data at startup...")
+    downloaded_data = download_data_at_startup()
+    print("DEBUG: Data download completed at startup")
+    
+    print("DEBUG: Starting automatic analysis at startup...")
+    try:
+        strategy = OptimalTradingStrategy(fee_rate=0.002)
+        analysis_result = strategy.calculate_optimal_trades(downloaded_data)
+        print("DEBUG: Automatic analysis completed at startup")
+        
+        # Display results
+        final_capital = float(analysis_result['optimal_capital'].iloc[-1])
+        total_trades = int((analysis_result['optimal_action'] != 'hold').sum())
+        long_trades = int((analysis_result['optimal_action'] == 'buy_long').sum())
+        short_trades = int((analysis_result['optimal_action'] == 'sell_short').sum())
+        
+        print("\n=== Analysis Results ===")
+        print(f"Final Capital: {final_capital:.4f}")
+        print(f"Total Trades: {total_trades}")
+        print(f"Long Trades: {long_trades}")
+        print(f"Short Trades: {short_trades}")
+        print("=== End of Results ===")
+
+        print("Starting web server on port 8080 at 0.0.0.0...")
+        app.run(host='0.0.0.0', port=8080)
+        
+    except Exception as e:
+        print(f"ERROR: Failed to run automatic analysis at startup: {str(e)}")
+        import traceback
+        print(f"ERROR: Traceback: {traceback.format_exc()}")
+        raise e
         
     except Exception as e:
         print(f"ERROR: Failed to run automatic analysis at startup: {str(e)}")
