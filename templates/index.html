@@ -348,8 +348,10 @@
             console.log('DEBUG: Capital chart created');
         }
 
-        // Initialize with sample data
-        window.onload = analyzeStrategy;
+        // Initialize with automatic analysis after page load
+        window.addEventListener('DOMContentLoaded', function() {
+            setTimeout(analyzeStrategy, 100);
+        });
     </script>
 </body>
 </html>
