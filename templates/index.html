@@ -154,11 +154,13 @@
 
         async function analyzeStrategy() {
             const feeRate = parseFloat(document.getElementById('feeRate').value);
+            console.log('DEBUG: Starting analysis with feeRate:', feeRate);
             
             document.getElementById('loading').style.display = 'block';
             document.getElementById('results').style.display = 'none';
 
             try {
+                console.log('DEBUG: Sending POST request to /analyze');
                 const response = await fetch('/analyze', {
                     method: 'POST',
                     headers: {
@@ -169,14 +171,19 @@
                     })
                 });
 
+                console.log('DEBUG: Received response, status:', response.status);
                 const result = await response.json();
+                console.log('DEBUG: Parsed JSON result:', result);
 
                 if (result.success) {
+                    console.log('DEBUG: Result success, calling displayResults');
                     displayResults(result);
                 } else {
+                    console.error('DEBUG: Result error:', result.error);
                     alert('Error: ' + result.error);
                 }
             } catch (error) {
+                console.error('DEBUG: Exception in analyzeStrategy:', error);
                 alert('Error: ' + error.message);
             } finally {
                 document.getElementById('loading').style.display = 'none';
@@ -184,8 +191,10 @@
         }
 
         function displayResults(result) {
+            console.log('DEBUG: In displayResults, result keys:', Object.keys(result));
             // Update summary
             const summary = result.summary;
+            console.log('DEBUG: Summary data:', summary);
             document.getElementById('summary').innerHTML = `
                 <div class="summary-item">
                     <div>Final Capital</div>
@@ -207,13 +216,17 @@
 
             // Create price chart with trade markers
             const chartData = result.chart_data;
+            console.log('DEBUG: Chart data keys:', Object.keys(chartData));
+            console.log('DEBUG: Chart data sample - timestamps length:', chartData.timestamps ? chartData.timestamps.length : 'undefined', 'prices length:', chartData.prices ? chartData.prices.length : 'undefined');
             createPriceChart(chartData);
             createCapitalChart(chartData);
 
             document.getElementById('results').style.display = 'block';
+            console.log('DEBUG: Results displayed');
         }
 
         function createPriceChart(chartData) {
+            console.log('DEBUG: In createPriceChart');
             const ctx = document.getElementById('priceChart').getContext('2d');
             
             if (priceChart) {
@@ -235,6 +248,7 @@
                     position: 'top'
                 }
             }));
+            console.log('DEBUG: Annotations created, count:', annotations.length);
 
             priceChart = new Chart(ctx, {
                 type: 'line',
@@ -279,9 +293,11 @@
                     }
                 }
             });
+            console.log('DEBUG: Price chart created');
         }
 
         function createCapitalChart(chartData) {
+            console.log('DEBUG: In createCapitalChart');
             const ctx = document.getElementById('capitalChart').getContext('2d');
             
             if (capitalChart) {
@@ -329,6 +345,7 @@
                     }
                 }
             });
+            console.log('DEBUG: Capital chart created');
         }
 
         // Initialize with sample data
