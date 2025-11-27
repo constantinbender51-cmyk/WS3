@@ -4,6 +4,11 @@ from optimal_trading import OptimalTradingStrategy
 import os
 import gdown
 from flask import Flask
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+import io
+import base64
 
 def download_data_at_startup():
     """Download data automatically at script startup"""
@@ -89,6 +94,56 @@ if __name__ == '__main__':
             <p>Total Trades: {total_trades}</p>
             <p>Long Trades: {long_trades}</p>
             <p>Short Trades: {short_trades}</p>
+            <p><a href="/plot">View Plot of Price Entries, Exits, and Capital</a></p>
+            """
+
+        @app.route('/plot')
+        def display_plot():
+            # Create plot
+            fig, ax1 = plt.subplots(figsize=(12, 8))
+            
+            # Plot price data
+            ax1.plot(analysis_result['timestamp'], analysis_result['close'], label='Close Price', color='black', linewidth=1)
+            
+            # Mark entry and exit points
+            long_entries = analysis_result[analysis_result['optimal_action'] == 'buy_long']
+            long_exits = analysis_result[analysis_result['optimal_action'] == 'sell_long']
+            short_entries = analysis_result[analysis_result['optimal_action'] == 'sell_short']
+            short_exits = analysis_result[analysis_result['optimal_action'] == 'buy_short']
+            
+            ax1.scatter(long_entries['timestamp'], long_entries['close'], color='green', marker='^', s=50, label='Long Entry', zorder=5)
+            ax1.scatter(long_exits['timestamp'], long_exits['close'], color='red', marker='v', s=50, label='Long Exit', zorder=5)
+            ax1.scatter(short_entries['timestamp'], short_entries['close'], color='blue', marker='v', s=50, label='Short Entry', zorder=5)
+            ax1.scatter(short_exits['timestamp'], short_exits['close'], color='orange', marker='^', s=50, label='Short Exit', zorder=5)
+            
+            ax1.set_xlabel('Timestamp')
+            ax1.set_ylabel('Price', color='black')
+            ax1.tick_params(axis='y', labelcolor='black')
+            ax1.legend(loc='upper left')
+            ax1.grid(True)
+            
+            # Plot capital on secondary axis
+            ax2 = ax1.twinx()
+            ax2.plot(analysis_result['timestamp'], analysis_result['optimal_capital'], label='Capital', color='purple', linewidth=2)
+            ax2.set_ylabel('Capital', color='purple')
+            ax2.tick_params(axis='y', labelcolor='purple')
+            ax2.legend(loc='upper right')
+            
+            plt.title('Price Entries, Exits, and Capital Over Time')
+            fig.tight_layout()
+            
+            # Save plot to a bytes buffer and encode as base64
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png')
+            buf.seek(0)
+            plot_data = base64.b64encode(buf.getvalue()).decode('utf-8')
+            buf.close()
+            plt.close(fig)
+            
+            return f"""
+            <h1>Plot: Price Entries, Exits, and Capital</h1>
+            <img src="data:image/png;base64,{plot_data}" alt="Trading Plot">
+            <p><a href="/">Back to Results</a></p>
             """
 
         print("Starting web server on port 8080 at 0.0.0.0...")
