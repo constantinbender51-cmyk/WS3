@@ -18,8 +18,8 @@ def analyze():
         data = request.get_json()
         fee_rate = float(data.get('fee_rate', 0.002))
         
-        # Fetch data from URL or use default Google Drive URL
-        data_url = data.get('data_url', 'https://drive.google.com/file/d/1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o/view?usp=drivesdk')
+        # Fetch data from default Google Drive URL
+        data_url = 'https://drive.google.com/file/d/1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o/view?usp=drivesdk'
         df = fetch_data_from_url(data_url)
         
         # Calculate optimal strategy
