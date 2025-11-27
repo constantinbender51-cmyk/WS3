@@ -18,13 +18,9 @@ def analyze():
         data = request.get_json()
         fee_rate = float(data.get('fee_rate', 0.002))
         
-        # Generate sample data, fetch from URL, or use uploaded data
-        if data.get('data_url'):
-            df = fetch_data_from_url(data['data_url'])
-        else:
-            # Use the specific Google Drive URL by default
-            default_url = 'https://drive.google.com/file/d/1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o/view?usp=drivesdk'
-            df = fetch_data_from_url(default_url)
+        # Fetch data from URL or use default Google Drive URL
+        data_url = data.get('data_url', 'https://drive.google.com/file/d/1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o/view?usp=drivesdk')
+        df = fetch_data_from_url(data_url)
         
         # Calculate optimal strategy
         strategy = OptimalTradingStrategy(fee_rate=fee_rate)
@@ -50,25 +46,7 @@ def analyze():
             'error': str(e)
         })
 
-def generate_sample_data(n_samples=1000):
-    """Generate sample OHLCV data for demonstration"""
-    np.random.seed(42)
-    dates = pd.date_range('2024-01-01', periods=n_samples, freq='1min')
-    
-    # Generate random walk prices with some trend
-    returns = np.random.normal(0.0001, 0.002, n_samples)
-    prices = 100 * np.cumprod(1 + returns)
-    
-    df = pd.DataFrame({
-        'timestamp': dates,
-        'open': prices,
-        'high': prices * (1 + np.abs(np.random.normal(0, 0.003, n_samples))),
-        'low': prices * (1 - np.abs(np.random.normal(0, 0.003, n_samples))),
-        'close': prices,
-        'volume': np.random.randint(1000, 10000, n_samples)
-    })
-    
-    return df
+
 
 
 
