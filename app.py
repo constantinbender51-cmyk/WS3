@@ -16,6 +16,7 @@ analysis_result = None
 def download_data_at_startup():
     """Download data automatically at script startup"""
     global downloaded_data
+    global analysis_result
     try:
         data_url = 'https://drive.google.com/file/d/1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o/view?usp=drivesdk'
         print("DEBUG: Starting automatic data download at startup...")
@@ -71,7 +72,6 @@ if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
     print("DEBUG: Starting automatic analysis at startup...")
     try:
         strategy = OptimalTradingStrategy(fee_rate=0.002)
-        global analysis_result
         analysis_result = strategy.calculate_optimal_trades(downloaded_data)
         print("DEBUG: Automatic analysis completed at startup")
     except Exception as e:
