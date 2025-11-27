@@ -78,6 +78,18 @@ if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
         print(f"ERROR: Failed to run automatic analysis at startup: {str(e)}")
         import traceback
         print(f"ERROR: Traceback: {traceback.format_exc()}")
+else:
+    # In debug reload, ensure analysis_result is initialized if data is available
+    if downloaded_data is not None and analysis_result is None:
+        print("DEBUG: Re-running analysis after reload...")
+        try:
+            strategy = OptimalTradingStrategy(fee_rate=0.002)
+            analysis_result = strategy.calculate_optimal_trades(downloaded_data)
+            print("DEBUG: Analysis re-run completed after reload")
+        except Exception as e:
+            print(f"ERROR: Failed to re-run analysis after reload: {str(e)}")
+            import traceback
+            print(f"ERROR: Traceback: {traceback.format_exc()}")
 
 @app.route('/')
 def index():
