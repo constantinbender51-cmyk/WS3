@@ -18,9 +18,11 @@ def analyze():
         data = request.get_json()
         fee_rate = float(data.get('fee_rate', 0.002))
         
-        # Generate sample data or use uploaded data
+        # Generate sample data, fetch from URL, or use uploaded data
         if data.get('use_sample_data', True):
             df = generate_sample_data()
+        elif data.get('data_url'):
+            df = fetch_data_from_url(data['data_url'])
         else:
             # In a real implementation, handle file upload
             df = generate_sample_data()
@@ -69,7 +71,27 @@ def generate_sample_data(n_samples=1000):
     
     return df
 
-def prepare_chart_data(result_df):
+
+
+def fetch_data_from_url(url):
+    """Fetch OHLCV data from a URL (CSV format expected)"""
+    try:
+        # Attempt to fetch data from URL
+        df = pd.read_csv(url)
+        
+        # Validate required columns
+        required_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            raise ValueError(f"Missing required columns: {missing_columns}")
+        
+        # Convert timestamp to datetime if needed
+        if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+        
+        return df
+    except Exception as e:
+        raise ValueError(f"Failed to fetch data from URL: {str(e)}")def prepare_chart_data(result_df):
     """Prepare data for chart visualization"""
     # Convert to list format for JSON serialization
     timestamps = result_df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist()
@@ -97,4 +119,4 @@ def prepare_chart_data(result_df):
     }
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, host='0.0.0.0', port=8080)
