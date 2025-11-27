@@ -63,36 +63,21 @@ def download_data_at_startup():
         print(f"ERROR: Traceback: {traceback.format_exc()}")
         raise e
 
-# Download data and start analysis when the script starts (only if not in debug mode reload)
-if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
-    print("DEBUG: Starting application - downloading data at startup...")
-    download_data_at_startup()
-    print("DEBUG: Data download completed at startup")
-    # Start analysis immediately after data download
-    print("DEBUG: Starting automatic analysis at startup...")
-    try:
-        strategy = OptimalTradingStrategy(fee_rate=0.002)
-        analysis_result = strategy.calculate_optimal_trades(downloaded_data)
-        print("DEBUG: Automatic analysis completed at startup")
-    except Exception as e:
-        print(f"ERROR: Failed to run automatic analysis at startup: {str(e)}")
-        import traceback
-        print(f"ERROR: Traceback: {traceback.format_exc()}")
-else:
-    # In debug reload, ensure data and analysis are re-initialized if needed
-    if downloaded_data is None:
-        print("DEBUG: Re-downloading data after reload...")
-        download_data_at_startup()
-    if downloaded_data is not None and analysis_result is None:
-        print("DEBUG: Re-running analysis after reload...")
-        try:
-            strategy = OptimalTradingStrategy(fee_rate=0.002)
-            analysis_result = strategy.calculate_optimal_trades(downloaded_data)
-            print("DEBUG: Analysis re-run completed after reload")
-        except Exception as e:
-            print(f"ERROR: Failed to re-run analysis after reload: {str(e)}")
-            import traceback
-            print(f"ERROR: Traceback: {traceback.format_exc()}")
+# Download data and start analysis when the script starts
+print("DEBUG: Starting application - downloading data at startup...")
+download_data_at_startup()
+print("DEBUG: Data download completed at startup")
+# Start analysis immediately after data download
+print("DEBUG: Starting automatic analysis at startup...")
+try:
+    strategy = OptimalTradingStrategy(fee_rate=0.002)
+    analysis_result = strategy.calculate_optimal_trades(downloaded_data)
+    print("DEBUG: Automatic analysis completed at startup")
+except Exception as e:
+    print(f"ERROR: Failed to run automatic analysis at startup: {str(e)}")
+    import traceback
+    print(f"ERROR: Traceback: {traceback.format_exc()}")
+    raise e  # Re-raise to prevent server start if analysis fails
 
 @app.route('/')
 def index():
@@ -205,4 +190,5 @@ def prepare_chart_data(result_df):
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
+    print("DEBUG: Starting Flask server after analysis completion...")
     app.run(debug=True, host='0.0.0.0', port=port)
