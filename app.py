@@ -1,197 +1,377 @@
+import gdown
 import pandas as pd
 import numpy as np
-from optimal_trading import OptimalTradingStrategy
-import os
-import gdown
-from flask import Flask
-import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
-import matplotlib.pyplot as plt
-import io
-import base64
+from flask import Flask, render_template_string
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from datetime import datetime
 
-# Create Flask app instance
+# Configuration
+TRANSACTION_FEE = 0.002  # 0.2%
+SLIPPAGE_MINUTES = 1
+INITIAL_CAPITAL = 10000
+POSITION_FLAT = 0
+POSITION_LONG = 1
+POSITION_SHORT = 2
+
 app = Flask(__name__)
 
-def download_data_at_startup():
-    """Download data automatically at script startup"""
-    try:
-        data_url = 'https://drive.google.com/file/d/1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o/view?usp=drivesdk'
-        print("DEBUG: Starting automatic data download at startup...")
-        print(f"DEBUG: Fetching data from URL: {data_url}")
+class OptimalTradingFinder:
+    def __init__(self, df):
+        self.df = df
+        self.prices = df['close'].values
+        self.n = len(self.prices)
+        self.trades = []
+        self.capital_history = []
+        self.position_history = []
         
-        # Handle Google Drive URLs with gdown
-        file_id = data_url.split('/d/')[1].split('/')[0]
-        download_url = f'https://drive.google.com/uc?id={file_id}'
-        print(f"DEBUG: Downloading from Google Drive. File ID: {file_id}")
+    def calculate_capital_change(self, entry_price, exit_price, position_type):
+        """Calculate capital multiplier for a trade including fees"""
+        if position_type == POSITION_LONG:
+            # Long: profit when price goes up
+            gross_return = exit_price / entry_price
+        else:  # SHORT
+            # Short: profit when price goes down
+            # If price drops 10%, we gain 10%
+            gross_return = 2 - (exit_price / entry_price)
         
-        # Download file temporarily
-        output_path = 'temp_data.csv'
-        gdown.download(download_url, output_path, quiet=False)
-        print(f"DEBUG: File downloaded to {output_path}")
+        # Apply fees: entry fee and exit fee
+        net_multiplier = gross_return * (1 - TRANSACTION_FEE) * (1 - TRANSACTION_FEE)
+        return net_multiplier
+    
+    def find_optimal_trades(self):
+        """Dynamic Programming to find optimal trade sequence"""
+        print(f"Processing {self.n} data points...")
+        print("Running DP optimization (this may take a few minutes)...")
         
-        df = pd.read_csv(output_path)
-        print(f"DEBUG: CSV loaded. Shape: {df.shape}")
+        # DP state: dp[t][position] = (capital, previous_position, entry_index)
+        # We track capital and backpointers
+        dp = np.ones((self.n, 3)) * -np.inf  # Initialize with -inf
+        backpointer = np.zeros((self.n, 3, 3), dtype=np.int32)  # [t][pos] = (prev_pos, prev_t, entry_t)
         
-        # Clean up temporary file
-        if os.path.exists(output_path):
-            os.remove(output_path)
-            print("DEBUG: Temporary file cleaned up")
+        # Initial state: start FLAT with initial capital
+        dp[0][POSITION_FLAT] = INITIAL_CAPITAL
         
-        # Validate required columns
-        required_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        if missing_columns:
-            print(f"ERROR: Missing columns: {missing_columns}")
-            raise ValueError(f"Missing required columns: {missing_columns}")
-        print(f"DEBUG: All required columns present: {required_columns}")
+        # Forward pass
+        for t in range(self.n - 1):
+            if t % 100000 == 0:
+                print(f"Progress: {t}/{self.n} ({100*t/self.n:.1f}%)")
+            
+            current_price = self.prices[t]
+            next_price = self.prices[t + 1]  # Execution price (slippage)
+            
+            # From FLAT
+            if dp[t][POSITION_FLAT] > 0:
+                capital_flat = dp[t][POSITION_FLAT]
+                
+                # Stay FLAT
+                if capital_flat > dp[t+1][POSITION_FLAT]:
+                    dp[t+1][POSITION_FLAT] = capital_flat
+                    backpointer[t+1][POSITION_FLAT] = [POSITION_FLAT, t, -1]
+                
+                # Enter LONG (pay fee, execute at next_price)
+                capital_after_entry = capital_flat * (1 - TRANSACTION_FEE)
+                if capital_after_entry > dp[t+1][POSITION_LONG]:
+                    dp[t+1][POSITION_LONG] = capital_after_entry
+                    backpointer[t+1][POSITION_LONG] = [POSITION_FLAT, t, t+1]
+                
+                # Enter SHORT (pay fee)
+                capital_after_entry = capital_flat * (1 - TRANSACTION_FEE)
+                if capital_after_entry > dp[t+1][POSITION_SHORT]:
+                    dp[t+1][POSITION_SHORT] = capital_after_entry
+                    backpointer[t+1][POSITION_SHORT] = [POSITION_FLAT, t, t+1]
+            
+            # From LONG
+            if dp[t][POSITION_LONG] > 0:
+                entry_idx = backpointer[t][POSITION_LONG][2]
+                if entry_idx >= 0:
+                    entry_price = self.prices[entry_idx]
+                    capital_at_entry = dp[t][POSITION_LONG]
+                    
+                    # Hold LONG (capital changes with price)
+                    price_ratio = next_price / entry_price
+                    capital_held = capital_at_entry * price_ratio
+                    if capital_held > dp[t+1][POSITION_LONG]:
+                        dp[t+1][POSITION_LONG] = capital_held
+                        backpointer[t+1][POSITION_LONG] = [POSITION_LONG, t, entry_idx]
+                    
+                    # Exit to FLAT (pay fee on exit)
+                    capital_exit = capital_held * (1 - TRANSACTION_FEE)
+                    if capital_exit > dp[t+1][POSITION_FLAT]:
+                        dp[t+1][POSITION_FLAT] = capital_exit
+                        backpointer[t+1][POSITION_FLAT] = [POSITION_LONG, t, -1]
+                    
+                    # Reverse to SHORT (exit long, enter short, pay 2 fees)
+                    capital_reverse = capital_held * (1 - TRANSACTION_FEE) * (1 - TRANSACTION_FEE)
+                    if capital_reverse > dp[t+1][POSITION_SHORT]:
+                        dp[t+1][POSITION_SHORT] = capital_reverse
+                        backpointer[t+1][POSITION_SHORT] = [POSITION_LONG, t, t+1]
+            
+            # From SHORT
+            if dp[t][POSITION_SHORT] > 0:
+                entry_idx = backpointer[t][POSITION_SHORT][2]
+                if entry_idx >= 0:
+                    entry_price = self.prices[entry_idx]
+                    capital_at_entry = dp[t][POSITION_SHORT]
+                    
+                    # Hold SHORT (capital changes inversely with price)
+                    price_ratio = next_price / entry_price
+                    capital_held = capital_at_entry * (2 - price_ratio)
+                    if capital_held > dp[t+1][POSITION_SHORT]:
+                        dp[t+1][POSITION_SHORT] = capital_held
+                        backpointer[t+1][POSITION_SHORT] = [POSITION_SHORT, t, entry_idx]
+                    
+                    # Exit to FLAT (pay fee on exit)
+                    capital_exit = capital_held * (1 - TRANSACTION_FEE)
+                    if capital_exit > dp[t+1][POSITION_FLAT]:
+                        dp[t+1][POSITION_FLAT] = capital_exit
+                        backpointer[t+1][POSITION_FLAT] = [POSITION_SHORT, t, -1]
+                    
+                    # Reverse to LONG (exit short, enter long, pay 2 fees)
+                    capital_reverse = capital_held * (1 - TRANSACTION_FEE) * (1 - TRANSACTION_FEE)
+                    if capital_reverse > dp[t+1][POSITION_LONG]:
+                        dp[t+1][POSITION_LONG] = capital_reverse
+                        backpointer[t+1][POSITION_LONG] = [POSITION_SHORT, t, t+1]
         
-        # Convert timestamp to datetime if needed
-        if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
-            print("DEBUG: Converting timestamp to datetime")
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-        print(f"DEBUG: Timestamp dtype: {df['timestamp'].dtype}")
+        # Find best final position
+        final_capitals = dp[self.n-1]
+        best_final_pos = np.argmax(final_capitals)
+        final_capital = final_capitals[best_final_pos]
         
-        print("DEBUG: Data downloaded and stored successfully at startup")
-        return df
+        print(f"\nOptimization complete!")
+        print(f"Final capital: ${final_capital:,.2f}")
+        print(f"Return: {(final_capital/INITIAL_CAPITAL - 1)*100:.2f}%")
         
-    except Exception as e:
-        print(f"ERROR: Failed to download data at startup: {str(e)}")
-        import traceback
-        print(f"ERROR: Traceback: {traceback.format_exc()}")
-        raise e
+        # Backtrack to reconstruct trades
+        self._backtrack(dp, backpointer, best_final_pos)
+        
+        return final_capital
+    
+    def _backtrack(self, dp, backpointer, final_pos):
+        """Reconstruct optimal trades from backpointers"""
+        print("\nReconstructing optimal trade sequence...")
+        
+        trades = []
+        capital_hist = [INITIAL_CAPITAL]
+        position_hist = [POSITION_FLAT]
+        
+        # Backtrack from end to start
+        t = self.n - 1
+        current_pos = final_pos
+        path = []
+        
+        while t > 0:
+            prev_pos, prev_t, entry_t = backpointer[t][current_pos]
+            path.append((t, current_pos, entry_t))
+            t = prev_t
+            current_pos = prev_pos
+        
+        path.reverse()
+        
+        # Forward pass to build trade list and history
+        current_capital = INITIAL_CAPITAL
+        current_position = POSITION_FLAT
+        entry_index = -1
+        entry_capital = 0
+        
+        for t, pos, entry_t in path:
+            # Position change detected
+            if pos != current_position:
+                # Closing a position
+                if current_position != POSITION_FLAT:
+                    exit_price = self.prices[t]
+                    trades.append({
+                        'entry_time': self.df.index[entry_index],
+                        'exit_time': self.df.index[t],
+                        'entry_price': self.prices[entry_index],
+                        'exit_price': exit_price,
+                        'position': 'LONG' if current_position == POSITION_LONG else 'SHORT',
+                        'entry_capital': entry_capital,
+                        'exit_capital': dp[t][POSITION_FLAT] if pos == POSITION_FLAT else current_capital
+                    })
+                
+                # Opening new position
+                if pos != POSITION_FLAT:
+                    entry_index = entry_t
+                    entry_capital = dp[t][pos]
+                
+                current_position = pos
+            
+            capital_hist.append(dp[t][pos])
+            position_hist.append(pos)
+        
+        self.trades = trades
+        self.capital_history = capital_hist
+        self.position_history = position_hist
+        
+        print(f"Total trades: {len(trades)}")
+    
+    def create_visualization(self):
+        """Create interactive Plotly visualization"""
+        fig = make_subplots(
+            rows=2, cols=1,
+            subplot_titles=('Price with Entry/Exit Points', 'Capital Curve'),
+            vertical_spacing=0.15,
+            row_heights=[0.6, 0.4]
+        )
+        
+        # Subsample for visualization if too many points
+        sample_rate = max(1, self.n // 10000)
+        plot_indices = range(0, self.n, sample_rate)
+        
+        # Price chart
+        fig.add_trace(
+            go.Scatter(
+                x=self.df.index[plot_indices],
+                y=self.prices[plot_indices],
+                name='Price',
+                line=dict(color='gray', width=1)
+            ),
+            row=1, col=1
+        )
+        
+        # Entry points
+        for trade in self.trades:
+            color = 'green' if trade['position'] == 'LONG' else 'red'
+            fig.add_trace(
+                go.Scatter(
+                    x=[trade['entry_time']],
+                    y=[trade['entry_price']],
+                    mode='markers',
+                    marker=dict(color=color, size=8, symbol='triangle-up'),
+                    name=f"{trade['position']} Entry",
+                    showlegend=False
+                ),
+                row=1, col=1
+            )
+            
+            # Exit points
+            fig.add_trace(
+                go.Scatter(
+                    x=[trade['exit_time']],
+                    y=[trade['exit_price']],
+                    mode='markers',
+                    marker=dict(color=color, size=8, symbol='triangle-down'),
+                    name=f"{trade['position']} Exit",
+                    showlegend=False
+                ),
+                row=1, col=1
+            )
+        
+        # Capital curve
+        capital_sample = range(0, len(self.capital_history), max(1, len(self.capital_history) // 10000))
+        fig.add_trace(
+            go.Scatter(
+                x=[self.df.index[i] if i < len(self.df.index) else self.df.index[-1] for i in capital_sample],
+                y=[self.capital_history[i] for i in capital_sample],
+                name='Capital',
+                line=dict(color='blue', width=2)
+            ),
+            row=2, col=1
+        )
+        
+        fig.update_xaxes(title_text="Time", row=2, col=1)
+        fig.update_yaxes(title_text="Price", row=1, col=1)
+        fig.update_yaxes(title_text="Capital ($)", row=2, col=1)
+        
+        fig.update_layout(height=800, showlegend=True, title_text="Optimal Trading Strategy")
+        
+        return fig.to_html(full_html=False)
+
+# Global variables
+finder = None
+chart_html = ""
+
+def load_and_process_data():
+    """Download and process the data"""
+    global finder, chart_html
+    
+    print("Downloading data from Google Drive...")
+    url = "https://drive.google.com/uc?id=1kDCl_29nXyW1mLNUAS-nsJe0O2pOuO6o"
+    output = "ohlcv_data.csv"
+    gdown.download(url, output, quiet=False)
+    
+    print("Loading CSV...")
+    df = pd.read_csv(output)
+    
+    # Assuming CSV has timestamp and OHLCV columns
+    # Adjust column names based on actual CSV structure
+    if 'timestamp' in df.columns:
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df.set_index('timestamp', inplace=True)
+    elif 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'])
+        df.set_index('date', inplace=True)
+    
+    print(f"Loaded {len(df)} rows")
+    print(f"Columns: {df.columns.tolist()}")
+    print(f"Date range: {df.index[0]} to {df.index[-1]}")
+    
+    # Initialize finder
+    finder = OptimalTradingFinder(df)
+    
+    # Find optimal trades
+    final_capital = finder.find_optimal_trades()
+    
+    # Create visualization
+    print("Creating visualization...")
+    chart_html = finder.create_visualization()
+    
+    print("Ready to serve web interface!")
+
+@app.route('/')
+def index():
+    if finder is None:
+        return "<h1>Processing data, please wait...</h1>"
+    
+    # Generate trade table HTML
+    trades_html = "<table border='1' style='border-collapse: collapse; width: 100%;'>"
+    trades_html += "<tr><th>Entry Time</th><th>Exit Time</th><th>Position</th><th>Entry Price</th><th>Exit Price</th><th>Entry Capital</th><th>Exit Capital</th><th>Return</th></tr>"
+    
+    for trade in finder.trades[:100]:  # Show first 100 trades
+        ret = (trade['exit_capital'] / trade['entry_capital'] - 1) * 100
+        trades_html += f"<tr><td>{trade['entry_time']}</td><td>{trade['exit_time']}</td><td>{trade['position']}</td>"
+        trades_html += f"<td>${trade['entry_price']:.2f}</td><td>${trade['exit_price']:.2f}</td>"
+        trades_html += f"<td>${trade['entry_capital']:.2f}</td><td>${trade['exit_capital']:.2f}</td>"
+        trades_html += f"<td style='color: {'green' if ret > 0 else 'red'};'>{ret:.2f}%</td></tr>"
+    
+    trades_html += "</table>"
+    
+    final_capital = finder.capital_history[-1] if finder.capital_history else INITIAL_CAPITAL
+    total_return = (final_capital / INITIAL_CAPITAL - 1) * 100
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Optimal Trading Strategy</title>
+        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    </head>
+    <body style="font-family: Arial, sans-serif; margin: 20px;">
+        <h1>Optimal Trading Strategy Results</h1>
+        <div style="background: #f0f0f0; padding: 20px; margin-bottom: 20px; border-radius: 5px;">
+            <h2>Summary Statistics</h2>
+            <p><strong>Initial Capital:</strong> ${INITIAL_CAPITAL:,.2f}</p>
+            <p><strong>Final Capital:</strong> ${final_capital:,.2f}</p>
+            <p><strong>Total Return:</strong> <span style="color: green; font-size: 24px;">{total_return:.2f}%</span></p>
+            <p><strong>Number of Trades:</strong> {len(finder.trades)}</p>
+            <p><strong>Transaction Fee:</strong> {TRANSACTION_FEE*100}% per trade</p>
+            <p><strong>Slippage:</strong> {SLIPPAGE_MINUTES} minute(s)</p>
+        </div>
+        
+        {chart_html}
+        
+        <h2>Trade Details (First 100 Trades)</h2>
+        {trades_html}
+    </body>
+    </html>
+    """
+    return html
 
 if __name__ == '__main__':
-    # Download data and run analysis
-    print("DEBUG: Starting application - downloading data at startup...")
-    downloaded_data = download_data_at_startup()
-    print("DEBUG: Data download completed at startup")
+    # Load and process data first
+    load_and_process_data()
     
-    print("DEBUG: Starting automatic analysis at startup...")
-    try:
-        strategy = OptimalTradingStrategy(fee_rate=0.002)
-        analysis_result = strategy.calculate_optimal_trades(downloaded_data)
-        print("DEBUG: Automatic analysis completed at startup")
-        
-        # Display results
-        final_capital = float(analysis_result['optimal_capital'].iloc[-1])
-        total_trades = int((analysis_result['optimal_action'] != 'hold').sum())
-        long_trades = int((analysis_result['optimal_action'] == 'buy_long').sum())
-        short_trades = int((analysis_result['optimal_action'] == 'sell_short').sum())
-        
-        print("\n=== Analysis Results ===")
-        print(f"Final Capital: {final_capital:.4f}")
-        print(f"Total Trades: {total_trades}")
-        print(f"Long Trades: {long_trades}")
-        print(f"Short Trades: {short_trades}")
-        print("=== End of Results ===")
-
-        # Define route for displaying results
-        @app.route('/')
-        def display_results():
-            # Create plot with background colors for entries and exits
-            fig, ax1 = plt.subplots(figsize=(12, 8))
-            
-            # Add background colors based on position state
-            position_state = analysis_result['position_state'].values
-            for i in range(len(position_state)):
-                if position_state[i] == 1:  # Long position
-                    ax1.axvspan(analysis_result['timestamp'].iloc[i], analysis_result['timestamp'].iloc[i], 
-                                ymin=0, ymax=1, color='green', alpha=0.3)
-                elif position_state[i] == 2:  # Short position
-                    ax1.axvspan(analysis_result['timestamp'].iloc[i], analysis_result['timestamp'].iloc[i], 
-                                ymin=0, ymax=1, color='red', alpha=0.3)
-                else:  # Flat position
-                    ax1.axvspan(analysis_result['timestamp'].iloc[i], analysis_result['timestamp'].iloc[i], 
-                                ymin=0, ymax=1, color='gray', alpha=0.1)
-            
-            # Plot price data
-            ax1.plot(analysis_result['timestamp'], analysis_result['close'], label='Close Price', color='black', linewidth=1)
-            
-            # Mark entry and exit points
-            long_entries = analysis_result[analysis_result['optimal_action'] == 'buy_long']
-            long_exits = analysis_result[analysis_result['optimal_action'] == 'sell_long']
-            short_entries = analysis_result[analysis_result['optimal_action'] == 'sell_short']
-            short_exits = analysis_result[analysis_result['optimal_action'] == 'buy_short']
-            
-            ax1.scatter(long_entries['timestamp'], long_entries['close'], color='green', marker='^', s=50, label='Long Entry', zorder=5)
-            ax1.scatter(long_exits['timestamp'], long_exits['close'], color='red', marker='v', s=50, label='Long Exit', zorder=5)
-            ax1.scatter(short_entries['timestamp'], short_entries['close'], color='blue', marker='v', s=50, label='Short Entry', zorder=5)
-            ax1.scatter(short_exits['timestamp'], short_exits['close'], color='orange', marker='^', s=50, label='Short Exit', zorder=5)
-            
-            ax1.set_xlabel('Timestamp')
-            ax1.set_ylabel('Price', color='black')
-            ax1.tick_params(axis='y', labelcolor='black')
-            ax1.legend(loc='upper left')
-            ax1.grid(True)
-            
-            # Plot capital on secondary axis
-            ax2 = ax1.twinx()
-            ax2.plot(analysis_result['timestamp'], analysis_result['optimal_capital'], label='Capital', color='purple', linewidth=2)
-            ax2.set_ylabel('Capital', color='purple')
-            ax2.tick_params(axis='y', labelcolor='purple')
-            ax2.legend(loc='upper right')
-            
-            plt.title('Price Entries, Exits, and Capital Over Time')
-            fig.tight_layout()
-            
-            # Save plot to a bytes buffer and encode as base64
-            buf = io.BytesIO()
-            plt.savefig(buf, format='png')
-            buf.seek(0)
-            plot_data = base64.b64encode(buf.getvalue()).decode('utf-8')
-            buf.close()
-            plt.close(fig)
-            
-            return f"""
-            <h1>Optimal Trading Strategy Results</h1>
-            <p>Final Capital: {final_capital:.4f}</p>
-            <p>Total Trades: {total_trades}</p>
-            <p>Long Trades: {long_trades}</p>
-            <p>Short Trades: {short_trades}</p>
-            <h2>Plot: Price Entries, Exits, and Capital</h2>
-            <img src="data:image/png;base64,{plot_data}" alt="Trading Plot">
-            """
-
-        print("Starting web server on port 8080 at 0.0.0.0...")
-        app.run(host='0.0.0.0', port=8080)
-# Run the app when executed directly
-if __name__ == '__main__':
-    # Download data and run analysis
-    print("DEBUG: Starting application - downloading data at startup...")
-    downloaded_data = download_data_at_startup()
-    print("DEBUG: Data download completed at startup")
-    
-    print("DEBUG: Starting automatic analysis at startup...")
-    try:
-        strategy = OptimalTradingStrategy(fee_rate=0.002)
-        analysis_result = strategy.calculate_optimal_trades(downloaded_data)
-        print("DEBUG: Automatic analysis completed at startup")
-        
-        # Display results
-        final_capital = float(analysis_result['optimal_capital'].iloc[-1])
-        total_trades = int((analysis_result['optimal_action'] != 'hold').sum())
-        long_trades = int((analysis_result['optimal_action'] == 'buy_long').sum())
-        short_trades = int((analysis_result['optimal_action'] == 'sell_short').sum())
-        
-        print("\n=== Analysis Results ===")
-        print(f"Final Capital: {final_capital:.4f}")
-        print(f"Total Trades: {total_trades}")
-        print(f"Long Trades: {long_trades}")
-        print(f"Short Trades: {short_trades}")
-        print("=== End of Results ===")
-
-        print("Starting web server on port 8080 at 0.0.0.0...")
-        app.run(host='0.0.0.0', port=8080)
-        
-    except Exception as e:
-        print(f"ERROR: Failed to run automatic analysis at startup: {str(e)}")
-        import traceback
-        print(f"ERROR: Traceback: {traceback.format_exc()}")
-        raise e
-        
-    except Exception as e:
-        print(f"ERROR: Failed to run automatic analysis at startup: {str(e)}")
-        import traceback
-        print(f"ERROR: Traceback: {traceback.format_exc()}")
-        raise e
+    # Start web server
+    print("\nStarting web server on http://0.0.0.0:8080")
+    app.run(host='0.0.0.0', port=8080, debug=False)
