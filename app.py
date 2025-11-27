@@ -92,6 +92,8 @@ def index():
             'long_trades': int((analysis_result['optimal_action'] == 'buy_long').sum()),
             'short_trades': int((analysis_result['optimal_action'] == 'sell_short').sum())
         }
+    else:
+        print("DEBUG: Analysis result is None, data may not be ready")
     return render_template('index.html', chart_data=chart_data, summary=summary)
 
 @app.route('/analyze', methods=['POST'])
