@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Optimal Trading Strategy Visualizer</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@2.2.1"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .controls {
+            margin-bottom: 20px;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 4px;
+        }
+        .control-group {
+            margin-bottom: 10px;
+        }
+        label {
+            display: inline-block;
+            width: 150px;
+            font-weight: bold;
+        }
+        input, select {
+            padding: 5px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        .chart-container {
+            position: relative;
+            height: 400px;
+            margin-bottom: 20px;
+        }
+        .summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .summary-item {
+            background: #e9ecef;
+            padding: 15px;
+            border-radius: 4px;
+            text-align: center;
+        }
+        .summary-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #28a745;
+        }
+        .legend {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .legend-color {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+        }
+        .loading {
+            text-align: center;
+            padding: 20px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Optimal Trading Strategy Visualizer</h1>
+        
+        <div class="controls">
+            <div class="control-group">
+                <label for="feeRate">Transaction Fee Rate:</label>
+                <input type="number" id="feeRate" step="0.001" min="0" max="0.1" value="0.002">
+                <span>(e.g., 0.002 for 0.2%)</span>
+            </div>
+            <div class="control-group">
+                <label for="dataPoints">Data Points:</label>
+                <input type="number" id="dataPoints" min="100" max="10000" value="1000">
+            </div>
+            <button onclick="analyzeStrategy()">Calculate Optimal Strategy</button>
+        </div>
+
+        <div id="loading" class="loading">
+            <p>Calculating optimal strategy... This may take a moment for large datasets.</p>
+        </div>
+
+        <div id="results" style="display: none;">
+            <div class="summary" id="summary">
+                <!-- Summary will be populated by JavaScript -->
+            </div>
+
+            <div class="legend">
+                <div class="legend-item">
+                    <div class="legend-color" style="background-color: green;"></div>
+                    <span>Buy Signals</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background-color: red;"></div>
+                    <span>Sell Signals</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background-color: blue;"></div>
+                    <span>Price</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background-color: orange;"></div>
+                    <span>Capital</span>
+                </div>
+            </div>
+
+            <div class="chart-container">
+                <canvas id="priceChart"></canvas>
+            </div>
+            
+            <div class="chart-container">
+                <canvas id="capitalChart"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let priceChart = null;
+        let capitalChart = null;
+
+        async function analyzeStrategy() {
+            const feeRate = parseFloat(document.getElementById('feeRate').value);
+            const dataPoints = parseInt(document.getElementById('dataPoints').value);
+            
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('results').style.display = 'none';
+
+            try {
+                const response = await fetch('/analyze', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        fee_rate: feeRate,
+                        data_points: dataPoints,
+                        use_sample_data: true
+                    })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    displayResults(result);
+                } else {
+                    alert('Error: ' + result.error);
+                }
+            } catch (error) {
+                alert('Error: ' + error.message);
+            } finally {
+                document.getElementById('loading').style.display = 'none';
+            }
+        }
+
+        function displayResults(result) {
+            // Update summary
+            const summary = result.summary;
+            document.getElementById('summary').innerHTML = `
+                <div class="summary-item">
+                    <div>Final Capital</div>
+                    <div class="summary-value">${summary.final_capital.toFixed(4)}</div>
+                </div>
+                <div class="summary-item">
+                    <div>Total Trades</div>
+                    <div class="summary-value">${summary.total_trades}</div>
+                </div>
+                <div class="summary-item">
+                    <div>Long Trades</div>
+                    <div class="summary-value">${summary.long_trades}</div>
+                </div>
+                <div class="summary-item">
+                    <div>Short Trades</div>
+                    <div class="summary-value">${summary.short_trades}</div>
+                </div>
+            `;
+
+            // Create price chart with trade markers
+            const chartData = result.chart_data;
+            createPriceChart(chartData);
+            createCapitalChart(chartData);
+
+            document.getElementById('results').style.display = 'block';
+        }
+
+        function createPriceChart(chartData) {
+            const ctx = document.getElementById('priceChart').getContext('2d');
+            
+            if (priceChart) {
+                priceChart.destroy();
+            }
+
+            // Prepare annotations for trade markers
+            const annotations = chartData.trade_markers.map(marker => ({
+                type: 'point',
+                xValue: marker.x,
+                yValue: marker.y,
+                backgroundColor: marker.color,
+                borderColor: marker.color,
+                borderWidth: 2,
+                radius: 6,
+                label: {
+                    enabled: true,
+                    content: marker.action,
+                    position: 'top'
+                }
+            }));
+
+            priceChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: chartData.timestamps,
+                    datasets: [{
+                        label: 'Price',
+                        data: chartData.prices,
+                        borderColor: 'blue',
+                        backgroundColor: 'rgba(0, 0, 255, 0.1)',
+                        borderWidth: 2,
+                        fill: false
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        title: {
+                            display: true,
+                            text: 'Price Chart with Optimal Trade Signals'
+                        },
+                        annotation: {
+                            annotations: annotations
+                        }
+                    },
+                    scales: {
+                        x: {
+                            display: true,
+                            title: {
+                                display: true,
+                                text: 'Time'
+                            }
+                        },
+                        y: {
+                            display: true,
+                            title: {
+                                display: true,
+                                text: 'Price'
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function createCapitalChart(chartData) {
+            const ctx = document.getElementById('capitalChart').getContext('2d');
+            
+            if (capitalChart) {
+                capitalChart.destroy();
+            }
+
+            capitalChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: chartData.timestamps,
+                    datasets: [{
+                        label: 'Capital',
+                        data: chartData.capital,
+                        borderColor: 'orange',
+                        backgroundColor: 'rgba(255, 165, 0, 0.1)',
+                        borderWidth: 2,
+                        fill: false
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        title: {
+                            display: true,
+                            text: 'Capital Evolution'
+                        }
+                    },
+                    scales: {
+                        x: {
+                            display: true,
+                            title: {
+                                display: true,
+                                text: 'Time'
+                            }
+                        },
+                        y: {
+                            display: true,
+                            title: {
+                                display: true,
+                                text: 'Capital'
+                            },
+                            beginAtZero: false
+                        }
+                    }
+                }
+            });
+        }
+
+        // Initialize with sample data
+        window.onload = analyzeStrategy;
+    </script>
+</body>
+</html>
