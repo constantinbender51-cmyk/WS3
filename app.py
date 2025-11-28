@@ -102,7 +102,7 @@ def plot_data():
     img.seek(0)
     plot_url = base64.b64encode(img.getvalue()).decode()
     
-    # HTML template to display the plot
+    # HTML template to display the plot and download link
     html_template = '''
     <!DOCTYPE html>
     <html>
@@ -113,10 +113,20 @@ def plot_data():
         <h1>Daily OHLCV Data from 2022 with Binary Column</h1>
         <img src="data:image/png;base64,{{ plot_url }}" alt="Plot">
         <p>Data includes a binary column with values set based on specified date ranges.</p>
+        <p><a href="/download">Download the processed dataset as CSV</a></p>
     </body>
     </html>
     '''
     return render_template_string(html_template, plot_url=plot_url)
+
+@app.route('/download')
+def download_data():
+    # Convert the DataFrame to CSV and serve as a downloadable file
+    csv_data = daily_df.to_csv(index=False)
+    return csv_data, 200, {
+        'Content-Type': 'text/csv',
+        'Content-Disposition': 'attachment; filename=daily_ohlcv_data.csv'
+    }
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=False)
