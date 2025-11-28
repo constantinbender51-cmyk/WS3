@@ -199,10 +199,12 @@ def train_models(X_train, y_train):
     models['Random Forest'] = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1, class_weight='balanced')
     models['Random Forest'].fit(X_train, y_train)
     
-    # XGBoost
+    # XGBoost - Map classes to [0, 1, 2] for compatibility
     print("4. Training XGBoost...")
     models['XGBoost'] = xgb.XGBClassifier(n_estimators=100, max_depth=6, learning_rate=0.1, random_state=42, n_jobs=-1)
-    models['XGBoost'].fit(X_train, y_train)
+    # Convert y_train from [-1, 0, 1] to [0, 1, 2] for XGBoost
+    y_train_mapped = y_train.map({-1: 0, 0: 1, 1: 2})
+    models['XGBoost'].fit(X_train, y_train_mapped)
     
     # LightGBM
     print("5. Training LightGBM...")
