@@ -213,7 +213,7 @@ def train_models(X_train, y_train):
     
     # Neural Network
     print("6. Training Neural Network...")
-    models['Neural Network'] = MLPClassifier(hidden_layers=(64, 32, 16), max_iter=500, random_state=42, early_stopping=True)
+    models['Neural Network'] = MLPClassifier(hidden_layer_sizes=(64, 32, 16), max_iter=500, random_state=42, early_stopping=True)
     models['Neural Network'].fit(X_train, y_train)
     
     print("\nAll models trained!")
