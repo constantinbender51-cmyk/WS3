@@ -1,6 +1,8 @@
 Flask
 pandas
 gdown
-matplotlib
 scikit-learn
 numpy
+xgboost
+lightgbm
+plotly
