@@ -11,7 +11,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.naive_bayes import GaussianNB
 from sklearn.neural_network import MLPClassifier
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrixfrom sklearn.utils.class_weight import compute_sample_weight
 import xgboost as xgb
 import lightgbm as lgb
 from flask import Flask, render_template_string
@@ -201,14 +201,18 @@ def train_models(X_train, y_train):
     
     # XGBoost - Map classes to [0, 1, 2] for compatibility
     print("4. Training XGBoost...")
-    models['XGBoost'] = xgb.XGBClassifier(n_estimators=100, max_depth=6, learning_rate=0.1, random_state=42, n_jobs=-1)
+    models['XGBoost'] = xgb.XGBClassifier(n_estimators=100, max_depth=6, learning_rate=0.1, random_state=42, n_jobs=-1, eval_metric='mlogloss')
     # Convert y_train from [-1, 0, 1] to [0, 1, 2] for XGBoost
     y_train_mapped = y_train.map({-1: 0, 0: 1, 1: 2})
-    models['XGBoost'].fit(X_train, y_train_mapped)
+    
+    # Calculate sample weights for XGBoost
+    sample_weights_xgb = compute_sample_weight(class_weight='balanced', y=y_train_mapped)
+    
+    models['XGBoost'].fit(X_train, y_train_mapped, sample_weight=sample_weights_xgb)
     
     # LightGBM
     print("5. Training LightGBM...")
-    models['LightGBM'] = lgb.LGBMClassifier(n_estimators=100, max_depth=6, learning_rate=0.1, random_state=42, n_jobs=-1, verbose=-1)
+    models['LightGBM'] = lgb.LGBMClassifier(n_estimators=100, max_depth=6, learning_rate=0.1, random_state=42, n_jobs=-1, verbose=-1, class_weight='balanced')
     models['LightGBM'].fit(X_train, y_train)
     
     # Neural Network
@@ -232,8 +236,15 @@ def evaluate_models(models, X_train, y_train, X_test, y_test):
         print(f"\n{name}:")
         
         # Predictions
-        train_pred = model.predict(X_train)
-        test_pred = model.predict(X_test)
+        # For XGBoost, the prediction needs to be re-mapped from [0, 1, 2] back to [-1, 0, 1]
+        if name == 'XGBoost':
+            train_pred_mapped = model.predict(X_train)
+            test_pred_mapped = model.predict(X_test)
+            train_pred = pd.Series(train_pred_mapped).map({0: -1, 1: 0, 2: 1}).values
+            test_pred = pd.Series(test_pred_mapped).map({0: -1, 1: 0, 2: 1}).values
+        else:
+            train_pred = model.predict(X_train)
+            test_pred = model.predict(X_test)
         
         # Accuracy
         train_acc = accuracy_score(y_train, train_pred)
