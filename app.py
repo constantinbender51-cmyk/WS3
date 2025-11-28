@@ -5,10 +5,6 @@ from flask import Flask, render_template_string
 import matplotlib.pyplot as plt
 import io
 import base64
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score
-import numpy as np
 
 app = Flask(__name__)
 
@@ -68,53 +64,7 @@ try:
     # Reset index to have datetime as a column for plotting
     daily_df.reset_index(inplace=True)
     
-    # Prepare features and target for logistic regression
-    # Use previous OHLCV data with lookback of 30 days
-    lookback = 30
-    features = []
-    targets = []
-    dates = []
-    
-    for i in range(lookback, len(daily_df)):
-        # Extract OHLCV values for the past 'lookback' days
-        feature_row = []
-        for j in range(lookback):
-            idx = i - lookback + j
-            feature_row.extend([
-                daily_df.iloc[idx]['open'],
-                daily_df.iloc[idx]['high'],
-                daily_df.iloc[idx]['low'],
-                daily_df.iloc[idx]['close'],
-                daily_df.iloc[idx]['volume']
-            ])
-        features.append(feature_row)
-        targets.append(daily_df.iloc[i]['binary_column'])
-        dates.append(daily_df.iloc[i]['datetime'])
-    
-    # Convert to numpy arrays
-    X = np.array(features)
-    y = np.array(targets)
-    dates_array = np.array(dates)
-    
-    # Split data into 50-50 train-test split
-    X_train, X_test, y_train, y_test, dates_train, dates_test = train_test_split(
-        X, y, dates_array, test_size=0.5, random_state=42, shuffle=False
-    )
-    
-    # Train logistic regression model
-    model = LogisticRegression(random_state=42, max_iter=400)
-    model.fit(X_train, y_train)
-    
-    # Make predictions on the entire dataset (features from lookback onwards)
-    y_pred_all = model.predict(X)
-    
-    # Create a DataFrame for predictions aligned with dates
-    pred_df = pd.DataFrame({
-        'datetime': dates_array,
-        'predicted_binary': y_pred_all
-    })
-    
-    print("Data processed and model trained successfully")
+    print("Data processed successfully")
     
 except Exception as e:
     print(f"Error processing data: {e}")
@@ -122,25 +72,6 @@ except Exception as e:
 
 @app.route('/')
 def plot_data():
-    # Calculate capital development for actual and predicted binary columns
-    # Start with initial capital of 1
-    initial_capital = 1.0
-    
-    # Calculate daily returns based on close price changes
-    daily_df['daily_return'] = daily_df['close'].pct_change()
-    
-    # Calculate strategy returns: long when binary is 1, short when 0
-    daily_df['actual_strategy_return'] = daily_df['daily_return'] * (2 * daily_df['binary_column'] - 1)
-    daily_df['actual_capital'] = initial_capital * (1 + daily_df['actual_strategy_return']).cumprod()
-    
-    # Merge predictions with daily_df for alignment
-    pred_merged = pd.merge(daily_df[['datetime']], pred_df, on='datetime', how='inner')
-    daily_df['predicted_binary'] = pred_merged['predicted_binary']
-    
-    # Calculate strategy returns for predictions
-    daily_df['predicted_strategy_return'] = daily_df['daily_return'] * (2 * daily_df['predicted_binary'] - 1)
-    daily_df['predicted_capital'] = initial_capital * (1 + daily_df['predicted_strategy_return']).cumprod()
-    
     # Create a plot with two y-axes
     fig, ax1 = plt.subplots(figsize=(12, 6))
     
@@ -151,19 +82,19 @@ def plot_data():
     ax1.tick_params(axis='y', labelcolor='blue')
     ax1.grid(True)
     
-    # Create a secondary y-axis for the capital development
+    # Create a secondary y-axis for the binary column
     ax2 = ax1.twinx()
-    ax2.plot(daily_df['datetime'], daily_df['actual_capital'], label='Actual Strategy Capital', color='red', linestyle='--')
-    ax2.plot(daily_df['datetime'], daily_df['predicted_capital'], label='Predicted Strategy Capital', color='green', linestyle='-.')
-    ax2.set_ylabel('Capital Development', color='red')
+    ax2.plot(daily_df['datetime'], daily_df['binary_column'], label='Binary Column', color='red', linestyle='--')
+    ax2.set_ylabel('Binary Column', color='red')
     ax2.tick_params(axis='y', labelcolor='red')
+    ax2.set_ylim(-0.1, 1.1)  # Set y-axis limits for binary values
     
     # Add legends
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
     
-    plt.title('Daily OHLCV Data from 2022 with Capital Development for Long/Short Strategy')
+    plt.title('Daily OHLCV Data from 2022 with Binary Column')
     
     # Save plot to a bytes buffer
     img = io.BytesIO()
@@ -171,31 +102,22 @@ def plot_data():
     img.seek(0)
     plot_url = base64.b64encode(img.getvalue()).decode()
     
-    # Calculate final capital returns
-    actual_final_capital = daily_df['actual_capital'].iloc[-1]
-    predicted_final_capital = daily_df['predicted_capital'].iloc[-1]
-    actual_return = (actual_final_capital - initial_capital) / initial_capital * 100
-    predicted_return = (predicted_final_capital - initial_capital) / initial_capital * 100
-    
-    # HTML template to display the plot and capital returns
+    # HTML template to display the plot and download link
     html_template = '''
     <!DOCTYPE html>
     <html>
     <head>
-        <title>OHLCV Data Plot with Capital Development</title>
+        <title>OHLCV Data Plot</title>
     </head>
     <body>
-        <h1>Daily OHLCV Data from 2022 with Capital Development for Long/Short Strategy</h1>
+        <h1>Daily OHLCV Data from 2022 with Binary Column</h1>
         <img src="data:image/png;base64,{{ plot_url }}" alt="Plot">
-        <p>Strategy: Long when binary is 1, Short when 0. Initial capital: 1.0.</p>
-        <p>Actual Strategy Final Capital: {{ actual_final_capital | round(4) }} (Return: {{ actual_return | round(2) }}%)</p>
-        <p>Predicted Strategy Final Capital: {{ predicted_final_capital | round(4) }} (Return: {{ predicted_return | round(2) }}%)</p>
-        <p>Data includes a binary column with values set based on specified date ranges and logistic regression predictions using 30-day OHLCV lookback.</p>
+        <p>Data includes a binary column with values set based on specified date ranges.</p>
         <p><a href="/download">Download the processed dataset as CSV</a></p>
     </body>
     </html>
     '''
-    return render_template_string(html_template, plot_url=plot_url, actual_final_capital=actual_final_capital, predicted_final_capital=predicted_final_capital, actual_return=actual_return, predicted_return=predicted_return)
+    return render_template_string(html_template, plot_url=plot_url)
 
 @app.route('/download')
 def download_data():
