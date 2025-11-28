@@ -2,3 +2,5 @@ Flask
 pandas
 gdown
 matplotlib
+scikit-learn
+numpy
