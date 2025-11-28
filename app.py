@@ -102,7 +102,7 @@ try:
     )
     
     # Train logistic regression model
-    model = LogisticRegression(random_state=42, max_iter=400)
+    model = LogisticRegression(random_state=42, max_iter=100)
     model.fit(X_train, y_train)
     
     # Make predictions on the entire dataset (features from lookback onwards)
