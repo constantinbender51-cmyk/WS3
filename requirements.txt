@@ -1,8 +1,0 @@
-Flask
-pandas
-gdown
-scikit-learn
-numpy
-xgboost
-lightgbm
-plotly
