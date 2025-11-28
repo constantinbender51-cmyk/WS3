@@ -6,7 +6,3 @@ numpy
 xgboost
 lightgbm
 plotly
-plotly.graph_objs
-plotly.express
-plotly.subplots
-warnings
