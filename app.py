@@ -37,8 +37,18 @@ def download_data(google_drive_url):
     output = 'trading_data.csv'
     gdown.download(download_url, output, quiet=False)
     
-    df = pd.read_csv(output, parse_dates=['date'] if 'date' in pd.read_csv(output, nrows=1).columns else None)
+    df = pd.read_csv(output)
+    
+    # Try to parse date column if it exists
+    date_cols = [col for col in df.columns if 'date' in col.lower()]
+    for col in date_cols:
+        try:
+            df[col] = pd.to_datetime(df[col])
+        except:
+            pass
+    
     print(f"Loaded {len(df)} rows")
+    print(f"Columns: {list(df.columns)}")
     return df
 
 
@@ -48,28 +58,33 @@ def create_baseline_features(df, lookback=30):
     
     # Returns
     for col in ['open', 'high', 'low', 'close']:
-        features[f'{col}_return'] = features[col].pct_change()
-        features[f'{col}_return_5d'] = features[col].pct_change(5)
-        features[f'{col}_return_10d'] = features[col].pct_change(10)
-        features[f'{col}_return_20d'] = features[col].pct_change(20)
+        if col in features.columns:
+            features[f'{col}_return'] = features[col].pct_change()
+            features[f'{col}_return_5d'] = features[col].pct_change(5)
+            features[f'{col}_return_10d'] = features[col].pct_change(10)
+            features[f'{col}_return_20d'] = features[col].pct_change(20)
     
     # Volume changes
-    features['volume_change'] = features['volume'].pct_change()
-    features['volume_ma_ratio'] = features['volume'] / features['volume'].rolling(20).mean()
+    if 'volume' in features.columns:
+        features['volume_change'] = features['volume'].pct_change()
+        features['volume_ma_ratio'] = features['volume'] / features['volume'].rolling(20).mean()
     
     # Price momentum
-    features['momentum_5'] = features['close'] / features['close'].shift(5) - 1
-    features['momentum_10'] = features['close'] / features['close'].shift(10) - 1
-    features['momentum_20'] = features['close'] / features['close'].shift(20) - 1
-    
-    # Volatility
-    features['volatility_5'] = features['close_return'].rolling(5).std()
-    features['volatility_10'] = features['close_return'].rolling(10).std()
-    features['volatility_20'] = features['close_return'].rolling(20).std()
+    if 'close' in features.columns:
+        features['momentum_5'] = features['close'] / features['close'].shift(5) - 1
+        features['momentum_10'] = features['close'] / features['close'].shift(10) - 1
+        features['momentum_20'] = features['close'] / features['close'].shift(20) - 1
+        
+        # Volatility
+        if 'close_return' in features.columns:
+            features['volatility_5'] = features['close_return'].rolling(5).std()
+            features['volatility_10'] = features['close_return'].rolling(10).std()
+            features['volatility_20'] = features['close_return'].rolling(20).std()
     
     # High-Low spread
-    features['hl_spread'] = (features['high'] - features['low']) / features['close']
-    features['hl_spread_ma'] = features['hl_spread'].rolling(10).mean()
+    if 'high' in features.columns and 'low' in features.columns and 'close' in features.columns:
+        features['hl_spread'] = (features['high'] - features['low']) / features['close']
+        features['hl_spread_ma'] = features['hl_spread'].rolling(10).mean()
     
     return features
 
@@ -77,6 +92,9 @@ def create_baseline_features(df, lookback=30):
 def create_technical_indicators(df):
     """Add technical indicators to features"""
     features = df.copy()
+    
+    if 'close' not in features.columns:
+        return features
     
     # RSI
     delta = features['close'].diff()
@@ -105,12 +123,13 @@ def create_technical_indicators(df):
         features[f'price_to_ma_{window}'] = features['close'] / features[f'ma_{window}']
     
     # ATR (Average True Range)
-    high_low = features['high'] - features['low']
-    high_close = np.abs(features['high'] - features['close'].shift())
-    low_close = np.abs(features['low'] - features['close'].shift())
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = ranges.max(axis=1)
-    features['atr'] = true_range.rolling(14).mean()
+    if 'high' in features.columns and 'low' in features.columns:
+        high_low = features['high'] - features['low']
+        high_close = np.abs(features['high'] - features['close'].shift())
+        low_close = np.abs(features['low'] - features['close'].shift())
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        true_range = ranges.max(axis=1)
+        features['atr'] = true_range.rolling(14).mean()
     
     return features
 
@@ -127,14 +146,27 @@ def prepare_data(df, use_technical=False, lookback=30):
     # Drop rows with NaN
     features = features.dropna()
     
-    # Define feature columns (exclude target and date columns)
-    exclude_cols = ['optimal_position', 'date', 'Date', 'Unnamed: 0']
-    feature_cols = [col for col in features.columns if col not in exclude_cols]
+    # Define columns to exclude (target, dates, and other non-numeric columns)
+    exclude_cols = ['optimal_position', 'date', 'Date', 'datetime', 'Datetime', 'Unnamed: 0', 'index']
+    
+    # Get all numeric columns that aren't excluded
+    feature_cols = []
+    for col in features.columns:
+        # Skip if in exclude list
+        if any(excl.lower() in col.lower() for excl in exclude_cols):
+            continue
+        # Only include numeric columns
+        if pd.api.types.is_numeric_dtype(features[col]):
+            feature_cols.append(col)
+    
+    # Remove 'optimal_position' from features if it somehow got included
+    feature_cols = [col for col in feature_cols if 'optimal_position' not in col.lower()]
     
     X = features[feature_cols]
     y = features['optimal_position']
     
     print(f"Features shape: {X.shape}")
+    print(f"Feature columns: {feature_cols[:10]}..." if len(feature_cols) > 10 else f"Feature columns: {feature_cols}")
     print(f"Target distribution:\n{y.value_counts()}")
     
     return X, y, features
