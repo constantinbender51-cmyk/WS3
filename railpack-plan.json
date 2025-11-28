@@ -1,0 +1,14 @@
+{
+  "name": "trading-ml-system",
+  "description": "Trading ML System with web dashboard",
+  "build": {
+    "apt": [
+      "libgomp1"
+    ],
+    "pip": "requirements.txt"
+  },
+  "run": {
+    "web": "python app.py",
+    "system": "libgomp1"
+  }
+}
