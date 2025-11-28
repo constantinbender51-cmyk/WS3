@@ -72,14 +72,29 @@ except Exception as e:
 
 @app.route('/')
 def plot_data():
-    # Create a plot
-    plt.figure(figsize=(12, 6))
-    plt.plot(daily_df['datetime'], daily_df['close'], label='Close Price')
-    plt.title('Daily OHLCV Data from 2022')
-    plt.xlabel('Date')
-    plt.ylabel('Close Price')
-    plt.legend()
-    plt.grid(True)
+    # Create a plot with two y-axes
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+    
+    # Plot close price on the primary y-axis
+    ax1.plot(daily_df['datetime'], daily_df['close'], label='Close Price', color='blue')
+    ax1.set_xlabel('Date')
+    ax1.set_ylabel('Close Price', color='blue')
+    ax1.tick_params(axis='y', labelcolor='blue')
+    ax1.grid(True)
+    
+    # Create a secondary y-axis for the binary column
+    ax2 = ax1.twinx()
+    ax2.plot(daily_df['datetime'], daily_df['binary_column'], label='Binary Column', color='red', linestyle='--')
+    ax2.set_ylabel('Binary Column', color='red')
+    ax2.tick_params(axis='y', labelcolor='red')
+    ax2.set_ylim(-0.1, 1.1)  # Set y-axis limits for binary values
+    
+    # Add legends
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+    
+    plt.title('Daily OHLCV Data from 2022 with Binary Column')
     
     # Save plot to a bytes buffer
     img = io.BytesIO()
@@ -95,7 +110,7 @@ def plot_data():
         <title>OHLCV Data Plot</title>
     </head>
     <body>
-        <h1>Daily OHLCV Data from 2022</h1>
+        <h1>Daily OHLCV Data from 2022 with Binary Column</h1>
         <img src="data:image/png;base64,{{ plot_url }}" alt="Plot">
         <p>Data includes a binary column with values set based on specified date ranges.</p>
     </body>
