@@ -5,6 +5,10 @@ from flask import Flask, render_template_string
 import matplotlib.pyplot as plt
 import io
 import base64
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
+import numpy as np
 
 app = Flask(__name__)
 
@@ -64,7 +68,53 @@ try:
     # Reset index to have datetime as a column for plotting
     daily_df.reset_index(inplace=True)
     
-    print("Data processed successfully")
+    # Prepare features and target for logistic regression
+    # Use previous OHLCV data with lookback of 30 days
+    lookback = 30
+    features = []
+    targets = []
+    dates = []
+    
+    for i in range(lookback, len(daily_df)):
+        # Extract OHLCV values for the past 'lookback' days
+        feature_row = []
+        for j in range(lookback):
+            idx = i - lookback + j
+            feature_row.extend([
+                daily_df.iloc[idx]['open'],
+                daily_df.iloc[idx]['high'],
+                daily_df.iloc[idx]['low'],
+                daily_df.iloc[idx]['close'],
+                daily_df.iloc[idx]['volume']
+            ])
+        features.append(feature_row)
+        targets.append(daily_df.iloc[i]['binary_column'])
+        dates.append(daily_df.iloc[i]['datetime'])
+    
+    # Convert to numpy arrays
+    X = np.array(features)
+    y = np.array(targets)
+    dates_array = np.array(dates)
+    
+    # Split data into 50-50 train-test split
+    X_train, X_test, y_train, y_test, dates_train, dates_test = train_test_split(
+        X, y, dates_array, test_size=0.5, random_state=42, shuffle=False
+    )
+    
+    # Train logistic regression model
+    model = LogisticRegression(random_state=42)
+    model.fit(X_train, y_train)
+    
+    # Make predictions on the entire dataset (features from lookback onwards)
+    y_pred_all = model.predict(X)
+    
+    # Create a DataFrame for predictions aligned with dates
+    pred_df = pd.DataFrame({
+        'datetime': dates_array,
+        'predicted_binary': y_pred_all
+    })
+    
+    print("Data processed and model trained successfully")
     
 except Exception as e:
     print(f"Error processing data: {e}")
@@ -82,10 +132,11 @@ def plot_data():
     ax1.tick_params(axis='y', labelcolor='blue')
     ax1.grid(True)
     
-    # Create a secondary y-axis for the binary column
+    # Create a secondary y-axis for the binary column and predictions
     ax2 = ax1.twinx()
-    ax2.plot(daily_df['datetime'], daily_df['binary_column'], label='Binary Column', color='red', linestyle='--')
-    ax2.set_ylabel('Binary Column', color='red')
+    ax2.plot(daily_df['datetime'], daily_df['binary_column'], label='Actual Binary', color='red', linestyle='--')
+    ax2.plot(pred_df['datetime'], pred_df['predicted_binary'], label='Predicted Binary', color='green', linestyle='-.')
+    ax2.set_ylabel('Binary Values', color='red')
     ax2.tick_params(axis='y', labelcolor='red')
     ax2.set_ylim(-0.1, 1.1)  # Set y-axis limits for binary values
     
@@ -94,7 +145,7 @@ def plot_data():
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
     
-    plt.title('Daily OHLCV Data from 2022 with Binary Column')
+    plt.title('Daily OHLCV Data from 2022 with Actual and Predicted Binary Column')
     
     # Save plot to a bytes buffer
     img = io.BytesIO()
@@ -107,12 +158,12 @@ def plot_data():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>OHLCV Data Plot</title>
+        <title>OHLCV Data Plot with Predictions</title>
     </head>
     <body>
-        <h1>Daily OHLCV Data from 2022 with Binary Column</h1>
+        <h1>Daily OHLCV Data from 2022 with Actual and Predicted Binary Column</h1>
         <img src="data:image/png;base64,{{ plot_url }}" alt="Plot">
-        <p>Data includes a binary column with values set based on specified date ranges.</p>
+        <p>Data includes a binary column with values set based on specified date ranges and logistic regression predictions using 30-day OHLCV lookback.</p>
         <p><a href="/download">Download the processed dataset as CSV</a></p>
     </body>
     </html>
