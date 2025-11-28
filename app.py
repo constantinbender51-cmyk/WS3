@@ -11,7 +11,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.naive_bayes import GaussianNB
 from sklearn.neural_network import MLPClassifier
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrixfrom sklearn.utils.class_weight import compute_sample_weight
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.utils.class_weight import compute_sample_weight
 import xgboost as xgb
 import lightgbm as lgb
 from flask import Flask, render_template_string
