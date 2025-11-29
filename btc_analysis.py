@@ -89,16 +89,28 @@ def predict_future(model, last_sequence, scaler):
     prediction = scaler.inverse_transform(prediction_scaled)
     return prediction[0, 0]
 
-def create_plot(df, atr_actual, atr_predicted):
-    """Create a plot of actual vs predicted ATR."""
-    plt.figure(figsize=(12, 6))
-    plt.plot(df.index, atr_actual, label='Actual ATR', color='blue')
-    plt.plot(df.index[-len(atr_predicted):], atr_predicted, label='Predicted ATR', color='red', linestyle='--')
-    plt.title('Actual vs Predicted ATR')
+def create_plot(train_dates, train_actual, train_predicted, test_dates, test_actual, test_predicted):
+    """Create a plot of actual vs predicted ATR for training and testing phases."""
+    plt.figure(figsize=(14, 8))
+    plt.subplot(2, 1, 1)
+    plt.plot(train_dates, train_actual, label='Actual ATR', color='blue')
+    plt.plot(train_dates, train_predicted, label='Predicted ATR', color='red', linestyle='--')
+    plt.title('Training Phase: Actual vs Predicted ATR')
     plt.xlabel('Date')
     plt.ylabel('ATR')
     plt.legend()
     plt.grid(True)
+    
+    plt.subplot(2, 1, 2)
+    plt.plot(test_dates, test_actual, label='Actual ATR', color='blue')
+    plt.plot(test_dates, test_predicted, label='Predicted ATR', color='red', linestyle='--')
+    plt.title('Testing Phase: Actual vs Predicted ATR')
+    plt.xlabel('Date')
+    plt.ylabel('ATR')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
     buf = io.BytesIO()
     plt.savefig(buf, format='png')
     buf.seek(0)
@@ -122,34 +134,47 @@ if __name__ == '__main__':
     # Train model
     model = train_model(X_train, y_train)
     
+    # Predict on training set
+    y_train_pred_scaled = model.predict(X_train)
+    y_train_pred = scaler.inverse_transform(y_train_pred_scaled.reshape(-1, 1)).flatten()
+    y_train_actual = scaler.inverse_transform(y_train.reshape(-1, 1)).flatten()
+    
     # Predict on test set
-    y_pred_scaled = model.predict(X_test)
-    y_pred = scaler.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
-    y_actual = scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
+    y_test_pred_scaled = model.predict(X_test)
+    y_test_pred = scaler.inverse_transform(y_test_pred_scaled.reshape(-1, 1)).flatten()
+    y_test_actual = scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
     
     # Calculate accuracy metrics for evaluation
-    rmse = np.sqrt(mean_squared_error(y_actual, y_pred))
-    mae = mean_absolute_error(y_actual, y_pred)
-    r2 = r2_score(y_actual, y_pred)
-    print(f"Test RMSE: {rmse}")
-    print(f"Test MAE: {mae}")
-    print(f"Test R²: {r2}")
+    train_rmse = np.sqrt(mean_squared_error(y_train_actual, y_train_pred))
+    train_mae = mean_absolute_error(y_train_actual, y_train_pred)
+    train_r2 = r2_score(y_train_actual, y_train_pred)
+    test_rmse = np.sqrt(mean_squared_error(y_test_actual, y_test_pred))
+    test_mae = mean_absolute_error(y_test_actual, y_test_pred)
+    test_r2 = r2_score(y_test_actual, y_test_pred)
+    print(f"Training RMSE: {train_rmse}")
+    print(f"Training MAE: {train_mae}")
+    print(f"Training R²: {train_r2}")
+    print(f"Test RMSE: {test_rmse}")
+    print(f"Test MAE: {test_mae}")
+    print(f"Test R²: {test_r2}")
     
     # Prepare data for plotting (align dates)
     # Adjust indices to account for lookback_days and forecast_days in prepare_data
     lookback_days = 14
     forecast_days = 14
-    start_idx = lookback_days + forecast_days - 1 + split  # Start index for test set in original data
-    plot_dates = df.index[start_idx:start_idx + len(y_actual)]
-    atr_actual_plot = y_actual
-    atr_predicted_plot = y_pred
+    train_start_idx = lookback_days + forecast_days - 1  # Start index for training set in original data
+    train_end_idx = train_start_idx + len(y_train_actual)
+    test_start_idx = lookback_days + forecast_days - 1 + split  # Start index for test set in original data
+    test_end_idx = test_start_idx + len(y_test_actual)
+    train_dates = df.index[train_start_idx:train_end_idx]
+    test_dates = df.index[test_start_idx:test_end_idx]
     
     # Set up Flask app
     app = Flask(__name__)
     
     @app.route('/')
     def index():
-        buf = create_plot(pd.DataFrame(index=plot_dates), atr_actual_plot, atr_predicted_plot)
+        buf = create_plot(train_dates, y_train_actual, y_train_pred, test_dates, y_test_actual, y_test_pred)
         return send_file(buf, mimetype='image/png')
     
     # Run the server
