@@ -50,20 +50,19 @@ def calculate_atr(df, period=14):
     return atr
 
 def prepare_data(df, lookback_days=14, forecast_days=14):
-    """Prepare data for LSTM model using OHLCV features and their log derivatives to predict ATR."""
+    """Prepare data for LSTM model using log return of 7-day SMA / volume as feature to predict ATR."""
     # Calculate ATR and add to dataframe
     df['atr'] = calculate_atr(df)
     
-    # Calculate log derivatives (log returns) for OHLCV features
-    df['log_open'] = np.log(df['open'] / df['open'].shift(1))
-    df['log_high'] = np.log(df['high'] / df['high'].shift(1))
-    df['log_low'] = np.log(df['low'] / df['low'].shift(1))
-    df['log_close'] = np.log(df['close'] / df['close'].shift(1))
-    df['log_volume'] = np.log(df['volume'] / df['volume'].shift(1))
+    # Calculate 7-day simple moving average of close price
+    df['sma_7'] = df['close'].rolling(window=7).mean()
     
-    # Use original OHLCV columns and their log derivatives as features, ATR as target
-    feature_columns = ['open', 'high', 'low', 'close', 'volume', 
-                      'log_open', 'log_high', 'log_low', 'log_close', 'log_volume']
+    # Calculate log return of 7-day SMA divided by volume
+    df['sma_7_log_return'] = np.log(df['sma_7'] / df['sma_7'].shift(1))
+    df['feature'] = df['sma_7_log_return'] / df['volume']
+    
+    # Use only the single feature: log return of 7-day SMA divided by volume
+    feature_columns = ['feature']
     target_column = 'atr'
     
     # Remove rows with NaN values (from ATR calculation and log derivatives)
@@ -240,8 +239,7 @@ if __name__ == '__main__':
     last_month_actual = []
     last_month_predicted = []
     for i in range(len(last_month_df) - lookback_days):
-        sequence = last_month_df.iloc[i:i+lookback_days][['open', 'high', 'low', 'close', 'volume', 
-                                                         'log_open', 'log_high', 'log_low', 'log_close', 'log_volume']].values
+        sequence = last_month_df.iloc[i:i+lookback_days][['feature']].values
         actual_value = last_month_df.iloc[i+lookback_days]['atr']
         prediction = predict_future(model, sequence, feature_scaler, target_scaler)
         
