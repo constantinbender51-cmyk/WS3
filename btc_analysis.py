@@ -212,9 +212,17 @@ if __name__ == '__main__':
     test_mae = mean_absolute_error(y_test_actual, y_test_pred)
     test_r2 = r2_score(y_test_actual, y_test_pred)
     
+    # Prepare data for plotting (align dates)
+    # Adjust indices to account for lookback_days and forecast_days in prepare_data
+    lookback_days = 30
+    forecast_days = 8
+    train_start_idx = lookback_days + forecast_days - 1  # Start index for training set in original data
+    train_end_idx = train_start_idx + len(y_train_actual)
+    test_start_idx = lookback_days + forecast_days - 1 + split  # Start index for test set in original data
+    test_end_idx = test_start_idx + len(y_test_actual)
+    
     # Calculate baseline metrics using shifted ATR (shift by 8 days)
     # Align shifted ATR with predictions (shift ATR series by forecast_days)
-    forecast_days = 8
     atr_shifted = df['atr'].shift(-forecast_days).dropna()
     # Get indices for training and testing sets
     train_shifted = atr_shifted.iloc[train_start_idx:train_end_idx]
@@ -242,14 +250,6 @@ if __name__ == '__main__':
     print(f"Test MAE: {test_baseline_mae}")
     print(f"Test R²: {test_baseline_r2}")
     
-    # Prepare data for plotting (align dates)
-    # Adjust indices to account for lookback_days and forecast_days in prepare_data
-    lookback_days = 30
-    forecast_days = 8
-    train_start_idx = lookback_days + forecast_days - 1  # Start index for training set in original data
-    train_end_idx = train_start_idx + len(y_train_actual)
-    test_start_idx = lookback_days + forecast_days - 1 + split  # Start index for test set in original data
-    test_end_idx = test_start_idx + len(y_test_actual)
     train_dates = df.index[train_start_idx:train_end_idx]
     test_dates = df.index[test_start_idx:test_end_idx]
     
