@@ -87,8 +87,9 @@ def prepare_data(df, lookback_days=30, forecast_days=8):
 def build_lstm_model(input_shape):
     """Build and compile LSTM model."""
     model = Sequential()
-    model.add(LSTM(100, return_sequences=True, input_shape=input_shape))
-    model.add(LSTM(100, return_sequences=False))
+    model.add(LSTM(200, return_sequences=True, input_shape=input_shape))
+    model.add(LSTM(200, return_sequences=True))
+    model.add(LSTM(200, return_sequences=False))
     model.add(Dense(25))
     model.add(Dense(1))
     model.compile(optimizer='adam', loss='mean_squared_error')
