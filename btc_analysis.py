@@ -61,7 +61,10 @@ def prepare_data(df, lookback_days=30, forecast_days=8):
     df['sma_29_high_low'] = df['high_low_feature'].rolling(window=29).mean()
     df['sma_60_high_low'] = df['high_low_feature'].rolling(window=60).mean()
     
-    feature_columns = ['high_low_feature', 'sma_7_high_low', 'sma_29_high_low', 'sma_60_high_low']
+    # Add weekday feature (1-7 where 1=Monday, 7=Sunday)
+    df['weekday'] = df.index.dayofweek + 1
+    
+    feature_columns = ['high_low_feature', 'sma_7_high_low', 'sma_29_high_low', 'sma_60_high_low', 'weekday']
     target_column = 'atr'
     
     # Remove rows with NaN values (from ATR calculation and log derivatives)
