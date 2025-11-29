@@ -49,20 +49,20 @@ def calculate_atr(df, period=14):
     atr = true_range.rolling(window=period).mean()
     return atr
 
-def prepare_data(atr_series, lookback_days=14, forecast_days=14):
-    """Prepare data for LSTM model."""
-    data = atr_series.dropna().values.reshape(-1, 1)
+def prepare_data(df, lookback_days=14, forecast_days=14):
+    """Prepare data for LSTM model using OHLCV features."""
+    # Use OHLCV columns as features
+    data = df[['open', 'high', 'low', 'close', 'volume']].dropna().values
     scaler = MinMaxScaler(feature_range=(0, 1))
     data_scaled = scaler.fit_transform(data)
     
     X, y = [], []
     for i in range(lookback_days, len(data_scaled) - forecast_days + 1):
-        X.append(data_scaled[i-lookback_days:i, 0])
-        y.append(data_scaled[i+forecast_days-1, 0])  # Predict ATR at the end of forecast period
+        X.append(data_scaled[i-lookback_days:i, :])  # Use all OHLCV features
+        y.append(data_scaled[i+forecast_days-1, 3])  # Predict close price at the end of forecast period
     
     X = np.array(X)
     y = np.array(y)
-    X = X.reshape(X.shape[0], X.shape[1], 1)
     
     return X, y, scaler
 
@@ -83,43 +83,46 @@ def train_model(X_train, y_train, epochs=100, batch_size=32):
     return model, history
 
 def predict_future(model, last_sequence, scaler):
-    """Predict future ATR values."""
-    last_sequence_scaled = scaler.transform(last_sequence.reshape(-1, 1))
-    prediction_scaled = model.predict(last_sequence_scaled.reshape(1, last_sequence_scaled.shape[0], 1))
-    prediction = scaler.inverse_transform(prediction_scaled)
-    return prediction[0, 0]
+    """Predict future close price values."""
+    last_sequence_scaled = scaler.transform(last_sequence)
+    prediction_scaled = model.predict(last_sequence_scaled.reshape(1, last_sequence_scaled.shape[0], last_sequence_scaled.shape[1]))
+    # Inverse transform for close price (index 3 in scaled data)
+    dummy = np.zeros((1, scaler.n_features_in_))
+    dummy[0, 3] = prediction_scaled[0, 0]
+    prediction = scaler.inverse_transform(dummy)[0, 3]
+    return prediction
 
 def create_combined_plot(train_dates, train_actual, train_predicted, test_dates, test_actual, test_predicted, history, last_month_dates, last_month_actual, last_month_predicted):
-    """Create a combined plot with ATR predictions and loss over epochs."""
+    """Create a combined plot with close price predictions and loss over epochs."""
     plt.figure(figsize=(14, 16))
     
-    # Subplot 1: ATR training phase
+    # Subplot 1: Close price training phase
     plt.subplot(4, 1, 1)
-    plt.plot(train_dates, train_actual, label='Actual ATR', color='blue')
-    plt.plot(train_dates, train_predicted, label='Predicted ATR', color='red', linestyle='--')
-    plt.title('Training Phase: Actual vs Predicted ATR')
+    plt.plot(train_dates, train_actual, label='Actual Close Price', color='blue')
+    plt.plot(train_dates, train_predicted, label='Predicted Close Price', color='red', linestyle='--')
+    plt.title('Training Phase: Actual vs Predicted Close Price')
     plt.xlabel('Date')
-    plt.ylabel('ATR')
+    plt.ylabel('Close Price')
     plt.legend()
     plt.grid(True)
     
-    # Subplot 2: ATR testing phase
+    # Subplot 2: Close price testing phase
     plt.subplot(4, 1, 2)
-    plt.plot(test_dates, test_actual, label='Actual ATR', color='blue')
-    plt.plot(test_dates, test_predicted, label='Predicted ATR', color='red', linestyle='--')
-    plt.title('Testing Phase: Actual vs Predicted ATR')
+    plt.plot(test_dates, test_actual, label='Actual Close Price', color='blue')
+    plt.plot(test_dates, test_predicted, label='Predicted Close Price', color='red', linestyle='--')
+    plt.title('Testing Phase: Actual vs Predicted Close Price')
     plt.xlabel('Date')
-    plt.ylabel('ATR')
+    plt.ylabel('Close Price')
     plt.legend()
     plt.grid(True)
     
-    # Subplot 3: Last month of ATR data
+    # Subplot 3: Last month of close price data
     plt.subplot(4, 1, 3)
-    plt.plot(last_month_dates, last_month_actual, label='Actual ATR', color='blue', marker='o', markersize=3)
-    plt.plot(last_month_dates, last_month_predicted, label='Predicted ATR', color='red', linestyle='--', marker='s', markersize=3)
-    plt.title('Last Month: Actual vs Predicted ATR')
+    plt.plot(last_month_dates, last_month_actual, label='Actual Close Price', color='blue', marker='o', markersize=3)
+    plt.plot(last_month_dates, last_month_predicted, label='Predicted Close Price', color='red', linestyle='--', marker='s', markersize=3)
+    plt.title('Last Month: Actual vs Predicted Close Price')
     plt.xlabel('Date')
-    plt.ylabel('ATR')
+    plt.ylabel('Close Price')
     plt.legend()
     plt.grid(True)
     plt.xticks(rotation=45)
@@ -162,10 +165,9 @@ def create_loss_plot(history):
 if __name__ == '__main__':
     # Fetch and prepare data
     df = fetch_binance_data()
-    atr = calculate_atr(df)
     
-    # Prepare data for model
-    X, y, scaler = prepare_data(atr, forecast_days=1)
+    # Prepare data for model using OHLCV features
+    X, y, scaler = prepare_data(df, forecast_days=1)
     
     # Split data (simple split for demonstration)
     split = int(0.8 * len(X))
@@ -214,17 +216,15 @@ if __name__ == '__main__':
     last_month_days = 30
     last_month_start_idx = max(0, len(df) - last_month_days)
     last_month_dates = df.index[last_month_start_idx:]
-    last_month_atr = atr.iloc[last_month_start_idx:]
+    last_month_df = df.iloc[last_month_start_idx:]
     
     # Prepare sequences for last month predictions
     last_month_actual = []
     last_month_predicted = []
-    for i in range(len(last_month_atr) - lookback_days):
-        sequence = last_month_atr.iloc[i:i+lookback_days].values.reshape(-1, 1)
-        sequence_scaled = scaler.transform(sequence)
-        prediction_scaled = model.predict(sequence_scaled.reshape(1, lookback_days, 1))
-        prediction = scaler.inverse_transform(prediction_scaled)[0, 0]
-        actual_value = last_month_atr.iloc[i+lookback_days]
+    for i in range(len(last_month_df) - lookback_days):
+        sequence = last_month_df.iloc[i:i+lookback_days][['open', 'high', 'low', 'close', 'volume']].values
+        actual_value = last_month_df.iloc[i+lookback_days]['close']
+        prediction = predict_future(model, sequence, scaler)
         
         last_month_actual.append(actual_value)
         last_month_predicted.append(prediction)
