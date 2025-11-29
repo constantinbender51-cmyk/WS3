@@ -132,7 +132,11 @@ if __name__ == '__main__':
     print(f"Test RMSE: {rmse}")
     
     # Prepare data for plotting (align dates)
-    plot_dates = df.index[14+14:][split+14:split+14+len(y_actual)]  # Adjust for lookback and forecast
+    # Adjust indices to account for lookback_days and forecast_days in prepare_data
+    lookback_days = 14
+    forecast_days = 14
+    start_idx = lookback_days + forecast_days - 1 + split  # Start index for test set in original data
+    plot_dates = df.index[start_idx:start_idx + len(y_actual)]
     atr_actual_plot = y_actual
     atr_predicted_plot = y_pred
     
