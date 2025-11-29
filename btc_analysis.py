@@ -54,12 +54,13 @@ def prepare_data(df, lookback_days=14, forecast_days=14):
     # Calculate ATR and add to dataframe
     df['atr'] = calculate_atr(df)
     
-    # Use simple returns and volume as features
+    # Use simple returns, volume, and high-low range as features
     df['price_feature'] = (df['close'] - df['close'].shift(1)) / df['close'].shift(1)
     df['volume_feature'] = df['volume']
+    df['high_low_feature'] = df['high'] - df['low']
     
-    # Use both price and volume as features
-    feature_columns = ['price_feature', 'volume_feature']
+    # Use price, volume, and high-low range as features
+    feature_columns = ['price_feature', 'volume_feature', 'high_low_feature']
     target_column = 'atr'
     
     # Remove rows with NaN values (from ATR calculation and log derivatives)
