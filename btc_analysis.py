@@ -216,9 +216,11 @@ if __name__ == '__main__':
     # Adjust indices to account for lookback_days and forecast_days in prepare_data
     lookback_days = 30
     forecast_days = 8
-    train_start_idx = lookback_days + forecast_days - 1  # Start index for training set in original data
+    # The target is set at i+forecast_days-1 where i starts from lookback_days
+    # So the first prediction corresponds to index: lookback_days + (forecast_days - 1)
+    train_start_idx = lookback_days + (forecast_days - 1)  # Start index for training set in original data
     train_end_idx = train_start_idx + len(y_train_actual)
-    test_start_idx = lookback_days + forecast_days - 1 + split  # Start index for test set in original data
+    test_start_idx = lookback_days + (forecast_days - 1) + split  # Start index for test set in original data
     test_end_idx = test_start_idx + len(y_test_actual)
     
     # Calculate baseline metrics using shifted ATR (shift by 8 days)
