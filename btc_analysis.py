@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import requests
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
 import matplotlib.pyplot as plt
@@ -127,9 +127,13 @@ if __name__ == '__main__':
     y_pred = scaler.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
     y_actual = scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
     
-    # Calculate RMSE for evaluation
+    # Calculate accuracy metrics for evaluation
     rmse = np.sqrt(mean_squared_error(y_actual, y_pred))
+    mae = mean_absolute_error(y_actual, y_pred)
+    r2 = r2_score(y_actual, y_pred)
     print(f"Test RMSE: {rmse}")
+    print(f"Test MAE: {mae}")
+    print(f"Test R²: {r2}")
     
     # Prepare data for plotting (align dates)
     # Adjust indices to account for lookback_days and forecast_days in prepare_data
