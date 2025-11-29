@@ -89,13 +89,13 @@ def calculate_indicators(df):
     df['EMA_90'] = df['close'].ewm(span=90, adjust=False).mean()
     df['EMA_60'] = df['close'].ewm(span=60, adjust=False).mean()
     
-    # Strategy: Long if Price > SMA_365 OR Price > EMA_120, Short if Price < EMA_120
+    # Strategy: Long if Price > EMA_90, Short if Price < EMA_90
     # We use shift(1) to avoid lookahead bias (decision made on yesterday's close implies trade at today's open/close)
     # 1 for Long, -1 for Short. 
     
     conditions = [
-        (df['close'] > df['SMA_365']) | (df['close'] > df['EMA_120']),
-        df['close'] < df['EMA_120']
+        df['close'] > df['EMA_90'],
+        df['close'] < df['EMA_90']
     ]
     choices = [1, -1] # 1 = Long, -1 = Short
     
