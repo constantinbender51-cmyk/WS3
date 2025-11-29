@@ -50,15 +50,23 @@ def calculate_atr(df, period=14):
     return atr
 
 def prepare_data(df, lookback_days=14, forecast_days=14):
-    """Prepare data for LSTM model using OHLCV features to predict ATR."""
+    """Prepare data for LSTM model using OHLCV features and their log derivatives to predict ATR."""
     # Calculate ATR and add to dataframe
     df['atr'] = calculate_atr(df)
     
-    # Use OHLCV columns as features, ATR as target
-    feature_columns = ['open', 'high', 'low', 'close', 'volume']
+    # Calculate log derivatives (log returns) for OHLCV features
+    df['log_open'] = np.log(df['open'] / df['open'].shift(1))
+    df['log_high'] = np.log(df['high'] / df['high'].shift(1))
+    df['log_low'] = np.log(df['low'] / df['low'].shift(1))
+    df['log_close'] = np.log(df['close'] / df['close'].shift(1))
+    df['log_volume'] = np.log(df['volume'] / df['volume'].shift(1))
+    
+    # Use original OHLCV columns and their log derivatives as features, ATR as target
+    feature_columns = ['open', 'high', 'low', 'close', 'volume', 
+                      'log_open', 'log_high', 'log_low', 'log_close', 'log_volume']
     target_column = 'atr'
     
-    # Remove rows with NaN values (from ATR calculation)
+    # Remove rows with NaN values (from ATR calculation and log derivatives)
     df_clean = df[feature_columns + [target_column]].dropna()
     
     # Scale features and target separately
@@ -232,7 +240,8 @@ if __name__ == '__main__':
     last_month_actual = []
     last_month_predicted = []
     for i in range(len(last_month_df) - lookback_days):
-        sequence = last_month_df.iloc[i:i+lookback_days][['open', 'high', 'low', 'close', 'volume']].values
+        sequence = last_month_df.iloc[i:i+lookback_days][['open', 'high', 'low', 'close', 'volume', 
+                                                         'log_open', 'log_high', 'log_low', 'log_close', 'log_volume']].values
         actual_value = last_month_df.iloc[i+lookback_days]['atr']
         prediction = predict_future(model, sequence, feature_scaler, target_scaler)
         
