@@ -27,14 +27,14 @@ def process_ohlcv_data():
         print("Data downloaded and loaded successfully.")
 
         # Ensure required columns are present
-        required_columns = ['Date', 'Close']
+        required_columns = ['datetime', 'Close']
         for col in required_columns:
             if col not in df.columns:
                 raise ValueError(f"CSV must contain a '{col}' column.")
         
-        # Convert 'Date' to datetime and set as index
-        df['Date'] = pd.to_datetime(df['Date'])
-        df = df.sort_values('Date').reset_index(drop=True)
+        # Convert 'datetime' to datetime and set as index
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        df = df.sort_values('datetime').reset_index(drop=True)
 
         # 1. Calculate daily returns
         df['daily_return'] = df['Close'].pct_change()
@@ -65,7 +65,7 @@ def process_ohlcv_data():
         # Return sample data if download fails
         dates = pd.date_range(start='2023-01-01', periods=100, freq='D')
         sample_df = pd.DataFrame({
-            'Date': dates,
+            'datetime': dates,
             'Open': range(100, 200),
             'High': range(105, 205),
             'Low': range(95, 195),
@@ -86,7 +86,7 @@ def index():
     
     # Plot Close price
     plt.subplot(2, 1, 1)
-    plt.plot(df['Date'], df['Close'], label='Close Price', linewidth=2)
+    plt.plot(df['datetime'], df['Close'], label='Close Price', linewidth=2)
     plt.title('OHLCV Data with Perfect Positions')
     plt.ylabel('Price')
     plt.legend()
@@ -99,7 +99,7 @@ def index():
     
     for position_value in [0, 1, 2]:
         mask = df['perfect_position'] == position_value
-        plt.scatter(df.loc[mask, 'Date'], df.loc[mask, 'perfect_position'], 
+        plt.scatter(df.loc[mask, 'datetime'], df.loc[mask, 'perfect_position'], 
                    c=colors[position_value], label=labels[position_value], alpha=0.7)
     
     plt.ylabel('Position')
@@ -172,7 +172,7 @@ def index():
     
     # Calculate statistics
     total_records = len(df)
-    date_range = f"{df['Date'].min().strftime('%Y-%m-%d')} to {df['Date'].max().strftime('%Y-%m-%d')}"
+    date_range = f"{df['datetime'].min().strftime('%Y-%m-%d')} to {df['datetime'].max().strftime('%Y-%m-%d')}"
     
     position_counts = df['perfect_position'].value_counts()
     long_count = position_counts.get(1, 0)
