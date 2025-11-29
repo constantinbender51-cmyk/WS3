@@ -50,12 +50,12 @@ def calculate_atr(df, period=14):
     return atr
 
 def prepare_data(df, lookback_days=14, forecast_days=14):
-    """Prepare data for LSTM model using absolute price and volume as features to predict ATR."""
+    """Prepare data for LSTM model using log returns and volume as features to predict ATR."""
     # Calculate ATR and add to dataframe
     df['atr'] = calculate_atr(df)
     
-    # Use absolute price (close price) and volume as features
-    df['price_feature'] = df['close']
+    # Use log returns and volume as features
+    df['price_feature'] = np.log(df['close'] / df['close'].shift(1))
     df['volume_feature'] = df['volume']
     
     # Use both price and volume as features
