@@ -87,6 +87,44 @@ def prepare_data(df, lookback_days=30, forecast_days=8):
     
     return X, y, feature_scaler, target_scaler
 
+def run_multiple_lookbacks(df, forecast_days=8):
+    """Run model for multiple lookback periods and print metrics."""
+    lookback_periods = [2, 4, 8, 16, 32]
+    for lookback_days in lookback_periods:
+        print(f"\nRunning for lookback_days={lookback_days}:")
+        X, y, feature_scaler, target_scaler = prepare_data(df, lookback_days=lookback_days, forecast_days=forecast_days)
+        if len(X) == 0:
+            print("  Not enough data for this lookback period.")
+            continue
+        split = int(0.8 * len(X))
+        X_train, X_test = X[:split], X[split:]
+        y_train, y_test = y[:split], y[split:]
+        
+        units = 16
+        model, history = train_model(X_train, y_train, units=units)
+        
+        y_train_pred_scaled = model.predict(X_train)
+        y_train_pred = target_scaler.inverse_transform(y_train_pred_scaled.reshape(-1, 1)).flatten()
+        y_train_actual = target_scaler.inverse_transform(y_train.reshape(-1, 1)).flatten()
+        
+        y_test_pred_scaled = model.predict(X_test)
+        y_test_pred = target_scaler.inverse_transform(y_test_pred_scaled.reshape(-1, 1)).flatten()
+        y_test_actual = target_scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
+        
+        train_rmse = np.sqrt(mean_squared_error(y_train_actual, y_train_pred))
+        train_mae = mean_absolute_error(y_train_actual, y_train_pred)
+        train_r2 = r2_score(y_train_actual, y_train_pred)
+        test_rmse = np.sqrt(mean_squared_error(y_test_actual, y_test_pred))
+        test_mae = mean_absolute_error(y_test_actual, y_test_pred)
+        test_r2 = r2_score(y_test_actual, y_test_pred)
+        
+        print(f"  Training RMSE: {train_rmse}")
+        print(f"  Training MAE: {train_mae}")
+        print(f"  Training R²: {train_r2}")
+        print(f"  Test RMSE: {test_rmse}")
+        print(f"  Test MAE: {test_mae}")
+        print(f"  Test R²: {test_r2}")
+
 def build_lstm_model(input_shape, units=200):
     """Build and compile LSTM model."""
     model = Sequential()
@@ -180,7 +218,10 @@ if __name__ == '__main__':
     # Fetch and prepare data
     df = fetch_binance_data()
     
-    # Prepare data for model using OHLCV features to predict ATR
+    # Run for multiple lookback periods
+    run_multiple_lookbacks(df, forecast_days=8)
+    
+    # Prepare data for model using OHLCV features to predict ATR (for Flask app)
     X, y, feature_scaler, target_scaler = prepare_data(df, lookback_days=30, forecast_days=8)
     
     # Split data (simple split for demonstration)
@@ -190,7 +231,7 @@ if __name__ == '__main__':
     
     # Train model with 16 units
     units = 16
-    print(f"Training model with {units} units...")
+    print(f"\nTraining model with {units} units for Flask app...")
     model, history = train_model(X_train, y_train, units=units)
     
     # Predict on training set
@@ -222,9 +263,7 @@ if __name__ == '__main__':
     test_start_idx = lookback_days + (forecast_days - 1) + split  # Start index for test set in original data
     test_end_idx = test_start_idx + len(y_test_actual)
     
-
-    
-    print(f"\nModel Metrics (with {units} units, predicting ATR 8 days ahead):")
+    print(f"\nModel Metrics for Flask app (with {units} units, predicting ATR 8 days ahead):")
     print(f"Training RMSE: {train_rmse}")
     print(f"Training MAE: {train_mae}")
     print(f"Training R²: {train_r2}")
@@ -247,8 +286,6 @@ if __name__ == '__main__':
     def loss_plot():
         buf = create_loss_plot(history)
         return send_file(buf, mimetype='image/png')
-    
-
     
     # Run the server
     app.run(host='0.0.0.0', port=8080, debug=False)
