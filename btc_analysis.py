@@ -79,8 +79,8 @@ def build_lstm_model(input_shape):
 def train_model(X_train, y_train, epochs=50, batch_size=32):
     """Train the LSTM model."""
     model = build_lstm_model((X_train.shape[1], 1))
-    model.fit(X_train, y_train, batch_size=batch_size, epochs=epochs, validation_split=0.2, verbose=1)
-    return model
+    history = model.fit(X_train, y_train, batch_size=batch_size, epochs=epochs, validation_split=0.2, verbose=1)
+    return model, history
 
 def predict_future(model, last_sequence, scaler):
     """Predict future ATR values."""
@@ -117,6 +117,23 @@ def create_plot(train_dates, train_actual, train_predicted, test_dates, test_act
     plt.close()
     return buf
 
+def create_loss_plot(history):
+    """Create a plot of training loss vs validation loss over epochs."""
+    plt.figure(figsize=(10, 6))
+    plt.plot(history.history['loss'], label='Training Loss', color='blue')
+    plt.plot(history.history['val_loss'], label='Validation Loss', color='red')
+    plt.title('Training Loss vs Validation Loss Over Epochs')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    plt.close()
+    return buf
+
 # Main execution
 if __name__ == '__main__':
     # Fetch and prepare data
@@ -132,7 +149,7 @@ if __name__ == '__main__':
     y_train, y_test = y[:split], y[split:]
     
     # Train model
-    model = train_model(X_train, y_train)
+    model, history = train_model(X_train, y_train)
     
     # Predict on training set
     y_train_pred_scaled = model.predict(X_train)
@@ -175,6 +192,10 @@ if __name__ == '__main__':
     @app.route('/')
     def index():
         buf = create_plot(train_dates, y_train_actual, y_train_pred, test_dates, y_test_actual, y_test_pred)
+        return send_file(buf, mimetype='image/png')
+    @app.route('/loss')
+    def loss_plot():
+        buf = create_loss_plot(history)
         return send_file(buf, mimetype='image/png')
     
     # Run the server
