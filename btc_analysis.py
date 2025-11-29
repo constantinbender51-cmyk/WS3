@@ -9,16 +9,25 @@ from datetime import datetime
 app = Flask(__name__)
 
 def fetch_btc_data():
+    import time
     url = "https://api.binance.com/api/v3/klines"
-    params = {
-        'symbol': 'BTCUSDT',
-        'interval': '1d',
-        'startTime': int(datetime(2018, 1, 1).timestamp() * 1000),
-        'limit': 1000
-    }
-    response = requests.get(url, params=params)
-    data = response.json()
-    df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+    all_data = []
+    start_time = int(datetime(2018, 1, 1).timestamp() * 1000)
+    while True:
+        params = {
+            'symbol': 'BTCUSDT',
+            'interval': '1d',
+            'startTime': start_time,
+            'limit': 1000
+        }
+        response = requests.get(url, params=params)
+        data = response.json()
+        if not data:
+            break
+        all_data.extend(data)
+        start_time = data[-1][6]  # Use close_time of last entry as next startTime
+        time.sleep(1)  # Respect rate limits with 1-second delay
+    df = pd.DataFrame(all_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df['close'] = df['close'].astype(float)
     df['high'] = df['high'].astype(float)
