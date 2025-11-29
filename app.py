@@ -11,7 +11,7 @@ app = Flask(__name__)
 # Constants
 GOOGLE_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1bjfIzg2_I_zN95v5oQac671_4AV0D74x/edit?usp=drivesdk&ouid=114372102418564925207&rtpof=true&sd=true'
 LOCAL_CSV_FILENAME = 'ohlcv_data.csv'
-FLAT_TRADE_THRESHOLD = 0.005  # 0.5% threshold
+FLAT_TRADE_THRESHOLD = 0.01  # 1% threshold
 
 # --- Data Processing Function ---
 def process_ohlcv_data():
@@ -84,8 +84,20 @@ def index():
     # Create plot
     plt.figure(figsize=(12, 8))
     
-    # Plot Close price
+    # Plot Close price with background colors for positions
     plt.subplot(2, 1, 1)
+    
+    # Add background colors for positions
+    colors = ['red', 'green', 'gray']
+    labels = ['Short (0)', 'Long (1)', 'Flat (2)']
+    
+    for i, position_value in enumerate([0, 1, 2]):
+        mask = df['perfect_position'] == position_value
+        position_dates = df.loc[mask, 'datetime']
+        if not position_dates.empty:
+            for date in position_dates:
+                plt.axvspan(date, date + pd.Timedelta(days=1), color=colors[i], alpha=0.3)
+    
     plt.plot(df['datetime'], df['close'], label='Close Price', linewidth=2)
     plt.title('OHLCV Data with Perfect Positions')
     plt.ylabel('Price')
