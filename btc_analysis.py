@@ -49,12 +49,16 @@ def determine_position_status(df):
     for i in range(len(df)):
         row = df.iloc[i]
         sma_365 = row['sma_365']
+        sma_120 = row['sma_120']
         price = row['close']
         
-        if pd.isna(sma_365):
+        if pd.isna(sma_365) or pd.isna(sma_120):
             position = 'neutral'
         elif price > sma_365:
-            position = 'long'
+            if price < sma_120:
+                position = 'short'
+            else:
+                position = 'long'
         else:
             position = 'short'
         
@@ -62,7 +66,8 @@ def determine_position_status(df):
             'date': df.index[i],
             'position': position,
             'price': price,
-            'sma_365': sma_365
+            'sma_365': sma_365,
+            'sma_120': sma_120
         })
         
         if i == len(df) - 1:
@@ -91,12 +96,16 @@ def calculate_capital(df, initial_capital=1000):
         
         # Determine signal based on previous day's SMAs and price
         sma_365_prev = prev_row['sma_365']
+        sma_120_prev = prev_row['sma_120']
         price_prev = prev_row['close']
         
-        if pd.isna(sma_365_prev):
+        if pd.isna(sma_365_prev) or pd.isna(sma_120_prev):
             signal = 'neutral'
         elif price_prev > sma_365_prev:
-            signal = 'long'
+            if price_prev < sma_120_prev:
+                signal = 'short'
+            else:
+                signal = 'long'
         else:
             signal = 'short'
         
@@ -227,7 +236,7 @@ def index():
             </div>
             <p><strong>Trading Strategy Capital:</strong> ${{ "%.2f"|format(trading_capital) }}</p>
             <p><strong>Buy and Hold Capital:</strong> ${{ "%.2f"|format(buy_hold_capital) }}</p>
-            <p><em>Strategy: LONG when price > 365 SMA, SHORT otherwise</em></p>
+            <p><em>Strategy: LONG when price > 365 SMA and price >= 120 SMA, SHORT otherwise</em></p>
             <p><em>Green shaded areas = Long positions, Red shaded areas = Short positions</em></p>
         </div>
         {{ plot|safe }}
