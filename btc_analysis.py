@@ -64,17 +64,23 @@ def calculate_indicators(df):
         # Check stop loss conditions
         current_high = df.iloc[i]['high']
         current_low = df.iloc[i]['low']
+        stop_loss_hit = False
         if current_position == 1 and entry_price > 0 and current_low <= entry_price * (1 - stop_loss_percent):
             df.iloc[i, df.columns.get_loc('position')] = 0  # Close long position
             df.iloc[i, df.columns.get_loc('stop_loss_hit')] = 1  # Mark stop loss hit
             current_position = 0
+            stop_loss_hit = True
         elif current_position == -1 and entry_price > 0 and current_high >= entry_price * (1 + stop_loss_percent):
             df.iloc[i, df.columns.get_loc('position')] = 0  # Close short position
             df.iloc[i, df.columns.get_loc('stop_loss_hit')] = 1  # Mark stop loss hit
             current_position = 0
+            stop_loss_hit = True
         
         # Calculate capital based on position
-        if current_position == 1:  # Long position
+        if stop_loss_hit:
+            # Apply stop loss penalty
+            df.iloc[i, df.columns.get_loc('capital')] = prev_capital * (1 - stop_loss_percent)
+        elif current_position == 1:  # Long position
             df.iloc[i, df.columns.get_loc('capital')] = prev_capital * (current_close / prev_close)
         elif current_position == -1:  # Short position
             df.iloc[i, df.columns.get_loc('capital')] = prev_capital * (2 - (current_close / prev_close))
