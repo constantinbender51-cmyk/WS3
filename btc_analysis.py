@@ -50,15 +50,18 @@ def calculate_atr(df, period=14):
     atr = true_range.rolling(window=period).mean()
     return atr
 
-def prepare_data(df, lookback_days=7, forecast_days=14):
+def prepare_data(df, lookback_days=30, forecast_days=2):
     """Prepare data for LSTM model using log returns and volume as features to predict ATR."""
     # Calculate ATR and add to dataframe
     df['atr'] = calculate_atr(df)
     
-    # Use only high-low range as feature
+    # Use high-low range and its moving averages as features
     df['high_low_feature'] = df['high'] - df['low']
+    df['sma_7_high_low'] = df['high_low_feature'].rolling(window=7).mean()
+    df['sma_29_high_low'] = df['high_low_feature'].rolling(window=29).mean()
+    df['sma_60_high_low'] = df['high_low_feature'].rolling(window=60).mean()
     
-    feature_columns = ['high_low_feature']
+    feature_columns = ['high_low_feature', 'sma_7_high_low', 'sma_29_high_low', 'sma_60_high_low']
     target_column = 'atr'
     
     # Remove rows with NaN values (from ATR calculation and log derivatives)
@@ -236,7 +239,7 @@ if __name__ == '__main__':
     last_month_actual = []
     last_month_predicted = []
     for i in range(len(last_month_df) - lookback_days):
-        sequence = last_month_df.iloc[i:i+lookback_days][['high_low_feature']].values
+        sequence = last_month_df.iloc[i:i+lookback_days][['high_low_feature', 'sma_7_high_low', 'sma_29_high_low', 'sma_60_high_low']].values
         actual_value = last_month_df.iloc[i+lookback_days]['atr']
         prediction = predict_future(model, sequence, feature_scaler, target_scaler)
         
