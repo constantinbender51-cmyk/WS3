@@ -1,1 +1,0 @@
-web: gunicorn btc_analysis:app
