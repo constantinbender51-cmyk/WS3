@@ -50,18 +50,14 @@ def calculate_atr(df, period=14):
     return atr
 
 def prepare_data(df, lookback_days=14, forecast_days=14):
-    """Prepare data for LSTM model using log return of 7-day SMA / volume as feature to predict ATR."""
+    """Prepare data for LSTM model using log return of price as feature to predict ATR."""
     # Calculate ATR and add to dataframe
     df['atr'] = calculate_atr(df)
     
-    # Calculate 7-day simple moving average of close price
-    df['sma_7'] = df['close'].rolling(window=7).mean()
+    # Calculate log return of price (close price)
+    df['feature'] = np.log(df['close'] / df['close'].shift(1))
     
-    # Calculate log return of 7-day SMA divided by volume
-    df['sma_7_log_return'] = np.log(df['sma_7'] / df['sma_7'].shift(1))
-    df['feature'] = df['sma_7_log_return'] / df['volume']
-    
-    # Use only the single feature: log return of 7-day SMA divided by volume
+    # Use only the single feature: log return of price
     feature_columns = ['feature']
     target_column = 'atr'
     
