@@ -80,14 +80,9 @@ def calculate_indicators(df):
     """
     # SMAs
     df['SMA_365'] = df['close'].rolling(window=365).mean()
-    df['SMA_120'] = df['close'].rolling(window=120).mean()
-    df['SMA_90'] = df['close'].rolling(window=90).mean()
-    df['SMA_60'] = df['close'].rolling(window=60).mean()
     
     # EMAs
-    df['EMA_120'] = df['close'].ewm(span=120, adjust=False).mean()
     df['EMA_90'] = df['close'].ewm(span=90, adjust=False).mean()
-    df['EMA_60'] = df['close'].ewm(span=60, adjust=False).mean()
     
     # Strategy: Long if Price > SMA_365, Neutral if Price < SMA_365
     # We use shift(1) to avoid lookahead bias (decision made on yesterday's close implies trade at today's open/close)
@@ -137,15 +132,10 @@ def generate_plot(df):
     # 2. SMAs
     fig.add_trace(go.Scatter(x=df['date'], y=df['SMA_365'], mode='lines', name='SMA 365', 
                              line=dict(color='purple', width=2)), row=1, col=1)
-    
-    for i, period in enumerate([120, 90, 60]):
-        fig.add_trace(go.Scatter(x=df['date'], y=df[f'SMA_{period}'], mode='lines', 
-                                 name=f'SMA {period}', line=dict(width=1, dash='dot')), row=1, col=1)
 
     # 3. EMAs
-    for i, period in enumerate([120, 90, 60]):
-        fig.add_trace(go.Scatter(x=df['date'], y=df[f'EMA_{period}'], mode='lines', 
-                                 name=f'EMA {period}', line=dict(width=1, dash='dash')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['EMA_90'], mode='lines', 
+                             name='EMA 90', line=dict(width=1, dash='dash')), row=1, col=1)
 
     # 4. Buy/Sell Markers
     # Buy signals (Flip to 1)
