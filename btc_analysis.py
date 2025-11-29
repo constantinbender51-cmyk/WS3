@@ -149,7 +149,7 @@ def generate_plot(df):
 
     # 5. Background Colors (Blue for long positions, Orange for short positions)
     # Create a mask for position: 1 = Long, -1 = Short
-    df_clean = df.dropna(subset=['position']).copy()
+    df_clean = df.copy()
     df_clean['group'] = (df_clean['position'] != df_clean['position'].shift()).cumsum()
     
     shapes = []
