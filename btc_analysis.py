@@ -45,6 +45,7 @@ def calculate_indicators(df):
     df.loc[(df['close'] < df['SMA_365']) & (df['close'] > df['SMA_120']), 'position'] = 0
     df['capital'] = 100.0  # Starting capital
     df['entry_price'] = 0.0  # Track entry price for stop loss
+    df['stop_loss_hit'] = 0  # 0 for no hit, 1 for hit
     stop_loss_percent = 0.01  # 1% stop loss
     for i in range(1, len(df)):
         current_position = df.iloc[i]['position']
@@ -65,9 +66,11 @@ def calculate_indicators(df):
         current_low = df.iloc[i]['low']
         if current_position == 1 and entry_price > 0 and current_low <= entry_price * (1 - stop_loss_percent):
             df.iloc[i, df.columns.get_loc('position')] = 0  # Close long position
+            df.iloc[i, df.columns.get_loc('stop_loss_hit')] = 1  # Mark stop loss hit
             current_position = 0
         elif current_position == -1 and entry_price > 0 and current_high >= entry_price * (1 + stop_loss_percent):
             df.iloc[i, df.columns.get_loc('position')] = 0  # Close short position
+            df.iloc[i, df.columns.get_loc('stop_loss_hit')] = 1  # Mark stop loss hit
             current_position = 0
         
         # Calculate capital based on position
@@ -128,6 +131,23 @@ def index():
     plot_url3 = base64.b64encode(img3.getvalue()).decode()
     plt.close()
     
+    # Plot 4: Stop Loss Events
+    plt.figure(figsize=(12, 6))
+    plt.plot(df['timestamp'], df['close'], label='BTC Price', color='blue')
+    stop_loss_dates = df[df['stop_loss_hit'] == 1]['timestamp']
+    stop_loss_prices = df[df['stop_loss_hit'] == 1]['close']
+    plt.scatter(stop_loss_dates, stop_loss_prices, color='red', marker='x', s=100, label='Stop Loss Hit', zorder=5)
+    plt.title('BTC Price with Stop Loss Events')
+    plt.xlabel('Date')
+    plt.ylabel('Price (USDT)')
+    plt.legend()
+    plt.grid(True)
+    img4 = io.BytesIO()
+    plt.savefig(img4, format='png')
+    img4.seek(0)
+    plot_url4 = base64.b64encode(img4.getvalue()).decode()
+    plt.close()
+    
     html = f"""
     <!DOCTYPE html>
     <html>
@@ -142,6 +162,8 @@ def index():
         <img src="data:image/png;base64,{plot_url2}" alt="Positions">
         <h2>Capital</h2>
         <img src="data:image/png;base64,{plot_url3}" alt="Capital">
+        <h2>Stop Loss Events</h2>
+        <img src="data:image/png;base64,{plot_url4}" alt="Stop Loss Events">
     </body>
     </html>
     """
