@@ -50,7 +50,7 @@ def calculate_atr(df, period=14):
     atr = true_range.rolling(window=period).mean()
     return atr
 
-def prepare_data(df, lookback_days=30, forecast_days=2):
+def prepare_data(df, lookback_days=30, forecast_days=4):
     """Prepare data for LSTM model using log returns and volume as features to predict ATR."""
     # Calculate ATR and add to dataframe
     df['atr'] = calculate_atr(df)
@@ -184,7 +184,7 @@ if __name__ == '__main__':
     df = fetch_binance_data()
     
     # Prepare data for model using OHLCV features to predict ATR
-    X, y, feature_scaler, target_scaler = prepare_data(df, lookback_days=30, forecast_days=2)
+    X, y, feature_scaler, target_scaler = prepare_data(df, lookback_days=30, forecast_days=4)
     
     # Split data (simple split for demonstration)
     split = int(0.8 * len(X))
@@ -221,7 +221,7 @@ if __name__ == '__main__':
     # Prepare data for plotting (align dates)
     # Adjust indices to account for lookback_days and forecast_days in prepare_data
     lookback_days = 30
-    forecast_days = 1
+    forecast_days = 4
     train_start_idx = lookback_days + forecast_days - 1  # Start index for training set in original data
     train_end_idx = train_start_idx + len(y_train_actual)
     test_start_idx = lookback_days + forecast_days - 1 + split  # Start index for test set in original data
