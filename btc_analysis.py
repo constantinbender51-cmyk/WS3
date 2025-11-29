@@ -232,7 +232,7 @@ if __name__ == '__main__':
     test_dates = df.index[test_start_idx:test_end_idx]
     
     # Prepare last month data for plotting
-    last_month_days = 30
+    last_month_days = min(30, len(df))  # Use available days if less than 30
     last_month_start_idx = max(0, len(df) - last_month_days)
     last_month_dates = df.index[last_month_start_idx:]
     last_month_df = df.iloc[last_month_start_idx:]
