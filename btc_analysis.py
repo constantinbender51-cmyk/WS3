@@ -36,8 +36,7 @@ def fetch_btc_data():
     return df
 
 def calculate_smas(df):
-    """Calculate 120-day and 365-day Simple Moving Averages."""
-    df['sma_120'] = df['close'].rolling(window=120).mean()
+    """Calculate 365-day Simple Moving Average."""
     df['sma_365'] = df['close'].rolling(window=365).mean()
     return df
 
@@ -49,16 +48,12 @@ def determine_position_status(df):
     for i in range(len(df)):
         row = df.iloc[i]
         sma_365 = row['sma_365']
-        sma_120 = row['sma_120']
         price = row['close']
         
-        if pd.isna(sma_365) or pd.isna(sma_120):
+        if pd.isna(sma_365):
             position = 'neutral'
         elif price > sma_365:
-            if price < sma_120:
-                position = 'short'
-            else:
-                position = 'long'
+            position = 'long'
         else:
             position = 'short'
         
@@ -66,8 +61,7 @@ def determine_position_status(df):
             'date': df.index[i],
             'position': position,
             'price': price,
-            'sma_365': sma_365,
-            'sma_120': sma_120
+            'sma_365': sma_365
         })
         
         if i == len(df) - 1:
@@ -96,18 +90,14 @@ def calculate_capital(df, initial_capital=1000):
         row = df.iloc[i]
         prev_row = df.iloc[i-1]
         
-        # Determine signal based on previous day's SMAs and price
+        # Determine signal based on previous day's SMA and price
         sma_365_prev = prev_row['sma_365']
-        sma_120_prev = prev_row['sma_120']
         price_prev = prev_row['close']
         
-        if pd.isna(sma_365_prev) or pd.isna(sma_120_prev):
+        if pd.isna(sma_365_prev):
             signal = 'neutral'
         elif price_prev > sma_365_prev:
-            if price_prev < sma_120_prev:
-                signal = 'short'
-            else:
-                signal = 'long'
+            signal = 'long'
         else:
             signal = 'short'
         
@@ -168,8 +158,7 @@ def index():
     # Add price trace
     fig.add_trace(go.Scatter(x=df.index, y=df['close'], mode='lines', name='BTC Price', line=dict(color='blue', width=2)), row=1, col=1)
     
-    # Add SMA traces
-    fig.add_trace(go.Scatter(x=df.index, y=df['sma_120'], mode='lines', name='120 SMA', line=dict(color='orange')), row=1, col=1)
+    # Add SMA trace
     fig.add_trace(go.Scatter(x=df.index, y=df['sma_365'], mode='lines', name='365 SMA', line=dict(color='purple', width=2)), row=1, col=1)
     
     # Add capital trace
@@ -245,7 +234,7 @@ def index():
             </div>
             <p><strong>Trading Strategy Capital:</strong> ${{ "%.2f"|format(trading_capital) }}</p>
             <p><strong>Buy and Hold Capital:</strong> ${{ "%.2f"|format(buy_hold_capital) }}</p>
-            <p><em>Strategy: LONG when price > 365 SMA and price >= 120 SMA, SHORT otherwise</em></p>
+            <p><em>Strategy: LONG when price > 365 SMA, SHORT otherwise</em></p>
             <p><em>Green shaded areas = Long positions, Red shaded areas = Short positions</em></p>
         </div>
         {{ plot|safe }}
