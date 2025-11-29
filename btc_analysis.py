@@ -175,15 +175,15 @@ def generate_plot(df):
         color = "rgba(0, 0, 255, 0.1)" if row['state'] else "rgba(255, 165, 0, 0.1)"
         shapes.append(dict(
             type="rect",
-            xref="x", yref="paper",
+            xref="x", 
+            yref="y domain", # Changed from 'paper' to 'y domain' to target the first subplot specifically
             x0=row['start_date'],
             x1=row['end_date'],
             y0=0, y1=1,
             fillcolor=color,
             opacity=0.5,
             layer="below",
-            line_width=0,
-            yref_paper="y1"
+            line_width=0
         ))
 
     # --- CAPITAL CURVE (Row 2) ---
