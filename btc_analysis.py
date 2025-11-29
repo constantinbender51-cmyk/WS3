@@ -76,7 +76,7 @@ def build_lstm_model(input_shape):
     model.compile(optimizer='adam', loss='mean_squared_error')
     return model
 
-def train_model(X_train, y_train, epochs=50, batch_size=32):
+def train_model(X_train, y_train, epochs=100, batch_size=32):
     """Train the LSTM model."""
     model = build_lstm_model((X_train.shape[1], 1))
     history = model.fit(X_train, y_train, batch_size=batch_size, epochs=epochs, validation_split=0.2, verbose=1)
@@ -89,12 +89,12 @@ def predict_future(model, last_sequence, scaler):
     prediction = scaler.inverse_transform(prediction_scaled)
     return prediction[0, 0]
 
-def create_combined_plot(train_dates, train_actual, train_predicted, test_dates, test_actual, test_predicted, history):
+def create_combined_plot(train_dates, train_actual, train_predicted, test_dates, test_actual, test_predicted, history, last_month_dates, last_month_actual, last_month_predicted):
     """Create a combined plot with ATR predictions and loss over epochs."""
-    plt.figure(figsize=(14, 12))
+    plt.figure(figsize=(14, 16))
     
     # Subplot 1: ATR training phase
-    plt.subplot(3, 1, 1)
+    plt.subplot(4, 1, 1)
     plt.plot(train_dates, train_actual, label='Actual ATR', color='blue')
     plt.plot(train_dates, train_predicted, label='Predicted ATR', color='red', linestyle='--')
     plt.title('Training Phase: Actual vs Predicted ATR')
@@ -104,7 +104,7 @@ def create_combined_plot(train_dates, train_actual, train_predicted, test_dates,
     plt.grid(True)
     
     # Subplot 2: ATR testing phase
-    plt.subplot(3, 1, 2)
+    plt.subplot(4, 1, 2)
     plt.plot(test_dates, test_actual, label='Actual ATR', color='blue')
     plt.plot(test_dates, test_predicted, label='Predicted ATR', color='red', linestyle='--')
     plt.title('Testing Phase: Actual vs Predicted ATR')
@@ -113,8 +113,19 @@ def create_combined_plot(train_dates, train_actual, train_predicted, test_dates,
     plt.legend()
     plt.grid(True)
     
-    # Subplot 3: Loss over epochs
-    plt.subplot(3, 1, 3)
+    # Subplot 3: Last month of ATR data
+    plt.subplot(4, 1, 3)
+    plt.plot(last_month_dates, last_month_actual, label='Actual ATR', color='blue', marker='o', markersize=3)
+    plt.plot(last_month_dates, last_month_predicted, label='Predicted ATR', color='red', linestyle='--', marker='s', markersize=3)
+    plt.title('Last Month: Actual vs Predicted ATR')
+    plt.xlabel('Date')
+    plt.ylabel('ATR')
+    plt.legend()
+    plt.grid(True)
+    plt.xticks(rotation=45)
+    
+    # Subplot 4: Loss over epochs
+    plt.subplot(4, 1, 4)
     plt.plot(history.history['loss'], label='Training Loss', color='blue')
     plt.plot(history.history['val_loss'], label='Validation Loss', color='red')
     plt.title('Training Loss vs Validation Loss Over Epochs')
@@ -199,12 +210,34 @@ if __name__ == '__main__':
     train_dates = df.index[train_start_idx:train_end_idx]
     test_dates = df.index[test_start_idx:test_end_idx]
     
+    # Prepare last month data for plotting
+    last_month_days = 30
+    last_month_start_idx = max(0, len(df) - last_month_days)
+    last_month_dates = df.index[last_month_start_idx:]
+    last_month_atr = atr.iloc[last_month_start_idx:]
+    
+    # Prepare sequences for last month predictions
+    last_month_actual = []
+    last_month_predicted = []
+    for i in range(len(last_month_atr) - lookback_days):
+        sequence = last_month_atr.iloc[i:i+lookback_days].values.reshape(-1, 1)
+        sequence_scaled = scaler.transform(sequence)
+        prediction_scaled = model.predict(sequence_scaled.reshape(1, lookback_days, 1))
+        prediction = scaler.inverse_transform(prediction_scaled)[0, 0]
+        actual_value = last_month_atr.iloc[i+lookback_days]
+        
+        last_month_actual.append(actual_value)
+        last_month_predicted.append(prediction)
+    
+    # Adjust last month dates to match prediction length
+    last_month_plot_dates = last_month_dates[lookback_days:lookback_days + len(last_month_actual)]
+    
     # Set up Flask app
     app = Flask(__name__)
     
     @app.route('/')
     def index():
-        buf = create_combined_plot(train_dates, y_train_actual, y_train_pred, test_dates, y_test_actual, y_test_pred, history)
+        buf = create_combined_plot(train_dates, y_train_actual, y_train_pred, test_dates, y_test_actual, y_test_pred, history, last_month_plot_dates, last_month_actual, last_month_predicted)
         return send_file(buf, mimetype='image/png')
     @app.route('/loss')
     def loss_plot():
