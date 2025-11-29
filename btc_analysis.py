@@ -54,8 +54,8 @@ def prepare_data(df, lookback_days=14, forecast_days=14):
     # Calculate ATR and add to dataframe
     df['atr'] = calculate_atr(df)
     
-    # Use log returns and volume as features
-    df['price_feature'] = np.log(df['close'] / df['close'].shift(1))
+    # Use simple returns and volume as features
+    df['price_feature'] = (df['close'] - df['close'].shift(1)) / df['close'].shift(1)
     df['volume_feature'] = df['volume']
     
     # Use both price and volume as features
