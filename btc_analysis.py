@@ -89,10 +89,12 @@ def predict_future(model, last_sequence, scaler):
     prediction = scaler.inverse_transform(prediction_scaled)
     return prediction[0, 0]
 
-def create_plot(train_dates, train_actual, train_predicted, test_dates, test_actual, test_predicted):
-    """Create a plot of actual vs predicted ATR for training and testing phases."""
-    plt.figure(figsize=(14, 8))
-    plt.subplot(2, 1, 1)
+def create_combined_plot(train_dates, train_actual, train_predicted, test_dates, test_actual, test_predicted, history):
+    """Create a combined plot with ATR predictions and loss over epochs."""
+    plt.figure(figsize=(14, 12))
+    
+    # Subplot 1: ATR training phase
+    plt.subplot(3, 1, 1)
     plt.plot(train_dates, train_actual, label='Actual ATR', color='blue')
     plt.plot(train_dates, train_predicted, label='Predicted ATR', color='red', linestyle='--')
     plt.title('Training Phase: Actual vs Predicted ATR')
@@ -101,12 +103,23 @@ def create_plot(train_dates, train_actual, train_predicted, test_dates, test_act
     plt.legend()
     plt.grid(True)
     
-    plt.subplot(2, 1, 2)
+    # Subplot 2: ATR testing phase
+    plt.subplot(3, 1, 2)
     plt.plot(test_dates, test_actual, label='Actual ATR', color='blue')
     plt.plot(test_dates, test_predicted, label='Predicted ATR', color='red', linestyle='--')
     plt.title('Testing Phase: Actual vs Predicted ATR')
     plt.xlabel('Date')
     plt.ylabel('ATR')
+    plt.legend()
+    plt.grid(True)
+    
+    # Subplot 3: Loss over epochs
+    plt.subplot(3, 1, 3)
+    plt.plot(history.history['loss'], label='Training Loss', color='blue')
+    plt.plot(history.history['val_loss'], label='Validation Loss', color='red')
+    plt.title('Training Loss vs Validation Loss Over Epochs')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
     plt.legend()
     plt.grid(True)
     
@@ -191,7 +204,7 @@ if __name__ == '__main__':
     
     @app.route('/')
     def index():
-        buf = create_plot(train_dates, y_train_actual, y_train_pred, test_dates, y_test_actual, y_test_pred)
+        buf = create_combined_plot(train_dates, y_train_actual, y_train_pred, test_dates, y_test_actual, y_test_pred, history)
         return send_file(buf, mimetype='image/png')
     @app.route('/loss')
     def loss_plot():
