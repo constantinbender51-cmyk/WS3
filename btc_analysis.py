@@ -5,6 +5,7 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.callbacks import EarlyStopping
 import matplotlib.pyplot as plt
 from flask import Flask, send_file
 import io
@@ -96,7 +97,8 @@ def build_lstm_model(input_shape):
 def train_model(X_train, y_train, epochs=100, batch_size=32):
     """Train the LSTM model."""
     model = build_lstm_model((X_train.shape[1], X_train.shape[2]))
-    history = model.fit(X_train, y_train, batch_size=batch_size, epochs=epochs, validation_split=0.2, verbose=1)
+    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    history = model.fit(X_train, y_train, batch_size=batch_size, epochs=epochs, validation_split=0.2, verbose=1, callbacks=[early_stopping])
     return model, history
 
 def predict_future(model, last_sequence, feature_scaler, target_scaler):
