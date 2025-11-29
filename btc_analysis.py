@@ -56,7 +56,7 @@ def prepare_data(atr_series, lookback_days=14, forecast_days=14):
     data_scaled = scaler.fit_transform(data)
     
     X, y = [], []
-    for i in range(lookback_days, len(data_scaled) - forecast_days):
+    for i in range(lookback_days, len(data_scaled) - forecast_days + 1):
         X.append(data_scaled[i-lookback_days:i, 0])
         y.append(data_scaled[i+forecast_days-1, 0])  # Predict ATR at the end of forecast period
     
