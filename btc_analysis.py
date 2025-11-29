@@ -41,16 +41,37 @@ def calculate_smas(df):
     df['sma_365'] = df['close'].rolling(window=365).mean()
     return df
 
-def determine_background_color(df):
-    """Determine background color based on SMA logic."""
-    latest = df.iloc[-1]
-    sma_365 = latest['sma_365']
-    price = latest['close']
+def determine_position_status(df):
+    """Determine current position status and historical positions."""
+    positions = []
+    current_position = None
     
-    if price > sma_365:
-        return 'green'
-    else:
-        return 'red'
+    for i in range(len(df)):
+        row = df.iloc[i]
+        sma_365 = row['sma_365']
+        price = row['close']
+        
+        if pd.isna(sma_365):
+            position = 'neutral'
+        elif price > sma_365:
+            position = 'long'
+        else:
+            position = 'short'
+        
+        positions.append({
+            'date': df.index[i],
+            'position': position,
+            'price': price,
+            'sma_365': sma_365
+        })
+        
+        if i == len(df) - 1:
+            current_position = position
+    
+    return {
+        'current_position': current_position,
+        'positions': positions
+    }
 
 def calculate_capital(df, initial_capital=1000):
     """Calculate capital for short/long positions and buy-and-hold."""
@@ -59,9 +80,10 @@ def calculate_capital(df, initial_capital=1000):
     current_price = df['close'].iloc[-1]
     buy_hold_capital = initial_capital * (current_price / buy_price)
     
-    # Trading strategy based on background color logic
+    # Trading strategy based on SMA logic
     capital = initial_capital
     position = None  # 'long', 'short', or None
+    position_history = []
     
     for i in range(1, len(df)):
         row = df.iloc[i]
@@ -71,7 +93,9 @@ def calculate_capital(df, initial_capital=1000):
         sma_365_prev = prev_row['sma_365']
         price_prev = prev_row['close']
         
-        if price_prev > sma_365_prev:
+        if pd.isna(sma_365_prev):
+            signal = 'neutral'
+        elif price_prev > sma_365_prev:
             signal = 'long'
         else:
             signal = 'short'
@@ -79,28 +103,35 @@ def calculate_capital(df, initial_capital=1000):
         # Execute trades
         if signal == 'long' and position != 'long':
             if position == 'short':
-                # Close short position (assume no leverage for simplicity)
-                capital *= (prev_row['close'] / buy_price_short)  # Simplified P&L
+                # Close short position
+                capital *= (prev_row['close'] / buy_price_short)
             # Open long position
             position = 'long'
             buy_price_long = row['close']
         elif signal == 'short' and position != 'short':
             if position == 'long':
                 # Close long position
-                capital *= (row['close'] / buy_price_long)  # Simplified P&L
-            # Open short position (assume no leverage for simplicity)
+                capital *= (row['close'] / buy_price_long)
+            # Open short position
             position = 'short'
             buy_price_short = row['close']
+        
+        position_history.append({
+            'date': df.index[i],
+            'position': position,
+            'capital': capital
+        })
     
     # Close final position if any
     if position == 'long':
         capital *= (current_price / buy_price_long)
     elif position == 'short':
-        capital *= (buy_price_short / current_price)  # Simplified for short
+        capital *= (buy_price_short / current_price)
     
     return {
         'trading_capital': capital,
-        'buy_hold_capital': buy_hold_capital
+        'buy_hold_capital': buy_hold_capital,
+        'position_history': position_history
     }
 
 @app.route('/')
@@ -109,31 +140,65 @@ def index():
     df = fetch_btc_data()
     df = calculate_smas(df)
     
-    # Determine background color
-    bg_color = determine_background_color(df)
+    # Determine position status
+    position_info = determine_position_status(df)
+    current_position = position_info['current_position']
+    positions = position_info['positions']
     
     # Calculate capital
     capital_info = calculate_capital(df)
     trading_capital = capital_info['trading_capital']
     buy_hold_capital = capital_info['buy_hold_capital']
+    position_history = capital_info['position_history']
     
-    # Create plot
+    # Create plot with shaded regions for positions
     fig = make_subplots(rows=1, cols=1)
     
     # Add price trace
-    fig.add_trace(go.Scatter(x=df.index, y=df['close'], mode='lines', name='BTC Price', line=dict(color='blue')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['close'], mode='lines', name='BTC Price', line=dict(color='blue', width=2)), row=1, col=1)
     
     # Add SMA traces
     fig.add_trace(go.Scatter(x=df.index, y=df['sma_120'], mode='lines', name='120 SMA', line=dict(color='orange')), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['sma_365'], mode='lines', name='365 SMA', line=dict(color='purple')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['sma_365'], mode='lines', name='365 SMA', line=dict(color='purple', width=2)), row=1, col=1)
     
-    # Update layout with dynamic background color
+    # Add shaded regions for long/short positions
+    current_region = None
+    region_start = None
+    
+    for i, pos in enumerate(positions):
+        if pos['position'] != current_region:
+            if current_region is not None and region_start is not None:
+                # Close previous region
+                color = 'rgba(0, 255, 0, 0.2)' if current_region == 'long' else 'rgba(255, 0, 0, 0.2)'
+                fig.add_vrect(
+                    x0=region_start, x1=pos['date'],
+                    fillcolor=color, 
+                    layer="below", line_width=0,
+                    annotation_text=current_region.upper(),
+                    annotation_position="top left"
+                )
+            
+            current_region = pos['position']
+            region_start = pos['date']
+    
+    # Close final region
+    if current_region is not None and region_start is not None:
+        color = 'rgba(0, 255, 0, 0.2)' if current_region == 'long' else 'rgba(255, 0, 0, 0.2)'
+        fig.add_vrect(
+            x0=region_start, x1=positions[-1]['date'],
+            fillcolor=color, 
+            layer="below", line_width=0,
+            annotation_text=current_region.upper(),
+            annotation_position="top left"
+        )
+    
+    # Update layout
     fig.update_layout(
-        title='BTC Daily Price with SMAs',
+        title=f'BTC Daily Price with SMAs - Current Position: {current_position.upper()}',
         xaxis_title='Date',
         yaxis_title='Price (USDT)',
-        plot_bgcolor=bg_color,
-        paper_bgcolor=bg_color
+        plot_bgcolor='white',
+        paper_bgcolor='white'
     )
     
     # Convert plot to HTML
@@ -147,22 +212,30 @@ def index():
         <title>BTC Analysis</title>
         <style>
             body { font-family: Arial, sans-serif; margin: 20px; }
-            .info { margin-bottom: 20px; }
+            .info { margin-bottom: 20px; padding: 15px; border-radius: 5px; }
+            .long { background-color: rgba(0, 255, 0, 0.1); border-left: 4px solid green; }
+            .short { background-color: rgba(255, 0, 0, 0.1); border-left: 4px solid red; }
+            .neutral { background-color: rgba(128, 128, 128, 0.1); border-left: 4px solid gray; }
+            .position-indicator { font-weight: bold; font-size: 18px; margin-bottom: 10px; }
         </style>
     </head>
     <body>
         <h1>BTC Daily Price Analysis</h1>
-        <div class="info">
-            <p><strong>Background Color:</strong> {{ bg_color }} (based on SMA logic)</p>
+        <div class="info {{ current_position }}">
+            <div class="position-indicator">
+                Current Position: <span style="color: {{ 'green' if current_position == 'long' else 'red' if current_position == 'short' else 'gray' }}">{{ current_position.upper() }}</span>
+            </div>
             <p><strong>Trading Strategy Capital:</strong> ${{ "%.2f"|format(trading_capital) }}</p>
             <p><strong>Buy and Hold Capital:</strong> ${{ "%.2f"|format(buy_hold_capital) }}</p>
+            <p><em>Strategy: LONG when price > 365 SMA, SHORT otherwise</em></p>
+            <p><em>Green shaded areas = Long positions, Red shaded areas = Short positions</em></p>
         </div>
         {{ plot|safe }}
     </body>
     </html>
     """
     
-    return render_template_string(html_template, bg_color=bg_color, trading_capital=trading_capital, buy_hold_capital=buy_hold_capital, plot=plot_html)
+    return render_template_string(html_template, current_position=current_position, trading_capital=trading_capital, buy_hold_capital=buy_hold_capital, plot=plot_html)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=False)
