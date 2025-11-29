@@ -172,15 +172,14 @@ def generate_plot(df):
         # Add shape to layout
         shapes.append(dict(
             type="rect",
-            xref="x", yref="paper",
+            xref="x", yref="y",
             x0=row['start_date'],
             x1=row['end_date'],
-            y0=0, y1=1, # covers full height of the plot area for this row
+            y0=df_clean['close'].min(), y1=df_clean['close'].max(),
             fillcolor=color,
-            opacity=0.5,
+            opacity=0.1,
             layer="below",
-            line_width=0,
-            yref_paper="y1" # Refer to the first subplot's y-axis domain
+            line_width=0
         ))
 
     # --- CAPITAL CURVE (Row 2) ---
