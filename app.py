@@ -70,8 +70,7 @@ def process_ohlcv_data():
             'high': range(105, 205),
             'low': range(95, 195),
             'close': range(100, 200),
-            'volume': [1000] * 100,
-            'optimal_position': [0] * 100
+            'volume': [1000] * 100
         })
         sample_df['daily_return'] = sample_df['close'].pct_change()
         sample_df['perfect_position'] = (sample_df['daily_return'] > 0).astype(int)
