@@ -53,11 +53,8 @@ def calculate_indicators(df):
         current_close = df.iloc[i]['close']
         prev_close = df.iloc[i-1]['close']
         
-        # Set entry price when position changes to long or short
-        if df.iloc[i-1]['position'] == 0 and current_position != 0:
-            df.iloc[i, df.columns.get_loc('entry_price')] = prev_close
-        else:
-            df.iloc[i, df.columns.get_loc('entry_price')] = df.iloc[i-1]['entry_price']
+        # Set entry price to the previous close for any given day
+        df.iloc[i, df.columns.get_loc('entry_price')] = prev_close
         
         entry_price = df.iloc[i]['entry_price']
         
