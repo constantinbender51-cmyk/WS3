@@ -45,13 +45,12 @@ def determine_background_color(df):
     """Determine background color based on SMA logic."""
     latest = df.iloc[-1]
     sma_365 = latest['sma_365']
-    sma_120 = latest['sma_120']
     price = latest['close']
     
-    if sma_365 > price and sma_120 < price:
-        return 'red'
-    else:
+    if price > sma_365:
         return 'green'
+    else:
+        return 'red'
 
 def calculate_capital(df, initial_capital=1000):
     """Calculate capital for short/long positions and buy-and-hold."""
@@ -70,13 +69,12 @@ def calculate_capital(df, initial_capital=1000):
         
         # Determine signal based on previous day's SMAs and price
         sma_365_prev = prev_row['sma_365']
-        sma_120_prev = prev_row['sma_120']
         price_prev = prev_row['close']
         
-        if sma_365_prev > price_prev and sma_120_prev < price_prev:
-            signal = 'short'
-        else:
+        if price_prev > sma_365_prev:
             signal = 'long'
+        else:
+            signal = 'short'
         
         # Execute trades
         if signal == 'long' and position != 'long':
