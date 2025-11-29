@@ -71,10 +71,10 @@ def prepare_data(df, lookback_days=14, forecast_days=14):
     X, y = [], []
     for i in range(lookback_days, len(features_scaled) - forecast_days + 1):
         X.append(features_scaled[i-lookback_days:i, :])  # Use all OHLCV features
-        y.append(target_scaled[i+forecast_days-1, 0])  # Predict ATR at the end of forecast period
+        y.append(target_scaled[i+forecast_days-1])  # Predict ATR at the end of forecast period
     
     X = np.array(X)
-    y = np.array(y)
+    y = np.array(y).reshape(-1)
     
     return X, y, feature_scaler, target_scaler
 
