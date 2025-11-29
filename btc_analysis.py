@@ -13,10 +13,10 @@ app = Flask(__name__)
 client = Client()
 
 def fetch_btc_data():
-    """Fetch daily BTC OHLCV data from Binance starting from 2020-01-01."""
+    """Fetch daily BTC OHLCV data from Binance starting from 2021-01-01."""
     symbol = 'BTCUSDT'
     interval = Client.KLINE_INTERVAL_1DAY
-    start_date = '2020-01-01'
+    start_date = '2021-01-01'
     
     klines = client.get_historical_klines(symbol, interval, start_date)
     
@@ -88,6 +88,8 @@ def calculate_capital(df, initial_capital=1000):
     # Trading strategy based on SMA logic
     capital = initial_capital
     position = None  # 'long', 'short', or None
+    buy_price_long = None
+    buy_price_short = None
     position_history = []
     
     for i in range(1, len(df)):
