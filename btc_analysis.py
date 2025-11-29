@@ -172,9 +172,9 @@ def generate_plot(df):
     
     for _, row in agg.iterrows():
         if row['position'] == 1:  # Long position
-            color = "rgba(0, 0, 255, 0.1)"
+            color = "rgba(0, 0, 255, 0.3)"
         elif row['position'] == -1:  # Short position
-            color = "rgba(255, 165, 0, 0.1)"
+            color = "rgba(255, 165, 0, 0.3)"
         else:
             continue  # Skip neutral positions (0)
         shapes.append(dict(
