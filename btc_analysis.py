@@ -175,7 +175,7 @@ if __name__ == '__main__':
     df = fetch_binance_data()
     
     # Prepare data for model using OHLCV features to predict ATR
-    X, y, feature_scaler, target_scaler = prepare_data(df, lookback_days=30, forecast_days=4)
+    X, y, feature_scaler, target_scaler = prepare_data(df, lookback_days=30, forecast_days=8)
     
     # Split data (simple split for demonstration)
     split = int(0.8 * len(X))
