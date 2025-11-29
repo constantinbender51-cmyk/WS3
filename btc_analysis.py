@@ -226,9 +226,9 @@ if __name__ == '__main__':
     test_start_idx = lookback_days + (forecast_days - 1) + split  # Start index for test set in original data
     test_end_idx = test_start_idx + len(y_test_actual)
     
-    # Calculate baseline metrics using shifted ATR (shift by 8 days)
-    # Align shifted ATR with predictions (shift ATR series by forecast_days)
-    atr_shifted = df['atr'].shift(-forecast_days).dropna()
+    # Calculate baseline metrics using shifted ATR (shift by 45 days)
+    # Align shifted ATR with predictions (shift ATR series by 45 days into the past)
+    atr_shifted = df['atr'].shift(45).dropna()
     # Get indices for training and testing sets
     train_shifted = atr_shifted.iloc[train_start_idx:train_end_idx]
     test_shifted = atr_shifted.iloc[test_start_idx:test_end_idx]
@@ -247,7 +247,7 @@ if __name__ == '__main__':
     print(f"Test RMSE: {test_rmse}")
     print(f"Test MAE: {test_mae}")
     print(f"Test R²: {test_r2}")
-    print(f"\nBaseline Metrics (shifted ATR by 8 days):")
+    print(f"\nBaseline Metrics (shifted ATR by 45 days):")
     print(f"Training RMSE: {train_baseline_rmse}")
     print(f"Training MAE: {train_baseline_mae}")
     print(f"Training R²: {train_baseline_r2}")
