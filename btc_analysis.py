@@ -110,7 +110,7 @@ def predict_future(model, last_sequence, feature_scaler, target_scaler):
     prediction = target_scaler.inverse_transform(prediction_scaled.reshape(-1, 1))[0, 0]
     return prediction
 
-def create_combined_plot(train_dates, train_actual, train_predicted, test_dates, test_actual, test_predicted, history):
+def create_combined_plot(train_dates, train_actual, train_predicted, test_dates, test_actual, test_predicted, history, train_baseline=None, test_baseline=None):
     """Create a combined plot with ATR predictions and loss over epochs."""
     plt.figure(figsize=(14, 12))
     
@@ -118,6 +118,8 @@ def create_combined_plot(train_dates, train_actual, train_predicted, test_dates,
     plt.subplot(3, 1, 1)
     plt.plot(train_dates, train_actual, label='Actual ATR', color='blue')
     plt.plot(train_dates, train_predicted, label='Predicted ATR', color='red', linestyle='--')
+    if train_baseline is not None:
+        plt.plot(train_dates, train_baseline, label='Baseline (Shifted ATR)', color='green', linestyle=':')
     plt.title('Training Phase: Actual vs Predicted ATR')
     plt.xlabel('Date')
     plt.ylabel('ATR')
@@ -128,6 +130,8 @@ def create_combined_plot(train_dates, train_actual, train_predicted, test_dates,
     plt.subplot(3, 1, 2)
     plt.plot(test_dates, test_actual, label='Actual ATR', color='blue')
     plt.plot(test_dates, test_predicted, label='Predicted ATR', color='red', linestyle='--')
+    if test_baseline is not None:
+        plt.plot(test_dates, test_baseline, label='Baseline (Shifted ATR)', color='green', linestyle=':')
     plt.title('Testing Phase: Actual vs Predicted ATR')
     plt.xlabel('Date')
     plt.ylabel('ATR')
@@ -267,13 +271,35 @@ if __name__ == '__main__':
     test_rmse = np.sqrt(mean_squared_error(y_test_actual, y_test_pred))
     test_mae = mean_absolute_error(y_test_actual, y_test_pred)
     test_r2 = r2_score(y_test_actual, y_test_pred)
-    print(f"\nModel Metrics (with {units} units, predicting ATR 8 days ahead):")
+    
+    # Calculate baseline metrics using shifted ATR (shift by 8 days)
+    # Align shifted ATR with predictions (shift ATR series by forecast_days)
+    atr_shifted = df['atr'].shift(-forecast_days).dropna()
+    # Get indices for training and testing sets
+    train_shifted = atr_shifted.iloc[train_start_idx:train_end_idx]
+    test_shifted = atr_shifted.iloc[test_start_idx:test_end_idx]
+    # Calculate baseline metrics
+    train_baseline_rmse = np.sqrt(mean_squared_error(y_train_actual, train_shifted))
+    train_baseline_mae = mean_absolute_error(y_train_actual, train_shifted)
+    train_baseline_r2 = r2_score(y_train_actual, train_shifted)
+    test_baseline_rmse = np.sqrt(mean_squared_error(y_test_actual, test_shifted))
+    test_baseline_mae = mean_absolute_error(y_test_actual, test_shifted)
+    test_baseline_r2 = r2_score(y_test_actual, test_shifted)
+    
+    print(f"\nModel Metrics (with {best_units} units, predicting ATR 8 days ahead):")
     print(f"Training RMSE: {train_rmse}")
     print(f"Training MAE: {train_mae}")
     print(f"Training R²: {train_r2}")
     print(f"Test RMSE: {test_rmse}")
     print(f"Test MAE: {test_mae}")
     print(f"Test R²: {test_r2}")
+    print(f"\nBaseline Metrics (shifted ATR by 8 days):")
+    print(f"Training RMSE: {train_baseline_rmse}")
+    print(f"Training MAE: {train_baseline_mae}")
+    print(f"Training R²: {train_baseline_r2}")
+    print(f"Test RMSE: {test_baseline_rmse}")
+    print(f"Test MAE: {test_baseline_mae}")
+    print(f"Test R²: {test_baseline_r2}")
     
     # Prepare data for plotting (align dates)
     # Adjust indices to account for lookback_days and forecast_days in prepare_data
@@ -291,7 +317,7 @@ if __name__ == '__main__':
     
     @app.route('/')
     def index():
-        buf = create_combined_plot(train_dates, y_train_actual, y_train_pred, test_dates, y_test_actual, y_test_pred, history)
+        buf = create_combined_plot(train_dates, y_train_actual, y_train_pred, test_dates, y_test_actual, y_test_pred, history, train_baseline=train_shifted, test_baseline=test_shifted)
         return send_file(buf, mimetype='image/png')
     
     @app.route('/loss')
