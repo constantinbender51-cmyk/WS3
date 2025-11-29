@@ -44,13 +44,37 @@ def calculate_indicators(df):
     df.loc[(df['close'] > df['SMA_365']) & (df['close'] < df['SMA_120']), 'position'] = 0
     df.loc[(df['close'] < df['SMA_365']) & (df['close'] > df['SMA_120']), 'position'] = 0
     df['capital'] = 100.0  # Starting capital
+    df['entry_price'] = 0.0  # Track entry price for stop loss
+    stop_loss_percent = 0.10  # 10% stop loss
     for i in range(1, len(df)):
-        if df.iloc[i]['position'] == 1:  # Long position
-            df.iloc[i, df.columns.get_loc('capital')] = df.iloc[i-1]['capital'] * (df.iloc[i]['close'] / df.iloc[i-1]['close'])
-        elif df.iloc[i]['position'] == -1:  # Short position
-            df.iloc[i, df.columns.get_loc('capital')] = df.iloc[i-1]['capital'] * (2 - (df.iloc[i]['close'] / df.iloc[i-1]['close']))
+        current_position = df.iloc[i]['position']
+        prev_capital = df.iloc[i-1]['capital']
+        current_close = df.iloc[i]['close']
+        prev_close = df.iloc[i-1]['close']
+        
+        # Set entry price when position changes to long or short
+        if df.iloc[i-1]['position'] == 0 and current_position != 0:
+            df.iloc[i, df.columns.get_loc('entry_price')] = prev_close
+        else:
+            df.iloc[i, df.columns.get_loc('entry_price')] = df.iloc[i-1]['entry_price']
+        
+        entry_price = df.iloc[i]['entry_price']
+        
+        # Check stop loss conditions
+        if current_position == 1 and entry_price > 0 and current_close <= entry_price * (1 - stop_loss_percent):
+            df.iloc[i, df.columns.get_loc('position')] = 0  # Close long position
+            current_position = 0
+        elif current_position == -1 and entry_price > 0 and current_close >= entry_price * (1 + stop_loss_percent):
+            df.iloc[i, df.columns.get_loc('position')] = 0  # Close short position
+            current_position = 0
+        
+        # Calculate capital based on position
+        if current_position == 1:  # Long position
+            df.iloc[i, df.columns.get_loc('capital')] = prev_capital * (current_close / prev_close)
+        elif current_position == -1:  # Short position
+            df.iloc[i, df.columns.get_loc('capital')] = prev_capital * (2 - (current_close / prev_close))
         else:  # Neutral position
-            df.iloc[i, df.columns.get_loc('capital')] = df.iloc[i-1]['capital']
+            df.iloc[i, df.columns.get_loc('capital')] = prev_capital
     return df
 
 @app.route('/')
