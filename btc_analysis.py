@@ -267,7 +267,7 @@ if __name__ == '__main__':
     test_rmse = np.sqrt(mean_squared_error(y_test_actual, y_test_pred))
     test_mae = mean_absolute_error(y_test_actual, y_test_pred)
     test_r2 = r2_score(y_test_actual, y_test_pred)
-    print(f"\nFinal Model Metrics (with {best_units} units):")
+    print(f"\nModel Metrics (with {units} units, predicting ATR 8 days ahead):")
     print(f"Training RMSE: {train_rmse}")
     print(f"Training MAE: {train_mae}")
     print(f"Training R²: {train_r2}")
@@ -299,10 +299,7 @@ if __name__ == '__main__':
         buf = create_loss_plot(history)
         return send_file(buf, mimetype='image/png')
     
-    @app.route('/units_comparison')
-    def units_comparison():
-        buf = create_units_comparison_plot(units_list, train_losses, test_losses)
-        return send_file(buf, mimetype='image/png')
+
     
     # Run the server
     app.run(host='0.0.0.0', port=8080, debug=False)
