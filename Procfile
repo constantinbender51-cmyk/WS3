@@ -1,1 +1,0 @@
-web: python btc_analysis.py
