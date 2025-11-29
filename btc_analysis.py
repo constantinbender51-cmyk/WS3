@@ -50,15 +50,16 @@ def calculate_atr(df, period=14):
     return atr
 
 def prepare_data(df, lookback_days=14, forecast_days=14):
-    """Prepare data for LSTM model using absolute price as feature to predict ATR."""
+    """Prepare data for LSTM model using absolute price and volume as features to predict ATR."""
     # Calculate ATR and add to dataframe
     df['atr'] = calculate_atr(df)
     
-    # Use absolute price (close price) as feature
-    df['feature'] = df['close']
+    # Use absolute price (close price) and volume as features
+    df['price_feature'] = df['close']
+    df['volume_feature'] = df['volume']
     
-    # Use only the single feature: log return of price
-    feature_columns = ['feature']
+    # Use both price and volume as features
+    feature_columns = ['price_feature', 'volume_feature']
     target_column = 'atr'
     
     # Remove rows with NaN values (from ATR calculation and log derivatives)
@@ -235,7 +236,7 @@ if __name__ == '__main__':
     last_month_actual = []
     last_month_predicted = []
     for i in range(len(last_month_df) - lookback_days):
-        sequence = last_month_df.iloc[i:i+lookback_days][['feature']].values
+        sequence = last_month_df.iloc[i:i+lookback_days][['price_feature', 'volume_feature']].values
         actual_value = last_month_df.iloc[i+lookback_days]['atr']
         prediction = predict_future(model, sequence, feature_scaler, target_scaler)
         
