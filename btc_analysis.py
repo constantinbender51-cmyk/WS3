@@ -115,7 +115,7 @@ def calculate_capital(df, initial_capital=1000):
         if signal == 'long' and position != 'long':
             if position == 'short':
                 # Close short position
-                capital *= (2-(prev_row['close'] / buy_price_short))
+                capital *= (2-(row['close'] / buy_price_short))
             # Open long position
             position = 'long'
             buy_price_long = row['close']
@@ -137,7 +137,7 @@ def calculate_capital(df, initial_capital=1000):
     if position == 'long':
         capital *= (current_price / buy_price_long)
     elif position == 'short':
-        capital *= (2-(buy_price_short / current_price))
+        capital *= (2-(current_price/buy_price_short))
     
     return {
         'trading_capital': capital,
