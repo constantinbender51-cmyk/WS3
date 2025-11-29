@@ -179,13 +179,25 @@ if __name__ == '__main__':
     
     # Predict on training set
     y_train_pred_scaled = model.predict(X_train)
-    y_train_pred = scaler.inverse_transform(y_train_pred_scaled.reshape(-1, 1)).flatten()
-    y_train_actual = scaler.inverse_transform(y_train.reshape(-1, 1)).flatten()
+    # Create dummy arrays with all features for inverse transformation
+    dummy_train_pred = np.zeros((len(y_train_pred_scaled), scaler.n_features_in_))
+    dummy_train_pred[:, 3] = y_train_pred_scaled.flatten()
+    y_train_pred = scaler.inverse_transform(dummy_train_pred)[:, 3]
+    
+    dummy_train_actual = np.zeros((len(y_train), scaler.n_features_in_))
+    dummy_train_actual[:, 3] = y_train.flatten()
+    y_train_actual = scaler.inverse_transform(dummy_train_actual)[:, 3]
     
     # Predict on test set
     y_test_pred_scaled = model.predict(X_test)
-    y_test_pred = scaler.inverse_transform(y_test_pred_scaled.reshape(-1, 1)).flatten()
-    y_test_actual = scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
+    # Create dummy arrays with all features for inverse transformation
+    dummy_test_pred = np.zeros((len(y_test_pred_scaled), scaler.n_features_in_))
+    dummy_test_pred[:, 3] = y_test_pred_scaled.flatten()
+    y_test_pred = scaler.inverse_transform(dummy_test_pred)[:, 3]
+    
+    dummy_test_actual = np.zeros((len(y_test), scaler.n_features_in_))
+    dummy_test_actual[:, 3] = y_test.flatten()
+    y_test_actual = scaler.inverse_transform(dummy_test_actual)[:, 3]
     
     # Calculate accuracy metrics for evaluation
     train_rmse = np.sqrt(mean_squared_error(y_train_actual, y_train_pred))
