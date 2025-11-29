@@ -214,6 +214,7 @@ if __name__ == '__main__':
     
     # Calculate baseline metrics using shifted ATR (shift by 8 days)
     # Align shifted ATR with predictions (shift ATR series by forecast_days)
+    forecast_days = 8
     atr_shifted = df['atr'].shift(-forecast_days).dropna()
     # Get indices for training and testing sets
     train_shifted = atr_shifted.iloc[train_start_idx:train_end_idx]
