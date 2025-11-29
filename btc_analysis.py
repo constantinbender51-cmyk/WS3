@@ -13,10 +13,10 @@ app = Flask(__name__)
 client = Client()
 
 def fetch_btc_data():
-    """Fetch daily BTC OHLCV data from Binance starting from 2022-01-01."""
+    """Fetch daily BTC OHLCV data from Binance starting from 2020-01-01."""
     symbol = 'BTCUSDT'
     interval = Client.KLINE_INTERVAL_1DAY
-    start_date = '2022-01-01'
+    start_date = '2020-01-01'
     
     klines = client.get_historical_klines(symbol, interval, start_date)
     
@@ -160,8 +160,8 @@ def index():
     buy_hold_capital = capital_info['buy_hold_capital']
     position_history = capital_info['position_history']
     
-    # Create plot with shaded regions for positions
-    fig = make_subplots(rows=1, cols=1)
+    # Create plot with subplots for price and capital
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, subplot_titles=('BTC Price with SMAs', 'Capital Over Time'))
     
     # Add price trace
     fig.add_trace(go.Scatter(x=df.index, y=df['close'], mode='lines', name='BTC Price', line=dict(color='blue', width=2)), row=1, col=1)
@@ -169,6 +169,11 @@ def index():
     # Add SMA traces
     fig.add_trace(go.Scatter(x=df.index, y=df['sma_120'], mode='lines', name='120 SMA', line=dict(color='orange')), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['sma_365'], mode='lines', name='365 SMA', line=dict(color='purple', width=2)), row=1, col=1)
+    
+    # Add capital trace
+    capital_dates = [entry['date'] for entry in position_history]
+    capital_values = [entry['capital'] for entry in position_history]
+    fig.add_trace(go.Scatter(x=capital_dates, y=capital_values, mode='lines', name='Trading Capital', line=dict(color='green', width=2)), row=2, col=1)
     
     # Add shaded regions for long/short positions
     current_region = None
@@ -203,12 +208,14 @@ def index():
     
     # Update layout
     fig.update_layout(
-        title=f'BTC Daily Price with SMAs - Current Position: {current_position.upper()}',
+        title=f'BTC Daily Price with SMAs and Capital - Current Position: {current_position.upper()}',
         xaxis_title='Date',
         yaxis_title='Price (USDT)',
         plot_bgcolor='white',
-        paper_bgcolor='white'
+        paper_bgcolor='white',
+        height=800
     )
+    fig.update_yaxes(title_text='Capital (USD)', row=2, col=1)
     
     # Convert plot to HTML
     plot_html = fig.to_html(full_html=False)
