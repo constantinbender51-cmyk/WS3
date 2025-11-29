@@ -159,24 +159,28 @@ def generate_plot(df):
     fig.add_trace(go.Scatter(x=sells['date'], y=sells['close'], mode='markers', name='Sell Signal',
                              marker=dict(symbol='triangle-down', color='red', size=12)), row=1, col=1)
 
-    # 5. Background Colors (Blue above SMA 365, Orange below)
-    df_clean = df.dropna(subset=['SMA_365']).copy()
-    df_clean['state'] = df_clean['close'] > df_clean['SMA_365']
-    df_clean['group'] = (df_clean['state'] != df_clean['state'].shift()).cumsum()
+    # 5. Background Colors for Positions (Blue for long, Orange for short)
+    df_clean = df.dropna(subset=['position']).copy()
+    df_clean['group'] = (df_clean['position'] != df_clean['position'].shift()).cumsum()
     
     shapes = []
     agg = df_clean.groupby('group').agg(
         start_date=('date', 'first'),
         end_date=('date', 'last'),
-        state=('state', 'first')
+        position=('position', 'first')
     )
     
     for _, row in agg.iterrows():
-        color = "rgba(0, 0, 255, 0.1)" if row['state'] else "rgba(255, 165, 0, 0.1)"
+        if row['position'] == 1:  # Long position
+            color = "rgba(0, 0, 255, 0.1)"
+        elif row['position'] == -1:  # Short position
+            color = "rgba(255, 165, 0, 0.1)"
+        else:
+            continue  # Skip neutral positions (0)
         shapes.append(dict(
             type="rect",
             xref="x", 
-            yref="y domain", # Changed from 'paper' to 'y domain' to target the first subplot specifically
+            yref="y domain",
             x0=row['start_date'],
             x1=row['end_date'],
             y0=0, y1=1,
