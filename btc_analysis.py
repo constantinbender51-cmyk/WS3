@@ -31,7 +31,9 @@ def calculate_indicators(df):
     df['position'] = 0  # 0 for neutral, 1 for long, -1 for short
     df.loc[df['close'] > df['SMA_365'], 'position'] = 1
     df.loc[df['close'] < df['SMA_365'], 'position'] = -1
-    df.loc[df['close'] < df['SMA_120'], 'position'] = 0
+    # Update neutral positions based on SMA_120 relative to SMA_365 condition
+    df.loc[(df['close'] > df['SMA_365']) & (df['close'] < df['SMA_120']), 'position'] = 0
+    df.loc[(df['close'] < df['SMA_365']) & (df['close'] > df['SMA_120']), 'position'] = 0
     df['capital'] = 100.0  # Starting capital
     for i in range(1, len(df)):
         if df.iloc[i]['position'] == 1:  # Long position
