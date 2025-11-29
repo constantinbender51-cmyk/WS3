@@ -118,56 +118,56 @@ def generate_plot(df):
     """
     Generates a Plotly HTML string.
     """
-    # Create subplots: Row 1 = Price & MAs, Row 2 = Capital Curve
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                        vertical_spacing=0.05, 
-                        subplot_titles=('BTCUSDT Price Analysis (Log Scale)', 'Capital Curve (Start 100)'),
-                        row_heights=[0.7, 0.3])
+    # Create single subplot with secondary y-axis for capital curve
+    fig = make_subplots(rows=1, cols=1, 
+                        subplot_titles=('BTCUSDT Price Analysis with Capital Development'),
+                        specs=[[{"secondary_y": True}]])
 
-    # --- PRICE CHART (Row 1) ---
+    # --- PRICE CHART WITH CAPITAL CURVE ---
     
     # 1. Price Line
     fig.add_trace(go.Scatter(x=df['date'], y=df['close'], mode='lines', name='Price', 
-                             line=dict(color='black', width=1)), row=1, col=1)
+                             line=dict(color='black', width=1)), secondary_y=False)
     
     # 2. SMAs
     fig.add_trace(go.Scatter(x=df['date'], y=df['SMA_365'], mode='lines', name='SMA 365', 
-                             line=dict(color='purple', width=2)), row=1, col=1)
+                             line=dict(color='purple', width=2)), secondary_y=False)
     
     sma_colors = ['#1f77b4', '#ff7f0e', '#2ca02c'] # Default plotly colors
     for i, period in enumerate([120, 90, 60]):
         fig.add_trace(go.Scatter(x=df['date'], y=df[f'SMA_{period}'], mode='lines', 
-                                 name=f'SMA {period}', line=dict(width=1, dash='dot')), row=1, col=1)
+                                 name=f'SMA {period}', line=dict(width=1, dash='dot')), secondary_y=False)
 
     # 3. EMAs
     for i, period in enumerate([120, 90, 60]):
         fig.add_trace(go.Scatter(x=df['date'], y=df[f'EMA_{period}'], mode='lines', 
-                                 name=f'EMA {period}', line=dict(width=1, dash='dash')), row=1, col=1)
+                                 name=f'EMA {period}', line=dict(width=1, dash='dash')), secondary_y=False)
 
-    # 4. Background Colors (Blue above SMA 365, Orange below)
-    # We identify crossover points to create shapes
-    # This can be heavy if there are too many crossovers, so we create rectangles based on daily data points
-    # Optimization: Find state changes
-    
-    # Create a mask for state: True if > SMA, False if < SMA
-    df_clean = df.dropna(subset=['SMA_365']).copy()
-    df_clean['state'] = df_clean['close'] > df_clean['SMA_365']
-    
-    # Find indices where state changes
-    df_clean['group'] = (df_clean['state'] != df_clean['state'].shift()).cumsum()
+    # 4. Capital Curve on secondary y-axis
+    fig.add_trace(go.Scatter(x=df['date'], y=df['capital_curve'], mode='lines', name='Capital', 
+                             line=dict(color='green', width=2)), secondary_y=True)
+
+    # 5. Background Colors (Blue for long positions, Orange for short positions)
+    # Create a mask for position: 1 = Long, -1 = Short
+    df_clean = df.dropna(subset=['position']).copy()
+    df_clean['group'] = (df_clean['position'] != df_clean['position'].shift()).cumsum()
     
     shapes = []
     
-    # Group by consecutive states to minimize number of shapes
-    # (Plotting thousands of single-day shapes slows down the browser)
+    # Group by consecutive positions to minimize number of shapes
     agg = df_clean.groupby('group').agg(
         start_date=('date', 'first'),
         end_date=('date', 'last'),
-        state=('state', 'first')
+        position=('position', 'first')
     )
     
     for _, row in agg.iterrows():
-        color = "rgba(0, 0, 255, 0.1)" if row['state'] else "rgba(255, 165, 0, 0.1)"
+        if row['position'] == 1:  # Long position
+            color = "rgba(0, 0, 255, 0.1)"
+        elif row['position'] == -1:  # Short position
+            color = "rgba(255, 165, 0, 0.1)"
+        else:
+            continue  # Skip neutral positions
         
         # Add shape to layout
         shapes.append(dict(
@@ -182,21 +182,17 @@ def generate_plot(df):
             line_width=0
         ))
 
-    # --- CAPITAL CURVE (Row 2) ---
-    fig.add_trace(go.Scatter(x=df['date'], y=df['capital_curve'], mode='lines', name='Capital', 
-                             line=dict(color='green', width=2)), row=2, col=1)
-
     # --- LAYOUT SETTINGS ---
     fig.update_layout(
         height=900,
         template="plotly_white",
-        title_text="Binance BTCUSDT Daily Analysis (2018 - Present)",
+        title_text="Binance BTCUSDT Daily Analysis with Capital Development (2018 - Present)",
         hovermode="x unified",
         shapes=shapes # Add the background rectangles
     )
     
-    fig.update_yaxes(type="log", row=1, col=1, title="Price (USDT)")
-    fig.update_yaxes(title="Equity", row=2, col=1)
+    fig.update_yaxes(type="log", title="Price (USDT)", secondary_y=False)
+    fig.update_yaxes(title="Capital", secondary_y=True)
 
     return fig.to_html(full_html=False)
 
