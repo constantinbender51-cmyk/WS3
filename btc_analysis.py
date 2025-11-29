@@ -174,36 +174,7 @@ def create_loss_plot(history):
     plt.close()
     return buf
 
-def create_units_comparison_plot(units_list, train_losses, test_losses):
-    """Create a plot comparing training and testing loss across different unit configurations."""
-    plt.figure(figsize=(12, 8))
-    
-    plt.subplot(2, 1, 1)
-    plt.plot(units_list, train_losses, 'bo-', label='Training Loss', linewidth=2, markersize=8)
-    plt.xscale('log', base=2)
-    plt.yscale('log')
-    plt.xlabel('Number of LSTM Units (log scale)')
-    plt.ylabel('Training Loss (log scale)')
-    plt.title('Training Loss vs Number of LSTM Units')
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    
-    plt.subplot(2, 1, 2)
-    plt.plot(units_list, test_losses, 'ro-', label='Testing Loss', linewidth=2, markersize=8)
-    plt.xscale('log', base=2)
-    plt.yscale('log')
-    plt.xlabel('Number of LSTM Units (log scale)')
-    plt.ylabel('Testing Loss (log scale)')
-    plt.title('Testing Loss vs Number of LSTM Units')
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    
-    plt.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png')
-    buf.seek(0)
-    plt.close()
-    return buf
+
 
 # Main execution
 if __name__ == '__main__':
@@ -218,41 +189,10 @@ if __name__ == '__main__':
     X_train, X_test = X[:split], X[split:]
     y_train, y_test = y[:split], y[split:]
     
-    # Test different unit configurations
-    units_list = [8, 16, 32, 64, 128, 256, 512]
-    train_losses = []
-    test_losses = []
-    
-    print("Testing different LSTM unit configurations...")
-    for units in units_list:
-        print(f"\nTraining model with {units} units...")
-        model, history = train_model(X_train, y_train, units=units)
-        
-        # Predict on training set
-        y_train_pred_scaled = model.predict(X_train)
-        y_train_pred = target_scaler.inverse_transform(y_train_pred_scaled.reshape(-1, 1)).flatten()
-        y_train_actual = target_scaler.inverse_transform(y_train.reshape(-1, 1)).flatten()
-        
-        # Predict on test set
-        y_test_pred_scaled = model.predict(X_test)
-        y_test_pred = target_scaler.inverse_transform(y_test_pred_scaled.reshape(-1, 1)).flatten()
-        y_test_actual = target_scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
-        
-        # Calculate losses
-        train_loss = mean_squared_error(y_train_actual, y_train_pred)
-        test_loss = mean_squared_error(y_test_actual, y_test_pred)
-        
-        train_losses.append(train_loss)
-        test_losses.append(test_loss)
-        
-        print(f"Units: {units}, Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}")
-    
-    # Train final model with the best configuration (lowest test loss)
-    best_units_idx = np.argmin(test_losses)
-    best_units = units_list[best_units_idx]
-    print(f"\nBest configuration: {best_units} units")
-    
-    model, history = train_model(X_train, y_train, units=best_units)
+    # Train model with 16 units
+    units = 16
+    print(f"Training model with {units} units...")
+    model, history = train_model(X_train, y_train, units=units)
     
     # Predict on training set
     y_train_pred_scaled = model.predict(X_train)
@@ -286,7 +226,7 @@ if __name__ == '__main__':
     test_baseline_mae = mean_absolute_error(y_test_actual, test_shifted)
     test_baseline_r2 = r2_score(y_test_actual, test_shifted)
     
-    print(f"\nModel Metrics (with {best_units} units, predicting ATR 8 days ahead):")
+    print(f"\nModel Metrics (with {units} units, predicting ATR 8 days ahead):")
     print(f"Training RMSE: {train_rmse}")
     print(f"Training MAE: {train_mae}")
     print(f"Training R²: {train_r2}")
