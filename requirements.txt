@@ -1,5 +1,0 @@
-pandas
-flask
-plotly
-requests
-gunicorn
