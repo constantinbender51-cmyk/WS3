@@ -237,7 +237,7 @@ if __name__ == '__main__':
     last_month_actual = []
     last_month_predicted = []
     for i in range(len(last_month_df) - lookback_days):
-        sequence = last_month_df.iloc[i:i+lookback_days][['price_feature', 'volume_feature']].values
+        sequence = last_month_df.iloc[i:i+lookback_days][['price_feature', 'volume_feature', 'high_low_feature']].values
         actual_value = last_month_df.iloc[i+lookback_days]['atr']
         prediction = predict_future(model, sequence, feature_scaler, target_scaler)
         
