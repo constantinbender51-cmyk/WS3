@@ -61,10 +61,12 @@ def calculate_indicators(df):
         entry_price = df.iloc[i]['entry_price']
         
         # Check stop loss conditions
-        if current_position == 1 and entry_price > 0 and current_close <= entry_price * (1 - stop_loss_percent):
+        current_high = df.iloc[i]['high']
+        current_low = df.iloc[i]['low']
+        if current_position == 1 and entry_price > 0 and current_low <= entry_price * (1 - stop_loss_percent):
             df.iloc[i, df.columns.get_loc('position')] = 0  # Close long position
             current_position = 0
-        elif current_position == -1 and entry_price > 0 and current_close >= entry_price * (1 + stop_loss_percent):
+        elif current_position == -1 and entry_price > 0 and current_high >= entry_price * (1 + stop_loss_percent):
             df.iloc[i, df.columns.get_loc('position')] = 0  # Close short position
             current_position = 0
         
