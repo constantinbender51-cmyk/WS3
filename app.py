@@ -11,7 +11,7 @@ app = Flask(__name__)
 # Constants
 GOOGLE_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1bjfIzg2_I_zN95v5oQac671_4AV0D74x/edit?usp=drivesdk&ouid=114372102418564925207&rtpof=true&sd=true'
 LOCAL_CSV_FILENAME = 'ohlcv_data.csv'
-FLAT_TRADE_THRESHOLD = 0.01  # 1% threshold
+FLAT_TRADE_THRESHOLD = 0.02  # 2% threshold
 
 # --- Data Processing Function ---
 def process_ohlcv_data():
