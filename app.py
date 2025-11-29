@@ -27,7 +27,7 @@ def process_ohlcv_data():
         print("Data downloaded and loaded successfully.")
 
         # Ensure required columns are present
-        required_columns = ['datetime', 'Close']
+        required_columns = ['datetime', 'close']
         for col in required_columns:
             if col not in df.columns:
                 raise ValueError(f"CSV must contain a '{col}' column.")
@@ -37,7 +37,7 @@ def process_ohlcv_data():
         df = df.sort_values('datetime').reset_index(drop=True)
 
         # 1. Calculate daily returns
-        df['daily_return'] = df['Close'].pct_change()
+        df['daily_return'] = df['close'].pct_change()
         
         # 2. Add initial 'perfect_position' column: 1 for positive return, 0 for non-positive
         df['perfect_position'] = (df['daily_return'] > 0).astype(int)
@@ -66,13 +66,14 @@ def process_ohlcv_data():
         dates = pd.date_range(start='2023-01-01', periods=100, freq='D')
         sample_df = pd.DataFrame({
             'datetime': dates,
-            'Open': range(100, 200),
-            'High': range(105, 205),
-            'Low': range(95, 195),
-            'Close': range(100, 200),
-            'Volume': [1000] * 100
+            'open': range(100, 200),
+            'high': range(105, 205),
+            'low': range(95, 195),
+            'close': range(100, 200),
+            'volume': [1000] * 100,
+            'optimal_position': [0] * 100
         })
-        sample_df['daily_return'] = sample_df['Close'].pct_change()
+        sample_df['daily_return'] = sample_df['close'].pct_change()
         sample_df['perfect_position'] = (sample_df['daily_return'] > 0).astype(int)
         return sample_df
 
@@ -86,7 +87,7 @@ def index():
     
     # Plot Close price
     plt.subplot(2, 1, 1)
-    plt.plot(df['datetime'], df['Close'], label='Close Price', linewidth=2)
+    plt.plot(df['datetime'], df['close'], label='Close Price', linewidth=2)
     plt.title('OHLCV Data with Perfect Positions')
     plt.ylabel('Price')
     plt.legend()
