@@ -46,7 +46,7 @@ def calculate_indicators(df):
     df['capital'] = 100.0  # Starting capital
     df['entry_price'] = 0.0  # Track entry price for stop loss
     df['stop_loss_hit'] = 0  # 0 for no hit, 1 for hit
-    stop_loss_percent = 0.01  # 1% stop loss
+    stop_loss_percent = 0.10  # 10% stop loss
     for i in range(1, len(df)):
         current_position = df.iloc[i]['position']
         prev_capital = df.iloc[i-1]['capital']
