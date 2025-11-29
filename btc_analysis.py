@@ -84,16 +84,22 @@ def calculate_indicators(df):
     # EMAs
     df['EMA_90'] = df['close'].ewm(span=90, adjust=False).mean()
     
-    # Strategy: Long if Price > SMA_365, Neutral if Price < SMA_365
+    # Strategy: Long if Price > SMA_365, Short if Price < SMA_365
     # We use shift(1) to avoid lookahead bias (decision made on yesterday's close implies trade at today's open/close)
-    # 1 for Long, 0 for Neutral. 
+    # 1 for Long, -1 for Short, 0 for Neutral.
     
     conditions = [
-        df['close'] > df['SMA_365']
+        df['close'] > df['SMA_365'],
+        df['close'] < df['SMA_365']
     ]
-    choices = [1] # 1 = Long
+    choices = [1, -1] # 1 = Long, -1 = Short
     
     df['position'] = np.select(conditions, choices, default=0)
+    
+    # Stop-loss: If price moves against position on that day, stay out for the rest of the day (set position to 0)
+    # For short positions: If high price > previous close (price increases against short), set position to 0
+    stop_loss_condition = (df['position'] == -1) & (df['high'] > df['close'].shift(1))
+    df.loc[stop_loss_condition, 'position'] = 0
     
     # Identify trade entries
     # Position change: 
@@ -228,7 +234,7 @@ def dashboard():
                     <div><strong>Current Price:</strong> ${df['close'].iloc[-1]:,.2f}</div>
                     <div><strong>365 SMA:</strong> ${df['SMA_365'].iloc[-1]:,.2f}</div>
                     <div><strong>Strategy Return:</strong> {((df['capital_curve'].iloc[-1]/100 - 1)*100):.2f}%</div>
-                    <div><strong>Signal:</strong> {'LONG' if df['close'].iloc[-1] > df['SMA_365'].iloc[-1] else 'SHORT'}</div>
+                    <div><strong>Signal:</strong> {'LONG' if df['position'].iloc[-1] == 1 else 'SHORT' if df['position'].iloc[-1] == -1 else 'NEUTRAL'}</div>
                 </div>
                 <div>
                     {plot_html}
