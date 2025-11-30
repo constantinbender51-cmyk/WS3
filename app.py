@@ -4,7 +4,7 @@ import pandas as pd
 import requests
 from datetime import datetime, timedelta
 import xgboost as xgb
-from sklearn.model_selection import TimeSeriesSplit
+from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import joblib
 import warnings
@@ -231,8 +231,8 @@ class RangePredictor:
         self.feature_engine = FeatureEngine()
         self.evaluation_data = {}
     
-    def train(self, df, test_size=0.15, val_size=0.15):
-        """Train the model with proper time-series split"""
+    def train(self, df, test_size=0.15):
+        """Train the model with GridSearchCV and time-series cross-validation"""
         
         # Engineer features
         print("\nEngineering features...")
@@ -247,51 +247,82 @@ class RangePredictor:
         print(f"Total samples after feature engineering: {len(df_features)}")
         print(f"Features: {len(self.feature_cols)}")
         
-        # Time-series split
+        # Time-series split for test set
         n = len(df_features)
         test_start = int(n * (1 - test_size))
-        val_start = int(n * (1 - test_size - val_size))
         
-        train_df = df_features.iloc[:val_start]
-        val_df = df_features.iloc[val_start:test_start]
+        train_val_df = df_features.iloc[:test_start]
         test_df = df_features.iloc[test_start:]
         
+        X_train_val, y_train_val = train_val_df[self.feature_cols], train_val_df['target']
+        X_test, y_test = test_df[self.feature_cols], test_df['target']
+        
         print(f"\nData split:")
-        print(f"Train: {len(train_df)} samples ({train_df.index[0]} to {train_df.index[-1]})")
-        print(f"Val:   {len(val_df)} samples ({val_df.index[0]} to {val_df.index[-1]})")
-        print(f"Test:  {len(test_df)} samples ({test_df.index[0]} to {test_df.index[-1]})")
+        print(f"Train+Val: {len(train_val_df)} samples ({train_val_df.index[0]} to {train_val_df.index[-1]})")
+        print(f"Test:      {len(test_df)} samples ({test_df.index[0]} to {test_df.index[-1]})")
+        
+        # GridSearchCV with TimeSeriesSplit
+        print("\nSetting up GridSearchCV...")
+        
+        # Parameter grid for hyperparameter tuning
+        param_grid = {
+            'learning_rate': [0.01, 0.05, 0.1],
+            'max_depth': [3, 4, 5, 6],
+            'min_child_weight': [3, 5, 7],
+            'subsample': [0.7, 0.8, 0.9],
+            'colsample_bytree': [0.7, 0.8, 0.9],
+            'gamma': [0.1, 0.3, 0.5],
+            'alpha': [0.1, 0.5, 1.0],
+            'lambda': [1.0, 3.0, 5.0]
+        }
+        
+        # Base parameters
+        base_params = {
+            'objective': 'reg:squarederror',
+            'eval_metric': 'mae',
+            'random_state': 42,
+            'n_jobs': -1,
+            'n_estimators': 1000
+        }
+        
+        # TimeSeriesSplit for cross-validation
+        tscv = TimeSeriesSplit(n_splits=5)
+        
+        # GridSearchCV
+        grid_search = GridSearchCV(
+            estimator=xgb.XGBRegressor(**base_params),
+            param_grid=param_grid,
+            cv=tscv,
+            scoring='neg_mean_absolute_error',
+            n_jobs=-1,
+            verbose=1
+        )
+        
+        print("\nStarting GridSearchCV...")
+        print(f"Parameter combinations: {len(param_grid['learning_rate']) * len(param_grid['max_depth']) * len(param_grid['min_child_weight']) * len(param_grid['subsample']) * len(param_grid['colsample_bytree']) * len(param_grid['gamma']) * len(param_grid['alpha']) * len(param_grid['lambda'])}")
+        
+        # Fit GridSearchCV
+        grid_search.fit(X_train_val, y_train_val)
+        
+        print("\nGridSearchCV completed!")
+        print(f"Best parameters: {grid_search.best_params_}")
+        print(f"Best CV score: {-grid_search.best_score_:.4f}")
+        
+        # Use best estimator
+        self.model = grid_search.best_estimator_
+        
+        # Create validation set from last 20% of train_val for evaluation
+        val_start = int(len(train_val_df) * 0.8)
+        train_df = train_val_df.iloc[:val_start]
+        val_df = train_val_df.iloc[val_start:]
         
         X_train, y_train = train_df[self.feature_cols], train_df['target']
         X_val, y_val = val_df[self.feature_cols], val_df['target']
-        X_test, y_test = test_df[self.feature_cols], test_df['target']
         
-        # XGBoost parameters
-        params = {
-            'objective': 'reg:squarederror',
-            'eval_metric': 'mae',
-            'learning_rate': 0.01,
-            'max_depth': 4,
-            'min_child_weight': 5,
-            'subsample': 0.7,
-            'colsample_bytree': 0.7,
-            'colsample_bylevel': 0.7,
-            'gamma': 0.5,
-            'alpha': 0.5,
-            'lambda': 3.0,
-            'random_state': 42,
-            'n_jobs': -1
-        }
-        
-        print("\nTraining XGBoost model...")
-        
-        self.model = xgb.XGBRegressor(**params, n_estimators=1000)
-        
-        self.model.fit(
-            X_train, y_train,
-            eval_set=[(X_train, y_train), (X_val, y_val)],
-            early_stopping_rounds=50,
-            verbose=50
-        )
+        print(f"\nFinal training split:")
+        print(f"Train: {len(train_df)} samples ({train_df.index[0]} to {train_df.index[-1]})")
+        print(f"Val:   {len(val_df)} samples ({val_df.index[0]} to {val_df.index[-1]})")
+        print(f"Test:  {len(test_df)} samples ({test_df.index[0]} to {test_df.index[-1]})")
         
         # Evaluate and store results
         print("\n" + "="*60)
@@ -302,7 +333,8 @@ class RangePredictor:
         self.evaluation_data = {
             'train': {'X': X_train, 'y': y_train, 'df': train_df},
             'val': {'X': X_val, 'y': y_val, 'df': val_df},
-            'test': {'X': X_test, 'y': y_test, 'df': test_df}
+            'test': {'X': X_test, 'y': y_test, 'df': test_df},
+            'best_params': grid_search.best_params_
         }
         
         for name, X, y in [('Train', X_train, y_train), 
@@ -343,6 +375,15 @@ class RangePredictor:
         self.evaluation_data['feature_importance'] = importance_df
         
         print(importance_df.head(15).to_string(index=False))
+        
+        # Grid search results summary
+        print("\n" + "="*60)
+        print("GRID SEARCH RESULTS")
+        print("="*60)
+        print(f"Best parameters found:")
+        for param, value in grid_search.best_params_.items():
+            print(f"  {param}: {value}")
+        print(f"\nBest cross-validation MAE: {-grid_search.best_score_:.4f}")
         
         return test_df, X_test, y_test
     
