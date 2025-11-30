@@ -6,6 +6,8 @@ from plotly.subplots import make_subplots
 from flask import Flask, render_template_string
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split
 import numpy as np
 
 app = Flask(__name__)
