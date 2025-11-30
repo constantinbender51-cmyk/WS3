@@ -81,13 +81,13 @@ def index():
         return "Error: Data not available. Check server logs for details."
     
     # Train logistic regression model
-    # Prepare features: previous 2 days close, |high-low|, 7-day SMA, 28-day SMA
+    # Prepare features: close from day i-1, close from day i-2, |high-low| from day i-1, 7-day SMA from day i-1, 28-day SMA from day i-1
     df_model = df.copy()
     df_model['prev_close_1'] = df_model['close'].shift(1)
     df_model['prev_close_2'] = df_model['close'].shift(2)
-    df_model['high_low_range'] = df_model['high'] - df_model['low']
-    df_model['sma_7'] = df_model['close'].rolling(window=7).mean()
-    df_model['sma_28'] = df_model['close'].rolling(window=28).mean()
+    df_model['high_low_range'] = (df_model['high'] - df_model['low']).shift(1)
+    df_model['sma_7'] = df_model['close'].rolling(window=7).mean().shift(1)
+    df_model['sma_28'] = df_model['close'].rolling(window=28).mean().shift(1)
     
     # Filter data where sma_position is exactly 0 and exclude first 365 days
     start_date = df_model['datetime'].iloc[0] + pd.Timedelta(days=365)
