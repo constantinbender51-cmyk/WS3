@@ -1,5 +1,0 @@
-flask
-gdown
-pandas
-plotly
-scikit-learn
