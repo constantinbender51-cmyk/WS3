@@ -86,8 +86,10 @@ def index():
     df_model['prev_close_1'] = df_model['close'].shift(1)
     df_model['prev_close_2'] = df_model['close'].shift(2)
     
-    # Filter data where sma_position is exactly 0
+    # Filter data where sma_position is exactly 0 and exclude first 365 days
+    start_date = df_model['datetime'].iloc[0] + pd.Timedelta(days=365)
     filtered_data = df_model[(df_model['sma_position'] == 0) & 
+                            (df_model['datetime'] >= start_date) &
                             (~df_model['prev_close_1'].isna()) & 
                             (~df_model['prev_close_2'].isna())].copy()
     
@@ -116,9 +118,16 @@ def index():
         
         df_model.loc[train_indices, 'train_pred'] = train_predictions
         df_model.loc[test_indices, 'test_pred'] = test_predictions
+        
+        # Add previous close for color coding
+        df_model['prev_close'] = df_model['close'].shift(1)
+        df_model['train_color'] = np.where(df_model.loc[train_indices, 'train_pred'] > df_model.loc[train_indices, 'prev_close'], 'green', 'red')
+        df_model['test_color'] = np.where(df_model.loc[test_indices, 'test_pred'] > df_model.loc[test_indices, 'prev_close'], 'green', 'red')
     else:
         df_model['train_pred'] = np.nan
         df_model['test_pred'] = np.nan
+        df_model['train_color'] = 'gray'
+        df_model['test_color'] = 'gray'
     
     # Create subplots
     fig = make_subplots(
@@ -157,13 +166,13 @@ def index():
         row=5, col=1
     )
     
-    # Add linear regression predictions
+    # Add linear regression predictions with color coding
     fig.add_trace(
-        go.Scatter(x=df_model['datetime'], y=df_model['train_pred'], mode='markers', name='Train Predictions', marker=dict(color='green', size=4)),
+        go.Scatter(x=df_model['datetime'], y=df_model['train_pred'], mode='markers', name='Train Predictions', marker=dict(color=df_model['train_color'], size=4)),
         row=6, col=1
     )
     fig.add_trace(
-        go.Scatter(x=df_model['datetime'], y=df_model['test_pred'], mode='markers', name='Test Predictions', marker=dict(color='orange', size=4)),
+        go.Scatter(x=df_model['datetime'], y=df_model['test_pred'], mode='markers', name='Test Predictions', marker=dict(color=df_model['test_color'], size=4)),
         row=6, col=1
     )
     fig.add_trace(
