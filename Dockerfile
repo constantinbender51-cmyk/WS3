@@ -25,5 +25,8 @@ RUN mkdir -p /app/models
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 
+# Expose port 8080 for web server
+EXPOSE 8080
+
 # Run the application
 CMD ["python", "app.py"]
