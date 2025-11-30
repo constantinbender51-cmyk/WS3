@@ -484,7 +484,6 @@ HTML_TEMPLATE = """
             <button class="tab active" onclick="showTab('overview')">Overview</button>
             <button class="tab" onclick="showTab('predictions')">Predictions</button>
             <button class="tab" onclick="showTab('features')">Features</button>
-            <button class="tab" onclick="showTab('insights')">Insights</button>
         </div>
         
         <div id="overview" class="tab-content active">
@@ -504,9 +503,7 @@ HTML_TEMPLATE = """
             <div class="chart" id="feature-analysis"></div>
         </div>
         
-        <div id="insights" class="tab-content">
-            <div class="insights" id="insights-content"></div>
-        </div>
+
     </div>
     
     <script>
@@ -524,7 +521,6 @@ HTML_TEMPLATE = """
                 renderMetrics(data);
                 renderPredictions(data);
                 renderFeatures(data);
-                renderInsights(data);
             });
         
         function renderMetrics(data) {
@@ -622,60 +618,7 @@ HTML_TEMPLATE = """
             });
         }
         
-        function renderInsights(data) {
-            const html = `
-                <h3>🔍 Key Insights from Model Evaluation</h3>
-                
-                <h4>1. Overfitting Detected</h4>
-                <ul>
-                    <li><strong>Train R² = ${data.train.r2.toFixed(3)}</strong> (excellent) vs <strong>Test R² = ${data.test.r2.toFixed(3)}</strong> (poor)</li>
-                    <li>Large gap indicates the model memorized training patterns that don't generalize</li>
-                    <li>The model learned training-specific noise rather than true predictive patterns</li>
-                </ul>
-                
-                <h4>2. Why Test Performance is Low</h4>
-                <ul>
-                    <li><strong>Regime Change:</strong> Test period (Nov 2024 - Nov 2025) may have different volatility patterns than training data (2018-2023)</li>
-                    <li><strong>Market Evolution:</strong> Crypto markets evolved significantly - 2024/2025 patterns differ from 2018-2023</li>
-                    <li><strong>Feature Limitations:</strong> Current features may not capture recent market dynamics</li>
-                    <li><strong>MAPE = ${data.test.mape.toFixed(1)}%</strong> means predictions are off by ~40% on average</li>
-                </ul>
-                
-                <h4>3. Model Behavior Analysis</h4>
-                <ul>
-                    <li><strong>Conservative Predictions:</strong> Model tends to predict around mean range values</li>
-                    <li><strong>Misses Extremes:</strong> Struggles with high volatility spikes (Nov 20: predicted $2489, actual $6899)</li>
-                    <li><strong>Reasonable on Normal Days:</strong> Performs better on typical volatility days (Nov 21: -1.4% error)</li>
-                </ul>
-                
-                <h4>4. Top Predictive Features</h4>
-                <ul>
-                    <li><strong>range_ma_5 (28.5%):</strong> Recent average range is most predictive</li>
-                    <li><strong>atr (21.1%):</strong> ATR captures volatility well</li>
-                    <li><strong>range_ma_10 (17.7%):</strong> 10-day average also important</li>
-                    <li>Temporal and regime features have minimal impact (<3% each)</li>
-                </ul>
-                
-                <h4>5. Recommendations for Improvement</h4>
-                <ul>
-                    <li><strong>Stronger Regularization:</strong> Increase alpha/lambda to reduce overfitting</li>
-                    <li><strong>Add Recent Features:</strong> Include features from 2024+ data patterns</li>
-                    <li><strong>Regime Detection:</strong> Train separate models for high/low volatility regimes</li>
-                    <li><strong>Ensemble Approach:</strong> Combine with GARCH or other volatility models</li>
-                    <li><strong>Rolling Retraining:</strong> Retrain monthly to adapt to market changes</li>
-                    <li><strong>Quantile Prediction:</strong> Predict range distributions instead of point estimates</li>
-                </ul>
-                
-                <h4>6. Practical Use Despite Low R²</h4>
-                <ul>
-                    <li>Even with R² = ${data.test.r2.toFixed(3)}, predictions provide directional guidance</li>
-                    <li>Use predictions as one signal among many, not standalone</li>
-                    <li>Best for risk management (setting wide stop-losses) rather than precise trading</li>
-                    <li>Consider prediction + 1 standard deviation for conservative estimates</li>
-                </ul>
-            `;
-            document.getElementById('insights-content').innerHTML = html;
-        }
+
     </script>
 </body>
 </html>
