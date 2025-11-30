@@ -4,6 +4,9 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from flask import Flask, render_template_string
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split
+import numpy as np
 
 app = Flask(__name__)
 
@@ -75,10 +78,50 @@ def index():
     if df.empty:
         return "Error: Data not available. Check server logs for details."
     
+    # Train linear regression model
+    # Prepare features: previous 2 days close
+    df_model = df.copy()
+    df_model['prev_close_1'] = df_model['close'].shift(1)
+    df_model['prev_close_2'] = df_model['close'].shift(2)
+    
+    # Filter data where sma_position is exactly 0
+    filtered_data = df_model[(df_model['sma_position'] == 0) & 
+                            (~df_model['prev_close_1'].isna()) & 
+                            (~df_model['prev_close_2'].isna())].copy()
+    
+    # Prepare features and target
+    X = filtered_data[['prev_close_1', 'prev_close_2']]
+    y = filtered_data['close']
+    
+    # 60-40 train-test split
+    if len(X) > 0:
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.4, random_state=42, shuffle=False)
+        
+        # Train linear regression model
+        model = LinearRegression()
+        model.fit(X_train, y_train)
+        
+        # Make predictions
+        train_predictions = model.predict(X_train)
+        test_predictions = model.predict(X_test)
+        
+        # Store predictions back in dataframe
+        df_model['train_pred'] = np.nan
+        df_model['test_pred'] = np.nan
+        
+        train_indices = X_train.index
+        test_indices = X_test.index
+        
+        df_model.loc[train_indices, 'train_pred'] = train_predictions
+        df_model.loc[test_indices, 'test_pred'] = test_predictions
+    else:
+        df_model['train_pred'] = np.nan
+        df_model['test_pred'] = np.nan
+    
     # Create subplots
     fig = make_subplots(
-        rows=5, cols=1,
-        subplot_titles=('Price (Close)', 'SMA Position', 'Model Output', 'Capital 1 (SMA-based)', 'Capital 2 (Model-based)'),
+        rows=6, cols=1,
+        subplot_titles=('Price (Close)', 'SMA Position', 'Model Output', 'Capital 1 (SMA-based)', 'Capital 2 (Model-based)', 'Linear Regression Predictions'),
         vertical_spacing=0.08
     )
     
@@ -112,14 +155,29 @@ def index():
         row=5, col=1
     )
     
+    # Add linear regression predictions
+    fig.add_trace(
+        go.Scatter(x=df_model['datetime'], y=df_model['train_pred'], mode='markers', name='Train Predictions', marker=dict(color='green', size=4)),
+        row=6, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=df_model['datetime'], y=df_model['test_pred'], mode='markers', name='Test Predictions', marker=dict(color='orange', size=4)),
+        row=6, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=df['datetime'], y=df['close'], mode='lines', name='Actual Close', line=dict(color='blue', width=1)),
+        row=6, col=1
+    )
+    
     # Update layout
-    fig.update_layout(height=1200, title_text="Financial Data Visualization")
-    fig.update_xaxes(title_text="Datetime", row=5, col=1)
+    fig.update_layout(height=1400, title_text="Financial Data Visualization")
+    fig.update_xaxes(title_text="Datetime", row=6, col=1)
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="SMA Position", row=2, col=1)
     fig.update_yaxes(title_text="Model Output", row=3, col=1)
     fig.update_yaxes(title_text="Capital 1", row=4, col=1)
     fig.update_yaxes(title_text="Capital 2", row=5, col=1)
+    fig.update_yaxes(title_text="Price", row=6, col=1)
     
     # Convert plot to HTML
     plot_html = fig.to_html(include_plotlyjs='cdn')
