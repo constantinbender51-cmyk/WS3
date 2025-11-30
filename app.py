@@ -28,7 +28,7 @@ try:
     else:
         raise KeyError("CSV must contain a 'datetime' column")
     # Check for required columns
-    required_cols = ['datetime', 'ohlcv', 'sma_position', 'model_output']
+    required_cols = ['datetime', 'open', 'high', 'low', 'close', 'sma_position', 'model_output']
     for col in required_cols:
         if col not in df.columns:
             raise KeyError(f"CSV must contain a '{col}' column")
@@ -44,13 +44,13 @@ def index():
     # Create subplots
     fig = make_subplots(
         rows=3, cols=1,
-        subplot_titles=('Price (OHLCV)', 'SMA Position', 'Model Output'),
+        subplot_titles=('Price (Close)', 'SMA Position', 'Model Output'),
         vertical_spacing=0.1
     )
     
-    # Add price trace (using ohlcv column)
+    # Add price trace (using close column)
     fig.add_trace(
-        go.Scatter(x=df['datetime'], y=df['ohlcv'], mode='lines', name='Price'),
+        go.Scatter(x=df['datetime'], y=df['close'], mode='lines', name='Price'),
         row=1, col=1
     )
     
