@@ -695,8 +695,8 @@ def get_evaluation():
     def prepare_split_data(split_name):
         split_data = eval_data[split_name]
         df = split_data['df']
-        actual = split_data['actual_range'].values
-        predicted = split_data['pred_range'].values
+        actual = split_data['actual_range']
+        predicted = split_data['pred_range']
         
         mae = mean_absolute_error(split_data['y'], split_data['pred'])
         rmse = np.sqrt(mean_squared_error(split_data['y'], split_data['pred']))
