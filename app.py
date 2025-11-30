@@ -112,6 +112,8 @@ def index():
         # Store predictions back in dataframe
         df_model['train_pred'] = np.nan
         df_model['test_pred'] = np.nan
+        df_model['train_color'] = 'gray'
+        df_model['test_color'] = 'gray'
         
         train_indices = X_train.index
         test_indices = X_test.index
@@ -121,8 +123,8 @@ def index():
         
         # Add previous close for color coding
         df_model['prev_close'] = df_model['close'].shift(1)
-        df_model['train_color'] = np.where(df_model.loc[train_indices, 'train_pred'] > df_model.loc[train_indices, 'prev_close'], 'green', 'red')
-        df_model['test_color'] = np.where(df_model.loc[test_indices, 'test_pred'] > df_model.loc[test_indices, 'prev_close'], 'green', 'red')
+        df_model.loc[train_indices, 'train_color'] = np.where(train_predictions > df_model.loc[train_indices, 'prev_close'], 'green', 'red')
+        df_model.loc[test_indices, 'test_color'] = np.where(test_predictions > df_model.loc[test_indices, 'prev_close'], 'green', 'red')
     else:
         df_model['train_pred'] = np.nan
         df_model['test_pred'] = np.nan
