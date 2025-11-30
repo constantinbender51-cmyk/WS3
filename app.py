@@ -140,6 +140,12 @@ def index():
         # Color coding: green if prediction is 1 (above previous close), red if 0 (below)
         df_model.loc[train_indices, 'train_color'] = np.where(train_predictions_binary == 1, 'green', 'red')
         df_model.loc[test_indices, 'test_color'] = np.where(test_predictions_binary == 1, 'green', 'red')
+        
+        # Calculate accuracy for train and test sets
+        train_accuracy = (train_predictions_binary == y_train).sum() / len(y_train)
+        test_accuracy = (test_predictions_binary == y_test).sum() / len(y_test)
+        print(f"Training Accuracy: {train_accuracy:.4f} ({train_accuracy * 100:.2f}%)")
+        print(f"Test Accuracy: {test_accuracy:.4f} ({test_accuracy * 100:.2f}%)")
     else:
         df_model['train_pred'] = np.nan
         df_model['test_pred'] = np.nan
