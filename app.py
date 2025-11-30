@@ -12,6 +12,9 @@ import numpy as np
 
 app = Flask(__name__)
 
+# Global parameter for number of days back to use in features
+days_back = 2
+
 # Download the CSV file if not exists
 file_id = '1urEZZhBwT4df6-IDYq1eK-wlGWYz8nfs'
 url = f'https://drive.google.com/uc?id={file_id}'
@@ -81,27 +84,31 @@ def index():
         return "Error: Data not available. Check server logs for details."
     
     # Train logistic regression model
-    # Prepare features: close from day i-1, close from day i-2, |high-low| from day i-1, 7-day SMA from day i-1, 28-day SMA from day i-1
+    # Prepare features: close from day i-1 to i-days_back, |high-low| from day i-1, 7-day SMA from day i-1, 28-day SMA from day i-1
     df_model = df.copy()
-    df_model['prev_close_1'] = df_model['close'].shift(1)
-    df_model['prev_close_2'] = df_model['close'].shift(2)
+    for i in range(1, days_back + 1):
+        df_model[f'prev_close_{i}'] = df_model['close'].shift(i)
     df_model['high_low_range'] = (df_model['high'] - df_model['low']).shift(1)
     df_model['sma_7'] = df_model['close'].rolling(window=7).mean().shift(1)
     df_model['sma_28'] = df_model['close'].rolling(window=28).mean().shift(1)
     
     # Filter data where sma_position is exactly 0 and exclude first 365 days
     start_date = df_model['datetime'].iloc[0] + pd.Timedelta(days=365)
+    # Create condition for non-null prev_close columns based on days_back
+    prev_close_conditions = [~df_model[f'prev_close_{i}'].isna() for i in range(1, days_back + 1)]
     filtered_data = df_model[(df_model['sma_position'] == 0) & 
                             (df_model['datetime'] >= start_date) &
-                            (~df_model['prev_close_1'].isna()) & 
-                            (~df_model['prev_close_2'].isna()) &
                             (~df_model['high_low_range'].isna()) &
                             (~df_model['sma_7'].isna()) &
                             (~df_model['sma_28'].isna())].copy()
+    # Apply prev_close conditions
+    for condition in prev_close_conditions:
+        filtered_data = filtered_data[condition]
     
     # Prepare features and target (binary: 1 if close > prev_close, else 0)
     filtered_data['target'] = (filtered_data['close'] > filtered_data['close'].shift(1)).astype(int)
-    X = filtered_data[['prev_close_1', 'prev_close_2', 'high_low_range', 'sma_7', 'sma_28']]
+    feature_columns = [f'prev_close_{i}' for i in range(1, days_back + 1)] + ['high_low_range', 'sma_7', 'sma_28']
+    X = filtered_data[feature_columns]
     y = filtered_data['target']
     
     # 60-40 train-test split
