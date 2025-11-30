@@ -77,9 +77,9 @@ def index():
     
     # Create subplots
     fig = make_subplots(
-        rows=4, cols=1,
-        subplot_titles=('Price (Close)', 'SMA Position', 'Model Output', 'Capital'),
-        vertical_spacing=0.1
+        rows=5, cols=1,
+        subplot_titles=('Price (Close)', 'SMA Position', 'Model Output', 'Capital 1 (SMA-based)', 'Capital 2 (Model-based)'),
+        vertical_spacing=0.08
     )
     
     # Add price trace (using close column)
@@ -100,23 +100,26 @@ def index():
         row=3, col=1
     )
     
-    # Add capital traces
+    # Add capital 1 trace (SMA-based)
     fig.add_trace(
-        go.Scatter(x=df['datetime'], y=df['capital1'], mode='lines', name='Capital 1 (SMA)'),
-        row=4, col=1
-    )
-    fig.add_trace(
-        go.Scatter(x=df['datetime'], y=df['capital2'], mode='lines', name='Capital 2 (Model)'),
+        go.Scatter(x=df['datetime'], y=df['capital1'], mode='lines', name='Capital 1 (SMA)', line=dict(color='blue')),
         row=4, col=1
     )
     
+    # Add capital 2 trace (Model-based)
+    fig.add_trace(
+        go.Scatter(x=df['datetime'], y=df['capital2'], mode='lines', name='Capital 2 (Model)', line=dict(color='red')),
+        row=5, col=1
+    )
+    
     # Update layout
-    fig.update_layout(height=1000, title_text="Financial Data Visualization")
-    fig.update_xaxes(title_text="Datetime", row=4, col=1)
+    fig.update_layout(height=1200, title_text="Financial Data Visualization")
+    fig.update_xaxes(title_text="Datetime", row=5, col=1)
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="SMA Position", row=2, col=1)
     fig.update_yaxes(title_text="Model Output", row=3, col=1)
-    fig.update_yaxes(title_text="Capital", row=4, col=1)
+    fig.update_yaxes(title_text="Capital 1", row=4, col=1)
+    fig.update_yaxes(title_text="Capital 2", row=5, col=1)
     
     # Convert plot to HTML
     plot_html = fig.to_html(include_plotlyjs='cdn')
