@@ -6,7 +6,7 @@ from plotly.subplots import make_subplots
 from flask import Flask, render_template_string
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 import numpy as np
 
@@ -80,34 +80,43 @@ def index():
     if df.empty:
         return "Error: Data not available. Check server logs for details."
     
-    # Train linear regression model
-    # Prepare features: previous 2 days close
+    # Train logistic regression model
+    # Prepare features: previous 2 days close, |high-low|, 7-day SMA, 28-day SMA
     df_model = df.copy()
     df_model['prev_close_1'] = df_model['close'].shift(1)
     df_model['prev_close_2'] = df_model['close'].shift(2)
+    df_model['high_low_range'] = df_model['high'] - df_model['low']
+    df_model['sma_7'] = df_model['close'].rolling(window=7).mean()
+    df_model['sma_28'] = df_model['close'].rolling(window=28).mean()
     
     # Filter data where sma_position is exactly 0 and exclude first 365 days
     start_date = df_model['datetime'].iloc[0] + pd.Timedelta(days=365)
     filtered_data = df_model[(df_model['sma_position'] == 0) & 
                             (df_model['datetime'] >= start_date) &
                             (~df_model['prev_close_1'].isna()) & 
-                            (~df_model['prev_close_2'].isna())].copy()
+                            (~df_model['prev_close_2'].isna()) &
+                            (~df_model['high_low_range'].isna()) &
+                            (~df_model['sma_7'].isna()) &
+                            (~df_model['sma_28'].isna())].copy()
     
-    # Prepare features and target
-    X = filtered_data[['prev_close_1', 'prev_close_2']]
-    y = filtered_data['close']
+    # Prepare features and target (binary: 1 if close > prev_close, else 0)
+    filtered_data['target'] = (filtered_data['close'] > filtered_data['close'].shift(1)).astype(int)
+    X = filtered_data[['prev_close_1', 'prev_close_2', 'high_low_range', 'sma_7', 'sma_28']]
+    y = filtered_data['target']
     
     # 60-40 train-test split
     if len(X) > 0:
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.4, random_state=42, shuffle=False)
         
-        # Train linear regression model
-        model = LinearRegression()
+        # Train logistic regression model
+        model = LogisticRegression(random_state=42)
         model.fit(X_train, y_train)
         
-        # Make predictions
-        train_predictions = model.predict(X_train)
-        test_predictions = model.predict(X_test)
+        # Make predictions (probabilities for class 1)
+        train_predictions_proba = model.predict_proba(X_train)[:, 1]
+        test_predictions_proba = model.predict_proba(X_test)[:, 1]
+        train_predictions_binary = (train_predictions_proba >= 0.5).astype(int)
+        test_predictions_binary = (test_predictions_proba >= 0.5).astype(int)
         
         # Store predictions back in dataframe
         df_model['train_pred'] = np.nan
@@ -118,13 +127,12 @@ def index():
         train_indices = X_train.index
         test_indices = X_test.index
         
-        df_model.loc[train_indices, 'train_pred'] = train_predictions
-        df_model.loc[test_indices, 'test_pred'] = test_predictions
+        df_model.loc[train_indices, 'train_pred'] = train_predictions_binary
+        df_model.loc[test_indices, 'test_pred'] = test_predictions_binary
         
-        # Add previous close for color coding
-        df_model['prev_close'] = df_model['close'].shift(1)
-        df_model.loc[train_indices, 'train_color'] = np.where(train_predictions > df_model.loc[train_indices, 'prev_close'], 'green', 'red')
-        df_model.loc[test_indices, 'test_color'] = np.where(test_predictions > df_model.loc[test_indices, 'prev_close'], 'green', 'red')
+        # Color coding: green if prediction is 1 (above previous close), red if 0 (below)
+        df_model.loc[train_indices, 'train_color'] = np.where(train_predictions_binary == 1, 'green', 'red')
+        df_model.loc[test_indices, 'test_color'] = np.where(test_predictions_binary == 1, 'green', 'red')
     else:
         df_model['train_pred'] = np.nan
         df_model['test_pred'] = np.nan
@@ -134,7 +142,7 @@ def index():
     # Create subplots
     fig = make_subplots(
         rows=6, cols=1,
-        subplot_titles=('Price (Close)', 'SMA Position', 'Model Output', 'Capital 1 (SMA-based)', 'Capital 2 (Model-based)', 'Linear Regression Predictions'),
+        subplot_titles=('Price (Close)', 'SMA Position', 'Model Output', 'Capital 1 (SMA-based)', 'Capital 2 (Model-based)', 'Logistic Regression Predictions'),
         vertical_spacing=0.08
     )
     
@@ -168,7 +176,7 @@ def index():
         row=5, col=1
     )
     
-    # Add linear regression predictions with color coding
+    # Add logistic regression predictions with color coding
     fig.add_trace(
         go.Scatter(x=df_model['datetime'], y=df_model['train_pred'], mode='markers', name='Train Predictions', marker=dict(color=df_model['train_color'], size=4)),
         row=6, col=1
