@@ -70,6 +70,10 @@ feature_cols = []
 # Log returns still calculated for potential future use
 df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
 
+# B. Close price ratio to yesterday's close
+df['close_ratio_yesterday'] = df['close'] / (df['close'].shift(1) + 1e-10)  # Add epsilon to avoid division by zero
+feature_cols.append('close_ratio_yesterday')
+
 # B. Kaufman Efficiency Ratio (KER) - The Chop Detector
 # KER = Direction / Volatility
 n_er = 13 # Standard setting
