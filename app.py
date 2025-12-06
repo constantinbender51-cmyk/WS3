@@ -201,20 +201,18 @@ projection = fit_and_project_equity(plot_data['strategy_equity'], future_days=36
 
 plt.figure(figsize=(12, 13))
 
-# Plot 1: Equity development for $1000 starting capital over one year
+# Plot 1: 12-month projection from $1000 starting capital
 ax1 = plt.subplot(4, 1, 1)
-# Scale equity to start at $1000
+# Scale projection to start at $1000
 scaling_factor = 1000 / plot_data['strategy_equity'].iloc[0]
-scaled_equity = plot_data['strategy_equity'] * scaling_factor
 scaled_projection = projection.copy()
 scaled_projection['equity'] = projection['equity'] * scaling_factor
-ax1.plot(plot_data.index, scaled_equity, label=f'Strategy from $1000 (Sharpe: {s_sharpe:.2f})', color='green')
-ax1.plot(scaled_projection['date'], scaled_projection['equity'], label='12-Month Projection from $1000', color='orange', linestyle='--', linewidth=2)
+ax1.plot(scaled_projection['date'], scaled_projection['equity'], label='12-Month Projection from $1000', color='orange', linestyle='-', linewidth=2)
 ax1.set_yscale('log')
-ax1.set_title('Equity Development for $1000 Starting Capital (One Year)')
+ax1.set_title('12-Month Projection from $1000 Starting Capital')
 ax1.legend()
 ax1.grid(True, which='both', linestyle='--', alpha=0.3)
-ax1.set_xlim([plot_data.index[0], scaled_projection['date'].iloc[-1]])
+ax1.set_xlim([scaled_projection['date'].iloc[0], scaled_projection['date'].iloc[-1]])
 ax1.set_ylabel('Equity ($)')
 
 # Plot 2: Original strategy equity comparison
