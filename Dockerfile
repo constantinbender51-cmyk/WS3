@@ -19,8 +19,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY app.py .
 
-# Create directory for model artifacts
+# Create directories for model artifacts and static files
 RUN mkdir -p /app/models
+RUN mkdir -p /app/static
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
