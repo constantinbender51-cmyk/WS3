@@ -217,30 +217,31 @@ ax1.set_xlim([scaled_projection['date'].iloc[0], scaled_projection['date'].iloc[
 ax1.set_ylabel('Equity ($)')
 
 # Plot 2: Original strategy equity comparison
-ax2 = plt.subplot(4, 1, 2, sharex=ax1)
+ax2 = plt.subplot(4, 1, 2)
 ax2.plot(plot_data.index, plot_data['strategy_equity'], label=f'Final Strategy (Sharpe: {s_sharpe:.2f})', color='blue')
 ax2.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
-ax2.plot(projection['date'], projection['equity'], label='12-Month Projection', color='orange', linestyle='--', linewidth=2)
 ax2.set_yscale('log')
 ax2.set_title(f'Optimized Strategy Equity (Sharpe: {s_sharpe:.2f})')
 ax2.legend()
 ax2.grid(True, which='both', linestyle='--', alpha=0.3)
+ax2.set_xlim([plot_data.index[0], plot_data.index[-1]])
 
 # Add Stats Box
 stats = f"CAGR: {s_cagr*100:.1f}%\nMaxDD: {s_mdd*100:.1f}%\nSharpe: {s_sharpe:.2f}"
 ax2.text(0.02, 0.85, stats, transform=ax2.transAxes, bbox=dict(facecolor='white', alpha=0.8))
 
 # Plot 3: Leverage deployment
-ax3 = plt.subplot(4, 1, 3, sharex=ax1)
+ax3 = plt.subplot(4, 1, 3)
 ax3.step(plot_data.index, plot_data['leverage_used'], where='post', color='purple', linewidth=1)
 ax3.fill_between(plot_data.index, 0, plot_data['leverage_used'], step='post', color='purple', alpha=0.2)
 ax3.set_title('Leverage Deployment (0.0x / 3.0x / 1.5x)')
 ax3.set_yticks(np.unique(plot_data['leverage_used']))
 ax3.set_ylabel('Leverage (x)')
 ax3.grid(True, axis='x', alpha=0.3)
+ax3.set_xlim([plot_data.index[0], plot_data.index[-1]])
 
 # Plot 4: Drawdown profile
-ax4 = plt.subplot(4, 1, 4, sharex=ax1)
+ax4 = plt.subplot(4, 1, 4)
 # Drawdown
 roll_max = plot_data['strategy_equity'].cummax()
 dd = (plot_data['strategy_equity'] - roll_max) / roll_max
@@ -249,6 +250,7 @@ ax4.fill_between(plot_data.index, dd, 0, color='red', alpha=0.1)
 ax4.set_title('Drawdown Profile')
 ax4.set_ylabel('Drawdown')
 ax4.grid(True, alpha=0.3)
+ax4.set_xlim([plot_data.index[0], plot_data.index[-1]])
 
 plt.tight_layout()
 plot_dir = '/app/static'
