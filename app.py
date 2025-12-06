@@ -4,6 +4,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
 from datetime import datetime
 from flask import Flask, send_file
 import os
@@ -14,15 +16,45 @@ symbol = 'BTC/USDT'
 timeframe = '1d'
 start_date_str = '2018-01-01 00:00:00'
 
-choppy_ranges = [
-    ('2019-11-22', '2020-01-18'),
-    ('2020-05-06', '2020-07-23'),
-    ('2021-05-19', '2021-07-30'),
-    ('2022-01-24', '2022-04-06'),
-    ('2023-03-19', '2023-10-25'),
-    ('2024-04-01', '2024-11-01'),
-    ('2025-03-01', '2025-04-20'),
-    ('2025-11-13', datetime.now().strftime('%Y-%m-%d'))
+# The specific "Losing Periods" (Drawdown > 15%) you identified
+# Format: (Start Date, End Date)
+losing_ranges = [
+    ('2018-08-27', '2018-09-06'),
+    ('2018-09-13', '2018-09-16'),
+    ('2018-09-19', '2018-11-18'),
+    ('2018-11-29', '2018-11-29'),
+    ('2019-08-20', '2019-09-23'),
+    ('2020-03-25', '2020-03-26'),
+    ('2020-04-03', '2020-05-06'),
+    ('2020-05-11', '2020-05-11'),
+    ('2020-07-09', '2020-07-22'),
+    ('2020-07-24', '2020-07-24'),
+    ('2021-01-19', '2021-02-18'),
+    ('2021-02-20', '2021-02-20'),
+    ('2021-02-23', '2021-03-08'),
+    ('2021-03-10', '2021-03-12'),
+    ('2021-03-14', '2021-11-07'),
+    ('2021-11-09', '2022-01-21'),
+    ('2022-01-23', '2022-06-10'),
+    ('2022-07-06', '2022-07-10'),
+    ('2022-07-15', '2022-09-05'),
+    ('2022-09-07', '2022-09-19'),
+    ('2022-09-21', '2022-11-20'),
+    ('2022-11-22', '2023-01-13'),
+    ('2023-01-15', '2023-01-15'),
+    ('2023-01-18', '2023-01-18'),
+    ('2024-07-21', '2024-11-09'),
+    ('2025-01-28', '2025-01-28'),
+    ('2025-02-01', '2025-02-25'),
+    ('2025-03-01', '2025-03-02'),
+    ('2025-03-06', '2025-03-06'),
+    ('2025-09-07', '2025-09-11'),
+    ('2025-09-14', '2025-09-15'),
+    ('2025-09-21', '2025-10-05'),
+    ('2025-10-07', '2025-10-07'),
+    ('2025-10-09', '2025-10-15'),
+    ('2025-10-19', '2025-11-16'),
+    ('2025-11-18', '2025-11-18')
 ]
 
 def fetch_binance_history(symbol, start_str):
@@ -53,220 +85,105 @@ def fetch_binance_history(symbol, start_str):
 # -------------------
 df = fetch_binance_history(symbol, start_date_str)
 
+# Labeling Target: 1 if date is in a Losing Period, 0 otherwise
 df['target'] = 0
-for start, end in choppy_ranges:
+for start, end in losing_ranges:
     mask = (df.index >= start) & (df.index <= end)
     df.loc[mask, 'target'] = 1
 
 # 3. FEATURE ENGINEERING
 # ----------------------
-window_size = 60
+# Calculate Inefficiency Index with window=14
+window_size = 14
 df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
-
-# Numerator: Sum of Absolute Log Returns
 df['sum_abs_log_ret'] = df['log_ret'].abs().rolling(window_size).mean()
-
-# Denominator: Absolute Sum of Log Returns
 df['abs_sum_log_ret'] = df['log_ret'].rolling(window_size).mean().abs()
-
-# Inefficiency Index
 epsilon = 1e-8
 df['inefficiency_index'] = df['sum_abs_log_ret'] / (df['abs_sum_log_ret'] + epsilon)
 df['inefficiency_index'] = df['inefficiency_index'].clip(upper=20)
 
-train_df = df.dropna(subset=['inefficiency_index']).copy()
+# Create 14 Lagged Features of the Index
+# "14 days of inefficiency index"
+feature_cols = []
+for i in range(14):
+    col_name = f'ineff_lag_{i}'
+    df[col_name] = df['inefficiency_index'].shift(i)
+    feature_cols.append(col_name)
+
+# Drop NaNs
+df.dropna(subset=feature_cols, inplace=True)
 
 # 4. TRAINING
 # -----------
-X = train_df[['inefficiency_index']]
-y = train_df['target']
+X = df[feature_cols]
+y = df['target']
 
+# Scale features
 scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
+X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=X.columns, index=X.index)
 
-model = LogisticRegression(class_weight='balanced', C=0.5)
-model.fit(X_scaled, y)
+# Split for validation
+X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, shuffle=False)
 
-# Predict on whole DF
-df_features = df[['inefficiency_index']].fillna(0)
-df_scaled = scaler.transform(df_features)
-df['prediction'] = model.predict(df_scaled)
+model = LogisticRegression(class_weight='balanced', C=0.5, max_iter=1000)
+model.fit(X_train, y_train)
 
-# 5. STRATEGY BACKTEST (Fixed Causality)
-# --------------------
-df['sma_40'] = df['close'].rolling(40).mean()
-df['sma_120'] = df['close'].rolling(120).mean()
+# 5. EVALUATION
+# -------------
+predictions = model.predict(X_test)
+print("\n--- Model Evaluation (Test Set) ---")
+print(classification_report(y_test, predictions))
 
-SL_PCT = 0.02
-TP_PCT = 0.16
+# Feature Importance
+print("\n--- Feature Importance (Correlation to Losing Periods) ---")
+importance = pd.DataFrame({'Lag': range(14), 'Coefficient': model.coef_[0]})
+print(importance.sort_values(by='Coefficient', ascending=False))
 
-df['strategy_equity'] = 1.0
-df['buy_hold_equity'] = 1.0
-df['position'] = 'CASH'
-df['daily_return'] = 0.0
-
-current_equity = 1.0
-hold_equity = 1.0
-
-# Start loop
-start_idx = max(120, window_size)
-
-for i in range(start_idx, len(df)):
-    today = df.index[i]
-    
-    # Yesterday's data (Day T-1)
-    # We rely ONLY on this to make decisions for Day T
-    prev_close = df['close'].iloc[i-1]
-    prev_sma40 = df['sma_40'].iloc[i-1]
-    prev_sma120 = df['sma_120'].iloc[i-1]
-    
-    # CRITICAL FIX HERE:
-    # Use prediction from i-1 (Yesterday). 
-    # If yesterday closed choppy, we don't trade today.
-    # df['prediction'].iloc[i] would be cheating (using today's close).
-    # prev_prediction = df['prediction'].iloc[i-1] # Choppy indicator ignored as per request
-    is_choppy = False # Ignore choppy market indicator
-    
-    # Execution Data (Day T)
-    open_price = df['open'].iloc[i]
-    high_price = df['high'].iloc[i]
-    low_price = df['low'].iloc[i]
-    close_price = df['close'].iloc[i]
-    
-    daily_ret = 0.0
-    position = 'CASH'
-    
-    # Buy & Hold Logic
-    bh_ret = (close_price - df['close'].iloc[i-1]) / df['close'].iloc[i-1]
-    hold_equity *= (1 + bh_ret)
-    
-    if not is_choppy:
-        # Long Logic
-        if prev_close > prev_sma40 and prev_close > prev_sma120:
-            position = 'LONG'
-            entry = open_price
-            stop_loss = entry * (1 - SL_PCT)
-            take_profit = entry * (1 + TP_PCT)
-            
-            if low_price <= stop_loss:
-                daily_ret = -SL_PCT
-            elif high_price >= take_profit:
-                daily_ret = TP_PCT
-            else:
-                daily_ret = (close_price - entry) / entry
-                
-        # Short Logic
-        elif prev_close < prev_sma40 and prev_close < prev_sma120:
-            position = 'SHORT'
-            entry = open_price
-            stop_loss = entry * (1 + SL_PCT)
-            take_profit = entry * (1 - TP_PCT)
-            
-            if high_price >= stop_loss:
-                daily_ret = -SL_PCT
-            elif low_price <= take_profit:
-                daily_ret = TP_PCT
-            else:
-                daily_ret = (entry - close_price) / entry
-    
-    current_equity *= (1 + daily_ret)
-    
-    df.at[today, 'strategy_equity'] = current_equity
-    df.at[today, 'buy_hold_equity'] = hold_equity
-    df.at[today, 'position'] = position
+# Predict on full dataset for plotting
+df['prediction'] = model.predict(X_scaled)
+df['prob_loss'] = model.predict_proba(X_scaled)[:, 1]
 
 # 6. VISUALIZATION
 # ----------------
-plt.figure(figsize=(14, 20))
+plt.figure(figsize=(14, 12))
 
-plot_data = df.iloc[start_idx:]
-
-# Calculate drawdown for visualization
-rolling_max = plot_data['strategy_equity'].cummax()
-drawdown = (plot_data['strategy_equity'] - rolling_max) / rolling_max
-
-# Plot 1: Equity
-ax1 = plt.subplot(4, 1, 1)
-ax1.plot(plot_data.index, plot_data['strategy_equity'], label='Strategy (Strictly Causal)', color='blue', linewidth=2)
-ax1.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
-# Mark periods with drawdown > 15%
-y_min, y_max = ax1.get_ylim()
-ax1.fill_between(plot_data.index, y_min, y_max,
-                 where=(drawdown < -0.15), facecolor='purple', alpha=0.2, label='Drawdown > 15%')
+# Subplot 1: Price & Actual Losing Zones
+ax1 = plt.subplot(3, 1, 1)
+ax1.plot(df.index, df['close'], color='black', alpha=0.7, label='BTC Price')
 ax1.set_yscale('log')
-ax1.set_title('Strategy Equity Curve (Log Scale)')
-ax1.grid(True, which='both', linestyle='--', alpha=0.5)
+# Highlight Actual Losing Periods (Red)
+for start, end in losing_ranges:
+    ax1.axvspan(pd.to_datetime(start), pd.to_datetime(end), color='red', alpha=0.2, label='Actual Drawdown' if start==losing_ranges[0][0] else "")
+ax1.set_title('BTC Price vs Actual Losing Periods (>15% DD)')
 ax1.legend()
+ax1.grid(True, which='both', linestyle='--', alpha=0.3)
 
-# Plot 2: Drawdown
-ax2 = plt.subplot(4, 1, 2, sharex=ax1)
-ax2.plot(plot_data.index, drawdown, color='red', alpha=0.6)
-ax2.fill_between(plot_data.index, drawdown, 0, color='red', alpha=0.1)
-ax2.set_ylabel('Drawdown')
-ax2.set_title('Strategy Drawdown')
+# Subplot 2: The Inefficiency Index
+ax2 = plt.subplot(3, 1, 2, sharex=ax1)
+ax2.plot(df.index, df['inefficiency_index'], color='purple', linewidth=1)
+ax2.set_title('Inefficiency Index (Window=14)')
+ax2.set_ylabel('Index Value')
 ax2.grid(True, alpha=0.3)
 
-# Plot 3: Price + Chop Flags
-ax3 = plt.subplot(4, 1, 3, sharex=ax1)
-ax3.plot(plot_data.index, plot_data['close'], label='Close Price', color='green', linewidth=1)
-ax3.set_title('Price Action vs Model Choppy Flags (Red)')
-ax3.set_ylabel('Price')
+# Subplot 3: Predicted Probability of Loss
+ax3 = plt.subplot(3, 1, 3, sharex=ax1)
+ax3.plot(df.index, df['prob_loss'], color='orange', linewidth=1, label='Prob. of Losing Period')
+ax3.axhline(0.5, color='gray', linestyle='--')
+ax3.fill_between(df.index, 0, df['prob_loss'], color='orange', alpha=0.2)
+ax3.set_title('Model Prediction: Probability of being in a Losing Period')
+ax3.set_ylabel('Probability')
 ax3.grid(True, alpha=0.3)
-# Overlay Choppy Signal (using i-1 prediction effectively shifted to today)
-# Note: For visualization, we just show where prediction was 1
-ax3.fill_between(plot_data.index, ax3.get_ylim()[0], ax3.get_ylim()[1],
-                 where=plot_data['prediction'] == 1, facecolor='red', alpha=0.15, label='Choppy Regime')
-ax3.legend()
-
-# Plot 4: Inefficiency Index
-ax4 = plt.subplot(4, 1, 4, sharex=ax1)
-ax4.plot(plot_data.index, plot_data['inefficiency_index'], label='Inefficiency Index', color='purple', linewidth=1)
-ax4.set_title('Inefficiency Index')
-ax4.set_ylabel('Index Value')
-ax4.grid(True, alpha=0.3)
-ax4.legend()
 
 plt.tight_layout()
 
+# Save
 plot_dir = '/app/static'
 if not os.path.exists(plot_dir):
     os.makedirs(plot_dir)
 plot_path = os.path.join(plot_dir, 'plot.png')
 plt.savefig(plot_path, dpi=300, bbox_inches='tight')
 
-# 7. DRAWDOWN PERIOD IDENTIFICATION
-# --------------------------------
-drawdown_periods = []
-in_drawdown_period = False
-period_start_date = None
-
-for i in range(len(plot_data)):
-    current_date = plot_data.index[i]
-    current_drawdown = drawdown.iloc[i]
-
-    if current_drawdown < -0.15 and not in_drawdown_period:
-        period_start_date = current_date
-        in_drawdown_period = True
-    elif current_drawdown >= -0.15 and in_drawdown_period:
-        period_end_date = plot_data.index[i-1] # End on the day before recovery
-        drawdown_periods.append((period_start_date, period_end_date))
-        in_drawdown_period = False
-
-# If a drawdown period extends to the end of the data
-if in_drawdown_period:
-    period_end_date = plot_data.index[-1]
-    drawdown_periods.append((period_start_date, period_end_date))
-
-# Print backtest results regardless of how the script is run (e.g., by Gunicorn)
-print(f"Final Strategy Equity: {current_equity:.2f}x")
-print(f"Final Buy & Hold Equity: {hold_equity:.2f}x")
-print("\nTime periods with drawdown greater than 15%:")
-if drawdown_periods:
-    for start, end in drawdown_periods:
-        print(f"  From {start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')}")
-else:
-    print("  No periods with drawdown greater than 15% found.")
-
+# Flask
 app = Flask(__name__)
 @app.route('/')
 def serve_plot(): return send_file(plot_path, mimetype='image/png')
