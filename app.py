@@ -257,6 +257,15 @@ if in_drawdown_period:
     period_end_date = plot_data.index[-1]
     drawdown_periods.append((period_start_date, period_end_date))
 
+# Print backtest results regardless of how the script is run (e.g., by Gunicorn)
+print(f"Final Strategy Equity: {current_equity:.2f}x")
+print(f"Final Buy & Hold Equity: {hold_equity:.2f}x")
+print("\nTime periods with drawdown greater than 15%:")
+if drawdown_periods:
+    for start, end in drawdown_periods:
+        print(f"  From {start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')}")
+else:
+    print("  No periods with drawdown greater than 15% found.")
 
 app = Flask(__name__)
 @app.route('/')
@@ -265,13 +274,5 @@ def serve_plot(): return send_file(plot_path, mimetype='image/png')
 def health(): return 'OK', 200
 
 if __name__ == '__main__':
-    print(f"Final Strategy Equity: {current_equity:.2f}x")
-    print(f"Final Buy & Hold Equity: {hold_equity:.2f}x")
-    print("\nTime periods with drawdown greater than 15%:")
-    if drawdown_periods:
-        for start, end in drawdown_periods:
-            print(f"  From {start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')}")
-    else:
-        print("  No periods with drawdown greater than 15% found.")
     print("\nStarting Web Server...")
     app.run(host='0.0.0.0', port=8080, debug=False)
