@@ -203,18 +203,22 @@ plt.figure(figsize=(12, 13))
 
 # Plot 1: Equity development for $1000 starting capital over one year
 ax1 = plt.subplot(4, 1, 1)
+# Filter to last 365 days (or available data) for one year of historical data
+one_year_data = plot_data.iloc[-365:] if len(plot_data) >= 365 else plot_data
 # Scale equity to start at $1000
-scaling_factor = 1000 / plot_data['strategy_equity'].iloc[0]
-scaled_equity = plot_data['strategy_equity'] * scaling_factor
-scaled_projection = projection.copy()
-scaled_projection['equity'] = projection['equity'] * scaling_factor
-ax1.plot(plot_data.index, scaled_equity, label=f'Strategy from $1000 (Sharpe: {s_sharpe:.2f})', color='green')
+scaling_factor = 1000 / one_year_data['strategy_equity'].iloc[0]
+scaled_equity = one_year_data['strategy_equity'] * scaling_factor
+# Generate projection from the filtered data
+projection_filtered = fit_and_project_equity(one_year_data['strategy_equity'], future_days=365)
+scaled_projection = projection_filtered.copy()
+scaled_projection['equity'] = projection_filtered['equity'] * scaling_factor
+ax1.plot(one_year_data.index, scaled_equity, label=f'Strategy from $1000 (Sharpe: {s_sharpe:.2f})', color='green')
 ax1.plot(scaled_projection['date'], scaled_projection['equity'], label='12-Month Projection from $1000', color='orange', linestyle='--', linewidth=2)
 ax1.set_yscale('log')
 ax1.set_title('Equity Development for $1000 Starting Capital (One Year)')
 ax1.legend()
 ax1.grid(True, which='both', linestyle='--', alpha=0.3)
-ax1.set_xlim([plot_data.index[0], scaled_projection['date'].iloc[-1]])
+ax1.set_xlim([one_year_data.index[0], scaled_projection['date'].iloc[-1]])
 ax1.set_ylabel('Equity ($)')
 
 # Plot 2: Original strategy equity comparison
