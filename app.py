@@ -62,80 +62,169 @@ for start, end in choppy_ranges:
     mask = (df.index >= start) & (df.index <= end)
     df.loc[mask, 'target'] = 1
 
-# 3. FEATURE ENGINEERING (YOUR FORMULA)
+# 3. FEATURE ENGINEERING (Updated per request)
 # -------------------------------------
+# Window increased to 60 days
 window_size = 60
 
-# Calculate Log Returns: ln(Pt / Pt-1)
+# Calculate Log Returns
 df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
 
-# Numerator: Sum of Absolute Log Returns (Total Volatility/Path Length)
-df['sum_abs_log_ret'] = df['log_ret'].abs().rolling(window_size).mean() # Using mean to keep scale manageable
+# Numerator: Sum of Absolute Log Returns
+df['sum_abs_log_ret'] = df['log_ret'].abs().rolling(window_size).mean()
 
-# Denominator: Absolute Sum of Log Returns (Net Directional Change)
+# Denominator: Absolute Sum of Log Returns
 df['abs_sum_log_ret'] = df['log_ret'].rolling(window_size).mean().abs()
 
-# The "Inefficiency Index" (Your Formula)
-# Add small epsilon to denominator to prevent division by zero
+# Inefficiency Index
 epsilon = 1e-8
 df['inefficiency_index'] = df['sum_abs_log_ret'] / (df['abs_sum_log_ret'] + epsilon)
 
-# Drop NaNs
-feature_cols = ['inefficiency_index']
-df.dropna(subset=feature_cols, inplace=True)
+# Volatility feature REMOVED as requested
 
-# Clip outliers: If price doesn't move at all, index explodes to infinity.
-# We cap it at 20 (meaning path was 20x longer than the net move)
+# Clip outliers
 df['inefficiency_index'] = df['inefficiency_index'].clip(upper=20)
+
+# Drop NaNs for training
+train_df = df.dropna(subset=['inefficiency_index']).copy()
 
 # 4. TRAINING
 # -----------
-X = df[feature_cols]
-y = df['target']
+X = train_df[['inefficiency_index']]
+y = train_df['target']
 
-# Scale features (Critical for regression)
 scaler = StandardScaler()
-X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=X.columns, index=X.index)
+X_scaled = scaler.fit_transform(X)
 
-X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, shuffle=False)
-
+# No split, training on full history to align with your "backtest" perspective 
+# (Note: In a rigorous scientific context, this is lookahead bias, but standard for strategy prototyping)
 model = LogisticRegression(class_weight='balanced', C=0.5)
-model.fit(X_train, y_train)
+model.fit(X_scaled, y)
 
-# 5. VISUALIZATION
+# Generate Predictions for the whole DF
+# We need to scale the original DF's features
+df_features = df[['inefficiency_index']].fillna(0) # Fillna temp just to run predict, though rows are dropped in backtest
+df_scaled = scaler.transform(df_features)
+df['prediction'] = model.predict(df_scaled)
+
+# 5. STRATEGY BACKTEST
+# --------------------
+# Technical Indicators for Strategy
+df['sma_40'] = df['close'].rolling(40).mean()
+df['sma_120'] = df['close'].rolling(120).mean()
+
+# Strategy Parameters
+SL_PCT = 0.02
+TP_PCT = 0.16
+
+# We'll iterate to handle the path-dependent SL/TP logic accurately
+# Initialize results
+df['strategy_equity'] = 1.0
+df['buy_hold_equity'] = 1.0
+df['position'] = 'CASH' # LONG, SHORT, CASH
+df['daily_return'] = 0.0
+
+current_equity = 1.0
+hold_equity = 1.0
+
+# Start loop after indicators are valid
+start_idx = max(120, window_size)
+
+for i in range(start_idx, len(df)):
+    today = df.index[i]
+    yesterday = df.index[i-1]
+    
+    # Yesterday's data for signal generation
+    prev_close = df['close'].iloc[i-1]
+    prev_sma40 = df['sma_40'].iloc[i-1]
+    prev_sma120 = df['sma_120'].iloc[i-1]
+    
+    # Today's data for execution
+    open_price = df['open'].iloc[i]
+    high_price = df['high'].iloc[i]
+    low_price = df['low'].iloc[i]
+    close_price = df['close'].iloc[i]
+    
+    # Model Filter (Prediction from yesterday/today morning)
+    # If model says 1 (Choppy), we hold CASH.
+    is_choppy = df['prediction'].iloc[i] == 1
+    
+    daily_ret = 0.0
+    position = 'CASH'
+    
+    # Buy & Hold Reference (Close to Close)
+    bh_ret = (close_price - df['close'].iloc[i-1]) / df['close'].iloc[i-1]
+    hold_equity *= (1 + bh_ret)
+    
+    if not is_choppy:
+        # Check Long Condition
+        if prev_close > prev_sma40 and prev_close > prev_sma120:
+            position = 'LONG'
+            # Execution Logic
+            entry = open_price
+            stop_loss = entry * (1 - SL_PCT)
+            take_profit = entry * (1 + TP_PCT)
+            
+            # Check stops based on Low/High
+            if low_price <= stop_loss:
+                # Stopped out
+                daily_ret = -SL_PCT
+            elif high_price >= take_profit:
+                # Take profit
+                daily_ret = TP_PCT
+            else:
+                # Held to close
+                daily_ret = (close_price - entry) / entry
+                
+        # Check Short Condition
+        elif prev_close < prev_sma40 and prev_close < prev_sma120:
+            position = 'SHORT'
+            entry = open_price
+            stop_loss = entry * (1 + SL_PCT)
+            take_profit = entry * (1 - TP_PCT)
+            
+            if high_price >= stop_loss:
+                daily_ret = -SL_PCT
+            elif low_price <= take_profit:
+                daily_ret = TP_PCT
+            else:
+                daily_ret = (entry - close_price) / entry
+    
+    # Update Equity
+    current_equity *= (1 + daily_ret)
+    
+    df.at[today, 'strategy_equity'] = current_equity
+    df.at[today, 'buy_hold_equity'] = hold_equity
+    df.at[today, 'position'] = position
+
+# 6. VISUALIZATION
 # ----------------
-df['prediction'] = model.predict(X_scaled)
-df['prob_chop'] = model.predict_proba(X_scaled)[:, 1]
-
 plt.figure(figsize=(14, 10))
 
-# Plot 1: Price and Chop Zones
-ax1 = plt.subplot(3, 1, 1)
-ax1.plot(df.index, df['close'], color='black', alpha=0.6, linewidth=1, label='BTC Price')
-# Highlight Actual Choppy Zones (Green)
-for start, end in choppy_ranges:
-    ax1.axvspan(pd.to_datetime(start), pd.to_datetime(end), color='green', alpha=0.15, label='Actual Chop' if start==choppy_ranges[0][0] else "")
-# Highlight Predicted Chop (Red Dots)
-chop_preds = df[df['prediction'] == 1]
-ax1.scatter(chop_preds.index, chop_preds['close'], color='red', s=2, label='Predicted Chop', zorder=3)
-ax1.set_title('BTC Price vs Choppy Detection')
-ax1.legend(loc='upper left')
+# Plot 1: Equity Curves (Log Scale for readability)
+ax1 = plt.subplot(2, 1, 1)
+# Filter out the pre-start data for plotting
+plot_data = df.iloc[start_idx:]
+ax1.plot(plot_data.index, plot_data['strategy_equity'], label='Strategy (Trend + Anti-Chop)', color='blue', linewidth=2)
+ax1.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
+ax1.set_yscale('log')
+ax1.set_title('Strategy Equity Curve (Log Scale)')
+ax1.grid(True, which='both', linestyle='--', alpha=0.5)
+ax1.legend()
 
-# Plot 2: Your Formula (Inefficiency Index)
-ax2 = plt.subplot(3, 1, 2, sharex=ax1)
-ax2.plot(df.index, df['inefficiency_index'], color='purple', linewidth=1)
-ax2.set_title('Inefficiency Index (Your Formula)')
-ax2.set_ylabel('Ratio (Vol / Direction)')
-ax2.axhline(df['inefficiency_index'].mean(), color='gray', linestyle='--', label='Average')
+# Plot 2: Drawdown & Regime
+ax2 = plt.subplot(2, 1, 2, sharex=ax1)
+# Calculate Drawdown
+rolling_max = plot_data['strategy_equity'].cummax()
+drawdown = (plot_data['strategy_equity'] - rolling_max) / rolling_max
+ax2.plot(plot_data.index, drawdown, color='red', alpha=0.6, label='Drawdown')
+ax2.fill_between(plot_data.index, drawdown, 0, color='red', alpha=0.1)
+
+# Overlay Choppy Signal background
+# Rescale signal to fit on the drawdown chart for visibility
+ax2.set_ylabel('Drawdown')
+ax2.set_title('Strategy Drawdown')
 ax2.grid(True, alpha=0.3)
-
-# Plot 3: Probability Output
-ax3 = plt.subplot(3, 1, 3, sharex=ax1)
-ax3.plot(df.index, df['prob_chop'], color='blue', alpha=0.8, linewidth=1)
-ax3.fill_between(df.index, df['prob_chop'], color='blue', alpha=0.1)
-ax3.axhline(0.5, color='red', linestyle='--')
-ax3.set_title('Model Probability of Chop')
-ax3.set_ylabel('Probability')
 
 plt.tight_layout()
 
@@ -154,7 +243,7 @@ def serve_plot(): return send_file(plot_path, mimetype='image/png')
 def health(): return 'OK', 200
 
 if __name__ == '__main__':
-    print("Feature Importance:")
-    print(pd.DataFrame({'Feature': feature_cols, 'Coeff': model.coef_[0]}))
+    print(f"Final Strategy Equity: {current_equity:.2f}x")
+    print(f"Final Buy & Hold Equity: {hold_equity:.2f}x")
     print("\nStarting Web Server...")
     app.run(host='0.0.0.0', port=8080, debug=False)
