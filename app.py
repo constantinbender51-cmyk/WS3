@@ -6,6 +6,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, accuracy_score
 from datetime import datetime, timedelta
+from flask import Flask, send_file
+import os
 
 # 1. SETUP & CONFIGURATION
 # ------------------------
@@ -132,3 +134,26 @@ plt.show()
 print("\n--- Feature Importance (Last 30 Days) ---")
 importance = pd.DataFrame({'lag': range(1, 31), 'coefficient': model.coef_[0]})
 print(importance.sort_values(by='coefficient', ascending=False).head(5))
+
+# Save the plot to a file
+plot_path = '/app/static/plot.png'
+plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+print(f"Plot saved to {plot_path}")
+
+# Start Flask web server
+def start_server():
+    app = Flask(__name__)
+    
+    @app.route('/')
+    def serve_plot():
+        return send_file(plot_path, mimetype='image/png')
+    
+    @app.route('/health')
+    def health_check():
+        return 'OK', 200
+    
+    print("Starting web server on port 8080...")
+    app.run(host='0.0.0.0', port=8080, debug=False)
+
+if __name__ == '__main__':
+    start_server()
