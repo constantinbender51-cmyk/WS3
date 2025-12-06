@@ -70,10 +70,12 @@ feature_cols = []
 # Log returns still calculated for potential future use
 df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
 
-# B. Close price ratio to yesterday's close (lagged 10 days)
+# B. Close price ratio to yesterday's close (lagged 1-10 days)
 df['close_ratio_yesterday'] = df['close'] / (df['close'].shift(1) + 1e-10)  # Add epsilon to avoid division by zero
-df['close_ratio_yesterday_lag10'] = df['close_ratio_yesterday'].shift(10)
-feature_cols.append('close_ratio_yesterday_lag10')
+# Create lagged versions for days 1-10
+for lag in range(1, 11):
+    df[f'close_ratio_yesterday_lag{lag}'] = df['close_ratio_yesterday'].shift(lag)
+    feature_cols.append(f'close_ratio_yesterday_lag{lag}')
 
 # B. Kaufman Efficiency Ratio (KER) - The Chop Detector
 # KER = Direction / Volatility
@@ -105,18 +107,22 @@ df['sma_50_abs_dist'] = df['sma_50_dist'].abs()
 df['sma_365_dist'] = (df['close'] - df['close'].rolling(365).mean()) / df['close'].rolling(365).mean()
 df['sma_365_abs_dist'] = df['sma_365_dist'].abs()
 
-# E. Distance to 365 SMA (lagged 10 days)
-df['sma_365_abs_dist_lag10'] = df['sma_365_abs_dist'].shift(10)
-feature_cols.append('sma_365_abs_dist_lag10')
+# E. Distance to 365 SMA (lagged 1-10 days)
+# Create lagged versions for days 1-10
+for lag in range(1, 11):
+    df[f'sma_365_abs_dist_lag{lag}'] = df['sma_365_abs_dist'].shift(lag)
+    feature_cols.append(f'sma_365_abs_dist_lag{lag}')
 
 # H. Distance from 120 SMA
 # Added as per user request for additional medium-term trend analysis
 df['sma_120_dist'] = (df['close'] - df['close'].rolling(120).mean()) / df['close'].rolling(120).mean()
 df['sma_120_abs_dist'] = df['sma_120_dist'].abs()
 
-# I. Distance to 120 SMA (lagged 10 days)
-df['sma_120_abs_dist_lag10'] = df['sma_120_abs_dist'].shift(10)
-feature_cols.append('sma_120_abs_dist_lag10')
+# I. Distance to 120 SMA (lagged 1-10 days)
+# Create lagged versions for days 1-10
+for lag in range(1, 11):
+    df[f'sma_120_abs_dist_lag{lag}'] = df['sma_120_abs_dist'].shift(lag)
+    feature_cols.append(f'sma_120_abs_dist_lag{lag}')
 
 # F. Distance to 120 SMA with 1.15 and 0.85 multipliers (Normalized) - Removed as per user request
 df['sma_120_1_15'] = df['close'].rolling(120).mean() * 1.15
