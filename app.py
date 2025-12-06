@@ -100,6 +100,7 @@ df['sma_365_abs_dist'] = df['sma_365_dist'].abs()
 
 # E. Distance to 365 SMA with abs dist * 1.075
 df['sma_365_abs_dist_1_075'] = df['sma_365_abs_dist'] * 1.075
+feature_cols.append('sma_365_abs_dist')
 feature_cols.append('sma_365_abs_dist_1_075')
 
 # H. Distance from 120 SMA
