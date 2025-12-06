@@ -144,20 +144,18 @@ plot_path = os.path.join(plot_dir, 'plot.png')
 plt.savefig(plot_path, dpi=300, bbox_inches='tight')
 print(f"Plot saved to {plot_path}")
 
-# Start Flask web server
-def start_server():
-    app = Flask(__name__)
-    
-    @app.route('/')
-    def serve_plot():
-        return send_file(plot_path, mimetype='image/png')
-    
-    @app.route('/health')
-    def health_check():
-        return 'OK', 200
-    
+# Create Flask app
+app = Flask(__name__)
+
+@app.route('/')
+def serve_plot():
+    return send_file(plot_path, mimetype='image/png')
+
+@app.route('/health')
+def health_check():
+    return 'OK', 200
+
+# Run evaluation and visualization before starting server
+if __name__ == '__main__':
     print("Starting web server on port 8080...")
     app.run(host='0.0.0.0', port=8080, debug=False)
-
-if __name__ == '__main__':
-    start_server()
