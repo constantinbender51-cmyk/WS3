@@ -19,8 +19,9 @@ SL_PCT = 0.02
 TP_PCT = 0.16
 
 # Circuit Breaker Params
-DRAWDOWN_LIMIT = -0.15  # -15%
-COOLDOWN_DAYS = 20      # Stay out for ~3 weeks
+DRAWDOWN_LIMIT = -0.15   # -15%
+INITIAL_COOLDOWN = 20    # Initial pause
+EXTENSION_COOLDOWN = 7   # Extend if still dropping
 
 def fetch_binance_history(symbol, start_str):
     print(f"Fetching data for {symbol} starting from {start_str}...")
@@ -54,28 +55,30 @@ df = fetch_binance_history(symbol, start_date_str)
 df['sma_fast'] = df['close'].rolling(SMA_FAST).mean()
 df['sma_slow'] = df['close'].rolling(SMA_SLOW).mean()
 
-# 3. BACKTEST ENGINE
-# ------------------
-df['strategy_equity'] = 1.0
+# 3. BACKTEST ENGINE (SHADOW VS REAL)
+# -----------------------------------
+# "Shadow" tracks the strategy performance if we NEVER stopped trading.
+# "Real" tracks our equity with the circuit breaker applied.
+
+df['shadow_equity'] = 1.0
+df['real_equity'] = 1.0
 df['buy_hold_equity'] = 1.0
-df['drawdown'] = 0.0
-df['position'] = 'CASH'
-df['state'] = 'ACTIVE' # ACTIVE or COOLDOWN
+df['shadow_dd'] = 0.0
+df['state'] = 'ACTIVE' # ACTIVE, COOLDOWN, EXTENDED
 
-equity = 1.0
-peak_equity = 1.0
+shadow_equity = 1.0
+real_equity = 1.0
 hold_equity = 1.0
+shadow_peak = 1.0
 
-# Circuit Breaker State
 cooldown_counter = 0
-last_trigger_equity = 0.0 # To prevent immediate re-triggering
 
 start_idx = SMA_SLOW
 
 for i in range(start_idx, len(df)):
     today = df.index[i]
     
-    # Yesterday's Data (Signal Generation)
+    # Yesterday's Data (Signal)
     prev_close = df['close'].iloc[i-1]
     prev_fast = df['sma_fast'].iloc[i-1]
     prev_slow = df['sma_slow'].iloc[i-1]
@@ -86,102 +89,149 @@ for i in range(start_idx, len(df)):
     low_p = df['low'].iloc[i]
     close_p = df['close'].iloc[i]
     
-    # 1. Update Buy & Hold
+    # --- A. CALCULATE RAW STRATEGY RETURN (SHADOW) ---
+    strategy_daily_ret = 0.0
+    
+    # Check Long
+    if prev_close > prev_fast and prev_close > prev_slow:
+        entry = open_p
+        sl = entry * (1 - SL_PCT)
+        tp = entry * (1 + TP_PCT)
+        if low_p <= sl: strategy_daily_ret = -SL_PCT
+        elif high_p >= tp: strategy_daily_ret = TP_PCT
+        else: strategy_daily_ret = (close_p - entry) / entry
+        
+    # Check Short
+    elif prev_close < prev_fast and prev_close < prev_slow:
+        entry = open_p
+        sl = entry * (1 + SL_PCT)
+        tp = entry * (1 - TP_PCT)
+        if high_p >= sl: strategy_daily_ret = -SL_PCT
+        elif low_p <= tp: strategy_daily_ret = TP_PCT
+        else: strategy_daily_ret = (entry - close_p) / entry
+        
+    # Update Shadow Equity (The "Ghost" Strategy)
+    shadow_equity *= (1 + strategy_daily_ret)
+    if shadow_equity > shadow_peak:
+        shadow_peak = shadow_equity
+    
+    current_shadow_dd = (shadow_equity - shadow_peak) / shadow_peak
+    
+    # Store Shadow Data (Needed for lookback checks)
+    df.at[today, 'shadow_equity'] = shadow_equity
+    df.at[today, 'shadow_dd'] = current_shadow_dd
+    
+    # --- B. UPDATE BUY & HOLD ---
     bh_ret = (close_p - df['close'].iloc[i-1]) / df['close'].iloc[i-1]
     hold_equity *= (1 + bh_ret)
     
-    # 2. Check Circuit Breaker Status
-    # Update Peak Equity
-    if equity > peak_equity:
-        peak_equity = equity
-        
-    current_dd = (equity - peak_equity) / peak_equity
+    # --- C. REAL PORTFOLIO LOGIC (CIRCUIT BREAKER) ---
+    real_daily_ret = 0.0
     
-    # Cooldown Logic
     if cooldown_counter > 0:
-        # We are cooling down
+        # We are in Cooldown (Cash)
         cooldown_counter -= 1
-        position = 'CASH'
-        daily_ret = 0.0
-        df.at[today, 'state'] = 'COOLDOWN'
+        real_daily_ret = 0.0
         
-    else:
-        # We are active
-        # Check if we need to Trigger Circuit Breaker
-        # Condition: DD < -15% AND we are below the equity level where we last triggered
-        # (This ensures we don't trigger daily if we stay flat at -15%)
-        if current_dd < DRAWDOWN_LIMIT and equity < (last_trigger_equity if last_trigger_equity > 0 else equity + 1):
-            cooldown_counter = COOLDOWN_DAYS
-            last_trigger_equity = equity # Set new floor
-            position = 'CASH'
-            daily_ret = 0.0
-            df.at[today, 'state'] = 'TRIGGERED'
-            print(f"[{today.date()}] Circuit Breaker Triggered! DD: {current_dd:.2%}. Cooling down for {COOLDOWN_DAYS} days.")
+        # If counter hits 0, we perform the "Extension Check"
+        if cooldown_counter == 0:
+            # Look back 7 days at SHADOW equity
+            # logic: If shadow strategy lost money in last 7 days, it's unsafe to re-enter.
+            idx_7d = i - 7
+            if idx_7d >= 0:
+                past_shadow = df['shadow_equity'].iloc[idx_7d]
+                # Avoid division by zero
+                if past_shadow > 0:
+                    recent_perf = (shadow_equity - past_shadow) / past_shadow
+                else:
+                    recent_perf = 0
+                
+                if recent_perf < 0:
+                    # Strategy is still bleeding. Extend.
+                    cooldown_counter = EXTENSION_COOLDOWN
+                    df.at[today, 'state'] = 'EXTENDED'
+                else:
+                    # Strategy stabilized. Resume.
+                    df.at[today, 'state'] = 'ACTIVE'
+            else:
+                df.at[today, 'state'] = 'ACTIVE'
         else:
-            # Normal Trading Logic
-            df.at[today, 'state'] = 'ACTIVE'
-            position = 'CASH'
-            daily_ret = 0.0
-            
-            # Long Signal
-            if prev_close > prev_fast and prev_close > prev_slow:
-                position = 'LONG'
-                entry = open_p
-                sl = entry * (1 - SL_PCT)
-                tp = entry * (1 + TP_PCT)
+            # Just verify state label
+            if df.at[today, 'state'] == 'ACTIVE': # Should not happen if counter > 0, but good for safety
+                df.at[today, 'state'] = 'COOLDOWN'
                 
-                if low_p <= sl: daily_ret = -SL_PCT
-                elif high_p >= tp: daily_ret = TP_PCT
-                else: daily_ret = (close_p - entry) / entry
+    else:
+        # We are Active
+        # Check Trigger Condition based on SHADOW DD
+        # Use a small buffer to avoid immediate re-trigger if we just resumed at -15.1%
+        # But generally, if shadow is deep in DD, we rely on the 7-day slope check to keep us out.
+        # Here we check if we fall below limit.
+        
+        if current_shadow_dd < DRAWDOWN_LIMIT:
+            # Trigger!
+            cooldown_counter = INITIAL_COOLDOWN
+            real_daily_ret = 0.0 # Go to cash immediately (simulate close at open?) 
+            # In backtest we assume we don't take the trade today if triggered at yesterday's close/today's open
+            # Note: Ideally trigger is based on Yesterday's DD. 
+            # Let's be strict: If YESTERDAY's Shadow DD < -15%, we don't trade today.
             
-            # Short Signal
-            elif prev_close < prev_fast and prev_close < prev_slow:
-                position = 'SHORT'
-                entry = open_p
-                sl = entry * (1 + SL_PCT)
-                tp = entry * (1 - TP_PCT)
-                
-                if high_p >= sl: daily_ret = -SL_PCT
-                elif low_p <= tp: daily_ret = TP_PCT
-                else: daily_ret = (entry - close_p) / entry
+            # Re-check causality:
+            # current_shadow_dd is calculated using TODAY's close. We can't use it to stop TODAY's trade.
+            # We must use YESTERDAY's Shadow DD.
+            
+            prev_shadow_dd = df['shadow_dd'].iloc[i-1] if i > 0 else 0
+            if prev_shadow_dd < DRAWDOWN_LIMIT:
+                 cooldown_counter = INITIAL_COOLDOWN
+                 real_daily_ret = 0.0
+                 df.at[today, 'state'] = 'TRIGGERED'
+            else:
+                # Safe to trade today
+                real_daily_ret = strategy_daily_ret
+                df.at[today, 'state'] = 'ACTIVE'
+        else:
+             real_daily_ret = strategy_daily_ret
+             df.at[today, 'state'] = 'ACTIVE'
 
-            equity *= (1 + daily_ret)
-
-    df.at[today, 'strategy_equity'] = equity
+    real_equity *= (1 + real_daily_ret)
+    
+    df.at[today, 'real_equity'] = real_equity
     df.at[today, 'buy_hold_equity'] = hold_equity
-    df.at[today, 'drawdown'] = current_dd
-    df.at[today, 'position'] = position
 
 # 4. VISUALIZATION
 # ----------------
 plt.figure(figsize=(14, 12))
 
-# Equity Curve
+# Plot 1: Equity Curves
 ax1 = plt.subplot(3, 1, 1)
 plot_data = df.iloc[start_idx:]
-ax1.plot(plot_data.index, plot_data['strategy_equity'], label='Strategy w/ Circuit Breaker', color='blue', linewidth=2)
-ax1.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
+ax1.plot(plot_data.index, plot_data['real_equity'], label='Real Equity (Protected)', color='blue', linewidth=2)
+ax1.plot(plot_data.index, plot_data['shadow_equity'], label='Shadow Equity (Unprotected)', color='red', alpha=0.5, linestyle='--', linewidth=1)
+ax1.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.3)
 ax1.set_yscale('log')
-ax1.set_title(f'Strategy Equity (Circuit Breaker: 15% DD -> {COOLDOWN_DAYS} Days Cash)')
-ax1.grid(True, which='both', linestyle='--', alpha=0.5)
+ax1.set_title('Real vs Shadow Equity')
 ax1.legend()
+ax1.grid(True, which='both', linestyle='--', alpha=0.3)
 
-# Drawdown Curve
+# Plot 2: Shadow Drawdown & Triggers
 ax2 = plt.subplot(3, 1, 2, sharex=ax1)
-ax2.plot(plot_data.index, plot_data['drawdown'], color='red', linewidth=1)
-ax2.fill_between(plot_data.index, plot_data['drawdown'], 0, color='red', alpha=0.1)
-ax2.axhline(DRAWDOWN_LIMIT, color='black', linestyle='--', label='-15% Trigger')
-ax2.set_title('Strategy Drawdown')
+ax2.plot(plot_data.index, plot_data['shadow_dd'], color='black', alpha=0.6, label='Shadow Drawdown')
+ax2.axhline(DRAWDOWN_LIMIT, color='red', linestyle='--', label='-15% Limit')
+ax2.fill_between(plot_data.index, plot_data['shadow_dd'], DRAWDOWN_LIMIT, 
+                 where=plot_data['shadow_dd'] < DRAWDOWN_LIMIT, color='red', alpha=0.1)
+ax2.set_title('Shadow Drawdown (The "Trigger" Source)')
 ax2.legend()
 ax2.grid(True, alpha=0.3)
 
-# Circuit Breaker Active Zones
+# Plot 3: Active vs Cooldown States
 ax3 = plt.subplot(3, 1, 3, sharex=ax1)
-# Create a numerical series for state: 1 for active, 0 for cooldown
-state_series = plot_data['state'].apply(lambda x: 1 if x in ['COOLDOWN', 'TRIGGERED'] else 0)
-ax3.fill_between(plot_data.index, 0, 1, where=state_series==1, color='orange', alpha=0.5, label='Circuit Breaker Active (Cash)')
-ax3.plot(plot_data.index, plot_data['close'], color='green', linewidth=1, label='Price')
-ax3.set_title('Circuit Breaker Activation Periods (Orange = Forced Cash)')
+# 0 = Active, 1 = Cooldown/Triggered, 2 = Extended
+state_map = {'ACTIVE': 0, 'TRIGGERED': 1, 'COOLDOWN': 1, 'EXTENDED': 2}
+num_state = plot_data['state'].map(state_map)
+
+ax3.fill_between(plot_data.index, 0, 1, where=num_state>=1, color='orange', alpha=0.5, label='Initial Pause (20 Days)')
+ax3.fill_between(plot_data.index, 0, 1, where=num_state==2, color='darkred', alpha=0.6, label='Extended Pause (Strategy still losing)')
+ax3.plot(plot_data.index, plot_data['close'], color='green', linewidth=1, label='BTC Price')
+ax3.set_title('Circuit Breaker States (Orange=20d, Red=7d Extension)')
 ax3.legend()
 
 plt.tight_layout()
@@ -200,6 +250,7 @@ def serve_plot(): return send_file(plot_path, mimetype='image/png')
 def health(): return 'OK', 200
 
 if __name__ == '__main__':
-    print(f"Final Strategy Equity: {equity:.2f}x")
+    print(f"Final Real Equity: {real_equity:.2f}x")
+    print(f"Final Shadow Equity: {shadow_equity:.2f}x")
     print("\nStarting Web Server...")
     app.run(host='0.0.0.0', port=8080, debug=False)
