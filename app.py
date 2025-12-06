@@ -123,8 +123,6 @@ df['dist_sma_120_0_85'] = (df['close'] - df['sma_120_0_85']) / df['close']
 # feature_cols.append('dist_sma_120_1_15')  # Removed
 # feature_cols.append('dist_sma_120_0_85')  # Removed
 
-df.dropna(subset=feature_cols, inplace=True)
-
 # 4. SCALING & TRAINING
 # ---------------------
 # Add normalized close price difference as a feature
@@ -132,6 +130,8 @@ scaler_close = StandardScaler()
 df['close_diff'] = df['close'] - df['close'].shift(1)
 df['close_diff_norm'] = scaler_close.fit_transform(df[['close_diff']])
 feature_cols.append('close_diff_norm')
+
+df.dropna(subset=feature_cols, inplace=True)
 
 X = df[feature_cols]
 y = df['target']
