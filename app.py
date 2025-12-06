@@ -94,7 +94,8 @@ df['sma_365_norm'] = (df['sma_365'] - df['close']) / df['close']
 feature_cols.append('sma_365_norm')
 
 # Drop NaN values created by the shifting (first 30 days) and SMA calculation (first 365 days)
-df.dropna(inplace=True)
+# Ensure we drop rows where ANY feature is NaN to maintain consistent array lengths
+df.dropna(subset=feature_cols, inplace=True)
 
 # 4. MODEL TRAINING
 # -----------------
