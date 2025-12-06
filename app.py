@@ -135,6 +135,38 @@ def calculate_sharpe_mdd(returns):
     
     return sharpe, max_dd
 
+# Helper function to get final metrics from equity curve
+def get_final_metrics(equity_series):
+    if equity_series.empty or equity_series.iloc[0] == 0:
+        return 0, 0, 0, 0
+
+    # Total Return
+    s_tot = equity_series.iloc[-1] - 1
+
+    # CAGR
+    num_years = (equity_series.index[-1] - equity_series.index[0]).days / 365.25
+    if num_years == 0 or equity_series.iloc[0] <= 0:
+        s_cagr = 0
+    else:
+        s_cagr = (equity_series.iloc[-1] / equity_series.iloc[0])**(1/num_years) - 1
+
+    # Daily Returns for Sharpe
+    daily_returns = equity_series.pct_change().dropna()
+    
+    if daily_returns.empty:
+        s_sharpe = 0
+    else:
+        mean_ret = daily_returns.mean()
+        std_ret = daily_returns.std()
+        s_sharpe = (mean_ret / std_ret) * np.sqrt(365) if std_ret > 0 else 0
+
+    # Max Drawdown
+    roll_max = equity_series.cummax()
+    drawdown = (equity_series - roll_max) / roll_max
+    s_mdd = drawdown.min()
+
+    return s_tot, s_cagr, s_mdd, s_sharpe
+
 # Outer loop: Thresholds (T_Low, T_High)
 for t_low, t_high in itertools.product(THRESH_RANGE, repeat=2):
     # Enforce logical constraint
