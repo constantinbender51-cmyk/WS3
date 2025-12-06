@@ -199,41 +199,57 @@ s_tot, s_cagr, s_mdd, s_sharpe = get_final_metrics(plot_data['strategy_equity'])
 # Get equity projection
 projection = fit_and_project_equity(plot_data['strategy_equity'], future_days=365)
 
-plt.figure(figsize=(12, 10))
+plt.figure(figsize=(12, 13))
 
-ax1 = plt.subplot(3, 1, 1)
-ax1.plot(plot_data.index, plot_data['strategy_equity'], label=f'Final Strategy (Sharpe: {s_sharpe:.2f})', color='blue')
-ax1.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
-# Plot projection
-ax1.plot(projection['date'], projection['equity'], label='12-Month Projection', color='orange', linestyle='--', linewidth=2)
+# Plot 1: Equity development for $1000 starting capital over one year
+ax1 = plt.subplot(4, 1, 1)
+# Scale equity to start at $1000
+scaling_factor = 1000 / plot_data['strategy_equity'].iloc[0]
+scaled_equity = plot_data['strategy_equity'] * scaling_factor
+scaled_projection = projection.copy()
+scaled_projection['equity'] = projection['equity'] * scaling_factor
+ax1.plot(plot_data.index, scaled_equity, label=f'Strategy from $1000 (Sharpe: {s_sharpe:.2f})', color='green')
+ax1.plot(scaled_projection['date'], scaled_projection['equity'], label='12-Month Projection from $1000', color='orange', linestyle='--', linewidth=2)
 ax1.set_yscale('log')
-ax1.set_title(f'Optimized Strategy Equity (Sharpe: {s_sharpe:.2f})')
+ax1.set_title('Equity Development for $1000 Starting Capital (One Year)')
 ax1.legend()
 ax1.grid(True, which='both', linestyle='--', alpha=0.3)
-# Extend x-axis slightly to show projection
-ax1.set_xlim([plot_data.index[0], projection['date'].iloc[-1]])
+ax1.set_xlim([plot_data.index[0], scaled_projection['date'].iloc[-1]])
+ax1.set_ylabel('Equity ($)')
+
+# Plot 2: Original strategy equity comparison
+ax2 = plt.subplot(4, 1, 2, sharex=ax1)
+ax2.plot(plot_data.index, plot_data['strategy_equity'], label=f'Final Strategy (Sharpe: {s_sharpe:.2f})', color='blue')
+ax2.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
+ax2.plot(projection['date'], projection['equity'], label='12-Month Projection', color='orange', linestyle='--', linewidth=2)
+ax2.set_yscale('log')
+ax2.set_title(f'Optimized Strategy Equity (Sharpe: {s_sharpe:.2f})')
+ax2.legend()
+ax2.grid(True, which='both', linestyle='--', alpha=0.3)
 
 # Add Stats Box
 stats = f"CAGR: {s_cagr*100:.1f}%\nMaxDD: {s_mdd*100:.1f}%\nSharpe: {s_sharpe:.2f}"
-ax1.text(0.02, 0.85, stats, transform=ax1.transAxes, bbox=dict(facecolor='white', alpha=0.8))
+ax2.text(0.02, 0.85, stats, transform=ax2.transAxes, bbox=dict(facecolor='white', alpha=0.8))
 
-ax2 = plt.subplot(3, 1, 2, sharex=ax1)
-ax2.step(plot_data.index, plot_data['leverage_used'], where='post', color='purple', linewidth=1)
-ax2.fill_between(plot_data.index, 0, plot_data['leverage_used'], step='post', color='purple', alpha=0.2)
-ax2.set_title('Leverage Deployment (0.0x / 3.0x / 1.5x)')
-ax2.set_yticks(np.unique(plot_data['leverage_used']))
-ax2.set_ylabel('Leverage (x)')
-ax2.grid(True, axis='x', alpha=0.3)
+# Plot 3: Leverage deployment
+ax3 = plt.subplot(4, 1, 3, sharex=ax1)
+ax3.step(plot_data.index, plot_data['leverage_used'], where='post', color='purple', linewidth=1)
+ax3.fill_between(plot_data.index, 0, plot_data['leverage_used'], step='post', color='purple', alpha=0.2)
+ax3.set_title('Leverage Deployment (0.0x / 3.0x / 1.5x)')
+ax3.set_yticks(np.unique(plot_data['leverage_used']))
+ax3.set_ylabel('Leverage (x)')
+ax3.grid(True, axis='x', alpha=0.3)
 
-ax3 = plt.subplot(3, 1, 3, sharex=ax1)
+# Plot 4: Drawdown profile
+ax4 = plt.subplot(4, 1, 4, sharex=ax1)
 # Drawdown
 roll_max = plot_data['strategy_equity'].cummax()
 dd = (plot_data['strategy_equity'] - roll_max) / roll_max
-ax3.plot(plot_data.index, dd, color='red')
-ax3.fill_between(plot_data.index, dd, 0, color='red', alpha=0.1)
-ax3.set_title('Drawdown Profile')
-ax3.set_ylabel('Drawdown')
-ax3.grid(True, alpha=0.3)
+ax4.plot(plot_data.index, dd, color='red')
+ax4.fill_between(plot_data.index, dd, 0, color='red', alpha=0.1)
+ax4.set_title('Drawdown Profile')
+ax4.set_ylabel('Drawdown')
+ax4.grid(True, alpha=0.3)
 
 plt.tight_layout()
 plot_dir = '/app/static'
