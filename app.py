@@ -201,15 +201,16 @@ projection = fit_and_project_equity(plot_data['strategy_equity'], future_days=36
 
 plt.figure(figsize=(12, 13))
 
-# Plot 1: 12-month projection from $1000 starting capital
+# Plot 1: 12-month projection from current strategy equity
 ax1 = plt.subplot(4, 1, 1)
-# Scale projection to start at $1000
-scaling_factor = 1000 / plot_data['strategy_equity'].iloc[0]
+# Scale projection to start at current strategy equity value
+current_equity = plot_data['strategy_equity'].iloc[-1]
+scaling_factor = current_equity / plot_data['strategy_equity'].iloc[0]
 scaled_projection = projection.copy()
 scaled_projection['equity'] = projection['equity'] * scaling_factor
-ax1.plot(scaled_projection['date'], scaled_projection['equity'], label='12-Month Projection from $1000', color='orange', linestyle='-', linewidth=2)
+ax1.plot(scaled_projection['date'], scaled_projection['equity'], label='12-Month Projection', color='orange', linestyle='-', linewidth=2)
 ax1.set_yscale('log')
-ax1.set_title('12-Month Projection from $1000 Starting Capital')
+ax1.set_title('12-Month Projection from Current Strategy Equity')
 ax1.legend()
 ax1.grid(True, which='both', linestyle='--', alpha=0.3)
 ax1.set_xlim([scaled_projection['date'].iloc[0], scaled_projection['date'].iloc[-1]])
