@@ -87,9 +87,9 @@ std = df['close'].rolling(window).std()
 df['bb_width'] = ( (sma + 2*std) - (sma - 2*std) ) / sma
 # feature_cols.append('bb_width')  # Removed from features
 
-# D. Distance from Medium Term Trend (22 SMA)
+# D. Distance from Medium Term Trend (119 SMA)
 # In chop, price whipsaws AROUND the SMA. In trend, it stays above/below.
-df['sma_50_dist'] = (df['close'] - df['close'].rolling(22).mean()) / df['close'].rolling(22).mean()
+df['sma_50_dist'] = (df['close'] - df['close'].rolling(119).mean()) / df['close'].rolling(119).mean()
 # We take absolute value because chop can be above or below, we just care that it's CLOSE to the average
 df['sma_50_abs_dist'] = df['sma_50_dist'].abs() 
 feature_cols.append('sma_50_abs_dist')
