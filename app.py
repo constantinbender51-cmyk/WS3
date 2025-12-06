@@ -84,6 +84,11 @@ for i in range(start_idx, len(df)):
     prev_fast = df['sma_fast'].iloc[i-1]
     prev_slow = df['sma_slow'].iloc[i-1]
     
+    # Two days ago (For Crossover Detection)
+    prev2_close = df['close'].iloc[i-2]
+    prev2_fast = df['sma_fast'].iloc[i-2]
+    prev2_slow = df['sma_slow'].iloc[i-2]
+    
     # Today's Execution Data
     open_p = df['open'].iloc[i]
     high_p = df['high'].iloc[i]
@@ -128,7 +133,22 @@ for i in range(start_idx, len(df)):
         real_daily_ret = 0.0
         df.at[today, 'state'] = 'BUSTED'
     else:
-        # 1. Handle Cooldown / State
+        # Check for Early Wake-up Signal (SMA Cross detected yesterday)
+        # We check if Price crossed SMA40 OR SMA120 between i-2 and i-1
+        
+        # Fast SMA Cross
+        cross_fast = (prev2_close < prev2_fast and prev_close > prev_fast) or \
+                     (prev2_close > prev2_fast and prev_close < prev_fast)
+        
+        # Slow SMA Cross
+        cross_slow = (prev2_close < prev2_slow and prev_close > prev_slow) or \
+                     (prev2_close > prev2_slow and prev_close < prev_slow)
+                     
+        if cooldown_counter > 0 and (cross_fast or cross_slow):
+            cooldown_counter = 0
+            df.at[today, 'state'] = 'RESET' # Mark specially for chart
+        
+        # Now process state
         if cooldown_counter > 0:
             cooldown_counter -= 1
             real_daily_ret = 0.0
@@ -144,33 +164,43 @@ for i in range(start_idx, len(df)):
                             cooldown_counter = EXTENSION_COOLDOWN
                             df.at[today, 'state'] = 'EXTENDED'
                         else:
-                            df.at[today, 'state'] = 'ACTIVE'
+                            # Resume
+                            if df.at[today, 'state'] != 'RESET': # Don't overwrite reset
+                                df.at[today, 'state'] = 'ACTIVE'
                     else:
-                         df.at[today, 'state'] = 'ACTIVE'
+                         if df.at[today, 'state'] != 'RESET':
+                             df.at[today, 'state'] = 'ACTIVE'
                 else:
-                    df.at[today, 'state'] = 'ACTIVE'
+                    if df.at[today, 'state'] != 'RESET':
+                        df.at[today, 'state'] = 'ACTIVE'
             else:
-                if df.at[today, 'state'] == 'ACTIVE': df.at[today, 'state'] = 'COOLDOWN'
+                if df.at[today, 'state'] != 'RESET':
+                    df.at[today, 'state'] = 'COOLDOWN'
                 
         else:
             # Active Trading
             # Check Trigger (Based on Shadow DD)
             prev_shadow_dd = df['shadow_dd'].iloc[i-1] if i > 0 else 0
             
-            if prev_shadow_dd < DRAWDOWN_LIMIT:
+            # If we just reset, we ignore the trigger for one day to allow entry, 
+            # otherwise we might loop (Reset -> Trigger -> Reset)
+            # But technically if Shadow is still -20%, we shouldn't enter unless cross happened.
+            # The cross sets counter=0 which puts us here.
+            
+            if prev_shadow_dd < DRAWDOWN_LIMIT and df.at[today, 'state'] != 'RESET':
                 cooldown_counter = INITIAL_COOLDOWN
                 real_daily_ret = 0.0
                 df.at[today, 'state'] = 'TRIGGERED'
             else:
                 # APPLY LEVERAGE HERE
-                # Note: Costs of borrowing are ignored for simplicity, but spread is deadly here.
                 real_daily_ret = raw_strategy_ret * LEVERAGE
-                df.at[today, 'state'] = 'ACTIVE'
+                if df.at[today, 'state'] != 'RESET':
+                    df.at[today, 'state'] = 'ACTIVE'
 
         real_equity *= (1 + real_daily_ret)
         
         # Check Bankruptcy
-        if real_equity <= 0.05: # Effectively busted at 95% loss
+        if real_equity <= 0.05:
             real_equity = 0
             is_busted = True
             print(f"💀 ACCOUNT LIQUIDATED ON {today.date()} 💀")
@@ -185,31 +215,32 @@ plt.figure(figsize=(14, 12))
 # Plot 1: Equity
 ax1 = plt.subplot(3, 1, 1)
 plot_data = df.iloc[start_idx:]
-ax1.plot(plot_data.index, plot_data['real_equity'], label=f'Real Equity ({LEVERAGE}x Lev)', color='blue', linewidth=2)
-ax1.plot(plot_data.index, plot_data['shadow_equity'], label='Shadow Equity (1x Signal)', color='red', alpha=0.5, linestyle='--', linewidth=1)
+ax1.plot(plot_data.index, plot_data['real_equity'], label=f'Real Equity ({LEVERAGE}x)', color='blue', linewidth=2)
+ax1.plot(plot_data.index, plot_data['shadow_equity'], label='Shadow Equity (1x)', color='red', alpha=0.5, linestyle='--', linewidth=1)
 ax1.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.3)
 ax1.set_yscale('log')
-ax1.set_title(f'Leveraged Strategy ({LEVERAGE}x) vs Shadow vs Buy&Hold')
+ax1.set_title(f'Leveraged Strategy ({LEVERAGE}x) w/ SMA Reset')
 ax1.legend()
 ax1.grid(True, which='both', linestyle='--', alpha=0.3)
 
 # Plot 2: Shadow Drawdown
 ax2 = plt.subplot(3, 1, 2, sharex=ax1)
-ax2.plot(plot_data.index, plot_data['shadow_dd'], color='black', alpha=0.6, label='Shadow Drawdown (1x)')
-ax2.axhline(DRAWDOWN_LIMIT, color='red', linestyle='--', label='Trigger Level')
-ax2.set_title('Signal Drawdown (Shadow)')
+ax2.plot(plot_data.index, plot_data['shadow_dd'], color='black', alpha=0.6, label='Shadow Drawdown')
+ax2.axhline(DRAWDOWN_LIMIT, color='red', linestyle='--', label='Trigger')
+ax2.set_title('Signal Drawdown')
 ax2.grid(True, alpha=0.3)
 
 # Plot 3: States
 ax3 = plt.subplot(3, 1, 3, sharex=ax1)
-state_map = {'ACTIVE': 0, 'TRIGGERED': 1, 'COOLDOWN': 1, 'EXTENDED': 2, 'BUSTED': 3}
+# 0=Active, 1=Cooldown, 2=Extended, 3=Busted, 4=Reset
+state_map = {'ACTIVE': 0, 'TRIGGERED': 1, 'COOLDOWN': 1, 'EXTENDED': 2, 'BUSTED': 3, 'RESET': 4}
 num_state = plot_data['state'].map(state_map)
 
 ax3.fill_between(plot_data.index, 0, 1, where=num_state==1, color='orange', alpha=0.5, label='Cooldown')
 ax3.fill_between(plot_data.index, 0, 1, where=num_state==2, color='darkred', alpha=0.6, label='Extended')
-ax3.fill_between(plot_data.index, 0, 1, where=num_state==3, color='black', alpha=1.0, label='LIQUIDATED')
+ax3.fill_between(plot_data.index, 0, 1, where=num_state==4, color='purple', alpha=0.8, label='SMA RESET (Early Entry)')
 ax3.plot(plot_data.index, plot_data['close'], color='green', linewidth=1, label='BTC Price')
-ax3.set_title(f'Trading State (Leverage: {LEVERAGE}x)')
+ax3.set_title('Trading State (Purple = SMA Cross Wake-up)')
 ax3.legend()
 
 plt.tight_layout()
