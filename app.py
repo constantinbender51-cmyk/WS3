@@ -20,7 +20,7 @@ choppy_ranges = [
     ('2021-05-26', '2021-07-23'),
     ('2022-01-24', '2022-04-06'),
     ('2023-03-19', '2023-10-18'),
-    ('2024-04-01', '2024-10-01'),
+    ('2024-03-18', '2024-10-01'),
     ('2025-03-08', '2025-04-13')
 ]
 
@@ -160,6 +160,8 @@ plt.figure(figsize=(14, 8))
 # Subplot 1: Price and Zones
 ax1 = plt.subplot(2, 1, 1)
 ax1.plot(df.index, df['close'], color='black', alpha=0.6, linewidth=1, label='BTC Price')
+# Add 365-day SMA
+ax1.plot(df.index, df['close'].rolling(365).mean(), color='blue', alpha=0.7, linewidth=1, label='365 SMA')
 
 # Actual Labels
 for start, end in choppy_ranges:
