@@ -70,12 +70,8 @@ feature_cols = []
 # Log returns still calculated for potential future use
 df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
 
-# B. Close price ratio to yesterday's close (lagged 1-10 days)
-df['close_ratio_yesterday'] = df['close'] / (df['close'].shift(1) + 1e-10)  # Add epsilon to avoid division by zero
-# Create lagged versions for days 1-10
-for lag in range(1, 11):
-    df[f'close_ratio_yesterday_lag{lag}'] = df['close_ratio_yesterday'].shift(lag)
-    feature_cols.append(f'close_ratio_yesterday_lag{lag}')
+# B. Close price ratio to yesterday's close (lagged 1-10 days) - REMOVED as per user request
+# This feature has been removed from the model
 
 # B. Kaufman Efficiency Ratio (KER) - The Chop Detector
 # KER = Direction / Volatility
