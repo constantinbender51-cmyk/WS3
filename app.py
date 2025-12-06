@@ -65,13 +65,9 @@ for start, end in choppy_ranges:
 # -------------------------------
 feature_cols = []
 
-# A. Lags (Reduced count to prevent overfitting, focused on recent window)
-# We use log returns for better statistical properties
+# A. Lags removed - using only technical indicators
+# Log returns still calculated for potential future use
 df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
-for i in range(1, 6): # Reduced from 13 to 5 to reduce noise
-    col = f'lag_{i}'
-    df[col] = df['log_ret'].shift(i)
-    feature_cols.append(col)
 
 # B. Kaufman Efficiency Ratio (KER) - The Chop Detector
 # KER = Direction / Volatility
