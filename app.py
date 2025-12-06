@@ -86,7 +86,14 @@ for i in range(1, window_size + 1):
     df[col_name] = (df['close'].shift(i) - df['close']) / df['close']
     feature_cols.append(col_name)
 
-# Drop NaN values created by the shifting (first 30 days)
+# Add 365-day Simple Moving Average (SMA) feature normalized in the same way
+# Calculate 365-day SMA of close price
+df['sma_365'] = df['close'].rolling(window=365).mean()
+# Normalize: (SMA[t] - Close[t]) / Close[t]
+df['sma_365_norm'] = (df['sma_365'] - df['close']) / df['close']
+feature_cols.append('sma_365_norm')
+
+# Drop NaN values created by the shifting (first 30 days) and SMA calculation (first 365 days)
 df.dropna(inplace=True)
 
 # 4. MODEL TRAINING
