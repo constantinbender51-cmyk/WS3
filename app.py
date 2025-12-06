@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from flask import Flask, send_file
 import os
+import itertools
 
 # 1. CONFIGURATION
 symbol = 'BTC/USDT'
@@ -18,14 +19,16 @@ SL_PCT = 0.02
 TP_PCT = 0.16
 III_WINDOW = 14 
 
-# --- OPTIMIZED PARAMETERS (2x scaled by 1.5x -> 3x max effective leverage) ---
-OPT_T_LOW = 0.10
-OPT_T_HIGH = 0.50
+# --- GRID SEARCH SPACE DEFINITION (5 VARIABLES) ---
 
-# Leverage tiers scaled by 1.5x:
-OPT_L_LOW = 0.0  # (0.0 * 1.5) - Cash below 10% efficiency
-OPT_L_MID = 3.0  # (2.0 * 1.5) - Standard risk (10% <= III < 50%)
-OPT_L_HIGH = 1.5 # (1.0 * 1.5) - Ultra-defensive (III >= 50%)
+# Threshold Search Space (T_Low, T_High): 0.0 to 0.9 in 0.1 steps (10 values)
+THRESH_RANGE = np.arange(0.0, 1.0, 0.1) 
+
+# Leverage Search Space (L_Low, L_Mid, L_High): 0.0 to 4.5 in 0.5 steps (10 values)
+LEV_RANGE = np.arange(0.0, 4.51, 0.5) 
+
+# MDD Constraint
+MAX_MDD_CONSTRAINT = -0.50 # Must be less than 50% drawdown
 
 def fetch_binance_history(symbol, start_str):
     print(f"Fetching data for {symbol} starting from {start_str}...")
@@ -48,61 +51,7 @@ def fetch_binance_history(symbol, start_str):
     df = df[~df.index.duplicated(keep='first')]
     return df
 
-# Helper to calculate metrics
-def get_final_metrics(equity_series):
-    ret = equity_series.pct_change().fillna(0)
-    days = (equity_series.index[-1] - equity_series.index[0]).days
-    total_ret = (equity_series.iloc[-1] / equity_series.iloc[0]) - 1
-    cagr = (equity_series.iloc[-1] / equity_series.iloc[0]) ** (365.0 / days) - 1
-    roll_max = equity_series.cummax()
-    drawdown = (equity_series - roll_max) / roll_max
-    max_dd = drawdown.min()
-    sharpe = (ret.mean() / ret.std()) * np.sqrt(365) if ret.std() != 0 else 0
-    return total_ret, cagr, max_dd, sharpe
-
-def fit_and_project_equity(equity_series, future_days=30):
-    """
-    Fit a polynomial to log-transformed equity data to model slowing exponential growth
-    and project future equity values.
-    
-    Parameters:
-    equity_series: pandas Series with datetime index and equity values
-    future_days: number of days to project into the future
-    
-    Returns:
-    DataFrame with columns ['date', 'equity'] for projected values
-    """
-    # Extract time indices as numeric (days since start)
-    time_days = np.arange(len(equity_series))
-    
-    # Log transform the equity data to linearize exponential trends
-    log_equity = np.log(equity_series.values)
-    
-    # Fit a quadratic polynomial (degree 2) to capture curvature on log scale
-    coeffs = np.polyfit(time_days, log_equity, deg=2)
-    poly_func = np.poly1d(coeffs)
-    
-    # Project future time indices
-    future_time = np.arange(len(equity_series), len(equity_series) + future_days)
-    future_log_equity = poly_func(future_time)
-    
-    # Convert back from log scale to original scale
-    future_equity = np.exp(future_log_equity)
-    
-    # Create future dates (assuming daily frequency)
-    last_date = equity_series.index[-1]
-    future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=future_days, freq='D')
-    
-    # Return as DataFrame
-    projection_df = pd.DataFrame({
-        'date': future_dates,
-        'equity': future_equity
-    })
-    
-    return projection_df
-
-
-# 2. DATA PREP
+# 2. DATA PREP & BASE RETURNS
 df = fetch_binance_history(symbol, start_date_str)
 
 # Calculate III
@@ -116,7 +65,8 @@ df['iii'] = df['net_direction'] / (df['path_length'] + epsilon)
 df['sma_fast'] = df['close'].rolling(SMA_FAST).mean()
 df['sma_slow'] = df['close'].rolling(SMA_SLOW).mean()
 
-# 3. BASE RETURNS (1x)
+# Pre-calculate 1x Strategy Returns
+print("Pre-calculating base strategy returns...")
 base_returns = []
 start_idx = max(SMA_SLOW, III_WINDOW)
 
@@ -128,6 +78,7 @@ for i in range(len(df)):
     prev_close = df['close'].iloc[i-1]
     prev_fast = df['sma_fast'].iloc[i-1]
     prev_slow = df['sma_slow'].iloc[i-1]
+    
     open_p = df['open'].iloc[i]
     high_p = df['high'].iloc[i]
     low_p = df['low'].iloc[i]
@@ -135,14 +86,19 @@ for i in range(len(df)):
     
     daily_ret = 0.0
     
+    # Trend Logic
     if prev_close > prev_fast and prev_close > prev_slow:
-        entry = open_p; sl = entry * (1 - SL_PCT); tp = entry * (1 + TP_PCT)
+        entry = open_p
+        sl = entry * (1 - SL_PCT)
+        tp = entry * (1 + TP_PCT)
         if low_p <= sl: daily_ret = -SL_PCT
         elif high_p >= tp: daily_ret = TP_PCT
         else: daily_ret = (close_p - entry) / entry
         
     elif prev_close < prev_fast and prev_close < prev_slow:
-        entry = open_p; sl = entry * (1 + SL_PCT); tp = entry * (1 - TP_PCT)
+        entry = open_p
+        sl = entry * (1 + SL_PCT)
+        tp = entry * (1 - TP_PCT)
         if high_p >= sl: daily_ret = -SL_PCT
         elif low_p <= tp: daily_ret = TP_PCT
         else: daily_ret = (entry - close_p) / entry
@@ -151,24 +107,87 @@ for i in range(len(df)):
 
 df['base_ret'] = base_returns
 
-# 4. FINAL BACKTEST WITH OPTIMIZED PARAMS
+# 3. LEVERAGE GRID SEARCH (Vectorized for Speed)
+total_iterations = len(THRESH_RANGE) * len(THRESH_RANGE) * len(LEV_RANGE)**3
+print(f"Starting Exhaustive 5-Variable Grid Search ({total_iterations} total combinations)...")
+
+base_ret_arr = np.array(base_returns)
 iii_prev = df['iii'].shift(1).fillna(0).values
 
-# Create optimized leverage array
+best_sharpe = -999
+best_combo = (0.0, 0.0, 0.0, 0.0, 0.0) # T_Low, T_High, L_Low, L_Mid, L_High
+best_mdd = 0
+
+# Metrics function optimized for arrays
+def calculate_sharpe_mdd(returns):
+    cum_ret = np.cumprod(1 + returns)
+    if cum_ret.size == 0 or cum_ret.iloc[0] == 0: return 0, 0
+    
+    # Sharpe
+    mean_ret = np.mean(returns)
+    std_ret = np.std(returns)
+    sharpe = (mean_ret / std_ret) * np.sqrt(365) if std_ret > 0 else 0
+    
+    # MDD
+    roll_max = np.maximum.accumulate(cum_ret)
+    drawdown = (cum_ret - roll_max) / roll_max
+    max_dd = drawdown.min()
+    
+    return sharpe, max_dd
+
+# Outer loop: Thresholds (T_Low, T_High)
+for t_low, t_high in itertools.product(THRESH_RANGE, repeat=2):
+    # Enforce logical constraint
+    if t_low >= t_high: continue 
+    
+    # Create Tier Mask for this specific threshold combo
+    # 0 = Low Tier (III < T_Low)
+    # 1 = Mid Tier (T_Low <= III < T_High)
+    # 2 = High Tier (III >= T_High)
+    
+    # Vectorized mask creation
+    tier_mask = np.full(len(df), 2, dtype=int) # Default High
+    tier_mask[iii_prev < t_high] = 1 # Mid
+    tier_mask[iii_prev < t_low] = 0  # Low
+
+    # Inner loop: Leverages (L_Low, L_Mid, L_High)
+    for l_low, l_mid, l_high in itertools.product(LEV_RANGE, repeat=3):
+        
+        # Construct leverage array using the calculated tiers
+        lookup = np.array([l_low, l_mid, l_high])
+        lev_arr = lookup[tier_mask]
+        
+        final_rets = base_ret_arr * lev_arr
+        
+        # Calculate Sharpe and MDD (Only analyze period where strategy is active)
+        sharpe, mdd = calculate_sharpe_mdd(pd.Series(final_rets[start_idx:]))
+        
+        # Check against MDD constraint
+        if mdd > MAX_MDD_CONSTRAINT: 
+            if sharpe > best_sharpe:
+                best_sharpe = sharpe
+                best_combo = (round(t_low, 2), round(t_high, 2), round(l_low, 2), round(l_mid, 2), round(l_high, 2))
+                best_mdd = mdd
+
+
+# 4. FINAL BACKTEST WITH BEST PARAMS
+OPT_T_LOW, OPT_T_HIGH, OPT_L_LOW, OPT_L_MID, OPT_L_HIGH = best_combo
+
+# Recalculate tier mask for the final run
+iii_prev = df['iii'].shift(1).fillna(0).values
 tier_mask_final = np.full(len(df), 2, dtype=int) 
 tier_mask_final[iii_prev < OPT_T_HIGH] = 1
 tier_mask_final[iii_prev < OPT_T_LOW] = 0
 
+# Final optimized leverage array
 lookup_final = np.array([OPT_L_LOW, OPT_L_MID, OPT_L_HIGH])
 lev_arr_final = lookup_final[tier_mask_final]
-final_rets_final = np.array(df['base_ret']) * lev_arr_final
+final_rets_final = base_ret_arr * lev_arr_final
 
 # Backtest simulation for plot data
 df['strategy_equity'] = 1.0
-df['buy_hold_equity'] = 1.0
 df['leverage_used'] = 0.0
 equity = 1.0
-hold_equity = 1.0
 is_busted = False
 
 for i in range(start_idx, len(df)):
@@ -183,74 +202,53 @@ for i in range(start_idx, len(df)):
             
     df.at[df.index[i], 'strategy_equity'] = equity
     df.at[df.index[i], 'leverage_used'] = leverage
-    
-    # Buy Hold
-    close_p = df['close'].iloc[i]
-    prev_p = df['close'].iloc[i-1]
-    bh_ret = (close_p - prev_p) / prev_p
-    hold_equity *= (1 + bh_ret)
-    df.at[df.index[i], 'buy_hold_equity'] = hold_equity
-
 
 # 5. METRICS & PLOT
 plot_data = df.iloc[start_idx:].copy()
 s_tot, s_cagr, s_mdd, s_sharpe = get_final_metrics(plot_data['strategy_equity'])
 
-# Get equity projection
-projection = fit_and_project_equity(plot_data['strategy_equity'], future_days=365)
+print("\n" + "="*45)
+print(f"BEST 5-VARIABLE OPTIMIZATION (Constrained MDD < {MAX_MDD_CONSTRAINT*100:.0f}%)")
+print(f"Optimal Thresholds: {OPT_T_LOW:.2f} (Low) / {OPT_T_HIGH:.2f} (High)")
+print(f"Optimal Leverages: {OPT_L_LOW:.1f}x / {OPT_L_MID:.1f}x / {OPT_L_HIGH:.1f}x")
+print("-" * 45)
+print(f"{'Sharpe Ratio':<15} | {s_sharpe:>10.2f}")
+print(f"{'Max Drawdown':<15} | {s_mdd*100:>10.1f}%")
+print(f"{'CAGR':<15} | {s_cagr*100:>10.1f}%")
+print("="*45 + "\n")
 
-plt.figure(figsize=(12, 13))
+plt.figure(figsize=(12, 10))
 
-# Plot 1: 12-month projection from current strategy equity
-ax1 = plt.subplot(4, 1, 1)
-# Scale projection to start at current strategy equity value
-current_equity = plot_data['strategy_equity'].iloc[-1]
-scaling_factor = current_equity / plot_data['strategy_equity'].iloc[0]
-scaled_projection = projection.copy()
-scaled_projection['equity'] = projection['equity'] * scaling_factor
-ax1.plot(scaled_projection['date'], scaled_projection['equity'], label='12-Month Projection', color='orange', linestyle='-', linewidth=2)
+ax1 = plt.subplot(3, 1, 1)
+ax1.plot(plot_data.index, plot_data['strategy_equity'], label=f'Best Strategy (Sharpe: {s_sharpe:.2f})', color='blue')
+ax1.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
 ax1.set_yscale('log')
-ax1.set_title('12-Month Projection from Current Strategy Equity')
+ax1.set_title(f'Final Optimized Strategy (T: {OPT_T_LOW}/{OPT_T_HIGH} | L: {OPT_L_LOW}x/{OPT_L_MID}x/{OPT_L_HIGH}x)')
 ax1.legend()
 ax1.grid(True, which='both', linestyle='--', alpha=0.3)
-ax1.set_xlim([scaled_projection['date'].iloc[0], scaled_projection['date'].iloc[-1]])
-ax1.set_ylabel('Equity ($)')
-
-# Plot 2: Original strategy equity comparison
-ax2 = plt.subplot(4, 1, 2)
-ax2.plot(plot_data.index, plot_data['strategy_equity'], label=f'Final Strategy (Sharpe: {s_sharpe:.2f})', color='blue')
-ax2.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
-ax2.set_yscale('log')
-ax2.set_title(f'Optimized Strategy Equity (Sharpe: {s_sharpe:.2f})')
-ax2.legend()
-ax2.grid(True, which='both', linestyle='--', alpha=0.3)
-ax2.set_xlim([plot_data.index[0], plot_data.index[-1]])
 
 # Add Stats Box
 stats = f"CAGR: {s_cagr*100:.1f}%\nMaxDD: {s_mdd*100:.1f}%\nSharpe: {s_sharpe:.2f}"
-ax2.text(0.02, 0.85, stats, transform=ax2.transAxes, bbox=dict(facecolor='white', alpha=0.8))
+ax1.text(0.02, 0.85, stats, transform=ax1.transAxes, bbox=dict(facecolor='white', alpha=0.8))
 
-# Plot 3: Leverage deployment
-ax3 = plt.subplot(4, 1, 3)
-ax3.step(plot_data.index, plot_data['leverage_used'], where='post', color='purple', linewidth=1)
-ax3.fill_between(plot_data.index, 0, plot_data['leverage_used'], step='post', color='purple', alpha=0.2)
-ax3.set_title('Leverage Deployment (0.0x / 3.0x / 1.5x)')
-ax3.set_yticks(np.unique(plot_data['leverage_used']))
-ax3.set_ylabel('Leverage (x)')
-ax3.grid(True, axis='x', alpha=0.3)
-ax3.set_xlim([plot_data.index[0], plot_data.index[-1]])
+ax2 = plt.subplot(3, 1, 2, sharex=ax1)
+ax2.step(plot_data.index, plot_data['leverage_used'], where='post', color='purple', linewidth=1)
+ax2.fill_between(plot_data.index, 0, plot_data['leverage_used'], step='post', color='purple', alpha=0.2)
+ax2.set_title('Leverage Deployed')
+ax2.set_yticks(np.unique(plot_data['leverage_used']))
+ax2.set_ylabel('Leverage (x)')
+ax2.grid(True, axis='x', alpha=0.3)
 
-# Plot 4: Drawdown profile
-ax4 = plt.subplot(4, 1, 4)
+ax3 = plt.subplot(3, 1, 3, sharex=ax1)
 # Drawdown
 roll_max = plot_data['strategy_equity'].cummax()
 dd = (plot_data['strategy_equity'] - roll_max) / roll_max
-ax4.plot(plot_data.index, dd, color='red')
-ax4.fill_between(plot_data.index, dd, 0, color='red', alpha=0.1)
-ax4.set_title('Drawdown Profile')
-ax4.set_ylabel('Drawdown')
-ax4.grid(True, alpha=0.3)
-ax4.set_xlim([plot_data.index[0], plot_data.index[-1]])
+ax3.plot(plot_data.index, dd, color='red')
+ax3.fill_between(plot_data.index, dd, 0, color='red', alpha=0.1)
+ax3.axhline(MAX_MDD_CONSTRAINT, color='black', linestyle='--')
+ax3.set_title('Drawdown Profile (Constrained < 50%)')
+ax3.set_ylabel('Drawdown')
+ax3.grid(True, alpha=0.3)
 
 plt.tight_layout()
 plot_dir = '/app/static'
