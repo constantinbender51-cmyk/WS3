@@ -177,12 +177,12 @@ for i in range(start_idx, len(df)):
 
 # 6. VISUALIZATION
 # ----------------
-plt.figure(figsize=(14, 15))
+plt.figure(figsize=(14, 20))
 
 plot_data = df.iloc[start_idx:]
 
 # Plot 1: Equity
-ax1 = plt.subplot(3, 1, 1)
+ax1 = plt.subplot(4, 1, 1)
 ax1.plot(plot_data.index, plot_data['strategy_equity'], label='Strategy (Strictly Causal)', color='blue', linewidth=2)
 ax1.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
 ax1.set_yscale('log')
@@ -191,7 +191,7 @@ ax1.grid(True, which='both', linestyle='--', alpha=0.5)
 ax1.legend()
 
 # Plot 2: Drawdown
-ax2 = plt.subplot(3, 1, 2, sharex=ax1)
+ax2 = plt.subplot(4, 1, 2, sharex=ax1)
 rolling_max = plot_data['strategy_equity'].cummax()
 drawdown = (plot_data['strategy_equity'] - rolling_max) / rolling_max
 ax2.plot(plot_data.index, drawdown, color='red', alpha=0.6)
@@ -201,7 +201,7 @@ ax2.set_title('Strategy Drawdown')
 ax2.grid(True, alpha=0.3)
 
 # Plot 3: Price + Chop Flags
-ax3 = plt.subplot(3, 1, 3, sharex=ax1)
+ax3 = plt.subplot(4, 1, 3, sharex=ax1)
 ax3.plot(plot_data.index, plot_data['close'], label='Close Price', color='green', linewidth=1)
 ax3.set_title('Price Action vs Model Choppy Flags (Red)')
 ax3.set_ylabel('Price')
@@ -211,6 +211,14 @@ ax3.grid(True, alpha=0.3)
 ax3.fill_between(plot_data.index, ax3.get_ylim()[0], ax3.get_ylim()[1],
                  where=plot_data['prediction'] == 1, facecolor='red', alpha=0.15, label='Choppy Regime')
 ax3.legend()
+
+# Plot 4: Inefficiency Index
+ax4 = plt.subplot(4, 1, 4, sharex=ax1)
+ax4.plot(plot_data.index, plot_data['inefficiency_index'], label='Inefficiency Index', color='purple', linewidth=1)
+ax4.set_title('Inefficiency Index')
+ax4.set_ylabel('Index Value')
+ax4.grid(True, alpha=0.3)
+ax4.legend()
 
 plt.tight_layout()
 
