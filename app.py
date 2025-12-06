@@ -77,7 +77,7 @@ change = df['close'].diff(n_er).abs()
 # Sum of absolute changes over period (Volatility)
 volatility = df['close'].diff(1).abs().rolling(n_er).sum()
 df['ker'] = change / volatility
-feature_cols.append('ker')
+# feature_cols.append('ker')  # Removed from features
 
 # C. Bollinger Band Width (Volatility Squeeze)
 # Low width usually indicates chop/consolidation
@@ -85,7 +85,7 @@ window = 20
 sma = df['close'].rolling(window).mean()
 std = df['close'].rolling(window).std()
 df['bb_width'] = ( (sma + 2*std) - (sma - 2*std) ) / sma
-feature_cols.append('bb_width')
+# feature_cols.append('bb_width')  # Removed from features
 
 # D. Distance from Medium Term Trend (50 SMA)
 # In chop, price whipsaws AROUND the SMA. In trend, it stays above/below.
