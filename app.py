@@ -199,12 +199,13 @@ for i in range(start_idx, len(df)):
 
 # 6. VISUALIZATION
 # ----------------
-plt.figure(figsize=(14, 10))
+plt.figure(figsize=(14, 15)) # Increased height for three plots
 
-# Plot 1: Equity Curves (Log Scale for readability)
-ax1 = plt.subplot(2, 1, 1)
 # Filter out the pre-start data for plotting
 plot_data = df.iloc[start_idx:]
+
+# Plot 1: Equity Curves (Log Scale for readability)
+ax1 = plt.subplot(3, 1, 1)
 ax1.plot(plot_data.index, plot_data['strategy_equity'], label='Strategy (Trend + Anti-Chop)', color='blue', linewidth=2)
 ax1.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
 ax1.set_yscale('log')
@@ -212,21 +213,29 @@ ax1.set_title('Strategy Equity Curve (Log Scale)')
 ax1.grid(True, which='both', linestyle='--', alpha=0.5)
 ax1.legend()
 
-# Plot 2: Drawdown & Regime
-ax2 = plt.subplot(2, 1, 2, sharex=ax1)
+# Plot 2: Drawdown
+ax2 = plt.subplot(3, 1, 2, sharex=ax1)
 # Calculate Drawdown
 rolling_max = plot_data['strategy_equity'].cummax()
 drawdown = (plot_data['strategy_equity'] - rolling_max) / rolling_max
 ax2.plot(plot_data.index, drawdown, color='red', alpha=0.6, label='Drawdown')
 ax2.fill_between(plot_data.index, drawdown, 0, color='red', alpha=0.1)
-
-# Overlay Choppy Signal background with red background color
-ax1.fill_between(plot_data.index, ax1.get_ylim()[0], ax1.get_ylim()[1],
-                 where=plot_data['prediction'] == 1, facecolor='red', alpha=0.1, label='Choppy Market (Model Prediction)')
-
 ax2.set_ylabel('Drawdown')
 ax2.set_title('Strategy Drawdown')
 ax2.grid(True, alpha=0.3)
+
+# Plot 3: Price Action with Choppy Indication (Linear Scale)
+ax3 = plt.subplot(3, 1, 3, sharex=ax1)
+ax3.plot(plot_data.index, plot_data['close'], label='Close Price', color='green', linewidth=1)
+ax3.set_title('Price Action with Choppy Market Predictions (Linear Scale)')
+ax3.set_ylabel('Price (USDT)')
+ax3.grid(True, alpha=0.3)
+
+# Overlay Choppy Signal background with red background color on price plot
+ax3.fill_between(plot_data.index, ax3.get_ylim()[0], ax3.get_ylim()[1],
+                 where=plot_data['prediction'] == 1, facecolor='red', alpha=0.1, label='Choppy Market (Model Prediction)')
+ax3.legend()
+ax3.set_xlabel('Date') # Add x-label to the bottom plot
 
 plt.tight_layout()
 
