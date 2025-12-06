@@ -154,6 +154,11 @@ ax1.set_yscale('log')
 # Highlight Actual Losing Periods (Red)
 for start, end in losing_ranges:
     ax1.axvspan(pd.to_datetime(start), pd.to_datetime(end), color='red', alpha=0.2, label='Actual Drawdown' if start==losing_ranges[0][0] else "")
+# Highlight periods where predicted probability of loss is > 0.5 (Yellow)
+ax1.fill_between(df.index, ax1.get_ylim()[0], ax1.get_ylim()[1],
+                 where=(df['prob_loss'] > 0.5),
+                 color='yellow', alpha=0.3, label='Predicted > 0.5 Prob',
+                 transform=ax1.get_xaxis_transform())
 ax1.set_title('BTC Price vs Actual Losing Periods (>15% DD)')
 ax1.legend()
 ax1.grid(True, which='both', linestyle='--', alpha=0.3)
