@@ -124,8 +124,8 @@ for i in range(start_idx, len(df)):
     # Use prediction from i-1 (Yesterday). 
     # If yesterday closed choppy, we don't trade today.
     # df['prediction'].iloc[i] would be cheating (using today's close).
-    prev_prediction = df['prediction'].iloc[i-1]
-    is_choppy = prev_prediction == 1
+    # prev_prediction = df['prediction'].iloc[i-1] # Choppy indicator ignored as per request
+    is_choppy = False # Ignore choppy market indicator
     
     # Execution Data (Day T)
     open_price = df['open'].iloc[i]
