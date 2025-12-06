@@ -85,11 +85,14 @@ def fetch_binance_history(symbol, start_str):
 # -------------------
 df = fetch_binance_history(symbol, start_date_str)
 
-# Labeling Target: 1 if date is in a Losing Period, 0 otherwise
+# Labeling Target: 1 if date is the START of a Losing Period, 0 otherwise
 df['target'] = 0
-for start, end in losing_ranges:
-    mask = (df.index >= start) & (df.index <= end)
-    df.loc[mask, 'target'] = 1
+for start_date_str, _ in losing_ranges:
+    # Convert start_date_str to datetime to match index type
+    start_dt = pd.to_datetime(start_date_str)
+    # Set target to 1 only for the exact start date
+    if start_dt in df.index:
+        df.loc[start_dt, 'target'] = 1
 
 # 3. FEATURE ENGINEERING
 # ----------------------
