@@ -150,18 +150,14 @@ model.fit(X_train, y_train)
 # -------------
 predictions = model.predict(X_test)
 print("\n--- Model Evaluation (Test Set) ---")
-time.sleep(0.5)
 print(classification_report(y_test, predictions))
-time.sleep(0.5)
 
 # Feature Importance
 print("\n--- Feature Importance ---")
-time.sleep(0.5)
 importance = pd.DataFrame({'feature': feature_cols, 'coef': model.coef_[0]})
 # Sort by absolute value to see impact regardless of direction
 importance['abs_coef'] = importance['coef'].abs()
 print(importance.sort_values(by='abs_coef', ascending=False).head(10))
-time.sleep(0.5)
 
 # 6. VISUALIZATION
 # ----------------
