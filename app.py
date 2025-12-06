@@ -234,6 +234,30 @@ if not os.path.exists(plot_dir):
 plot_path = os.path.join(plot_dir, 'plot.png')
 plt.savefig(plot_path, dpi=300, bbox_inches='tight')
 
+# 7. DRAWDOWN PERIOD IDENTIFICATION
+# --------------------------------
+drawdown_periods = []
+in_drawdown_period = False
+period_start_date = None
+
+for i in range(len(plot_data)):
+    current_date = plot_data.index[i]
+    current_drawdown = drawdown.iloc[i]
+
+    if current_drawdown < -0.15 and not in_drawdown_period:
+        period_start_date = current_date
+        in_drawdown_period = True
+    elif current_drawdown >= -0.15 and in_drawdown_period:
+        period_end_date = plot_data.index[i-1] # End on the day before recovery
+        drawdown_periods.append((period_start_date, period_end_date))
+        in_drawdown_period = False
+
+# If a drawdown period extends to the end of the data
+if in_drawdown_period:
+    period_end_date = plot_data.index[-1]
+    drawdown_periods.append((period_start_date, period_end_date))
+
+
 app = Flask(__name__)
 @app.route('/')
 def serve_plot(): return send_file(plot_path, mimetype='image/png')
@@ -243,5 +267,11 @@ def health(): return 'OK', 200
 if __name__ == '__main__':
     print(f"Final Strategy Equity: {current_equity:.2f}x")
     print(f"Final Buy & Hold Equity: {hold_equity:.2f}x")
+    print("\nTime periods with drawdown greater than 15%:")
+    if drawdown_periods:
+        for start, end in drawdown_periods:
+            print(f"  From {start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')}")
+    else:
+        print("  No periods with drawdown greater than 15% found.")
     print("\nStarting Web Server...")
     app.run(host='0.0.0.0', port=8080, debug=False)
