@@ -181,10 +181,18 @@ plt.figure(figsize=(14, 20))
 
 plot_data = df.iloc[start_idx:]
 
+# Calculate drawdown for visualization
+rolling_max = plot_data['strategy_equity'].cummax()
+drawdown = (plot_data['strategy_equity'] - rolling_max) / rolling_max
+
 # Plot 1: Equity
 ax1 = plt.subplot(4, 1, 1)
 ax1.plot(plot_data.index, plot_data['strategy_equity'], label='Strategy (Strictly Causal)', color='blue', linewidth=2)
 ax1.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
+# Mark periods with drawdown > 15%
+y_min, y_max = ax1.get_ylim()
+ax1.fill_between(plot_data.index, y_min, y_max,
+                 where=(drawdown < -0.15), facecolor='purple', alpha=0.2, label='Drawdown > 15%')
 ax1.set_yscale('log')
 ax1.set_title('Strategy Equity Curve (Log Scale)')
 ax1.grid(True, which='both', linestyle='--', alpha=0.5)
@@ -192,8 +200,6 @@ ax1.legend()
 
 # Plot 2: Drawdown
 ax2 = plt.subplot(4, 1, 2, sharex=ax1)
-rolling_max = plot_data['strategy_equity'].cummax()
-drawdown = (plot_data['strategy_equity'] - rolling_max) / rolling_max
 ax2.plot(plot_data.index, drawdown, color='red', alpha=0.6)
 ax2.fill_between(plot_data.index, drawdown, 0, color='red', alpha=0.1)
 ax2.set_ylabel('Drawdown')
