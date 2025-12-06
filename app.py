@@ -123,6 +123,11 @@ df.dropna(subset=feature_cols, inplace=True)
 
 # 4. SCALING & TRAINING
 # ---------------------
+# Add normalized close price as a feature
+scaler_close = StandardScaler()
+df['close_norm'] = scaler_close.fit_transform(df[['close']])
+feature_cols.append('close_norm')
+
 X = df[feature_cols]
 y = df['target']
 
