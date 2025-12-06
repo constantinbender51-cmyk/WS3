@@ -9,6 +9,7 @@ from sklearn.metrics import classification_report
 from datetime import datetime
 from flask import Flask, send_file
 import os
+import time
 
 # 1. SETUP & CONFIGURATION
 # ------------------------
@@ -26,6 +27,7 @@ choppy_ranges = [
 
 def fetch_binance_history(symbol, start_str):
     print(f"Fetching data for {symbol} starting from {start_str}...")
+    time.sleep(0.5)
     exchange = ccxt.binance()
     since = exchange.parse8601(start_str)
     all_ohlcv = []
@@ -39,6 +41,7 @@ def fetch_binance_history(symbol, start_str):
             if since > exchange.milliseconds(): break
         except Exception as e:
             print(f"Error fetching: {e}")
+            time.sleep(0.5)
             break
             
     df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -46,6 +49,7 @@ def fetch_binance_history(symbol, start_str):
     df.set_index('timestamp', inplace=True)
     df = df[~df.index.duplicated(keep='first')]
     print(f"Fetched {len(df)} days of data.")
+    time.sleep(0.5)
     return df
 
 # 2. DATA PREPARATION
@@ -136,14 +140,18 @@ model.fit(X_train, y_train)
 # -------------
 predictions = model.predict(X_test)
 print("\n--- Model Evaluation (Test Set) ---")
+time.sleep(0.5)
 print(classification_report(y_test, predictions))
+time.sleep(0.5)
 
 # Feature Importance
 print("\n--- Feature Importance ---")
+time.sleep(0.5)
 importance = pd.DataFrame({'feature': feature_cols, 'coef': model.coef_[0]})
 # Sort by absolute value to see impact regardless of direction
 importance['abs_coef'] = importance['coef'].abs()
 print(importance.sort_values(by='abs_coef', ascending=False).head(10))
+time.sleep(0.5)
 
 # 6. VISUALIZATION
 # ----------------
@@ -191,4 +199,5 @@ def health(): return 'OK', 200
 
 if __name__ == '__main__':
     print("Starting web server on port 8080...")
+    time.sleep(0.5)
     app.run(host='0.0.0.0', port=8080, debug=False)
