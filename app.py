@@ -93,13 +93,9 @@ df['sma_50_dist'] = (df['close'] - df['close'].rolling(119).mean()) / df['close'
 df['sma_50_abs_dist'] = df['sma_50_dist'].abs() 
 # feature_cols.append('sma_50_abs_dist')  # Removed as per user request
 
-# E. Distance to 365 SMA with 1.15 and 0.85 multipliers (Normalized)
-df['sma_365_1_15'] = df['close'].rolling(365).mean() * 1.15
-df['sma_365_0_85'] = df['close'].rolling(365).mean() * 0.85
-df['dist_sma_365_1_15'] = (df['close'] - df['sma_365_1_15']) / df['close']
-df['dist_sma_365_0_85'] = (df['close'] - df['sma_365_0_85']) / df['close']
-feature_cols.append('dist_sma_365_1_15')
-feature_cols.append('dist_sma_365_0_85')
+# E. Distance to 365 SMA with abs dist * 1.1
+df['sma_365_abs_dist_1_1'] = df['sma_365_abs_dist'] * 1.1
+feature_cols.append('sma_365_abs_dist_1_1')
 
 # F. Distance to 120 SMA with 1.15 and 0.85 multipliers (Normalized) - Removed as per user request
 df['sma_120_1_15'] = df['close'].rolling(120).mean() * 1.15
