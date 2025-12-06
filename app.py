@@ -136,7 +136,11 @@ importance = pd.DataFrame({'lag': range(1, 31), 'coefficient': model.coef_[0]})
 print(importance.sort_values(by='coefficient', ascending=False).head(5))
 
 # Save the plot to a file
-plot_path = '/app/static/plot.png'
+import os
+plot_dir = '/app/static'
+if not os.path.exists(plot_dir):
+    os.makedirs(plot_dir)
+plot_path = os.path.join(plot_dir, 'plot.png')
 plt.savefig(plot_path, dpi=300, bbox_inches='tight')
 print(f"Plot saved to {plot_path}")
 
