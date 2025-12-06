@@ -91,50 +91,60 @@ for i in range(len(df)):
         base_returns.append(0.0)
         continue
     
+    # Use yesterday's data (i-1) to determine today's position
     prev_close = df['close'].iloc[i-1]
+    # Current day's price for execution
     current_price = df['close'].iloc[i]
     open_p = df['open'].iloc[i]
     high_p = df['high'].iloc[i]
     low_p = df['low'].iloc[i]
     close_p = df['close'].iloc[i]
     
-    sma_fast = df['sma_fast'].iloc[i-1]
-    sma_slow = df['sma_slow'].iloc[i-1]
-    upper_band = df['upper_band'].iloc[i-1]
-    lower_band = df['lower_band'].iloc[i-1]
+    # All indicators calculated using yesterday's data
+    sma_fast_yesterday = df['sma_fast'].iloc[i-1]
+    sma_slow_yesterday = df['sma_slow'].iloc[i-1]
+    upper_band_yesterday = df['upper_band'].iloc[i-1]
+    lower_band_yesterday = df['lower_band'].iloc[i-1]
     
     daily_ret = 0.0
     signal = "FLAT"
     
-    # Update cross flag based on previous close to current price (Tumbler logic)
-    if prev_close < sma_fast and current_price > sma_fast:
+    # Update cross flag based on yesterday's close to yesterday's price (using yesterday's data)
+    # For cross detection, we compare yesterday's close to yesterday's SMA (both from i-1)
+    if i > start_idx:
+        prev_prev_close = df['close'].iloc[i-2]
+    else:
+        prev_prev_close = prev_close  # fallback for first day
+    
+    # Cross detection using yesterday's data
+    if prev_prev_close < sma_fast_yesterday and prev_close > sma_fast_yesterday:
         cross_flag = 1  # Just crossed UP
-    elif prev_close > sma_fast and current_price < sma_fast:
+    elif prev_prev_close > sma_fast_yesterday and prev_close < sma_fast_yesterday:
         cross_flag = -1  # Just crossed DOWN
     
-    # Reset flag if price exits bands
-    if current_price > upper_band or current_price < lower_band:
+    # Reset flag if price exits bands (using yesterday's price)
+    if prev_close > upper_band_yesterday or prev_close < lower_band_yesterday:
         cross_flag = 0
     
-    # Generate signal using Tumbler logic
+    # Generate signal using Tumbler logic with yesterday's data
     # LONG conditions
-    if current_price > upper_band:
+    if prev_close > upper_band_yesterday:
         signal = "LONG"
-    elif current_price > sma_fast and cross_flag == 1:
+    elif prev_close > sma_fast_yesterday and cross_flag == 1:
         signal = "LONG"
     # SHORT conditions
-    elif current_price < lower_band:
+    elif prev_close < lower_band_yesterday:
         signal = "SHORT"
-    elif current_price < sma_fast and cross_flag == -1:
+    elif prev_close < sma_fast_yesterday and cross_flag == -1:
         signal = "SHORT"
     
-    # Apply SMA slow (124) filter
-    if signal == "LONG" and current_price < sma_slow:
+    # Apply SMA slow (124) filter using yesterday's data
+    if signal == "LONG" and prev_close < sma_slow_yesterday:
         signal = "FLAT"
-    elif signal == "SHORT" and current_price > sma_slow:
+    elif signal == "SHORT" and prev_close > sma_slow_yesterday:
         signal = "FLAT"
     
-    # Execute trades with stop loss and take profit
+    # Execute trades with stop loss and take profit (using today's prices)
     if signal == "LONG":
         entry = open_p
         sl = entry * (1 - SL_PCT)
