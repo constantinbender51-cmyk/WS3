@@ -138,10 +138,10 @@ plt.legend()
 plt.grid(True, which='both', linestyle='--', linewidth=0.5)
 plt.show()
 
-# Output the coefficients to see which days in history matter most
-print("\n--- Feature Importance (Last 30 Days) ---")
-importance = pd.DataFrame({'lag': range(1, 31), 'coefficient': model.coef_[0]})
-print(importance.sort_values(by='coefficient', ascending=False).head(5))
+# Output the coefficients to see which features matter most
+print("\n--- Feature Importance (All Features) ---")
+importance = pd.DataFrame({'feature': feature_cols, 'coefficient': model.coef_[0]})
+print(importance.sort_values(by='coefficient', ascending=False).head(10))
 
 # Save the plot to a file
 import os
