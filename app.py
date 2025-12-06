@@ -60,6 +60,47 @@ def get_final_metrics(equity_series):
     sharpe = (ret.mean() / ret.std()) * np.sqrt(365) if ret.std() != 0 else 0
     return total_ret, cagr, max_dd, sharpe
 
+def fit_and_project_equity(equity_series, future_days=30):
+    """
+    Fit a polynomial to log-transformed equity data to model slowing exponential growth
+    and project future equity values.
+    
+    Parameters:
+    equity_series: pandas Series with datetime index and equity values
+    future_days: number of days to project into the future
+    
+    Returns:
+    DataFrame with columns ['date', 'equity'] for projected values
+    """
+    # Extract time indices as numeric (days since start)
+    time_days = np.arange(len(equity_series))
+    
+    # Log transform the equity data to linearize exponential trends
+    log_equity = np.log(equity_series.values)
+    
+    # Fit a quadratic polynomial (degree 2) to capture curvature on log scale
+    coeffs = np.polyfit(time_days, log_equity, deg=2)
+    poly_func = np.poly1d(coeffs)
+    
+    # Project future time indices
+    future_time = np.arange(len(equity_series), len(equity_series) + future_days)
+    future_log_equity = poly_func(future_time)
+    
+    # Convert back from log scale to original scale
+    future_equity = np.exp(future_log_equity)
+    
+    # Create future dates (assuming daily frequency)
+    last_date = equity_series.index[-1]
+    future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=future_days, freq='D')
+    
+    # Return as DataFrame
+    projection_df = pd.DataFrame({
+        'date': future_dates,
+        'equity': future_equity
+    })
+    
+    return projection_df
+
 
 # 2. DATA PREP
 df = fetch_binance_history(symbol, start_date_str)
