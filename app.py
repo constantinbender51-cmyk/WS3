@@ -221,7 +221,7 @@ ax2.plot(plot_data.index, drawdown, color='red', alpha=0.6, label='Drawdown')
 ax2.fill_between(plot_data.index, drawdown, 0, color='red', alpha=0.1)
 
 # Overlay Choppy Signal background with red background color
-ax2.fill_between(plot_data.index, ax2.get_ylim()[0], ax2.get_ylim()[1],
+ax1.fill_between(plot_data.index, ax1.get_ylim()[0], ax1.get_ylim()[1],
                  where=plot_data['prediction'] == 1, facecolor='red', alpha=0.1, label='Choppy Market (Model Prediction)')
 
 ax2.set_ylabel('Drawdown')
