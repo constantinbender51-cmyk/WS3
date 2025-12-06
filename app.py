@@ -12,9 +12,8 @@ timeframe = '1d'
 start_date_str = '2018-01-01 00:00:00'
 
 # Strategy Params
-SMA_FAST = 57
-SMA_SLOW = 124
-BAND_WIDTH = 0.05
+SMA_FAST = 40
+SMA_SLOW = 120
 SL_PCT = 0.02
 TP_PCT = 0.16
 III_WINDOW = 14 
@@ -75,98 +74,38 @@ df['iii'] = df['net_direction'] / (df['path_length'] + epsilon)
 # Indicators
 df['sma_fast'] = df['close'].rolling(SMA_FAST).mean()
 df['sma_slow'] = df['close'].rolling(SMA_SLOW).mean()
-# Calculate bands for SMA fast (57)
-df['upper_band'] = df['sma_fast'] * (1 + BAND_WIDTH)
-df['lower_band'] = df['sma_fast'] * (1 - BAND_WIDTH)
 
-# 3. BASE RETURNS (1x) - Tumbler Strategy Logic
+# 3. BASE RETURNS (1x)
 base_returns = []
 start_idx = max(SMA_SLOW, III_WINDOW)
-
-# Initialize cross flag for state machine (0=no cross, 1=up cross, -1=down cross)
-cross_flag = 0
 
 for i in range(len(df)):
     if i < start_idx:
         base_returns.append(0.0)
         continue
     
-    # Use yesterday's data (i-1) to determine today's position
     prev_close = df['close'].iloc[i-1]
-    # Current day's price for execution
-    current_price = df['close'].iloc[i]
+    prev_fast = df['sma_fast'].iloc[i-1]
+    prev_slow = df['sma_slow'].iloc[i-1]
     open_p = df['open'].iloc[i]
     high_p = df['high'].iloc[i]
     low_p = df['low'].iloc[i]
     close_p = df['close'].iloc[i]
     
-    # All indicators calculated using yesterday's data
-    sma_fast_yesterday = df['sma_fast'].iloc[i-1]
-    sma_slow_yesterday = df['sma_slow'].iloc[i-1]
-    upper_band_yesterday = df['upper_band'].iloc[i-1]
-    lower_band_yesterday = df['lower_band'].iloc[i-1]
-    
     daily_ret = 0.0
-    signal = "FLAT"
     
-    # Update cross flag based on yesterday's close to yesterday's price (using yesterday's data)
-    # For cross detection, we compare yesterday's close to yesterday's SMA (both from i-1)
-    if i > start_idx:
-        prev_prev_close = df['close'].iloc[i-2]
-    else:
-        prev_prev_close = prev_close  # fallback for first day
-    
-    # Cross detection using yesterday's data
-    if prev_prev_close < sma_fast_yesterday and prev_close > sma_fast_yesterday:
-        cross_flag = 1  # Just crossed UP
-    elif prev_prev_close > sma_fast_yesterday and prev_close < sma_fast_yesterday:
-        cross_flag = -1  # Just crossed DOWN
-    
-    # Reset flag if price exits bands (using yesterday's price)
-    if prev_close > upper_band_yesterday or prev_close < lower_band_yesterday:
-        cross_flag = 0
-    
-    # Generate signal using Tumbler logic with yesterday's data
-    # LONG conditions
-    if prev_close > upper_band_yesterday:
-        signal = "LONG"
-    elif prev_close > sma_fast_yesterday and cross_flag == 1:
-        signal = "LONG"
-    # SHORT conditions
-    elif prev_close < lower_band_yesterday:
-        signal = "SHORT"
-    elif prev_close < sma_fast_yesterday and cross_flag == -1:
-        signal = "SHORT"
-    
-    # Apply SMA slow (124) filter using yesterday's data
-    if signal == "LONG" and prev_close < sma_slow_yesterday:
-        signal = "FLAT"
-    elif signal == "SHORT" and prev_close > sma_slow_yesterday:
-        signal = "FLAT"
-    
-    # Execute trades with stop loss and take profit (using today's prices)
-    if signal == "LONG":
-        entry = open_p
-        sl = entry * (1 - SL_PCT)
-        tp = entry * (1 + TP_PCT)
-        if low_p <= sl:
-            daily_ret = -SL_PCT
-        elif high_p >= tp:
-            daily_ret = TP_PCT
-        else:
-            daily_ret = (close_p - entry) / entry
-            
-    elif signal == "SHORT":
-        entry = open_p
-        sl = entry * (1 + SL_PCT)
-        tp = entry * (1 - TP_PCT)
-        if high_p >= sl:
-            daily_ret = -SL_PCT
-        elif low_p <= tp:
-            daily_ret = TP_PCT
-        else:
-            daily_ret = (entry - close_p) / entry
-    
+    if prev_close > prev_fast and prev_close > prev_slow:
+        entry = open_p; sl = entry * (1 - SL_PCT); tp = entry * (1 + TP_PCT)
+        if low_p <= sl: daily_ret = -SL_PCT
+        elif high_p >= tp: daily_ret = TP_PCT
+        else: daily_ret = (close_p - entry) / entry
+        
+    elif prev_close < prev_fast and prev_close < prev_slow:
+        entry = open_p; sl = entry * (1 + SL_PCT); tp = entry * (1 - TP_PCT)
+        if high_p >= sl: daily_ret = -SL_PCT
+        elif low_p <= tp: daily_ret = TP_PCT
+        else: daily_ret = (entry - close_p) / entry
+        
     base_returns.append(daily_ret)
 
 df['base_ret'] = base_returns
