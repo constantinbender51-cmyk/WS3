@@ -139,7 +139,6 @@ print(classification_report(y_test, predictions))
 
 # Feature Importance
 print("\n--- Feature Importance (Correlation to Losing Periods) ---")
-importance = pd.DataFrame({'Lag': range(7), 'Coefficient': model.coef_[0]})
 importance = pd.DataFrame({'Lag': range(30), 'Coefficient': model.coef_[0]})
 
 # Predict on full dataset for plotting
