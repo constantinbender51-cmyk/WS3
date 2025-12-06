@@ -144,6 +144,7 @@ importance = pd.DataFrame({'Lag': range(30), 'Coefficient': model.coef_[0]})
 # Predict on full dataset for plotting
 df['prediction'] = model.predict(X_scaled)
 df['prob_loss'] = model.predict_proba(X_scaled)[:, 1]
+df['prob_loss_sma_7'] = df['prob_loss'].rolling(window=7).mean()
 
 # 6. VISUALIZATION
 # ----------------
@@ -156,10 +157,10 @@ ax1.set_yscale('log')
 # Highlight Actual Losing Periods (Red)
 for start, end in losing_ranges:
     ax1.axvspan(pd.to_datetime(start), pd.to_datetime(end), color='red', alpha=0.2, label='Actual Drawdown' if start==losing_ranges[0][0] else "")
-# Highlight periods where predicted probability of loss is > 0.5 (Yellow)
+# Highlight periods where 7-day SMA of predicted probability of loss is > 0.5 (Yellow)
 ax1.fill_between(df.index, ax1.get_ylim()[0], ax1.get_ylim()[1],
-                 where=(df['prob_loss'] > 0.5),
-                 color='yellow', alpha=0.3, label='Predicted > 0.5 Prob')
+                 where=(df['prob_loss_sma_7'] > 0.5),
+                 color='yellow', alpha=0.3, label='Predicted SMA > 0.5 Prob')
 ax1.set_title('BTC Price vs Actual Losing Periods (>15% DD)')
 ax1.legend()
 ax1.grid(True, which='both', linestyle='--', alpha=0.3)
@@ -174,10 +175,12 @@ ax2.grid(True, alpha=0.3)
 # Subplot 3: Predicted Probability of Loss
 ax3 = plt.subplot(3, 1, 3, sharex=ax1)
 ax3.plot(df.index, df['prob_loss'], color='orange', linewidth=1, label='Prob. of Losing Period')
+ax3.plot(df.index, df['prob_loss_sma_7'], color='blue', linewidth=1, linestyle='--', label='7-day SMA Prob.')
 ax3.axhline(0.5, color='gray', linestyle='--')
 ax3.fill_between(df.index, 0, df['prob_loss'], color='orange', alpha=0.2)
 ax3.set_title('Model Prediction: Probability of being in a Losing Period')
 ax3.set_ylabel('Probability')
+ax3.legend()
 ax3.grid(True, alpha=0.3)
 
 plt.tight_layout()
