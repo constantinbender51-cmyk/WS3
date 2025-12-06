@@ -64,7 +64,7 @@ for start, end in choppy_ranges:
 
 # 3. FEATURE ENGINEERING (YOUR FORMULA)
 # -------------------------------------
-window_size = 30
+window_size = 60
 
 # Calculate Log Returns: ln(Pt / Pt-1)
 df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
