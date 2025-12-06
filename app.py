@@ -174,11 +174,17 @@ ax1.set_title('Choppy Market Detection (Green=Actual, Red=Predicted)')
 ax1.legend()
 
 # Subplot 2: The Efficiency Ratio (Explanation of logic)
-ax2 = plt.subplot(2, 1, 2, sharex=ax1)
+ax2 = plt.subplot(3, 1, 2, sharex=ax1)
 ax2.plot(df.index, df['ker'], color='blue', linewidth=1, label='Efficiency Ratio (KER)')
 ax2.axhline(0.4, color='gray', linestyle='--', label='Chop Threshold')
 ax2.set_title('Kaufman Efficiency Ratio (Low = Chop, High = Trend)')
 ax2.legend()
+
+# Subplot 3: Absolute Distance from 365 SMA * 1.075
+ax3 = plt.subplot(3, 1, 3, sharex=ax1)
+ax3.plot(df.index, df['sma_365_abs_dist_1_075'], color='purple', linewidth=1, label='365 SMA Abs Dist * 1.075')
+ax3.set_title('Absolute Distance from 365 SMA Multiplied by 1.075')
+ax3.legend()
 
 import os
 plot_dir = '/app/static'
