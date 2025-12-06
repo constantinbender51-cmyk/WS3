@@ -102,6 +102,16 @@ df['sma_365_abs_dist'] = df['sma_365_dist'].abs()
 df['sma_365_abs_dist_1_1'] = df['sma_365_abs_dist'] * 1.1
 feature_cols.append('sma_365_abs_dist_1_1')
 
+# H. Distance from 120 SMA
+# Added as per user request for additional medium-term trend analysis
+df['sma_120_dist'] = (df['close'] - df['close'].rolling(120).mean()) / df['close'].rolling(120).mean()
+df['sma_120_abs_dist'] = df['sma_120_dist'].abs()
+
+# I. Distance to 120 SMA with abs dist * 1.075
+df['sma_120_abs_dist_1_075'] = df['sma_120_abs_dist'] * 1.075
+feature_cols.append('sma_120_abs_dist')
+feature_cols.append('sma_120_abs_dist_1_075')
+
 # F. Distance to 120 SMA with 1.15 and 0.85 multipliers (Normalized) - Removed as per user request
 df['sma_120_1_15'] = df['close'].rolling(120).mean() * 1.15
 df['sma_120_0_85'] = df['close'].rolling(120).mean() * 0.85
