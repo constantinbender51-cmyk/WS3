@@ -97,7 +97,7 @@ for start_date_str, _ in losing_ranges:
 # 3. FEATURE ENGINEERING
 # ----------------------
 # Calculate Inefficiency Index with window=14
-window_size = 14
+window_size = 7
 df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
 df['sum_abs_log_ret'] = df['log_ret'].abs().rolling(window_size).mean()
 df['abs_sum_log_ret'] = df['log_ret'].rolling(window_size).mean().abs()
@@ -108,7 +108,7 @@ df['inefficiency_index'] = df['inefficiency_index'].clip(upper=20)
 # Create 14 Lagged Features of the Index
 # "14 days of inefficiency index"
 feature_cols = []
-for i in range(14):
+for i in range(7):
     col_name = f'ineff_lag_{i}'
     df[col_name] = df['inefficiency_index'].shift(i)
     feature_cols.append(col_name)
@@ -139,7 +139,7 @@ print(classification_report(y_test, predictions))
 
 # Feature Importance
 print("\n--- Feature Importance (Correlation to Losing Periods) ---")
-importance = pd.DataFrame({'Lag': range(14), 'Coefficient': model.coef_[0]})
+importance = pd.DataFrame({'Lag': range(7), 'Coefficient': model.coef_[0]})
 print(importance.sort_values(by='Coefficient', ascending=False))
 
 # Predict on full dataset for plotting
@@ -168,7 +168,7 @@ ax1.grid(True, which='both', linestyle='--', alpha=0.3)
 # Subplot 2: The Inefficiency Index
 ax2 = plt.subplot(3, 1, 2, sharex=ax1)
 ax2.plot(df.index, df['inefficiency_index'], color='purple', linewidth=1)
-ax2.set_title('Inefficiency Index (Window=14)')
+ax2.set_title('Inefficiency Index (Window=7)')
 ax2.set_ylabel('Index Value')
 ax2.grid(True, alpha=0.3)
 
