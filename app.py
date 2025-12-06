@@ -104,11 +104,11 @@ df['strategy_equity'] = 1.0
 df['buy_hold_equity'] = 1.0
 df['position'] = 'CASH'
 df['daily_return'] = 0.0
-df['causal_drawdown'] = 0.0 # New column to store causal drawdown values
 
 current_equity = 1.0
 hold_equity = 1.0
-max_equity_observed = 1.0 # This will track the highest `current_equity` reached so far.
+potential_equity = 1.0 # Tracks equity if strategy always traded
+max_potential_equity_observed = 1.0 # Tracks highest `potential_equity` reached
 
 # Start loop
 start_idx = max(120, window_size)
@@ -122,10 +122,10 @@ for i in range(start_idx, len(df)):
     prev_sma120 = df['sma_120'].iloc[i-1]
     prev_prediction_is_choppy = df['prediction'].iloc[i-1] == 1 # Model's choppy prediction from yesterday
     
-    # Calculate yesterday's drawdown based on the equity at the end of day i-1
-    # `current_equity` at this point holds the value for day i-1's close.
-    # `max_equity_observed` at this point holds the max equity up to day i-1's close.
-    yesterday_drawdown_value = (current_equity - max_equity_observed) / max_equity_observed
+    # Calculate yesterday's drawdown based on the POTENTIAL equity (if we didn't stay out)
+    # `potential_equity` at this point holds the value for day i-1's close.
+    # `max_potential_equity_observed` tracks the highest `potential_equity` reached.
+    potential_drawdown_value = (potential_equity - max_potential_equity_observed) / max_potential_equity_observed
     
     # Combine conditions to decide if we trade today
     is_market_restricted_today = False
@@ -133,7 +133,7 @@ for i in range(start_idx, len(df)):
     if prev_prediction_is_choppy: # If model predicted choppy yesterday
         is_market_restricted_today = True
     
-    if yesterday_drawdown_value < -0.15: # If yesterday's drawdown was > 15%
+    if potential_drawdown_value < -0.15: # If yesterday's POTENTIAL drawdown was > 15%
         is_market_restricted_today = True
         
     # Execution Data (Day T)
@@ -142,52 +142,60 @@ for i in range(start_idx, len(df)):
     low_price = df['low'].iloc[i]
     close_price = df['close'].iloc[i]
     
-    daily_ret = 0.0
+    daily_ret_potential = 0.0 # Daily return if strategy always traded
+    daily_ret_actual = 0.0    # Actual daily return, considering restrictions
     position = 'CASH'
     
     # Buy & Hold Logic (always trades)
     bh_ret = (close_price - df['close'].iloc[i-1]) / df['close'].iloc[i-1]
     hold_equity *= (1 + bh_ret)
     
-    # Strategy Logic
-    if not is_market_restricted_today: # Only trade if not restricted
-        # Long Logic
-        if prev_close > prev_sma40 and prev_close > prev_sma120:
-            position = 'LONG'
-            entry = open_price
-            stop_loss = entry * (1 - SL_PCT)
-            take_profit = entry * (1 + TP_PCT)
+    # Calculate potential daily return (what the strategy *would have done*)
+    if prev_close > prev_sma40 and prev_close > prev_sma120: # Long Logic
+        position_potential = 'LONG'
+        entry = open_price
+        stop_loss = entry * (1 - SL_PCT)
+        take_profit = entry * (1 + TP_PCT)
+        
+        if low_price <= stop_loss:
+            daily_ret_potential = -SL_PCT
+        elif high_price >= take_profit:
+            daily_ret_potential = TP_PCT
+        else:
+            daily_ret_potential = (close_price - entry) / entry
             
-            if low_price <= stop_loss:
-                daily_ret = -SL_PCT
-            elif high_price >= take_profit:
-                daily_ret = TP_PCT
-            else:
-                daily_ret = (close_price - entry) / entry
-                
-        # Short Logic
-        elif prev_close < prev_sma40 and prev_close < prev_sma120:
-            position = 'SHORT'
-            entry = open_price
-            stop_loss = entry * (1 + SL_PCT)
-            take_profit = entry * (1 - TP_PCT)
+    elif prev_close < prev_sma40 and prev_close < prev_sma120: # Short Logic
+        position_potential = 'SHORT'
+        entry = open_price
+        stop_loss = entry * (1 + SL_PCT)
+        take_profit = entry * (1 - TP_PCT)
+        
+        if high_price >= stop_loss:
+            daily_ret_potential = -SL_PCT
+        elif low_price <= take_profit:
+            daily_ret_potential = TP_PCT
+        else:
+            daily_ret_potential = (entry - close_price) / entry
             
-            if high_price >= stop_loss:
-                daily_ret = -SL_PCT
-            elif low_price <= take_profit:
-                daily_ret = TP_PCT
-            else:
-                daily_ret = (entry - close_price) / entry
-    
-    current_equity *= (1 + daily_ret) # Update current_equity for day `i`
-    
-    # Update max_equity_observed *after* `current_equity` has been updated for day `i`
-    max_equity_observed = max(max_equity_observed, current_equity)
+    # Update potential equity and its max observed for drawdown calculation
+    potential_equity *= (1 + daily_ret_potential)
+    max_potential_equity_observed = max(max_potential_equity_observed, potential_equity)
+
+    # Now, decide actual trading based on restrictions
+    if not is_market_restricted_today:
+        # If not restricted, actual return is the potential return
+        daily_ret_actual = daily_ret_potential
+        position = position_potential # Assign the position that would have been taken
+    else:
+        # If restricted, the strategy stays in cash, so daily_ret_actual is 0
+        daily_ret_actual = 0.0
+        position = 'CASH'
+
+    current_equity *= (1 + daily_ret_actual) # Update current_equity based on actual trade decision
     
     df.at[today, 'strategy_equity'] = current_equity
     df.at[today, 'buy_hold_equity'] = hold_equity
     df.at[today, 'position'] = position
-    df.at[today, 'causal_drawdown'] = (current_equity - max_equity_observed) / max_equity_observed
 
 # 6. VISUALIZATION
 # ----------------
