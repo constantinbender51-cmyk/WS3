@@ -94,19 +94,23 @@ df['sma_50_dist'] = (df['close'] - df['close'].rolling(119).mean()) / df['close'
 df['sma_50_abs_dist'] = df['sma_50_dist'].abs() 
 feature_cols.append('sma_50_abs_dist')
 
-# E. Normalized Average True Range (ATR)
-# ATR measures volatility, normalized by price to make it scale-independent
-atr_window = 14
-tr = pd.concat([
-    df['high'] - df['low'],
-    (df['high'] - df['close'].shift()).abs(),
-    (df['low'] - df['close'].shift()).abs()
-], axis=1).max(axis=1)
-df['atr'] = tr.rolling(atr_window).mean()
-df['norm_atr'] = df['atr'] / df['close']
-feature_cols.append('norm_atr')
+# E. Distance to 365 SMA with 1.1 and 0.9 multipliers (Normalized)
+df['sma_365_1_1'] = df['close'].rolling(365).mean() * 1.1
+df['sma_365_0_9'] = df['close'].rolling(365).mean() * 0.9
+df['dist_sma_365_1_1'] = (df['close'] - df['sma_365_1_1']) / df['close']
+df['dist_sma_365_0_9'] = (df['close'] - df['sma_365_0_9']) / df['close']
+feature_cols.append('dist_sma_365_1_1')
+feature_cols.append('dist_sma_365_0_9')
 
-# F. Distance from Long-Term Trend (365 SMA)
+# F. Distance to 120 SMA with 1.1 and 0.9 multipliers (Normalized)
+df['sma_120_1_1'] = df['close'].rolling(120).mean() * 1.1
+df['sma_120_0_9'] = df['close'].rolling(120).mean() * 0.9
+df['dist_sma_120_1_1'] = (df['close'] - df['sma_120_1_1']) / df['close']
+df['dist_sma_120_0_9'] = (df['close'] - df['sma_120_0_9']) / df['close']
+feature_cols.append('dist_sma_120_1_1')
+feature_cols.append('dist_sma_120_0_9')
+
+# G. Distance from Long-Term Trend (365 SMA)
 # Similar logic to 50 SMA but over a longer period to capture broader consolidation
 df['sma_365_dist'] = (df['close'] - df['close'].rolling(365).mean()) / df['close'].rolling(365).mean()
 df['sma_365_abs_dist'] = df['sma_365_dist'].abs()
