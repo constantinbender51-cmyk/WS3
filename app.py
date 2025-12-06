@@ -21,11 +21,11 @@ III_WINDOW = 14
 
 # --- GRID SEARCH SPACE DEFINITION (5 VARIABLES) ---
 
-# Threshold Search Space (T_Low, T_High): 0.0 to 0.9 in 0.1 steps
-THRESH_RANGE = np.arange(0.0, 1.0, 0.1) 
+# Threshold Search Space (T_Low, T_High): 0.0 to 0.95 in 0.05 steps
+THRESH_RANGE = np.arange(0.0, 1.0, 0.05) 
 
-# Leverage Search Space (L_Low, L_Mid, L_High): 0.0 to 4.5 in 0.5 steps
-LEV_RANGE = np.arange(0.0, 4.51, 0.5) 
+# Leverage Search Space (L_Low, L_Mid, L_High): 0.0 to 4.5 in 0.25 steps
+LEV_RANGE = np.arange(0.0, 4.51, 0.25) 
 
 # MDD Constraint
 MAX_MDD_CONSTRAINT = -0.50 # Must be less than 50% drawdown
