@@ -196,15 +196,22 @@ for i in range(start_idx, len(df)):
 plot_data = df.iloc[start_idx:].copy()
 s_tot, s_cagr, s_mdd, s_sharpe = get_final_metrics(plot_data['strategy_equity'])
 
+# Get equity projection
+projection = fit_and_project_equity(plot_data['strategy_equity'], future_days=30)
+
 plt.figure(figsize=(12, 10))
 
 ax1 = plt.subplot(3, 1, 1)
 ax1.plot(plot_data.index, plot_data['strategy_equity'], label=f'Final Strategy (Sharpe: {s_sharpe:.2f})', color='blue')
 ax1.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
+# Plot projection
+ax1.plot(projection['date'], projection['equity'], label='30-Day Projection', color='orange', linestyle='--', linewidth=2)
 ax1.set_yscale('log')
 ax1.set_title(f'Optimized Strategy Equity (Sharpe: {s_sharpe:.2f})')
 ax1.legend()
 ax1.grid(True, which='both', linestyle='--', alpha=0.3)
+# Extend x-axis slightly to show projection
+ax1.set_xlim([plot_data.index[0], projection['date'].iloc[-1]])
 
 # Add Stats Box
 stats = f"CAGR: {s_cagr*100:.1f}%\nMaxDD: {s_mdd*100:.1f}%\nSharpe: {s_sharpe:.2f}"
