@@ -93,6 +93,11 @@ df['sma_50_dist'] = (df['close'] - df['close'].rolling(119).mean()) / df['close'
 df['sma_50_abs_dist'] = df['sma_50_dist'].abs() 
 # feature_cols.append('sma_50_abs_dist')  # Removed as per user request
 
+# G. Distance from Long-Term Trend (365 SMA)
+# Similar logic to 50 SMA but over a longer period to capture broader consolidation
+df['sma_365_dist'] = (df['close'] - df['close'].rolling(365).mean()) / df['close'].rolling(365).mean()
+df['sma_365_abs_dist'] = df['sma_365_dist'].abs()
+
 # E. Distance to 365 SMA with abs dist * 1.1
 df['sma_365_abs_dist_1_1'] = df['sma_365_abs_dist'] * 1.1
 feature_cols.append('sma_365_abs_dist_1_1')
@@ -104,12 +109,6 @@ df['dist_sma_120_1_15'] = (df['close'] - df['sma_120_1_15']) / df['close']
 df['dist_sma_120_0_85'] = (df['close'] - df['sma_120_0_85']) / df['close']
 # feature_cols.append('dist_sma_120_1_15')  # Removed
 # feature_cols.append('dist_sma_120_0_85')  # Removed
-
-# G. Distance from Long-Term Trend (365 SMA)
-# Similar logic to 50 SMA but over a longer period to capture broader consolidation
-df['sma_365_dist'] = (df['close'] - df['close'].rolling(365).mean()) / df['close'].rolling(365).mean()
-df['sma_365_abs_dist'] = df['sma_365_dist'].abs()
-feature_cols.append('sma_365_abs_dist')
 
 df.dropna(subset=feature_cols, inplace=True)
 
