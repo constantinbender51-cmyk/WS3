@@ -80,12 +80,8 @@ df['abs_sum_log_ret'] = df['log_ret'].rolling(window_size).mean().abs()
 epsilon = 1e-8
 df['inefficiency_index'] = df['sum_abs_log_ret'] / (df['abs_sum_log_ret'] + epsilon)
 
-# Add Volatility (Std Dev) as a secondary context feature
-# (Sometimes high volatility is chop, sometimes it's a breakout)
-df['volatility'] = df['log_ret'].rolling(window_size).std()
-
 # Drop NaNs
-feature_cols = ['inefficiency_index', 'volatility']
+feature_cols = ['inefficiency_index']
 df.dropna(subset=feature_cols, inplace=True)
 
 # Clip outliers: If price doesn't move at all, index explodes to infinity.
