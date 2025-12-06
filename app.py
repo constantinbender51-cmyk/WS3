@@ -117,6 +117,7 @@ iii_prev = df['iii'].shift(1).fillna(0).values
 best_sharpe = -999
 best_combo = (0.0, 0.0, 0.0, 0.0, 0.0) # T_Low, T_High, L_Low, L_Mid, L_High
 best_mdd = 0
+iteration_count = 0
 
 # Metrics function optimized for arrays
 def calculate_sharpe_mdd(returns):
@@ -184,6 +185,13 @@ for t_low, t_high in itertools.product(THRESH_RANGE, repeat=2):
 
     # Inner loop: Leverages (L_Low, L_Mid, L_High)
     for l_low, l_mid, l_high in itertools.product(LEV_RANGE, repeat=3):
+        iteration_count += 1
+        
+        # Progress logging every 100,000 iterations
+        if iteration_count % 100000 == 0:
+            print(f"Progress: {iteration_count:,} / {total_iterations:,} iterations ({iteration_count/total_iterations*100:.1f}%)")
+            print(f"  Current best Sharpe: {best_sharpe:.2f}")
+            print(f"  Current params: T_Low={t_low:.2f}, T_High={t_high:.2f}, L_Low={l_low:.2f}, L_Mid={l_mid:.2f}, L_High={l_high:.2f}")
         
         # Construct leverage array using the calculated tiers
         lookup = np.array([l_low, l_mid, l_high])
