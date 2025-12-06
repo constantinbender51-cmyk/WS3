@@ -28,7 +28,7 @@ THRESH_RANGE = np.arange(0.0, 1.0, 0.05)
 LEV_RANGE = np.arange(0.0, 4.51, 0.25) 
 
 # MDD Constraint
-MAX_MDD_CONSTRAINT = -0.50 # Must be less than 50% drawdown
+MAX_MDD_CONSTRAINT = -0.70 # Must be less than 70% drawdown
 
 def fetch_binance_history(symbol, start_str):
     print(f"Fetching data for {symbol} starting from {start_str}...")
