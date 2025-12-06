@@ -2,60 +2,25 @@ import ccxt
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
 from datetime import datetime
 from flask import Flask, send_file
 import os
 
-# 1. SETUP & CONFIGURATION
-# ------------------------
+# 1. CONFIGURATION
+# ----------------
 symbol = 'BTC/USDT'
 timeframe = '1d'
 start_date_str = '2018-01-01 00:00:00'
 
-# The specific "Losing Periods" (Drawdown > 15%) you identified
-# Format: (Start Date, End Date)
-losing_ranges = [
-    ('2018-08-27', '2018-09-06'),
-    ('2018-09-13', '2018-09-16'),
-    ('2018-09-19', '2018-11-18'),
-    ('2018-11-29', '2018-11-29'),
-    ('2019-08-20', '2019-09-23'),
-    ('2020-03-25', '2020-03-26'),
-    ('2020-04-03', '2020-05-06'),
-    ('2020-05-11', '2020-05-11'),
-    ('2020-07-09', '2020-07-22'),
-    ('2020-07-24', '2020-07-24'),
-    ('2021-01-19', '2021-02-18'),
-    ('2021-02-20', '2021-02-20'),
-    ('2021-02-23', '2021-03-08'),
-    ('2021-03-10', '2021-03-12'),
-    ('2021-03-14', '2021-11-07'),
-    ('2021-11-09', '2022-01-21'),
-    ('2022-01-23', '2022-06-10'),
-    ('2022-07-06', '2022-07-10'),
-    ('2022-07-15', '2022-09-05'),
-    ('2022-09-07', '2022-09-19'),
-    ('2022-09-21', '2022-11-20'),
-    ('2022-11-22', '2023-01-13'),
-    ('2023-01-15', '2023-01-15'),
-    ('2023-01-18', '2023-01-18'),
-    ('2024-07-21', '2024-11-09'),
-    ('2025-01-28', '2025-01-28'),
-    ('2025-02-01', '2025-02-25'),
-    ('2025-03-01', '2025-03-02'),
-    ('2025-03-06', '2025-03-06'),
-    ('2025-09-07', '2025-09-11'),
-    ('2025-09-14', '2025-09-15'),
-    ('2025-09-21', '2025-10-05'),
-    ('2025-10-07', '2025-10-07'),
-    ('2025-10-09', '2025-10-15'),
-    ('2025-10-19', '2025-11-16'),
-    ('2025-11-18', '2025-11-18')
-]
+# Strategy Params
+SMA_FAST = 40
+SMA_SLOW = 120
+SL_PCT = 0.02
+TP_PCT = 0.16
+
+# Circuit Breaker Params
+DRAWDOWN_LIMIT = -0.15  # -15%
+COOLDOWN_DAYS = 20      # Stay out for ~3 weeks
 
 def fetch_binance_history(symbol, start_str):
     print(f"Fetching data for {symbol} starting from {start_str}...")
@@ -81,114 +46,149 @@ def fetch_binance_history(symbol, start_str):
     print(f"Fetched {len(df)} days of data.")
     return df
 
-# 2. DATA PREPARATION
-# -------------------
+# 2. PREPARE DATA
+# ---------------
 df = fetch_binance_history(symbol, start_date_str)
 
-# Labeling Target: 1 if date is the START of a Losing Period, 0 otherwise
-df['target'] = 0
-for start_date_str, _ in losing_ranges:
-    # Convert start_date_str to datetime to match index type
-    start_dt = pd.to_datetime(start_date_str)
-    # Set target to 1 only for the exact start date
-    if start_dt in df.index:
-        df.loc[start_dt, 'target'] = 1
+# Calculate Indicators
+df['sma_fast'] = df['close'].rolling(SMA_FAST).mean()
+df['sma_slow'] = df['close'].rolling(SMA_SLOW).mean()
 
-# 3. FEATURE ENGINEERING
-# ----------------------
-# Calculate Inefficiency Index with window=14
-window_size = 30
-df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
-df['sum_abs_log_ret'] = df['log_ret'].abs().rolling(window_size).mean()
-df['abs_sum_log_ret'] = df['log_ret'].rolling(window_size).mean().abs()
-epsilon = 1e-8
-df['inefficiency_index'] = df['sum_abs_log_ret'] / (df['abs_sum_log_ret'] + epsilon)
-df['inefficiency_index'] = df['inefficiency_index'].clip(upper=20)
+# 3. BACKTEST ENGINE
+# ------------------
+df['strategy_equity'] = 1.0
+df['buy_hold_equity'] = 1.0
+df['drawdown'] = 0.0
+df['position'] = 'CASH'
+df['state'] = 'ACTIVE' # ACTIVE or COOLDOWN
 
-# Create 14 Lagged Features of the Index
-# "14 days of inefficiency index"
-feature_cols = []
-for i in range(30):
-    col_name = f'ineff_lag_{i}'
-    df[col_name] = df['inefficiency_index'].shift(i)
-    feature_cols.append(col_name)
+equity = 1.0
+peak_equity = 1.0
+hold_equity = 1.0
 
-# Drop NaNs
-df.dropna(subset=feature_cols, inplace=True)
+# Circuit Breaker State
+cooldown_counter = 0
+last_trigger_equity = 0.0 # To prevent immediate re-triggering
 
-# 4. TRAINING
-# -----------
-X = df[feature_cols]
-y = df['target']
+start_idx = SMA_SLOW
 
-# Scale features
-scaler = StandardScaler()
-X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=X.columns, index=X.index)
+for i in range(start_idx, len(df)):
+    today = df.index[i]
+    
+    # Yesterday's Data (Signal Generation)
+    prev_close = df['close'].iloc[i-1]
+    prev_fast = df['sma_fast'].iloc[i-1]
+    prev_slow = df['sma_slow'].iloc[i-1]
+    
+    # Today's Data (Execution)
+    open_p = df['open'].iloc[i]
+    high_p = df['high'].iloc[i]
+    low_p = df['low'].iloc[i]
+    close_p = df['close'].iloc[i]
+    
+    # 1. Update Buy & Hold
+    bh_ret = (close_p - df['close'].iloc[i-1]) / df['close'].iloc[i-1]
+    hold_equity *= (1 + bh_ret)
+    
+    # 2. Check Circuit Breaker Status
+    # Update Peak Equity
+    if equity > peak_equity:
+        peak_equity = equity
+        
+    current_dd = (equity - peak_equity) / peak_equity
+    
+    # Cooldown Logic
+    if cooldown_counter > 0:
+        # We are cooling down
+        cooldown_counter -= 1
+        position = 'CASH'
+        daily_ret = 0.0
+        df.at[today, 'state'] = 'COOLDOWN'
+        
+    else:
+        # We are active
+        # Check if we need to Trigger Circuit Breaker
+        # Condition: DD < -15% AND we are below the equity level where we last triggered
+        # (This ensures we don't trigger daily if we stay flat at -15%)
+        if current_dd < DRAWDOWN_LIMIT and equity < (last_trigger_equity if last_trigger_equity > 0 else equity + 1):
+            cooldown_counter = COOLDOWN_DAYS
+            last_trigger_equity = equity # Set new floor
+            position = 'CASH'
+            daily_ret = 0.0
+            df.at[today, 'state'] = 'TRIGGERED'
+            print(f"[{today.date()}] Circuit Breaker Triggered! DD: {current_dd:.2%}. Cooling down for {COOLDOWN_DAYS} days.")
+        else:
+            # Normal Trading Logic
+            df.at[today, 'state'] = 'ACTIVE'
+            position = 'CASH'
+            daily_ret = 0.0
+            
+            # Long Signal
+            if prev_close > prev_fast and prev_close > prev_slow:
+                position = 'LONG'
+                entry = open_p
+                sl = entry * (1 - SL_PCT)
+                tp = entry * (1 + TP_PCT)
+                
+                if low_p <= sl: daily_ret = -SL_PCT
+                elif high_p >= tp: daily_ret = TP_PCT
+                else: daily_ret = (close_p - entry) / entry
+            
+            # Short Signal
+            elif prev_close < prev_fast and prev_close < prev_slow:
+                position = 'SHORT'
+                entry = open_p
+                sl = entry * (1 + SL_PCT)
+                tp = entry * (1 - TP_PCT)
+                
+                if high_p >= sl: daily_ret = -SL_PCT
+                elif low_p <= tp: daily_ret = TP_PCT
+                else: daily_ret = (entry - close_p) / entry
 
-# Split for validation
-X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, shuffle=False)
+            equity *= (1 + daily_ret)
 
-model = LogisticRegression(class_weight='balanced', C=0.5, max_iter=1000)
-model.fit(X_train, y_train)
+    df.at[today, 'strategy_equity'] = equity
+    df.at[today, 'buy_hold_equity'] = hold_equity
+    df.at[today, 'drawdown'] = current_dd
+    df.at[today, 'position'] = position
 
-# 5. EVALUATION
-# -------------
-predictions = model.predict(X_test)
-print("\n--- Model Evaluation (Test Set) ---")
-print(classification_report(y_test, predictions))
-
-# Feature Importance
-print("\n--- Feature Importance (Correlation to Losing Periods) ---")
-importance = pd.DataFrame({'Lag': range(30), 'Coefficient': model.coef_[0]})
-
-# Predict on full dataset for plotting
-df['prediction'] = model.predict(X_scaled)
-df['prob_loss'] = model.predict_proba(X_scaled)[:, 1]
-df['prob_loss_sma_7'] = df['prob_loss'].rolling(window=7).mean()
-
-# 6. VISUALIZATION
+# 4. VISUALIZATION
 # ----------------
 plt.figure(figsize=(14, 12))
 
-# Subplot 1: Price & Actual Losing Zones
+# Equity Curve
 ax1 = plt.subplot(3, 1, 1)
-ax1.plot(df.index, df['close'], color='black', alpha=0.7, label='BTC Price')
+plot_data = df.iloc[start_idx:]
+ax1.plot(plot_data.index, plot_data['strategy_equity'], label='Strategy w/ Circuit Breaker', color='blue', linewidth=2)
+ax1.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
 ax1.set_yscale('log')
-# Highlight Actual Losing Periods (Red)
-for start, end in losing_ranges:
-    ax1.axvspan(pd.to_datetime(start), pd.to_datetime(end), color='red', alpha=0.2, label='Actual Drawdown' if start==losing_ranges[0][0] else "")
-# Highlight periods where 7-day SMA of predicted probability of loss is > 0.5 (Yellow)
-ax1.fill_between(df.index, ax1.get_ylim()[0], ax1.get_ylim()[1],
-                 where=(df['prob_loss_sma_7'] > 0.5),
-                 color='yellow', alpha=0.3, label='Predicted SMA > 0.5 Prob')
-ax1.set_title('BTC Price vs Actual Losing Periods (>15% DD)')
+ax1.set_title(f'Strategy Equity (Circuit Breaker: 15% DD -> {COOLDOWN_DAYS} Days Cash)')
+ax1.grid(True, which='both', linestyle='--', alpha=0.5)
 ax1.legend()
-ax1.grid(True, which='both', linestyle='--', alpha=0.3)
 
-# Subplot 2: The Inefficiency Index
+# Drawdown Curve
 ax2 = plt.subplot(3, 1, 2, sharex=ax1)
-ax2.plot(df.index, df['inefficiency_index'], color='purple', linewidth=1)
-ax2.set_title('Inefficiency Index (Window=30)')
-ax2.set_ylabel('Index Value')
+ax2.plot(plot_data.index, plot_data['drawdown'], color='red', linewidth=1)
+ax2.fill_between(plot_data.index, plot_data['drawdown'], 0, color='red', alpha=0.1)
+ax2.axhline(DRAWDOWN_LIMIT, color='black', linestyle='--', label='-15% Trigger')
+ax2.set_title('Strategy Drawdown')
+ax2.legend()
 ax2.grid(True, alpha=0.3)
 
-# Subplot 3: Predicted Probability of Loss
+# Circuit Breaker Active Zones
 ax3 = plt.subplot(3, 1, 3, sharex=ax1)
-ax3.plot(df.index, df['prob_loss'], color='orange', linewidth=1, label='Prob. of Losing Period')
-ax3.plot(df.index, df['prob_loss_sma_7'], color='blue', linewidth=1, linestyle='--', label='7-day SMA Prob.')
-ax3.axhline(0.5, color='gray', linestyle='--')
-ax3.fill_between(df.index, 0, df['prob_loss'], color='orange', alpha=0.2)
-ax3.set_title('Model Prediction: Probability of being in a Losing Period')
-ax3.set_ylabel('Probability')
+# Create a numerical series for state: 1 for active, 0 for cooldown
+state_series = plot_data['state'].apply(lambda x: 1 if x in ['COOLDOWN', 'TRIGGERED'] else 0)
+ax3.fill_between(plot_data.index, 0, 1, where=state_series==1, color='orange', alpha=0.5, label='Circuit Breaker Active (Cash)')
+ax3.plot(plot_data.index, plot_data['close'], color='green', linewidth=1, label='Price')
+ax3.set_title('Circuit Breaker Activation Periods (Orange = Forced Cash)')
 ax3.legend()
-ax3.grid(True, alpha=0.3)
 
 plt.tight_layout()
 
 # Save
 plot_dir = '/app/static'
-if not os.path.exists(plot_dir):
-    os.makedirs(plot_dir)
+if not os.path.exists(plot_dir): os.makedirs(plot_dir)
 plot_path = os.path.join(plot_dir, 'plot.png')
 plt.savefig(plot_path, dpi=300, bbox_inches='tight')
 
@@ -200,5 +200,6 @@ def serve_plot(): return send_file(plot_path, mimetype='image/png')
 def health(): return 'OK', 200
 
 if __name__ == '__main__':
+    print(f"Final Strategy Equity: {equity:.2f}x")
     print("\nStarting Web Server...")
     app.run(host='0.0.0.0', port=8080, debug=False)
