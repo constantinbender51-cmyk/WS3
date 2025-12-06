@@ -94,6 +94,12 @@ df['sma_50_dist'] = (df['close'] - df['close'].rolling(50).mean()) / df['close']
 df['sma_50_abs_dist'] = df['sma_50_dist'].abs() 
 feature_cols.append('sma_50_abs_dist')
 
+# E. Distance from Long-Term Trend (365 SMA)
+# Similar logic to 50 SMA but over a longer period to capture broader consolidation
+df['sma_365_dist'] = (df['close'] - df['close'].rolling(365).mean()) / df['close'].rolling(365).mean()
+df['sma_365_abs_dist'] = df['sma_365_dist'].abs()
+feature_cols.append('sma_365_abs_dist')
+
 df.dropna(subset=feature_cols, inplace=True)
 
 # 4. SCALING & TRAINING
