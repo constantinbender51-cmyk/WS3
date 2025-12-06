@@ -12,8 +12,9 @@ timeframe = '1d'
 start_date_str = '2018-01-01 00:00:00'
 
 # Strategy Params
-SMA_FAST = 40
-SMA_SLOW = 120
+SMA_FAST = 57
+SMA_SLOW = 124
+BAND_WIDTH = 0.05
 SL_PCT = 0.02
 TP_PCT = 0.16
 III_WINDOW = 14 
@@ -74,10 +75,16 @@ df['iii'] = df['net_direction'] / (df['path_length'] + epsilon)
 # Indicators
 df['sma_fast'] = df['close'].rolling(SMA_FAST).mean()
 df['sma_slow'] = df['close'].rolling(SMA_SLOW).mean()
+# Calculate bands for SMA fast (57)
+df['upper_band'] = df['sma_fast'] * (1 + BAND_WIDTH)
+df['lower_band'] = df['sma_fast'] * (1 - BAND_WIDTH)
 
-# 3. BASE RETURNS (1x)
+# 3. BASE RETURNS (1x) - Tumbler Strategy Logic
 base_returns = []
 start_idx = max(SMA_SLOW, III_WINDOW)
+
+# Initialize cross flag for state machine (0=no cross, 1=up cross, -1=down cross)
+cross_flag = 0
 
 for i in range(len(df)):
     if i < start_idx:
@@ -85,27 +92,71 @@ for i in range(len(df)):
         continue
     
     prev_close = df['close'].iloc[i-1]
-    prev_fast = df['sma_fast'].iloc[i-1]
-    prev_slow = df['sma_slow'].iloc[i-1]
+    current_price = df['close'].iloc[i]
     open_p = df['open'].iloc[i]
     high_p = df['high'].iloc[i]
     low_p = df['low'].iloc[i]
     close_p = df['close'].iloc[i]
     
-    daily_ret = 0.0
+    sma_fast = df['sma_fast'].iloc[i-1]
+    sma_slow = df['sma_slow'].iloc[i-1]
+    upper_band = df['upper_band'].iloc[i-1]
+    lower_band = df['lower_band'].iloc[i-1]
     
-    if prev_close > prev_fast and prev_close > prev_slow:
-        entry = open_p; sl = entry * (1 - SL_PCT); tp = entry * (1 + TP_PCT)
-        if low_p <= sl: daily_ret = -SL_PCT
-        elif high_p >= tp: daily_ret = TP_PCT
-        else: daily_ret = (close_p - entry) / entry
-        
-    elif prev_close < prev_fast and prev_close < prev_slow:
-        entry = open_p; sl = entry * (1 + SL_PCT); tp = entry * (1 - TP_PCT)
-        if high_p >= sl: daily_ret = -SL_PCT
-        elif low_p <= tp: daily_ret = TP_PCT
-        else: daily_ret = (entry - close_p) / entry
-        
+    daily_ret = 0.0
+    signal = "FLAT"
+    
+    # Update cross flag based on previous close to current price (Tumbler logic)
+    if prev_close < sma_fast and current_price > sma_fast:
+        cross_flag = 1  # Just crossed UP
+    elif prev_close > sma_fast and current_price < sma_fast:
+        cross_flag = -1  # Just crossed DOWN
+    
+    # Reset flag if price exits bands
+    if current_price > upper_band or current_price < lower_band:
+        cross_flag = 0
+    
+    # Generate signal using Tumbler logic
+    # LONG conditions
+    if current_price > upper_band:
+        signal = "LONG"
+    elif current_price > sma_fast and cross_flag == 1:
+        signal = "LONG"
+    # SHORT conditions
+    elif current_price < lower_band:
+        signal = "SHORT"
+    elif current_price < sma_fast and cross_flag == -1:
+        signal = "SHORT"
+    
+    # Apply SMA slow (124) filter
+    if signal == "LONG" and current_price < sma_slow:
+        signal = "FLAT"
+    elif signal == "SHORT" and current_price > sma_slow:
+        signal = "FLAT"
+    
+    # Execute trades with stop loss and take profit
+    if signal == "LONG":
+        entry = open_p
+        sl = entry * (1 - SL_PCT)
+        tp = entry * (1 + TP_PCT)
+        if low_p <= sl:
+            daily_ret = -SL_PCT
+        elif high_p >= tp:
+            daily_ret = TP_PCT
+        else:
+            daily_ret = (close_p - entry) / entry
+            
+    elif signal == "SHORT":
+        entry = open_p
+        sl = entry * (1 + SL_PCT)
+        tp = entry * (1 - TP_PCT)
+        if high_p >= sl:
+            daily_ret = -SL_PCT
+        elif low_p <= tp:
+            daily_ret = TP_PCT
+        else:
+            daily_ret = (entry - close_p) / entry
+    
     base_returns.append(daily_ret)
 
 df['base_ret'] = base_returns
