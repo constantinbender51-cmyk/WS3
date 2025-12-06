@@ -93,21 +93,21 @@ df['sma_50_dist'] = (df['close'] - df['close'].rolling(119).mean()) / df['close'
 df['sma_50_abs_dist'] = df['sma_50_dist'].abs() 
 feature_cols.append('sma_50_abs_dist')
 
-# E. Distance to 365 SMA with 1.1 and 0.9 multipliers (Normalized)
-df['sma_365_1_1'] = df['close'].rolling(365).mean() * 1.1
-df['sma_365_0_9'] = df['close'].rolling(365).mean() * 0.9
-df['dist_sma_365_1_1'] = (df['close'] - df['sma_365_1_1']) / df['close']
-df['dist_sma_365_0_9'] = (df['close'] - df['sma_365_0_9']) / df['close']
-feature_cols.append('dist_sma_365_1_1')
-feature_cols.append('dist_sma_365_0_9')
+# E. Distance to 365 SMA with 1.05 and 0.95 multipliers (Normalized)
+df['sma_365_1_05'] = df['close'].rolling(365).mean() * 1.05
+df['sma_365_0_95'] = df['close'].rolling(365).mean() * 0.95
+df['dist_sma_365_1_05'] = (df['close'] - df['sma_365_1_05']) / df['close']
+df['dist_sma_365_0_95'] = (df['close'] - df['sma_365_0_95']) / df['close']
+feature_cols.append('dist_sma_365_1_05')
+feature_cols.append('dist_sma_365_0_95')
 
-# F. Distance to 120 SMA with 1.1 and 0.9 multipliers (Normalized)
-df['sma_120_1_1'] = df['close'].rolling(120).mean() * 1.1
-df['sma_120_0_9'] = df['close'].rolling(120).mean() * 0.9
-df['dist_sma_120_1_1'] = (df['close'] - df['sma_120_1_1']) / df['close']
-df['dist_sma_120_0_9'] = (df['close'] - df['sma_120_0_9']) / df['close']
-feature_cols.append('dist_sma_120_1_1')
-feature_cols.append('dist_sma_120_0_9')
+# F. Distance to 120 SMA with 1.05 and 0.95 multipliers (Normalized)
+df['sma_120_1_05'] = df['close'].rolling(120).mean() * 1.05
+df['sma_120_0_95'] = df['close'].rolling(120).mean() * 0.95
+df['dist_sma_120_1_05'] = (df['close'] - df['sma_120_1_05']) / df['close']
+df['dist_sma_120_0_95'] = (df['close'] - df['sma_120_0_95']) / df['close']
+feature_cols.append('dist_sma_120_1_05')
+feature_cols.append('dist_sma_120_0_95')
 
 # G. Distance from Long-Term Trend (365 SMA)
 # Similar logic to 50 SMA but over a longer period to capture broader consolidation
