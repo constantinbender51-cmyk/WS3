@@ -21,14 +21,33 @@ III_WINDOW = 14
 
 # --- GRID SEARCH SPACE DEFINITION (6 VARIABLES) ---
 
-# Threshold Search Space (T_Low, T_High): 0.0 to 0.95 in 0.05 steps
-THRESH_RANGE = np.arange(0.0, 1.0, 0.05) 
+# Threshold Search Space (T_Low, T_High) adjusted based on user input
+# Centered around 0.15 and 0.2, with +/- 10% range and 0.05 step
+T_LOW_CENTER = 0.15
+T_HIGH_CENTER = 0.2
+T_RANGE_HALF_WIDTH = 0.1 * T_HIGH_CENTER # +/- 10% of T_High
+THRESH_RANGE = np.arange(T_LOW_CENTER - T_RANGE_HALF_WIDTH, T_LOW_CENTER + T_RANGE_HALF_WIDTH + 0.05, 0.05)
+THRESH_RANGE = np.round(THRESH_RANGE, 2)
+# Ensure T_High is covered and adjust slightly if needed for consistency
+THRESH_RANGE_HIGH = np.arange(T_HIGH_CENTER - T_RANGE_HALF_WIDTH, T_HIGH_CENTER + T_RANGE_HALF_WIDTH + 0.05, 0.05)
+THRESH_RANGE_HIGH = np.round(THRESH_RANGE_HIGH, 2)
+# Combine and ensure unique values, also ensuring T_LOW < T_HIGH is handled later
+THRESH_RANGE = np.unique(np.concatenate([THRESH_RANGE, THRESH_RANGE_HIGH]))
 
-# Leverage Search Space (L_Low, L_Mid, L_High): 0.0 to 4.5 in 0.5 steps (reduced granularity 2x)
-LEV_RANGE = np.arange(0.0, 4.51, 0.5) 
+# Leverage Search Space (L_Low, L_Mid, L_High) adjusted based on user input
+# User specified 0.5, 4.5, 2 and granularity of 0.05
+LEV_RANGE = np.arange(0.5, 4.51, 0.05)
+LEV_RANGE = np.round(LEV_RANGE, 2)
 
-# III Period Search Space: 1 to 60 in steps of 5
-III_RANGE = np.arange(1, 61, 5)
+# III Period Search Space adjusted based on user input
+# Centered around 36, with +/- 10% range and 0.5 step
+III_CENTER = 36
+III_RANGE_HALF_WIDTH = 0.1 * III_CENTER # +/- 10%
+III_RANGE = np.arange(III_CENTER - III_RANGE_HALF_WIDTH, III_CENTER + III_RANGE_HALF_WIDTH + 0.5, 0.5)
+III_RANGE = np.round(III_RANGE, 1)
+# Ensure III_RANGE is within reasonable bounds (e.g., min 1, max 60)
+III_RANGE = III_RANGE[(III_RANGE >= 1) & (III_RANGE <= 60)]
+III_RANGE = np.unique(III_RANGE.astype(int))
 
 # SMA Periods fixed at 40 and 120 (removed from grid search) 
 
