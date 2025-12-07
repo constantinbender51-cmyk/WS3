@@ -112,6 +112,10 @@ for i in range(len(df)):
 
 df['base_ret'] = base_returns
 
+# Create aligned arrays for grid search
+base_ret_arr = np.array(base_returns)
+iii_prev = df['iii'].shift(1).fillna(0).values
+
 # 3. GRID SEARCH (Vectorized for Speed)
 total_iterations = len(THRESH_RANGE) * len(THRESH_RANGE) * len(LEV_RANGE)**3 * len(III_RANGE)
 print(f"Starting Exhaustive 6-Variable Grid Search ({total_iterations} total combinations)...")
@@ -202,6 +206,10 @@ for t_low, t_high in itertools.product(THRESH_RANGE, repeat=2):
         tier_mask = np.full(len(df_temp), 2, dtype=int) # Default High
         tier_mask[iii_prev_temp < t_high] = 1 # Mid
         tier_mask[iii_prev_temp < t_low] = 0  # Low
+        
+        # Ensure mask aligns with base_ret_arr (same length)
+        if len(tier_mask) != len(base_ret_arr):
+            tier_mask = tier_mask[:len(base_ret_arr)]
 
         # Inner loop: Leverages (L_Low, L_Mid, L_High)
         for l_low, l_mid, l_high in itertools.product(LEV_RANGE, repeat=3):
@@ -216,6 +224,10 @@ for t_low, t_high in itertools.product(THRESH_RANGE, repeat=2):
             # Construct leverage array using the calculated tiers
             lookup = np.array([l_low, l_mid, l_high])
             lev_arr = lookup[tier_mask]
+            
+            # Ensure lev_arr aligns with base_ret_arr
+            if len(lev_arr) != len(base_ret_arr):
+                lev_arr = lev_arr[:len(base_ret_arr)]
             
             final_rets = base_ret_arr * lev_arr
             
@@ -288,9 +300,18 @@ tier_mask_final = np.full(len(df), 2, dtype=int)
 tier_mask_final[iii_prev < OPT_T_HIGH] = 1
 tier_mask_final[iii_prev < OPT_T_LOW] = 0
 
+# Ensure mask aligns with base_ret_arr
+if len(tier_mask_final) != len(base_ret_arr):
+    tier_mask_final = tier_mask_final[:len(base_ret_arr)]
+
 # Final optimized leverage array
 lookup_final = np.array([OPT_L_LOW, OPT_L_MID, OPT_L_HIGH])
 lev_arr_final = lookup_final[tier_mask_final]
+
+# Ensure lev_arr_final aligns with base_ret_arr
+if len(lev_arr_final) != len(base_ret_arr):
+    lev_arr_final = lev_arr_final[:len(base_ret_arr)]
+
 final_rets_final = base_ret_arr * lev_arr_final
 
 # Backtest simulation for plot data
@@ -299,7 +320,14 @@ df['leverage_used'] = 0.0
 equity = 1.0
 is_busted = False
 
+# Ensure start_idx is consistent with final_rets_final length
+if start_idx >= len(final_rets_final):
+    start_idx = len(final_rets_final) - 1
+
 for i in range(start_idx, len(df)):
+    # Ensure index is within bounds
+    if i >= len(final_rets_final):
+        break
     daily_ret = final_rets_final[i]
     leverage = lev_arr_final[i]
     
