@@ -238,12 +238,13 @@ df['net_direction'] = df['log_ret'].rolling(OPT_III_WINDOW).sum().abs()
 df['path_length'] = df['log_ret'].abs().rolling(OPT_III_WINDOW).sum()
 df['iii'] = df['net_direction'] / (df['path_length'] + epsilon)
 
-# Indicators and base returns already calculated with SMA periods 40 and 120
+# Recalculate base returns for final backtest (do not reuse the existing base_returns list)
 start_idx = max(OPT_SMA_SLOW, OPT_III_WINDOW)
+final_base_returns = []
 
 for i in range(len(df)):
     if i < start_idx:
-        base_returns.append(0.0)
+        final_base_returns.append(0.0)
         continue
     
     prev_close = df['close'].iloc[i-1]
@@ -274,10 +275,10 @@ for i in range(len(df)):
         elif low_p <= tp: daily_ret = TP_PCT
         else: daily_ret = (entry - close_p) / entry
         
-    base_returns.append(daily_ret)
+    final_base_returns.append(daily_ret)
 
-df['base_ret'] = base_returns
-base_ret_arr = np.array(base_returns)
+df['base_ret'] = final_base_returns
+base_ret_arr = np.array(final_base_returns)
 
 # Recalculate tier mask for the final run
 iii_prev = df['iii'].shift(1).fillna(0).values
