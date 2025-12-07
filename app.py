@@ -127,8 +127,11 @@ iteration_count = 0
 
 # Metrics function optimized for arrays
 def calculate_sharpe_mdd(returns):
-    cum_ret = np.cumprod(1 + returns)
-    if cum_ret.size == 0 or cum_ret.iloc[0] == 0: return 0, 0
+    if returns.empty or returns.size == 0:
+        return 0, 0
+    cum_ret = np.cumprod(1 + returns.values)
+    if cum_ret.size == 0 or cum_ret[0] == 0:
+        return 0, 0
     
     # Sharpe
     mean_ret = np.mean(returns)
