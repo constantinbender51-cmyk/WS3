@@ -19,13 +19,16 @@ SL_PCT = 0.02
 TP_PCT = 0.16
 III_WINDOW = 14 
 
-# --- GRID SEARCH SPACE DEFINITION (7 VARIABLES) ---
+# --- GRID SEARCH SPACE DEFINITION (6 VARIABLES) ---
 
 # Threshold Search Space (T_Low, T_High): 0.0 to 0.95 in 0.05 steps
 THRESH_RANGE = np.arange(0.0, 1.0, 0.05) 
 
 # Leverage Search Space (L_Low, L_Mid, L_High): 0.0 to 4.5 in 0.5 steps (reduced granularity 2x)
 LEV_RANGE = np.arange(0.0, 4.51, 0.5) 
+
+# III Period Search Space: 1 to 60 in steps of 5
+III_RANGE = np.arange(1, 61, 5)
 
 # SMA Periods fixed at 40 and 120 (removed from grid search) 
 
@@ -110,14 +113,14 @@ for i in range(len(df)):
 df['base_ret'] = base_returns
 
 # 3. GRID SEARCH (Vectorized for Speed)
-total_iterations = len(THRESH_RANGE) * len(THRESH_RANGE) * len(LEV_RANGE)**3
-print(f"Starting Exhaustive 5-Variable Grid Search ({total_iterations} total combinations)...")
+total_iterations = len(THRESH_RANGE) * len(THRESH_RANGE) * len(LEV_RANGE)**3 * len(III_RANGE)
+print(f"Starting Exhaustive 6-Variable Grid Search ({total_iterations} total combinations)...")
 
 base_ret_arr = np.array(base_returns)
 iii_prev = df['iii'].shift(1).fillna(0).values
 
 best_sharpe = -999
-best_combo = (0.0, 0.0, 0.0, 0.0, 0.0) # T_Low, T_High, L_Low, L_Mid, L_High (SMA_FAST and SMA_SLOW fixed at 40 and 120)
+best_combo = (0.0, 0.0, 0.0, 0.0, 0.0, 1) # T_Low, T_High, L_Low, L_Mid, L_High, III_WINDOW (SMA_FAST and SMA_SLOW fixed at 40 and 120)
 best_mdd = 0
 iteration_count = 0
 
@@ -173,52 +176,70 @@ def get_final_metrics(equity_series):
 # Threshold loops (SMA periods fixed at 40 and 120, not in grid search)
 for t_low, t_high in itertools.product(THRESH_RANGE, repeat=2):
     # Enforce logical constraint
-    if t_low >= t_high: continue 
+    if t_low >= t_igh: continue 
     
-    # Create Tier Mask for this specific threshold combo
-    # 0 = Low Tier (III < T_Low)
-    # 1 = Mid Tier (T_Low <= III < T_High)
-    # 2 = High Tier (III >= T_High)
-    
-    # Vectorized mask creation
-    tier_mask = np.full(len(df), 2, dtype=int) # Default High
-    tier_mask[iii_prev < t_high] = 1 # Mid
-    tier_mask[iii_prev < t_low] = 0  # Low
+    # III period loop
+    for iii_window in III_RANGE:
+        # Calculate III for this window
+        df_temp = df.copy()
+        df_temp['log_ret'] = np.log(df_temp['close'] / df_temp['close'].shift(1))
+        df_temp['net_direction'] = df_temp['log_ret'].rolling(iii_window).sum().abs()
+        df_temp['path_length'] = df_temp['log_ret'].abs().rolling(iii_window).sum()
+        epsilon = 1e-8
+        df_temp['iii'] = df_temp['net_direction'] / (df_temp['path_length'] + epsilon)
+        iii_prev_temp = df_temp['iii'].shift(1).fillna(0).values
+        
+        # Create Tier Mask for this specific threshold combo
+        # 0 = Low Tier (III < T_Low)
+        # 1 = Mid Tier (T_Low <= III < T_High)
+        # 2 = High Tier (III >= T_High)
+        
+        # Vectorized mask creation
+        tier_mask = np.full(len(df_temp), 2, dtype=int) # Default High
+        tier_mask[iii_prev_temp < t_high] = 1 # Mid
+        tier_mask[iii_prev_temp < t_low] = 0  # Low
 
-    # Inner loop: Leverages (L_Low, L_Mid, L_High)
-    for l_low, l_mid, l_high in itertools.product(LEV_RANGE, repeat=3):
-        iteration_count += 1
-        
-        # Progress logging every 100,000 iterations
-        if iteration_count % 100000 == 0:
-            print(f"Progress: {iteration_count:,} / {total_iterations:,} iterations ({iteration_count/total_iterations*100:.1f}%)")
-            print(f"  Current best Sharpe: {best_sharpe:.2f}")
-            print(f"  Current params: T_Low={t_low:.2f}, T_High={t_high:.2f}, L_Low={l_low:.2f}, L_Mid={l_mid:.2f}, L_High={l_high:.2f}")
-        
-        # Construct leverage array using the calculated tiers
-        lookup = np.array([l_low, l_mid, l_high])
-        lev_arr = lookup[tier_mask]
-        
-        final_rets = base_ret_arr * lev_arr
-        
-        # Calculate Sharpe and MDD (Only analyze period where strategy is active)
-        sharpe, mdd = calculate_sharpe_mdd(pd.Series(final_rets[start_idx:]))
-        
-        # Check against MDD constraint
-        if mdd > MAX_MDD_CONSTRAINT: 
-            if sharpe > best_sharpe:
-                best_sharpe = sharpe
-                best_combo = (round(t_low, 2), round(t_high, 2), round(l_low, 2), round(l_mid, 2), round(l_high, 2))
-                best_mdd = mdd
+        # Inner loop: Leverages (L_Low, L_Mid, L_High)
+        for l_low, l_mid, l_high in itertools.product(LEV_RANGE, repeat=3):
+            iteration_count += 1
+            
+            # Progress logging every 100,000 iterations
+            if iteration_count % 100000 == 0:
+                print(f"Progress: {iteration_count:,} / {total_iterations:,} iterations ({iteration_count/total_iterations*100:.1f}%)")
+                print(f"  Current best Sharpe: {best_sharpe:.2f}")
+                print(f"  Current params: T_Low={t_low:.2f}, T_High={t_high:.2f}, L_Low={l_low:.2f}, L_Mid={l_mid:.2f}, L_High={l_high:.2f}, III_WINDOW={iii_window}")
+            
+            # Construct leverage array using the calculated tiers
+            lookup = np.array([l_low, l_mid, l_high])
+            lev_arr = lookup[tier_mask]
+            
+            final_rets = base_ret_arr * lev_arr
+            
+            # Calculate Sharpe and MDD (Only analyze period where strategy is active)
+            sharpe, mdd = calculate_sharpe_mdd(pd.Series(final_rets[start_idx:]))
+            
+            # Check against MDD constraint
+            if mdd > MAX_MDD_CONSTRAINT: 
+                if sharpe > best_sharpe:
+                    best_sharpe = sharpe
+                    best_combo = (round(t_low, 2), round(t_high, 2), round(l_low, 2), round(l_mid, 2), round(l_high, 2), iii_window)
+                    best_mdd = mdd
 
 
 # 4. FINAL BACKTEST WITH BEST PARAMS
-OPT_T_LOW, OPT_T_HIGH, OPT_L_LOW, OPT_L_MID, OPT_L_HIGH = best_combo
+OPT_T_LOW, OPT_T_HIGH, OPT_L_LOW, OPT_L_MID, OPT_L_HIGH, OPT_III_WINDOW = best_combo
 OPT_SMA_FAST = SMA_FAST  # Fixed at 40
 OPT_SMA_SLOW = SMA_SLOW  # Fixed at 120
 
+# Recalculate III with optimal window
+epsilon = 1e-8
+df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+df['net_direction'] = df['log_ret'].rolling(OPT_III_WINDOW).sum().abs()
+df['path_length'] = df['log_ret'].abs().rolling(OPT_III_WINDOW).sum()
+df['iii'] = df['net_direction'] / (df['path_length'] + epsilon)
+
 # Indicators and base returns already calculated with SMA periods 40 and 120
-start_idx = max(OPT_SMA_SLOW, III_WINDOW)
+start_idx = max(OPT_SMA_SLOW, OPT_III_WINDOW)
 
 for i in range(len(df)):
     if i < start_idx:
@@ -295,10 +316,11 @@ s_tot, s_cagr, s_mdd, s_sharpe = get_final_metrics(plot_data['strategy_equity'])
 plot_data['buy_hold_equity'] = (plot_data['close'] / plot_data['close'].iloc[0])
 
 print("\n" + "="*45)
-print(f"BEST 5-VARIABLE OPTIMIZATION (Constrained MDD < {MAX_MDD_CONSTRAINT*100:.0f}%)")
+print(f"BEST 6-VARIABLE OPTIMIZATION (Constrained MDD < {MAX_MDD_CONSTRAINT*100:.0f}%)")
 print(f"SMA Periods (Fixed): {OPT_SMA_FAST} (Fast) / {OPT_SMA_SLOW} (Slow)")
 print(f"Optimal Thresholds: {OPT_T_LOW:.2f} (Low) / {OPT_T_HIGH:.2f} (High)")
 print(f"Optimal Leverages: {OPT_L_LOW:.1f}x / {OPT_L_MID:.1f}x / {OPT_L_HIGH:.1f}x")
+print(f"Optimal III Period: {OPT_III_WINDOW}")
 print("-" * 45)
 print(f"{'Sharpe Ratio':<15} | {s_sharpe:>10.2f}")
 print(f"{'Max Drawdown':<15} | {s_mdd*100:>10.1f}%")
@@ -311,7 +333,7 @@ ax1 = plt.subplot(3, 1, 1)
 ax1.plot(plot_data.index, plot_data['strategy_equity'], label=f'Best Strategy (Sharpe: {s_sharpe:.2f})', color='blue')
 ax1.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
 ax1.set_yscale('log')
-ax1.set_title(f'Final Optimized Strategy (SMA Fixed: {OPT_SMA_FAST}/{OPT_SMA_SLOW} | T: {OPT_T_LOW}/{OPT_T_HIGH} | L: {OPT_L_LOW}x/{OPT_L_MID}x/{OPT_L_HIGH}x)')
+ax1.set_title(f'Final Optimized Strategy (SMA Fixed: {OPT_SMA_FAST}/{OPT_SMA_SLOW} | T: {OPT_T_LOW}/{OPT_T_HIGH} | L: {OPT_L_LOW}x/{OPT_L_MID}x/{OPT_L_HIGH}x | III: {OPT_III_WINDOW})')
 ax1.legend()
 ax1.grid(True, which='both', linestyle='--', alpha=0.3)
 
