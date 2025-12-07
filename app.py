@@ -176,7 +176,7 @@ def get_final_metrics(equity_series):
 # Threshold loops (SMA periods fixed at 40 and 120, not in grid search)
 for t_low, t_high in itertools.product(THRESH_RANGE, repeat=2):
     # Enforce logical constraint
-    if t_low >= t_igh: continue 
+    if t_low >= t_high: continue 
     
     # III period loop
     for iii_window in III_RANGE:
