@@ -116,7 +116,8 @@ df['base_ret'] = base_returns
 total_iterations = len(THRESH_RANGE) * len(THRESH_RANGE) * len(LEV_RANGE)**3 * len(III_RANGE)
 print(f"Starting Exhaustive 6-Variable Grid Search ({total_iterations} total combinations)...")
 
-base_ret_arr = np.array(base_returns)
+# Use the base returns from DataFrame to ensure consistency
+base_ret_arr = df['base_ret'].values
 iii_prev = df['iii'].shift(1).fillna(0).values
 
 best_sharpe = -999
@@ -238,15 +239,12 @@ df['net_direction'] = df['log_ret'].rolling(OPT_III_WINDOW).sum().abs()
 df['path_length'] = df['log_ret'].abs().rolling(OPT_III_WINDOW).sum()
 df['iii'] = df['net_direction'] / (df['path_length'] + epsilon)
 
-# Recalculate base returns for final backtest (do not reuse the existing base_returns list)
+# Recalculate base returns for final backtest
 start_idx = max(OPT_SMA_SLOW, OPT_III_WINDOW)
-final_base_returns = []
+# Ensure we create a list with the same length as df
+final_base_returns = [0.0] * len(df)
 
-for i in range(len(df)):
-    if i < start_idx:
-        final_base_returns.append(0.0)
-        continue
-    
+for i in range(start_idx, len(df)):
     prev_close = df['close'].iloc[i-1]
     prev_fast = df['sma_fast'].iloc[i-1]
     prev_slow = df['sma_slow'].iloc[i-1]
@@ -275,10 +273,11 @@ for i in range(len(df)):
         elif low_p <= tp: daily_ret = TP_PCT
         else: daily_ret = (entry - close_p) / entry
         
-    final_base_returns.append(daily_ret)
+    final_base_returns[i] = daily_ret
 
+# Assign to DataFrame and update base_ret_arr
 df['base_ret'] = final_base_returns
-base_ret_arr = np.array(final_base_returns)
+base_ret_arr = df['base_ret'].values
 
 # Recalculate tier mask for the final run
 iii_prev = df['iii'].shift(1).fillna(0).values
