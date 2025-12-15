@@ -8,3 +8,5 @@ flask==3.0.0
 ccxt==4.2.76
 matplotlib==3.8.0
 gunicorn==21.2.0
+dash==2.15.0
+plotly==5.19.0
