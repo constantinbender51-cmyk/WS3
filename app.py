@@ -1,427 +1,390 @@
 import ccxt
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from datetime import datetime
-from flask import Flask, send_file
-import os
-import itertools
+import matplotlib
+matplotlib.use('Agg') # Use 'Agg' backend for non-GUI environments
+from matplotlib.figure import Figure
+import io
+import base64
+from flask import Flask, render_template_string
+from datetime import datetime, timedelta
+import time
 
-# 1. CONFIGURATION
-symbol = 'BTC/USDT'
-timeframe = '1d'
-start_date_str = '2018-01-01 00:00:00'
+# --- Configuration ---
+SYMBOL = 'BTC/USDT'
+TIMEFRAME = '1d'
+START_DATE = '2018-01-01 00:00:00'
+RSI_PERIOD = 14
+LONG_ENTRY_LEVEL = 15
+SHORT_ENTRY_LEVEL = 75
+PORT = 8080
 
-# Strategy Params (SMA periods fixed at 40 and 120, not part of grid search)
-SMA_FAST = 40
-SMA_SLOW = 120
-SL_PCT = 0.02
-TP_PCT = 0.16
-III_WINDOW = 14 
+# --- Flask Setup ---
+app = Flask(__name__)
 
-# --- GRID SEARCH SPACE DEFINITION (6 VARIABLES) ---
+# --- Data Fetching and Caching ---
 
-# Threshold Search Space (T_Low, T_High) adjusted based on user input
-# Centered around 0.15 and 0.2, with +/- 10% range and 0.05 step
-T_LOW_CENTER = 0.15
-T_HIGH_CENTER = 0.2
-T_RANGE_HALF_WIDTH = 0.1 * T_HIGH_CENTER # +/- 10% of T_High
-THRESH_RANGE = np.arange(T_LOW_CENTER - T_RANGE_HALF_WIDTH, T_LOW_CENTER + T_RANGE_HALF_WIDTH + 0.05, 0.05)
-THRESH_RANGE = np.round(THRESH_RANGE, 2)
-# Ensure T_High is covered and adjust slightly if needed for consistency
-THRESH_RANGE_HIGH = np.arange(T_HIGH_CENTER - T_RANGE_HALF_WIDTH, T_HIGH_CENTER + T_RANGE_HALF_WIDTH + 0.05, 0.05)
-THRESH_RANGE_HIGH = np.round(THRESH_RANGE_HIGH, 2)
-# Combine and ensure unique values, also ensuring T_LOW < T_HIGH is handled later
-THRESH_RANGE = np.unique(np.concatenate([THRESH_RANGE, THRESH_RANGE_HIGH]))
+def fetch_binance_data(symbol, timeframe, since_date_str):
+    """Fetches historical OHLCV data from Binance, handling pagination."""
+    print(f"Connecting to Binance and fetching {symbol} data from {since_date_str}...")
+    binance = ccxt.binance({
+        'enableRateLimit': True,
+        'rateLimit': 500  # Adjust based on API limits
+    })
 
-# Leverage Search Space (L_Low, L_Mid, L_High) adjusted based on user input
-# User specified 0.5, 4.5, 2 and granularity of 0.05
-LEV_RANGE = np.arange(0.5, 4.51, 0.05)
-LEV_RANGE = np.round(LEV_RANGE, 2)
-
-# III Period Search Space adjusted based on user input
-# Centered around 36, with +/- 10% range and 0.5 step
-III_CENTER = 36
-III_RANGE_HALF_WIDTH = 0.1 * III_CENTER # +/- 10%
-III_RANGE = np.arange(III_CENTER - III_RANGE_HALF_WIDTH, III_CENTER + III_RANGE_HALF_WIDTH + 0.5, 0.5)
-III_RANGE = np.round(III_RANGE, 1)
-# Ensure III_RANGE is within reasonable bounds (e.g., min 1, max 60)
-III_RANGE = III_RANGE[(III_RANGE >= 1) & (III_RANGE <= 60)]
-III_RANGE = np.unique(III_RANGE.astype(int))
-
-# SMA Periods fixed at 40 and 120 (removed from grid search) 
-
-# MDD Constraint
-MAX_MDD_CONSTRAINT = -0.70 # Must be less than 70% drawdown
-
-def fetch_binance_history(symbol, start_str):
-    print(f"Fetching data for {symbol} starting from {start_str}...")
-    exchange = ccxt.binance()
-    since = exchange.parse8601(start_str)
+    # Convert start date string to milliseconds timestamp
+    since_ms = binance.parse8601(since_date_str)
+    
     all_ohlcv = []
+    limit = 1000 # Max limit per request for Binance 1d klines
+
     while True:
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
-            if not ohlcv: break
+            # Fetch 1000 candles starting from 'since_ms'
+            ohlcv = binance.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit)
+            
+            if not ohlcv:
+                print("No more data found.")
+                break
+            
             all_ohlcv.extend(ohlcv)
-            since = ohlcv[-1][0] + 1
-            if since > exchange.milliseconds(): break
+            
+            # Set the 'since' to the timestamp of the last fetched candle to continue fetching
+            since_ms = ohlcv[-1][0] + binance.parse_timeframe(timeframe) * 1000 
+            
+            print(f"Fetched {len(ohlcv)} candles. Last date: {binance.iso8601(ohlcv[-1][0])}")
+
+            # Safety break for testing or very long history (Binance is rate limited)
+            if len(ohlcv) < limit:
+                break
+            
+            # Sleep to respect rate limits
+            time.sleep(binance.rateLimit / 1000)
+
         except Exception as e:
-            print(f"Error fetching: {e}")
+            print(f"An error occurred while fetching data: {e}")
             break
+
+    if not all_ohlcv:
+        raise Exception("Failed to fetch any historical data.")
+        
+    # Convert list of lists to Pandas DataFrame
     df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
-    df = df[~df.index.duplicated(keep='first')]
+    df.drop_duplicates(inplace=True)
+    df.sort_index(inplace=True)
+    
+    print(f"Total data points fetched: {len(df)}")
     return df
 
-# 2. DATA PREP & BASE RETURNS
-df = fetch_binance_history(symbol, start_date_str)
+# --- Technical Analysis (RSI) ---
 
-# Calculate III
-df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
-df['net_direction'] = df['log_ret'].rolling(III_WINDOW).sum().abs()
-df['path_length'] = df['log_ret'].abs().rolling(III_WINDOW).sum()
-epsilon = 1e-8
-df['iii'] = df['net_direction'] / (df['path_length'] + epsilon)
-
-# Indicators
-df['sma_fast'] = df['close'].rolling(SMA_FAST).mean()
-df['sma_slow'] = df['close'].rolling(SMA_SLOW).mean()
-
-# Pre-calculate 1x Strategy Returns
-print("Pre-calculating base strategy returns...")
-base_returns = []
-start_idx = max(SMA_SLOW, III_WINDOW)
-
-for i in range(len(df)):
-    if i < start_idx:
-        base_returns.append(0.0)
-        continue
+def calculate_rsi(data, window=14):
+    """
+    Calculates the Relative Strength Index (RSI) using the standard Wilders
+    smoothing method (RMA/EWM).
+    """
+    delta = data['close'].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
     
-    prev_close = df['close'].iloc[i-1]
-    prev_fast = df['sma_fast'].iloc[i-1]
-    prev_slow = df['sma_slow'].iloc[i-1]
+    # Custom function for Wilders Smoothing (equivalent to RMA in trading platforms)
+    def rma(series, periods):
+        return series.ewm(alpha=1/periods, adjust=False).mean()
+
+    avg_gain = rma(gain, window)
+    avg_loss = rma(loss, window)
     
-    open_p = df['open'].iloc[i]
-    high_p = df['high'].iloc[i]
-    low_p = df['low'].iloc[i]
-    close_p = df['close'].iloc[i]
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
     
-    daily_ret = 0.0
+    data['RSI'] = rsi
+    return data
+
+# --- Backtesting Logic ---
+
+def backtest_strategy(df):
+    """
+    Applies the RSI strategy and calculates compounded returns.
+    Strategy: Long when RSI crosses above 15, Short when RSI crosses below 75.
+    Daily compounding: 100% of capital is traded daily.
+    """
+    df = calculate_rsi(df, RSI_PERIOD)
     
-    # Trend Logic
-    if prev_close > prev_fast and prev_close > prev_slow:
-        entry = open_p
-        sl = entry * (1 - SL_PCT)
-        tp = entry * (1 + TP_PCT)
-        if low_p <= sl: daily_ret = -SL_PCT
-        elif high_p >= tp: daily_ret = TP_PCT
-        else: daily_ret = (close_p - entry) / entry
-        
-    elif prev_close < prev_fast and prev_close < prev_slow:
-        entry = open_p
-        sl = entry * (1 + SL_PCT)
-        tp = entry * (1 - TP_PCT)
-        if high_p >= sl: daily_ret = -SL_PCT
-        elif low_p <= tp: daily_ret = TP_PCT
-        else: daily_ret = (entry - close_p) / entry
-        
-    base_returns.append(daily_ret)
+    # 1. Generate Raw Signals
+    # Long Signal (1): RSI crosses above 15
+    df['Long_Signal'] = ((df['RSI'].shift(1) <= LONG_ENTRY_LEVEL) & (df['RSI'] > LONG_ENTRY_LEVEL)).astype(int)
+    # Short Signal (-1): RSI crosses below 75
+    df['Short_Signal'] = -((df['RSI'].shift(1) >= SHORT_ENTRY_LEVEL) & (df['RSI'] < SHORT_ENTRY_LEVEL)).astype(int)
 
-df['base_ret'] = base_returns
-
-# Create aligned arrays for grid search
-base_ret_arr = np.array(base_returns)
-iii_prev = df['iii'].shift(1).fillna(0).values
-
-# 3. GRID SEARCH (Vectorized for Speed)
-total_iterations = len(THRESH_RANGE) * len(THRESH_RANGE) * len(LEV_RANGE)**3 * len(III_RANGE)
-print(f"Starting Exhaustive 6-Variable Grid Search ({total_iterations} total combinations)...")
-
-# Use the base returns from DataFrame to ensure consistency
-base_ret_arr = df['base_ret'].values
-iii_prev = df['iii'].shift(1).fillna(0).values
-
-best_sharpe = -999
-best_combo = (0.0, 0.0, 0.0, 0.0, 0.0, 1) # T_Low, T_High, L_Low, L_Mid, L_High, III_WINDOW (SMA_FAST and SMA_SLOW fixed at 40 and 120)
-best_mdd = 0
-iteration_count = 0
-
-# Metrics function optimized for arrays
-def calculate_sharpe_mdd(returns):
-    if returns.empty or returns.size == 0:
-        return 0, 0
-    cum_ret = np.cumprod(1 + returns.values)
-    if cum_ret.size == 0 or cum_ret[0] == 0:
-        return 0, 0
+    # Combine signals and fill gaps to hold position
+    df['Signal'] = df['Long_Signal'] + df['Short_Signal']
     
-    # Sharpe
-    mean_ret = np.mean(returns)
-    std_ret = np.std(returns)
-    sharpe = (mean_ret / std_ret) * np.sqrt(365) if std_ret > 0 else 0
+    # Forward fill signals to maintain position until the next opposite signal
+    # Start position is flat (0)
+    df['Position'] = df['Signal'].replace(0, method='ffill')
+    df['Position'] = df['Position'].fillna(0)
     
-    # MDD
-    roll_max = np.maximum.accumulate(cum_ret)
-    drawdown = (cum_ret - roll_max) / roll_max
-    max_dd = drawdown.min()
+    # 2. Calculate Daily Returns
+    # Daily asset return (close-to-close)
+    df['Daily_Return'] = df['close'].pct_change()
     
-    return sharpe, max_dd
-
-# Helper function to get final metrics from equity curve
-def get_final_metrics(equity_series):
-    if equity_series.empty or equity_series.iloc[0] == 0:
-        return 0, 0, 0, 0
-
-    # Total Return
-    s_tot = equity_series.iloc[-1] - 1
-
-    # CAGR
-    num_years = (equity_series.index[-1] - equity_series.index[0]).days / 365.25
-    if num_years == 0 or equity_series.iloc[0] <= 0:
-        s_cagr = 0
-    else:
-        s_cagr = (equity_series.iloc[-1] / equity_series.iloc[0])**(1/num_years) - 1
-
-    # Daily Returns for Sharpe
-    daily_returns = equity_series.pct_change().dropna()
+    # Strategy Return: Position on Day T-1 * Asset Return on Day T
+    # The 'Position' is the decision made at the end of the day, applied for the next day's movement.
+    df['Strategy_Return'] = df['Position'].shift(1) * df['Daily_Return']
     
-    if daily_returns.empty:
-        s_sharpe = 0
-    else:
-        mean_ret = daily_returns.mean()
-        std_ret = daily_returns.std()
-        s_sharpe = (mean_ret / std_ret) * np.sqrt(365) if std_ret > 0 else 0
-
-    # Max Drawdown
-    roll_max = equity_series.cummax()
-    drawdown = (equity_series - roll_max) / roll_max
-    s_mdd = drawdown.min()
-
-    return s_tot, s_cagr, s_mdd, s_sharpe
-
-# Threshold loops (SMA periods fixed at 40 and 120, not in grid search)
-for t_low, t_high in itertools.product(THRESH_RANGE, repeat=2):
-    # Enforce logical constraint
-    if t_low >= t_high: continue 
+    # 3. Calculate Cumulative Equity
+    # Strategy Return is compounded daily (1 + return). Start with $1 (or 100%).
+    # Fill NaN from initial shift with 0 return (since no position was open)
+    df['Strategy_Return'] = df['Strategy_Return'].fillna(0)
+    df['Cumulative_Equity'] = (1 + df['Strategy_Return']).cumprod()
     
-    # III period loop
-    for iii_window in III_RANGE:
-        # Calculate III for this window
-        df_temp = df.copy()
-        df_temp['log_ret'] = np.log(df_temp['close'] / df_temp['close'].shift(1))
-        df_temp['net_direction'] = df_temp['log_ret'].rolling(iii_window).sum().abs()
-        df_temp['path_length'] = df_temp['log_ret'].abs().rolling(iii_window).sum()
-        epsilon = 1e-8
-        df_temp['iii'] = df_temp['net_direction'] / (df_temp['path_length'] + epsilon)
-        iii_prev_temp = df_temp['iii'].shift(1).fillna(0).values
-        
-        # Create Tier Mask for this specific threshold combo
-        # 0 = Low Tier (III < T_Low)
-        # 1 = Mid Tier (T_Low <= III < T_High)
-        # 2 = High Tier (III >= T_High)
-        
-        # Vectorized mask creation
-        tier_mask = np.full(len(df_temp), 2, dtype=int) # Default High
-        tier_mask[iii_prev_temp < t_high] = 1 # Mid
-        tier_mask[iii_prev_temp < t_low] = 0  # Low
-        
-        # Ensure mask aligns with base_ret_arr (same length)
-        if len(tier_mask) != len(base_ret_arr):
-            tier_mask = tier_mask[:len(base_ret_arr)]
+    # Calculate Buy & Hold baseline
+    df['Buy_Hold_Equity'] = (1 + df['Daily_Return']).cumprod()
+    
+    return df.dropna(subset=['RSI'])
 
-        # Inner loop: Leverages (L_Low, L_Mid, L_High)
-        for l_low, l_mid, l_high in itertools.product(LEV_RANGE, repeat=3):
-            iteration_count += 1
+# --- Analysis & Plotting ---
+
+def plot_to_base64(fig):
+    """Converts a matplotlib figure to a base64 encoded string for HTML embedding."""
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight')
+    buf.seek(0)
+    data = base64.b64encode(buf.getbuffer()).decode('ascii')
+    return data
+
+def create_equity_plot(df):
+    """Generates the main equity curve plot."""
+    fig = Figure(figsize=(12, 6))
+    ax = fig.add_subplot(111)
+    
+    # Strategy Equity Curve
+    ax.plot(df['Cumulative_Equity'], label='RSI Strategy Equity', color='blue')
+    # Buy & Hold Benchmark
+    ax.plot(df['Buy_Hold_Equity'], label='Buy & Hold Equity', color='grey', linestyle='--')
+    
+    # Calculate final performance metrics
+    strategy_return = (df['Cumulative_Equity'].iloc[-1] - 1) * 100
+    benchmark_return = (df['Buy_Hold_Equity'].iloc[-1] - 1) * 100
+    
+    ax.set_title(f"RSI Backtest Equity Curve for {SYMBOL} ({df.index.min().date()} to {df.index.max().date()})")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Cumulative Equity (starting at 1.0)")
+    ax.grid(True, linestyle='--', alpha=0.6)
+    ax.legend()
+    fig.tight_layout()
+    
+    # Add final returns text box
+    ax.text(0.02, 0.98, 
+            f'Strategy Return: {strategy_return:.2f}%\nBuy & Hold Return: {benchmark_return:.2f}%',
+            transform=ax.transAxes, 
+            fontsize=10, 
+            verticalalignment='top',
+            bbox=dict(boxstyle="round,pad=0.5", facecolor='lightblue', alpha=0.5))
             
-            # Progress logging every 100,000 iterations
-            if iteration_count % 100000 == 0:
-                print(f"Progress: {iteration_count:,} / {total_iterations:,} iterations ({iteration_count/total_iterations*100:.1f}%)")
-                print(f"  Current best Sharpe: {best_sharpe:.2f}")
-                print(f"  Current params: T_Low={t_low:.2f}, T_High={t_high:.2f}, L_Low={l_low:.2f}, L_Mid={l_mid:.2f}, L_High={l_high:.2f}, III_WINDOW={iii_window}")
-            
-            # Construct leverage array using the calculated tiers
-            lookup = np.array([l_low, l_mid, l_high])
-            lev_arr = lookup[tier_mask]
-            
-            # Ensure lev_arr aligns with base_ret_arr
-            if len(lev_arr) != len(base_ret_arr):
-                lev_arr = lev_arr[:len(base_ret_arr)]
-            
-            final_rets = base_ret_arr * lev_arr
-            
-            # Calculate Sharpe and MDD (Only analyze period where strategy is active)
-            sharpe, mdd = calculate_sharpe_mdd(pd.Series(final_rets[start_idx:]))
-            
-            # Check against MDD constraint
-            if mdd > MAX_MDD_CONSTRAINT: 
-                if sharpe > best_sharpe:
-                    best_sharpe = sharpe
-                    best_combo = (round(t_low, 2), round(t_high, 2), round(l_low, 2), round(l_mid, 2), round(l_high, 2), iii_window)
-                    best_mdd = mdd
+    return plot_to_base64(fig)
 
-
-# 4. FINAL BACKTEST WITH BEST PARAMS
-OPT_T_LOW, OPT_T_HIGH, OPT_L_LOW, OPT_L_MID, OPT_L_HIGH, OPT_III_WINDOW = best_combo
-OPT_SMA_FAST = SMA_FAST  # Fixed at 40
-OPT_SMA_SLOW = SMA_SLOW  # Fixed at 120
-
-# Recalculate III with optimal window
-epsilon = 1e-8
-df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
-df['net_direction'] = df['log_ret'].rolling(OPT_III_WINDOW).sum().abs()
-df['path_length'] = df['log_ret'].abs().rolling(OPT_III_WINDOW).sum()
-df['iii'] = df['net_direction'] / (df['path_length'] + epsilon)
-
-# Recalculate base returns for final backtest
-start_idx = max(OPT_SMA_SLOW, OPT_III_WINDOW)
-# Ensure we create a list with the same length as df
-final_base_returns = [0.0] * len(df)
-
-for i in range(start_idx, len(df)):
-    prev_close = df['close'].iloc[i-1]
-    prev_fast = df['sma_fast'].iloc[i-1]
-    prev_slow = df['sma_slow'].iloc[i-1]
+def create_avg_returns_plot(df, period=14):
+    """
+    Calculates and plots the average return over the N days following a Long or Short signal.
+    """
+    long_signals = df[df['Long_Signal'] == 1].index
+    short_signals = df[df['Short_Signal'] == -1].index
     
-    open_p = df['open'].iloc[i]
-    high_p = df['high'].iloc[i]
-    low_p = df['low'].iloc[i]
-    close_p = df['close'].iloc[i]
+    daily_returns = df['Daily_Return']
     
-    daily_ret = 0.0
-    
-    # Trend Logic
-    if prev_close > prev_fast and prev_close > prev_slow:
-        entry = open_p
-        sl = entry * (1 - SL_PCT)
-        tp = entry * (1 + TP_PCT)
-        if low_p <= sl: daily_ret = -SL_PCT
-        elif high_p >= tp: daily_ret = TP_PCT
-        else: daily_ret = (close_p - entry) / entry
+    # Function to calculate rolling average returns for a given signal type
+    def calculate_rolling_returns(signals, returns_series, days):
+        returns_list = []
+        for signal_date in signals:
+            end_date = signal_date + timedelta(days=days)
+            # Find the slice of returns for the next 'days' period
+            future_returns = returns_series.loc[signal_date + timedelta(days=1):end_date]
+            
+            if len(future_returns) == days:
+                # Calculate the cumulative return (1 + r1) * (1 + r2) ... - 1
+                cumulative_return = (1 + future_returns).prod() - 1
+                returns_list.append(cumulative_return)
         
-    elif prev_close < prev_fast and prev_close < prev_slow:
-        entry = open_p
-        sl = entry * (1 + SL_PCT)
-        tp = entry * (1 - TP_PCT)
-        if high_p >= sl: daily_ret = -SL_PCT
-        elif low_p <= tp: daily_ret = TP_PCT
-        else: daily_ret = (entry - close_p) / entry
-        
-    final_base_returns[i] = daily_ret
-
-# Assign to DataFrame and update base_ret_arr
-df['base_ret'] = final_base_returns
-base_ret_arr = df['base_ret'].values
-
-# Recalculate tier mask for the final run
-iii_prev = df['iii'].shift(1).fillna(0).values
-tier_mask_final = np.full(len(df), 2, dtype=int) 
-tier_mask_final[iii_prev < OPT_T_HIGH] = 1
-tier_mask_final[iii_prev < OPT_T_LOW] = 0
-
-# Ensure mask aligns with base_ret_arr
-if len(tier_mask_final) != len(base_ret_arr):
-    tier_mask_final = tier_mask_final[:len(base_ret_arr)]
-
-# Final optimized leverage array
-lookup_final = np.array([OPT_L_LOW, OPT_L_MID, OPT_L_HIGH])
-lev_arr_final = lookup_final[tier_mask_final]
-
-# Ensure lev_arr_final aligns with base_ret_arr
-if len(lev_arr_final) != len(base_ret_arr):
-    lev_arr_final = lev_arr_final[:len(base_ret_arr)]
-
-final_rets_final = base_ret_arr * lev_arr_final
-
-# Backtest simulation for plot data
-df['strategy_equity'] = 1.0
-df['leverage_used'] = 0.0
-equity = 1.0
-is_busted = False
-
-# Ensure start_idx is consistent with final_rets_final length
-if start_idx >= len(final_rets_final):
-    start_idx = len(final_rets_final) - 1
-
-for i in range(start_idx, len(df)):
-    # Ensure index is within bounds
-    if i >= len(final_rets_final):
-        break
-    daily_ret = final_rets_final[i]
-    leverage = lev_arr_final[i]
-    
-    if not is_busted:
-        equity *= (1 + daily_ret)
-        if equity <= 0.05:
-            equity = 0
-            is_busted = True
+        if not returns_list:
+            return 0, 0
             
-    df.at[df.index[i], 'strategy_equity'] = equity
-    df.at[df.index[i], 'leverage_used'] = leverage
+        return np.mean(returns_list) * 100, len(returns_list)
 
-# 5. METRICS & PLOT
-plot_data = df.iloc[start_idx:].copy()
-s_tot, s_cagr, s_mdd, s_sharpe = get_final_metrics(plot_data['strategy_equity'])
-# Calculate buy-and-hold equity for comparison
-plot_data['buy_hold_equity'] = (plot_data['close'] / plot_data['close'].iloc[0])
+    long_avg_return, long_count = calculate_rolling_returns(long_signals, daily_returns, period)
+    short_avg_return, short_count = calculate_rolling_returns(short_signals, daily_returns, period)
 
-print("\n" + "="*45)
-print(f"BEST 6-VARIABLE OPTIMIZATION (Constrained MDD < {MAX_MDD_CONSTRAINT*100:.0f}%)")
-print(f"SMA Periods (Fixed): {OPT_SMA_FAST} (Fast) / {OPT_SMA_SLOW} (Slow)")
-print(f"Optimal Thresholds: {OPT_T_LOW:.2f} (Low) / {OPT_T_HIGH:.2f} (High)")
-print(f"Optimal Leverages: {OPT_L_LOW:.1f}x / {OPT_L_MID:.1f}x / {OPT_L_HIGH:.1f}x")
-print(f"Optimal III Period: {OPT_III_WINDOW}")
-print("-" * 45)
-print(f"{'Sharpe Ratio':<15} | {s_sharpe:>10.2f}")
-print(f"{'Max Drawdown':<15} | {s_mdd*100:>10.1f}%")
-print(f"{'CAGR':<15} | {s_cagr*100:>10.1f}%")
-print("="*45 + "\n")
+    # Plotting the results
+    fig = Figure(figsize=(8, 6))
+    ax = fig.add_subplot(111)
+    
+    data = {
+        'Long Signal': long_avg_return,
+        'Short Signal': short_avg_return
+    }
+    counts = {
+        'Long Signal': long_count,
+        'Short Signal': short_count
+    }
+    
+    bars = ax.bar(data.keys(), data.values(), 
+                  color=['green' if long_avg_return >= 0 else 'red', 
+                         'red' if short_avg_return >= 0 else 'green']) # Note: Short profit is asset drop
+                         
+    ax.set_title(f"Avg. {period}-Day Return Following Signal Entry")
+    ax.set_ylabel("Average Cumulative Return (%)")
+    ax.grid(axis='y', linestyle='--', alpha=0.6)
 
-plt.figure(figsize=(12, 10))
+    # Add text labels on bars
+    for i, bar in enumerate(bars):
+        signal_type = list(data.keys())[i]
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width() / 2., 
+                height + (0.5 if height >= 0 else -1.5), 
+                f'{height:.2f}%\n(N={counts[signal_type]})',
+                ha='center', 
+                va='bottom' if height >= 0 else 'top',
+                fontsize=10)
 
-ax1 = plt.subplot(3, 1, 1)
-ax1.plot(plot_data.index, plot_data['strategy_equity'], label=f'Best Strategy (Sharpe: {s_sharpe:.2f})', color='blue')
-ax1.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
-ax1.set_yscale('log')
-ax1.set_title(f'Final Optimized Strategy (SMA Fixed: {OPT_SMA_FAST}/{OPT_SMA_SLOW} | T: {OPT_T_LOW}/{OPT_T_HIGH} | L: {OPT_L_LOW}x/{OPT_L_MID}x/{OPT_L_HIGH}x | III: {OPT_III_WINDOW})')
-ax1.legend()
-ax1.grid(True, which='both', linestyle='--', alpha=0.3)
+    fig.tight_layout()
+    return plot_to_base64(fig)
 
-# Add Stats Box
-stats = f"CAGR: {s_cagr*100:.1f}%\nMaxDD: {s_mdd*100:.1f}%\nSharpe: {s_sharpe:.2f}"
-ax1.text(0.02, 0.85, stats, transform=ax1.transAxes, bbox=dict(facecolor='white', alpha=0.8))
 
-ax2 = plt.subplot(3, 1, 2, sharex=ax1)
-ax2.step(plot_data.index, plot_data['leverage_used'], where='post', color='purple', linewidth=1)
-ax2.fill_between(plot_data.index, 0, plot_data['leverage_used'], step='post', color='purple', alpha=0.2)
-ax2.set_title('Leverage Deployed')
-ax2.set_yticks(np.unique(plot_data['leverage_used']))
-ax2.set_ylabel('Leverage (x)')
-ax2.grid(True, axis='x', alpha=0.3)
+# --- Flask Routes and App Setup ---
 
-ax3 = plt.subplot(3, 1, 3, sharex=ax1)
-# Drawdown
-roll_max = plot_data['strategy_equity'].cummax()
-dd = (plot_data['strategy_equity'] - roll_max) / roll_max
-ax3.plot(plot_data.index, dd, color='red')
-ax3.fill_between(plot_data.index, dd, 0, color='red', alpha=0.1)
-ax3.axhline(MAX_MDD_CONSTRAINT, color='black', linestyle='--')
-ax3.set_title('Drawdown Profile (Constrained < 50%)')
-ax3.set_ylabel('Drawdown')
-ax3.grid(True, alpha=0.3)
-
-plt.tight_layout()
-plot_dir = '/app/static'
-if not os.path.exists(plot_dir): os.makedirs(plot_dir)
-plot_path = os.path.join(plot_dir, 'plot.png')
-plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-
-app = Flask(__name__)
 @app.route('/')
-def serve_plot(): return send_file(plot_path, mimetype='image/png')
-@app.route('/health')
-def health(): return 'OK', 200
+def home():
+    """Main route to run backtest, generate plots, and display HTML."""
+    try:
+        # Load or Fetch Data
+        df = fetch_binance_data(SYMBOL, TIMEFRAME, START_DATE)
+        
+        # Run Backtest
+        results_df = backtest_strategy(df)
+        
+        # Generate Plots
+        equity_plot_base64 = create_equity_plot(results_df)
+        avg_returns_plot_base64 = create_avg_returns_plot(results_df)
+        
+        # Prepare key metrics for display
+        final_equity = results_df['Cumulative_Equity'].iloc[-1]
+        benchmark_equity = results_df['Buy_Hold_Equity'].iloc[-1]
+        
+        summary = {
+            'final_strategy_return': f"{(final_equity - 1) * 100:.2f}%",
+            'final_benchmark_return': f"{(benchmark_equity - 1) * 100:.2f}%",
+            'total_days': len(results_df),
+            'start_date': results_df.index.min().strftime('%Y-%m-%d'),
+            'end_date': results_df.index.max().strftime('%Y-%m-%d'),
+        }
+
+    except Exception as e:
+        # Simple error handling for display
+        error_message = f"Error during data fetching or backtesting: {e}"
+        print(error_message)
+        # Use a minimal template for error
+        return render_template_string(ERROR_HTML, error=error_message), 500
+
+    return render_template_string(HTML_TEMPLATE, 
+                                  equity_plot=equity_plot_base64, 
+                                  avg_returns_plot=avg_returns_plot_base64,
+                                  summary=summary)
+
+# --- HTML Template (Embedded in Python file) ---
+
+# HTML template string using Tailwind CSS for clean, responsive styling
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Binance RSI Backtest Results</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f7f9fb; }
+        .card { background-color: white; border-radius: 1rem; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); }
+        h1 { border-bottom: 2px solid #3b82f6; padding-bottom: 0.5rem; }
+    </style>
+</head>
+<body class="p-4 md:p-8">
+    <div class="max-w-6xl mx-auto">
+        <h1 class="text-3xl font-extrabold text-blue-600 mb-6">
+            RSI (14) Backtesting Analysis: {{ summary.start_date }} to {{ summary.end_date }}
+        </h1>
+
+        <!-- Summary Metrics -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+            <div class="card p-6 border-l-4 border-blue-500">
+                <p class="text-sm text-gray-500">Total Days Analyzed</p>
+                <p class="text-3xl font-bold text-gray-800">{{ summary.total_days }}</p>
+            </div>
+            <div class="card p-6 border-l-4 border-green-500">
+                <p class="text-sm text-gray-500">Strategy Cumulative Return</p>
+                <p class="text-3xl font-bold {{ 'text-green-600' if summary.final_strategy_return[0] != '-' else 'text-red-600' }}">{{ summary.final_strategy_return }}</p>
+            </div>
+            <div class="card p-6 border-l-4 border-gray-500">
+                <p class="text-sm text-gray-500">Buy & Hold (Benchmark) Return</p>
+                <p class="text-3xl font-bold {{ 'text-green-600' if summary.final_benchmark_return[0] != '-' else 'text-red-600' }}">{{ summary.final_benchmark_return }}</p>
+            </div>
+        </div>
+
+        <!-- Plot 1: Equity Curve -->
+        <div class="card p-6 mb-8">
+            <h2 class="text-xl font-semibold text-gray-700 mb-4">
+                Strategy Equity vs. Buy & Hold (Daily Compounding)
+            </h2>
+            <img src="data:image/png;base64,{{ equity_plot }}" alt="Equity Curve Plot" class="w-full h-auto rounded-lg"/>
+            <p class="text-sm text-gray-600 mt-2">
+                RSI Entry Rules: Long > {{ LONG_ENTRY_LEVEL }}, Short < {{ SHORT_ENTRY_LEVEL }}.
+            </p>
+        </div>
+
+        <!-- Plot 2: Average Returns -->
+        <div class="card p-6">
+            <h2 class="text-xl font-semibold text-gray-700 mb-4">
+                Average Future Cumulative Return ({{ RSI_PERIOD }} Days)
+            </h2>
+            <img src="data:image/png;base64,{{ avg_returns_plot }}" alt="Average Future Returns Plot" class="w-full h-auto rounded-lg"/>
+            <p class="text-sm text-gray-600 mt-2">
+                This plot shows the average cumulative return over the 14 days immediately following each signal. (N = number of trades).
+            </p>
+        </div>
+
+    </div>
+</body>
+</html>
+"""
+
+# Error Template
+ERROR_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Error</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>body { font-family: 'Inter', sans-serif; background-color: #fef2f2; }</style>
+</head>
+<body class="p-8">
+    <div class="max-w-xl mx-auto bg-white p-6 rounded-lg shadow-lg border-l-4 border-red-500">
+        <h1 class="text-2xl font-bold text-red-600 mb-4">Analysis Failed</h1>
+        <p class="text-gray-700">The backtesting script encountered an error, likely due to a network issue or missing data.</p>
+        <p class="mt-4 p-3 bg-gray-100 rounded text-sm font-mono text-red-700">Error: {{ error }}</p>
+        <p class="mt-4 text-sm text-gray-500">Please check your internet connection and ensure all required Python libraries are installed.</p>
+    </div>
+</body>
+</html>
+"""
+
+# --- Main Execution ---
 
 if __name__ == '__main__':
-    print("Starting Web Server...")
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    print(f"Starting web server on http://127.0.0.1:{PORT}")
+    print("Fetching data (this may take a few minutes for 2018-present)...")
+    
+    # Run Flask application
+    app.run(host='0.0.0.0', port=PORT)
