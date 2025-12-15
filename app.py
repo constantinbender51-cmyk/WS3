@@ -16,10 +16,19 @@ SYMBOL = 'BTC/USDT'
 TIMEFRAME = '30m'
 START_DATE = '2018-01-01 00:00:00'
 RSI_PERIOD = 14
-LONG_ENTRY_LEVEL = 30 # UPDATED: Long when RSI rises above 30
-SHORT_ENTRY_LEVEL = 70 # UPDATED: Short when RSI drops below 70
-PLOT_FUTURE_PERIOD = 14
+LONG_ENTRY_LEVEL = 30 # Long when RSI rises above 30
+SHORT_ENTRY_LEVEL = 70 # Short when RSI drops below 70
+PLOT_FUTURE_PERIOD = 14 # Used for both position duration and average return plot
 PORT = 8080
+
+# --- Global Caching ---
+global_results_df = None
+global_summary = None
+global_equity_plot = None
+global_rsi_plot = None
+global_avg_returns_plot = None
+global_last_month_plot = None
+global_error_message = None
 
 # --- Flask Setup ---
 app = Flask(__name__)
@@ -29,51 +38,42 @@ app = Flask(__name__)
 def fetch_binance_data(symbol, timeframe, since_date_str):
     """Fetches historical OHLCV data from Binance, handling pagination."""
     print(f"Connecting to Binance and fetching {symbol} data from {since_date_str}...")
-    # WARNING: Fetching 30m data since 2018-01-01 involves a very large number of data points.
-    # The fetching process will take a significant amount of time due to API rate limits and pagination.
+    # NOTE: Fetching 30m data since 2018-01-01 involves a very large number of data points.
     binance = ccxt.binance({
         'enableRateLimit': True,
         'rateLimit': 500  # Adjust based on API limits
     })
 
-    # Convert start date string to milliseconds timestamp
     since_ms = binance.parse8601(since_date_str)
-    
     all_ohlcv = []
-    limit = 1000 # Max limit per request for Binance 30m klines
+    limit = 1000 
 
     while True:
         try:
-            # Fetch 1000 candles starting from 'since_ms'
             ohlcv = binance.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit)
             
             if not ohlcv:
-                print("No more data found.")
                 break
             
             all_ohlcv.extend(ohlcv)
             
-            # Set the 'since' to the timestamp of the last fetched candle to continue fetching
-            # Add one timeframe unit to the last timestamp to avoid fetching the same candle
+            # Move to the start of the next candle
             since_ms = ohlcv[-1][0] + binance.parse_timeframe(timeframe) * 1000 
             
             print(f"Fetched {len(ohlcv)} candles. Last date: {binance.iso8601(ohlcv[-1][0])}")
 
-            # Safety break for testing or very long history (Binance is rate limited)
             if len(ohlcv) < limit:
                 break
             
-            # Sleep to respect rate limits
             time.sleep(binance.rateLimit / 1000)
 
         except Exception as e:
             print(f"An error occurred while fetching data: {e}")
-            break
+            raise e
 
     if not all_ohlcv:
         raise Exception("Failed to fetch any historical data.")
         
-    # Convert list of lists to Pandas DataFrame
     df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
@@ -86,15 +86,11 @@ def fetch_binance_data(symbol, timeframe, since_date_str):
 # --- Technical Analysis (RSI) ---
 
 def calculate_rsi(data, window=14):
-    """
-    Calculates the Relative Strength Index (RSI) using the standard Wilders
-    smoothing method (RMA/EWM).
-    """
+    """Calculates the Relative Strength Index (RSI)."""
     delta = data['close'].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
     
-    # Custom function for Wilders Smoothing (equivalent to RMA in trading platforms)
     def rma(series, periods):
         return series.ewm(alpha=1/periods, adjust=False).mean()
 
@@ -111,9 +107,7 @@ def calculate_rsi(data, window=14):
 
 def backtest_strategy(df):
     """
-    Applies the RSI strategy and calculates compounded returns.
-    Strategy: Long when RSI crosses above 30, Short when RSI crosses below 70.
-    Daily compounding (per period): 100% of capital is traded every period.
+    Applies the RSI strategy with decreasing weighted position size and calculates compounded returns.
     """
     df = calculate_rsi(df, RSI_PERIOD)
     
@@ -125,31 +119,58 @@ def backtest_strategy(df):
     # Short Signal (-1): RSI crosses DOWN below 70. Yesterday >= 70 AND Today < 70
     df['Short_Signal'] = -((df['RSI'].shift(1) >= SHORT_ENTRY_LEVEL) & (df['RSI'] < SHORT_ENTRY_LEVEL)).astype(int)
 
-    # Combine signals and fill gaps to hold position
     df['Signal'] = df['Long_Signal'] + df['Short_Signal']
     
-    # Forward fill signals to maintain position until the next opposite signal
-    # Start position is flat (0)
-    df['Position'] = df['Signal'].replace(0, method='ffill')
-    df['Position'] = df['Position'].fillna(0)
-    
-    # 2. Calculate Daily Returns (Per 30-minute period)
+    # 2. Calculate Decreasing Weighted Position
+    df['Position'] = 0.0
+    periods_since_entry = 0
+    current_signal = 0
+
+    # Iterate through data to manage trade state and decaying position size
+    for i in range(len(df)):
+        new_signal = df.iloc[i]['Signal']
+        
+        # A new signal overrides any current trade
+        if new_signal != 0:
+            periods_since_entry = 1
+            current_signal = new_signal
+        # Continue trade, count periods
+        elif current_signal != 0 and periods_since_entry < PLOT_FUTURE_PERIOD:
+            periods_since_entry += 1
+        # Trade duration expired, go flat
+        elif current_signal != 0 and periods_since_entry >= PLOT_FUTURE_PERIOD:
+            periods_since_entry = 0
+            current_signal = 0
+        
+        # Calculate DECREASING weighted position size
+        if current_signal != 0 and periods_since_entry > 0:
+            # Weight decreases linearly: 1 - (periods_since_entry / PLOT_FUTURE_PERIOD)
+            # Example: period 1 -> 1 - 1/14 = 13/14. period 14 -> 1 - 14/14 = 0.
+            weight = 1.0 - (periods_since_entry / PLOT_FUTURE_PERIOD)
+            
+            # The Position column stores the intended position size (which is the weight * direction)
+            df.iloc[i, df.columns.get_loc('Position')] = current_signal * weight
+        else:
+            # Flat (0) position
+            df.iloc[i, df.columns.get_loc('Position')] = 0.0
+
+    # 3. Calculate Cumulative Equity
+    # Daily Return (Per 30-minute period)
     df['Daily_Return'] = df['close'].pct_change()
     
     # Strategy Return: Position on Period T-1 * Asset Return on Period T
+    # Note: Position.shift(1) is the weight decided at the close of T-1, applied to the return of T
     df['Strategy_Return'] = df['Position'].shift(1) * df['Daily_Return']
     
-    # 3. Calculate Cumulative Equity
     df['Strategy_Return'] = df['Strategy_Return'].fillna(0)
     df['Cumulative_Equity'] = (1 + df['Strategy_Return']).cumprod()
     
     # Calculate Buy & Hold baseline
     df['Buy_Hold_Equity'] = (1 + df['Daily_Return']).cumprod()
     
-    # Drop initial rows where RSI or shifted values are NaN
     return df.dropna(subset=['RSI']).copy()
 
-# --- Analysis & Plotting ---
+# --- Plotting Functions (Using global constants) ---
 
 def plot_to_base64(fig):
     """Converts a matplotlib figure to a base64 encoded string for HTML embedding."""
@@ -163,13 +184,9 @@ def create_equity_plot(df):
     """Generates the main equity curve plot."""
     fig = Figure(figsize=(12, 6))
     ax = fig.add_subplot(111)
-    
-    # Strategy Equity Curve (RED for a strategy aiming for UP movement/Long)
     ax.plot(df['Cumulative_Equity'], label='RSI Strategy Equity', color='red') 
-    # Buy & Hold Benchmark
     ax.plot(df['Buy_Hold_Equity'], label='Buy & Hold Equity', color='grey', linestyle='--')
     
-    # Calculate final performance metrics
     strategy_return = (df['Cumulative_Equity'].iloc[-1] - 1) * 100
     benchmark_return = (df['Buy_Hold_Equity'].iloc[-1] - 1) * 100
     
@@ -180,7 +197,6 @@ def create_equity_plot(df):
     ax.legend()
     fig.tight_layout()
     
-    # Add final returns text box
     ax.text(0.02, 0.98, 
             f'Strategy Return: {strategy_return:.2f}%\nBuy & Hold Return: {benchmark_return:.2f}%',
             transform=ax.transAxes, 
@@ -195,28 +211,23 @@ def create_rsi_plot(df):
     fig = Figure(figsize=(12, 4))
     ax = fig.add_subplot(111)
     
-    # Plot RSI Line
     ax.plot(df.index, df['RSI'], label=f'RSI ({RSI_PERIOD})', color='purple', linewidth=1.5)
     
-    # Plot Thresholds (Red for Long Entry, Blue for Short Entry)
     ax.axhline(LONG_ENTRY_LEVEL, color='red', linestyle='--', linewidth=1.0, label=f'Long Entry ({LONG_ENTRY_LEVEL})')
     ax.axhline(SHORT_ENTRY_LEVEL, color='blue', linestyle='--', linewidth=1.0, label=f'Short Entry ({SHORT_ENTRY_LEVEL})')
     
-    # Shade Overbought/Oversold regions
-    ax.fill_between(df.index, SHORT_ENTRY_LEVEL, 100, color='blue', alpha=0.05) # Overbought (Short Entry Zone)
-    ax.fill_between(df.index, 0, LONG_ENTRY_LEVEL, color='red', alpha=0.05)    # Oversold (Long Entry Zone)
+    ax.fill_between(df.index, SHORT_ENTRY_LEVEL, 100, color='blue', alpha=0.05) 
+    ax.fill_between(df.index, 0, LONG_ENTRY_LEVEL, color='red', alpha=0.05)    
 
     ax.set_title(f"Relative Strength Index (RSI) for {SYMBOL} ({TIMEFRAME}) with Entry Zones")
     ax.set_xlabel("Date")
     ax.set_ylabel("RSI Value")
-    ax.set_ylim(0, 100) # Ensure y-axis is 0-100
+    ax.set_ylim(0, 100) 
     ax.grid(True, linestyle=':', alpha=0.6)
     
-    # Highlight entry signals on the plot for visualization
     long_entries = df[df['Long_Signal'] == 1].index
     short_entries = df[df['Short_Signal'] == -1].index
     
-    # Chinese convention: Red for Long (Buy), Blue for Short (Sell)
     ax.scatter(long_entries, df.loc[long_entries, 'RSI'], marker='^', color='red', s=50, label='Long Signal')
     ax.scatter(short_entries, df.loc[short_entries, 'RSI'], marker='v', color='blue', s=50, label='Short Signal')
     
@@ -232,27 +243,18 @@ def calculate_rolling_returns_series(signals, returns_series, periods):
     
     num_periods = periods
     
-    # Iterate through all signal dates
     for signal_date in signals:
-        # Define the window starting the period AFTER the signal
-        future_returns = returns_series.loc[signal_date:].iloc[1:num_periods+1] # Slice 1 to num_periods periods ahead
+        future_returns = returns_series.loc[signal_date:].iloc[1:num_periods+1]
         
-        # Check if we have enough data points
         if len(future_returns) == num_periods:
-            # Calculate cumulative return for each period in the window
-            # (1 + r1), (1 + r1)(1 + r2), ..., (1 + r1)...(1 + r_periods)
             cum_returns = (1 + future_returns).cumprod() - 1
             trade_returns.append(cum_returns.values)
     
     if not trade_returns:
-        # Return an array of zeros if no trades were executed (or not enough data)
         return np.zeros(num_periods), 0
     
-    # Convert list of arrays/series into a 2D numpy array
     returns_matrix = np.array(trade_returns)
-    
-    # Calculate the average return across all trades for each period (column)
-    avg_cum_returns = np.mean(returns_matrix, axis=0) * 100 # Convert to percentage
+    avg_cum_returns = np.mean(returns_matrix, axis=0) * 100
     
     return avg_cum_returns, len(trade_returns)
 
@@ -261,28 +263,23 @@ def create_avg_returns_plot(df, period=PLOT_FUTURE_PERIOD):
     Calculates and plots the average cumulative return line for periods 1 to N 
     following a Long or Short signal, using Red for Long and Blue for Short.
     """
-    # Long signals use Long_Signal == 1
     long_signals = df[df['Long_Signal'] == 1].index
-    # Short signals use Short_Signal == -1
     short_signals = df[df['Short_Signal'] == -1].index 
-    
     daily_returns = df['Daily_Return']
     
     long_avg_returns, long_count = calculate_rolling_returns_series(long_signals, daily_returns, period)
     short_avg_returns, short_count = calculate_rolling_returns_series(short_signals, daily_returns, period)
 
-    # Plotting the results
     fig = Figure(figsize=(10, 6))
     ax = fig.add_subplot(111)
-    
     x_periods = np.arange(1, period + 1)
     
-    # CHINESE CONVENTION: Long Plot in RED (Price movement after Long signal)
+    # CHINESE CONVENTION: Long Plot in RED 
     ax.plot(x_periods, long_avg_returns, 
             label=f'Long Signal Price Change (N={long_count})', 
             color='red', linewidth=2, marker='o', markersize=4)
     
-    # CHINESE CONVENTION: Short Plot in BLUE (Price movement after Short signal)
+    # CHINESE CONVENTION: Short Plot in BLUE
     ax.plot(x_periods, short_avg_returns, 
             label=f'Short Signal Price Change (N={short_count})', 
             color='blue', linewidth=2, marker='x', markersize=4)
@@ -304,8 +301,6 @@ def create_last_month_plot(df):
     Generates a plot for the last month (30 calendar days) of data showing price and position shading.
     Uses Red for Long position and Blue for Short position backgrounds.
     """
-    
-    # Get data for the last 30 calendar days. 
     end_date = df.index.max()
     start_date = end_date - timedelta(days=30)
     last_month_df = df.loc[start_date:end_date].copy()
@@ -313,11 +308,9 @@ def create_last_month_plot(df):
     fig = Figure(figsize=(12, 6))
     ax = fig.add_subplot(111)
 
-    # Calculate min/max range for fill_between
     y_min = last_month_df['low'].min() * 0.99
     y_max = last_month_df['high'].max() * 1.01
 
-    # Create masks for Long, Short periods
     is_long = last_month_df['Position'] > 0
     is_short = last_month_df['Position'] < 0
 
@@ -338,7 +331,6 @@ def create_last_month_plot(df):
     ax.set_ylabel(f"{SYMBOL} Close Price")
     ax.grid(True, linestyle=':', alpha=0.7)
     
-    # Creating a custom legend for the line and fill areas using Chinese color convention
     legend_elements = [
         Line2D([0], [0], color='gray', lw=2, label='Close Price'),
         Line2D([0], [0], color='red', lw=10, alpha=0.1, label='Long Position'),
@@ -350,50 +342,56 @@ def create_last_month_plot(df):
     return plot_to_base64(fig)
 
 
-# --- Flask Routes and App Setup ---
+def setup_backtest():
+    """Initializes global variables by running the fetch and backtest logic."""
+    global global_results_df, global_summary, global_equity_plot, global_rsi_plot, global_avg_returns_plot, global_last_month_plot, global_error_message
 
-@app.route('/')
-def home():
-    """Main route to run backtest, generate plots, and display HTML."""
     try:
         # Load or Fetch Data
         df = fetch_binance_data(SYMBOL, TIMEFRAME, START_DATE)
         
         # Run Backtest
-        results_df = backtest_strategy(df)
+        global_results_df = backtest_strategy(df)
         
         # Generate Plots
-        equity_plot_base64 = create_equity_plot(results_df)
-        rsi_plot_base64 = create_rsi_plot(results_df) 
-        # For 30m data, PLOT_FUTURE_PERIOD=14 is interpreted as 14 periods (7 hours)
-        avg_returns_plot_base64 = create_avg_returns_plot(results_df)
-        last_month_plot_base64 = create_last_month_plot(results_df) 
+        global_equity_plot = create_equity_plot(global_results_df)
+        global_rsi_plot = create_rsi_plot(global_results_df) 
+        global_avg_returns_plot = create_avg_returns_plot(global_results_df)
+        global_last_month_plot = create_last_month_plot(global_results_df) 
         
         # Prepare key metrics for display
-        final_equity = results_df['Cumulative_Equity'].iloc[-1]
-        benchmark_equity = results_df['Buy_Hold_Equity'].iloc[-1]
+        final_equity = global_results_df['Cumulative_Equity'].iloc[-1]
+        benchmark_equity = global_results_df['Buy_Hold_Equity'].iloc[-1]
         
-        summary = {
+        global_summary = {
             'final_strategy_return': f"{(final_equity - 1) * 100:.2f}%",
             'final_benchmark_return': f"{(benchmark_equity - 1) * 100:.2f}%",
-            'total_days': len(results_df),
-            'start_date': results_df.index.min().strftime('%Y-%m-%d %H:%M'),
-            'end_date': results_df.index.max().strftime('%Y-%m-%d %H:%M'),
+            'total_days': len(global_results_df),
+            'start_date': global_results_df.index.min().strftime('%Y-%m-%d %H:%M'),
+            'end_date': global_results_df.index.max().strftime('%Y-%m-%d %H:%M'),
         }
+        global_error_message = None # Clear any previous error
 
     except Exception as e:
-        # Simple error handling for display
-        error_message = f"Error during data fetching or backtesting: {e}"
-        print(error_message)
-        # Use a minimal template for error
-        return render_template_string(ERROR_HTML, error=error_message), 500
+        global_error_message = f"Error during initial setup (Data Fetching/Backtesting): {e}"
+        print(global_error_message)
+
+
+# --- Flask Routes and App Setup ---
+
+@app.route('/')
+def home():
+    """Serves the pre-calculated results from global cache."""
+    if global_error_message:
+        # Serve error page if initial setup failed
+        return render_template_string(ERROR_HTML, error=global_error_message), 500
 
     return render_template_string(HTML_TEMPLATE, 
-                                  equity_plot=equity_plot_base64, 
-                                  rsi_plot=rsi_plot_base64, 
-                                  avg_returns_plot=avg_returns_plot_base64,
-                                  last_month_plot=last_month_plot_base64,
-                                  summary=summary,
+                                  equity_plot=global_equity_plot, 
+                                  rsi_plot=global_rsi_plot, 
+                                  avg_returns_plot=global_avg_returns_plot,
+                                  last_month_plot=global_last_month_plot,
+                                  summary=global_summary,
                                   TIMEFRAME=TIMEFRAME,
                                   RSI_PERIOD=RSI_PERIOD,
                                   LONG_ENTRY_LEVEL=LONG_ENTRY_LEVEL,
@@ -454,11 +452,11 @@ HTML_TEMPLATE = """
         <!-- Plot 1: Equity Curve -->
         <div class="card p-6 mb-8">
             <h2 class="text-xl font-semibold text-gray-700 mb-4">
-                Strategy Equity (Red=Long Focus) vs. Buy & Hold (Compounded Per Period)
+                Strategy Equity (Decreasing Weighted Position) vs. Buy & Hold (Compounded Per Period)
             </h2>
             <img src="data:image/png;base64,{{ equity_plot }}" alt="Equity Curve Plot" class="w-full h-auto rounded-lg"/>
             <p class="text-sm text-gray-600 mt-2">
-                Strategy equity curve compared to the asset's Buy & Hold return.
+                Strategy equity curve based on the weighted position size ({{ PLOT_FUTURE_PERIOD }}/{{ PLOT_FUTURE_PERIOD }} decreasing linearly to 0 over {{ PLOT_FUTURE_PERIOD }} periods after signal).
             </p>
         </div>
 
@@ -514,8 +512,14 @@ ERROR_HTML = """
 # --- Main Execution ---
 
 if __name__ == '__main__':
-    print(f"Starting web server on http://127.0.0.1:{PORT}")
-    print("Fetching data (this may take a long time for 30m since 2018)...")
+    print("--- Starting Backtest Setup ---")
+    print("Fetching data and running backtest (this will take time for 30m since 2018)...")
+    setup_backtest()
+    
+    if global_error_message is None:
+        print(f"--- Setup Complete. Starting Web Server on http://127.0.0.1:{PORT} ---")
+    else:
+        print("--- Setup FAILED. Server will serve error message. ---")
     
     # Run Flask application
     app.run(host='0.0.0.0', port=PORT)
