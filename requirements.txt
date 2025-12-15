@@ -1,6 +1,6 @@
 ccxt
 pandas
 numpy
-plotly
+matplotlib
 dash
 gunicorn
