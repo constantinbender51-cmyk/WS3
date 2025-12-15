@@ -13,7 +13,7 @@ from matplotlib.lines import Line2D
 
 # --- Configuration ---
 SYMBOL = 'BTC/USDT'
-TIMEFRAME = '1d'
+TIMEFRAME = '30m' # UPDATED to 30-minute timeframe
 START_DATE = '2018-01-01 00:00:00'
 RSI_PERIOD = 14
 LONG_ENTRY_LEVEL = 15
@@ -29,6 +29,8 @@ app = Flask(__name__)
 def fetch_binance_data(symbol, timeframe, since_date_str):
     """Fetches historical OHLCV data from Binance, handling pagination."""
     print(f"Connecting to Binance and fetching {symbol} data from {since_date_str}...")
+    # WARNING: Fetching 30m data since 2018-01-01 involves a very large number of data points.
+    # The fetching process will take a significant amount of time due to API rate limits and pagination.
     binance = ccxt.binance({
         'enableRateLimit': True,
         'rateLimit': 500  # Adjust based on API limits
@@ -38,7 +40,7 @@ def fetch_binance_data(symbol, timeframe, since_date_str):
     since_ms = binance.parse8601(since_date_str)
     
     all_ohlcv = []
-    limit = 1000 # Max limit per request for Binance 1d klines
+    limit = 1000 # Max limit per request for Binance 30m klines
 
     while True:
         try:
@@ -132,15 +134,15 @@ def backtest_strategy(df):
     df['Position'] = df['Position'].fillna(0)
     
     # 2. Calculate Daily Returns
-    # Daily asset return (close-to-close)
+    # Daily asset return (close-to-close) - now 30-minute return
     df['Daily_Return'] = df['close'].pct_change()
     
     # Strategy Return: Position on Day T-1 * Asset Return on Day T
-    # The 'Position' is the decision made at the end of the day, applied for the next day's movement.
+    # The 'Position' is the decision made at the end of the period, applied for the next period's movement.
     df['Strategy_Return'] = df['Position'].shift(1) * df['Daily_Return']
     
     # 3. Calculate Cumulative Equity
-    # Strategy Return is compounded daily (1 + return). Start with $1 (or 100%).
+    # Strategy Return is compounded per period (1 + return). Start with $1 (or 100%).
     # Fill NaN from initial shift with 0 return (since no position was open)
     df['Strategy_Return'] = df['Strategy_Return'].fillna(0)
     df['Cumulative_Equity'] = (1 + df['Strategy_Return']).cumprod()
@@ -175,7 +177,7 @@ def create_equity_plot(df):
     strategy_return = (df['Cumulative_Equity'].iloc[-1] - 1) * 100
     benchmark_return = (df['Buy_Hold_Equity'].iloc[-1] - 1) * 100
     
-    ax.set_title(f"RSI Backtest Equity Curve for {SYMBOL} ({df.index.min().date()} to {df.index.max().date()})")
+    ax.set_title(f"RSI Backtest Equity Curve for {SYMBOL} ({TIMEFRAME})")
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative Equity (starting at 1.0)")
     ax.grid(True, linestyle='--', alpha=0.6)
@@ -208,7 +210,7 @@ def create_rsi_plot(df):
     ax.fill_between(df.index, SHORT_ENTRY_LEVEL, 100, color='blue', alpha=0.05) # Overbought (Short Entry Zone)
     ax.fill_between(df.index, 0, LONG_ENTRY_LEVEL, color='red', alpha=0.05)    # Oversold (Long Entry Zone)
 
-    ax.set_title(f"Relative Strength Index (RSI) for {SYMBOL} with Entry Zones")
+    ax.set_title(f"Relative Strength Index (RSI) for {SYMBOL} ({TIMEFRAME}) with Entry Zones")
     ax.set_xlabel("Date")
     ax.set_ylabel("RSI Value")
     ax.set_ylim(0, 100) # Ensure y-axis is 0-100
@@ -229,40 +231,40 @@ def create_rsi_plot(df):
 
 
 def calculate_rolling_returns_series(signals, returns_series, days):
-    """Calculates the average cumulative return for days 1 to 'days' following signals."""
+    """Calculates the average cumulative return for periods 1 to 'days' following signals."""
     trade_returns = []
+    
+    # Convert 'days' to the number of 30-minute periods: 14 days * 48 periods/day = 672 periods
+    # We will use the original period variable name for consistency, but note it's now 14 days/672 periods
+    num_periods = days 
     
     # Iterate through all signal dates
     for signal_date in signals:
-        # Define the 14-day window starting the day AFTER the signal
-        start_date = signal_date + timedelta(days=1)
-        end_date = signal_date + timedelta(days=days)
+        # Define the window starting the period AFTER the signal
+        future_returns = returns_series.loc[signal_date:].iloc[1:num_periods+1] # Slice 1 to num_periods periods ahead
         
-        # Get the returns slice (t+1 to t+14)
-        future_returns = returns_series.loc[start_date:end_date]
-        
-        # Check if we have enough data points (14 days)
-        if len(future_returns) == days:
-            # Calculate cumulative return for each day in the window
-            # (1 + r1), (1 + r1)(1 + r2), ..., (1 + r1)...(1 + r14)
+        # Check if we have enough data points
+        if len(future_returns) == num_periods:
+            # Calculate cumulative return for each period in the window
+            # (1 + r1), (1 + r1)(1 + r2), ..., (1 + r1)...(1 + r_periods)
             cum_returns = (1 + future_returns).cumprod() - 1
             trade_returns.append(cum_returns.values)
     
     if not trade_returns:
         # Return an array of zeros if no trades were executed (or not enough data)
-        return np.zeros(days), 0
+        return np.zeros(num_periods), 0
     
     # Convert list of arrays/series into a 2D numpy array
     returns_matrix = np.array(trade_returns)
     
-    # Calculate the average return across all trades for each day (column)
+    # Calculate the average return across all trades for each period (column)
     avg_cum_returns = np.mean(returns_matrix, axis=0) * 100 # Convert to percentage
     
     return avg_cum_returns, len(trade_returns)
 
 def create_avg_returns_plot(df, period=PLOT_FUTURE_PERIOD):
     """
-    Calculates and plots the average cumulative return line for days 1 to N 
+    Calculates and plots the average cumulative return line for periods 1 to N 
     following a Long or Short signal, using Red for Long and Blue for Short.
     """
     # Long signals use Long_Signal == 1
@@ -272,6 +274,7 @@ def create_avg_returns_plot(df, period=PLOT_FUTURE_PERIOD):
     
     daily_returns = df['Daily_Return']
     
+    # Note: `period` is now 14 trading periods, not 14 calendar days
     long_avg_returns, long_count = calculate_rolling_returns_series(long_signals, daily_returns, period)
     short_avg_returns, short_count = calculate_rolling_returns_series(short_signals, daily_returns, period)
 
@@ -279,22 +282,22 @@ def create_avg_returns_plot(df, period=PLOT_FUTURE_PERIOD):
     fig = Figure(figsize=(10, 6))
     ax = fig.add_subplot(111)
     
-    x_days = np.arange(1, period + 1)
+    x_periods = np.arange(1, period + 1)
     
     # CHINESE CONVENTION: Long Plot in RED (Price movement after Long signal)
-    ax.plot(x_days, long_avg_returns, 
+    ax.plot(x_periods, long_avg_returns, 
             label=f'Long Signal Price Change (N={long_count})', 
             color='red', linewidth=2, marker='o', markersize=4)
     
     # CHINESE CONVENTION: Short Plot in BLUE (Price movement after Short signal)
-    ax.plot(x_days, short_avg_returns, 
+    ax.plot(x_periods, short_avg_returns, 
             label=f'Short Signal Price Change (N={short_count})', 
             color='blue', linewidth=2, marker='x', markersize=4)
     
     ax.axhline(0, color='gray', linestyle='--', alpha=0.7)
     
-    ax.set_title(f"Average Cumulative Price Change (Days 1 to {period} Post-Signal)")
-    ax.set_xlabel("Days After Signal Entry")
+    ax.set_title(f"Avg Cumulative Price Change (Periods 1 to {period} Post-Signal)")
+    ax.set_xlabel(f"Periods ({TIMEFRAME}) After Signal Entry")
     ax.set_ylabel("Average Cumulative Price Change (%)")
     ax.legend()
     ax.grid(True, linestyle=':', alpha=0.6)
@@ -305,12 +308,15 @@ def create_avg_returns_plot(df, period=PLOT_FUTURE_PERIOD):
 
 def create_last_month_plot(df):
     """
-    Generates a plot for the last month of data showing price and position shading.
+    Generates a plot for the last month (30 calendar days) of data showing price and position shading.
     Uses Red for Long position and Blue for Short position backgrounds.
     """
     
-    # Get the last 30 days of data
-    last_month_df = df.iloc[-30:].copy()
+    # Get data for the last 30 calendar days. 
+    # For 30m candles, this will be up to 1440 candles (48 * 30).
+    end_date = df.index.max()
+    start_date = end_date - timedelta(days=30)
+    last_month_df = df.loc[start_date:end_date].copy()
 
     fig = Figure(figsize=(12, 6))
     ax = fig.add_subplot(111)
@@ -335,7 +341,7 @@ def create_last_month_plot(df):
     ax.plot(last_month_df.index, last_month_df['close'], label='Close Price', color='gray', linewidth=2)
     
     # 4. Final plot settings
-    ax.set_title(f"Position Visualization: Last 30 Days ({last_month_df.index.min().date()} to {last_month_df.index.max().date()})")
+    ax.set_title(f"Position Visualization: Last 30 Days ({TIMEFRAME} candles)")
     ax.set_xlabel("Date")
     ax.set_ylabel(f"{SYMBOL} Close Price")
     ax.grid(True, linestyle=':', alpha=0.7)
@@ -366,7 +372,8 @@ def home():
         
         # Generate Plots
         equity_plot_base64 = create_equity_plot(results_df)
-        rsi_plot_base64 = create_rsi_plot(results_df)  # NEW RSI Plot
+        rsi_plot_base64 = create_rsi_plot(results_df) 
+        # For 30m data, PLOT_FUTURE_PERIOD=14 is interpreted as 14 periods (7 hours)
         avg_returns_plot_base64 = create_avg_returns_plot(results_df)
         last_month_plot_base64 = create_last_month_plot(results_df) 
         
@@ -378,8 +385,8 @@ def home():
             'final_strategy_return': f"{(final_equity - 1) * 100:.2f}%",
             'final_benchmark_return': f"{(benchmark_equity - 1) * 100:.2f}%",
             'total_days': len(results_df),
-            'start_date': results_df.index.min().strftime('%Y-%m-%d'),
-            'end_date': results_df.index.max().strftime('%Y-%m-%d'),
+            'start_date': results_df.index.min().strftime('%Y-%m-%d %H:%M'),
+            'end_date': results_df.index.max().strftime('%Y-%m-%d %H:%M'),
         }
 
     except Exception as e:
@@ -391,10 +398,11 @@ def home():
 
     return render_template_string(HTML_TEMPLATE, 
                                   equity_plot=equity_plot_base64, 
-                                  rsi_plot=rsi_plot_base64,  # Pass new plot data
+                                  rsi_plot=rsi_plot_base64, 
                                   avg_returns_plot=avg_returns_plot_base64,
                                   last_month_plot=last_month_plot_base64,
                                   summary=summary,
+                                  TIMEFRAME=TIMEFRAME,
                                   RSI_PERIOD=RSI_PERIOD,
                                   LONG_ENTRY_LEVEL=LONG_ENTRY_LEVEL,
                                   SHORT_ENTRY_LEVEL=SHORT_ENTRY_LEVEL,
@@ -420,13 +428,14 @@ HTML_TEMPLATE = """
 <body class="p-4 md:p-8">
     <div class="max-w-6xl mx-auto">
         <h1 class="text-3xl font-extrabold text-red-600 mb-6">
-            RSI ({{ RSI_PERIOD }}) Backtesting Analysis: {{ summary.start_date }} to {{ summary.end_date }}
+            RSI ({{ RSI_PERIOD }}) Backtesting Analysis: {{ TIMEFRAME }} Timeframe
         </h1>
+        <p class="text-gray-600 mb-4">Data period: {{ summary.start_date }} to {{ summary.end_date }}</p>
 
         <!-- Summary Metrics -->
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
             <div class="card p-6 border-l-4 border-red-500">
-                <p class="text-sm text-gray-500">Total Days Analyzed</p>
+                <p class="text-sm text-gray-500">Total Periods Analyzed</p>
                 <p class="text-3xl font-bold text-gray-800">{{ summary.total_days }}</p>
             </div>
             <div class="card p-6 border-l-4 border-red-600">
@@ -446,14 +455,14 @@ HTML_TEMPLATE = """
             </h2>
             <img src="data:image/png;base64,{{ rsi_plot }}" alt="RSI Indicator Plot" class="w-full h-auto rounded-lg"/>
             <p class="text-sm text-gray-600 mt-2">
-                RSI thresholds: Long Entry at 15 (Red Zone), Short Entry at 75 (Blue Zone). Signals mark the crossover points.
+                RSI thresholds: Long Entry at {{ LONG_ENTRY_LEVEL }} (Red Zone), Short Entry at {{ SHORT_ENTRY_LEVEL }} (Blue Zone). Signals mark the crossover points.
             </p>
         </div>
 
         <!-- Plot 1: Equity Curve -->
         <div class="card p-6 mb-8">
             <h2 class="text-xl font-semibold text-gray-700 mb-4">
-                Strategy Equity (Red=Long Focus) vs. Buy & Hold (Daily Compounding)
+                Strategy Equity (Red=Long Focus) vs. Buy & Hold (Compounded Per Period)
             </h2>
             <img src="data:image/png;base64,{{ equity_plot }}" alt="Equity Curve Plot" class="w-full h-auto rounded-lg"/>
             <p class="text-sm text-gray-600 mt-2">
@@ -464,22 +473,22 @@ HTML_TEMPLATE = """
         <!-- Plot 3: Last Month Position -->
         <div class="card p-6 mb-8">
             <h2 class="text-xl font-semibold text-gray-700 mb-4">
-                Position Visualization: Last 30 Days (Red=Long, Blue=Short)
+                Position Visualization: Last 30 Calendar Days (Red=Long, Blue=Short)
             </h2>
             <img src="data:image/png;base64,{{ last_month_plot }}" alt="Last Month Position Plot" class="w-full h-auto rounded-lg"/>
             <p class="text-sm text-gray-600 mt-2">
-                Shows the price action and the strategy's position (background color) for the most recent 30 days.
+                Shows the price action and the strategy's position (background color) for the most recent 30 calendar days ({{ TIMEFRAME }} candles).
             </p>
         </div>
 
         <!-- Plot 2: Average Returns -->
         <div class="card p-6">
             <h2 class="text-xl font-semibold text-gray-700 mb-4">
-                Average Future Cumulative Price Change (Days 1 to {{ PLOT_FUTURE_PERIOD }})
+                Average Future Cumulative Price Change (Periods 1 to {{ PLOT_FUTURE_PERIOD }})
             </h2>
             <img src="data:image/png;base64,{{ avg_returns_plot }}" alt="Average Future Returns Plot" class="w-full h-auto rounded-lg"/>
             <p class="text-sm text-gray-600 mt-2">
-                This plot shows the average cumulative return of the underlying asset over the 14 days following each Long (Red line) or Short (Blue line) signal entry.
+                This plot shows the average cumulative return of the underlying asset over the {{ PLOT_FUTURE_PERIOD }} periods following each Long (Red line) or Short (Blue line) signal entry.
             </p>
         </div>
 
