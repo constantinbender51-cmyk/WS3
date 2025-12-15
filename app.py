@@ -22,6 +22,7 @@ PLOT_FUTURE_PERIOD = 14 # Used for both position duration and average return plo
 PORT = 8080
 
 # --- Global Caching ---
+# These must be initialized to None or a default state
 global_results_df = None
 global_summary = None
 global_equity_plot = None
@@ -60,7 +61,9 @@ def fetch_binance_data(symbol, timeframe, since_date_str):
             # Move to the start of the next candle
             since_ms = ohlcv[-1][0] + binance.parse_timeframe(timeframe) * 1000 
             
-            print(f"Fetched {len(ohlcv)} candles. Last date: {binance.iso8601(ohlcv[-1][0])}")
+            # Print update on progress
+            current_date = binance.iso8601(ohlcv[-1][0])
+            print(f"Fetched {len(ohlcv)} candles. Latest date: {current_date}")
 
             if len(ohlcv) < limit:
                 break
@@ -108,6 +111,7 @@ def calculate_rsi(data, window=14):
 def backtest_strategy(df):
     """
     Applies the RSI strategy with decreasing weighted position size and calculates compounded returns.
+    Position decreases linearly: 1 - (periods_since_entry / PLOT_FUTURE_PERIOD).
     """
     df = calculate_rsi(df, RSI_PERIOD)
     
@@ -145,21 +149,18 @@ def backtest_strategy(df):
         # Calculate DECREASING weighted position size
         if current_signal != 0 and periods_since_entry > 0:
             # Weight decreases linearly: 1 - (periods_since_entry / PLOT_FUTURE_PERIOD)
-            # Example: period 1 -> 1 - 1/14 = 13/14. period 14 -> 1 - 14/14 = 0.
             weight = 1.0 - (periods_since_entry / PLOT_FUTURE_PERIOD)
             
-            # The Position column stores the intended position size (which is the weight * direction)
+            # Apply the position size (weight) and direction (current_signal)
             df.iloc[i, df.columns.get_loc('Position')] = current_signal * weight
         else:
             # Flat (0) position
             df.iloc[i, df.columns.get_loc('Position')] = 0.0
 
     # 3. Calculate Cumulative Equity
-    # Daily Return (Per 30-minute period)
     df['Daily_Return'] = df['close'].pct_change()
     
     # Strategy Return: Position on Period T-1 * Asset Return on Period T
-    # Note: Position.shift(1) is the weight decided at the close of T-1, applied to the return of T
     df['Strategy_Return'] = df['Position'].shift(1) * df['Daily_Return']
     
     df['Strategy_Return'] = df['Strategy_Return'].fillna(0)
@@ -311,6 +312,7 @@ def create_last_month_plot(df):
     y_min = last_month_df['low'].min() * 0.99
     y_max = last_month_df['high'].max() * 1.01
 
+    # Position is the *weighted* position, so we check if it was non-zero
     is_long = last_month_df['Position'] > 0
     is_short = last_month_df['Position'] < 0
 
@@ -370,9 +372,10 @@ def setup_backtest():
             'start_date': global_results_df.index.min().strftime('%Y-%m-%d %H:%M'),
             'end_date': global_results_df.index.max().strftime('%Y-%m-%d %H:%M'),
         }
-        global_error_message = None # Clear any previous error
+        global_error_message = None # Clear error on success
 
     except Exception as e:
+        # Catch and store the error message
         global_error_message = f"Error during initial setup (Data Fetching/Backtesting): {e}"
         print(global_error_message)
 
@@ -382,9 +385,11 @@ def setup_backtest():
 @app.route('/')
 def home():
     """Serves the pre-calculated results from global cache."""
-    if global_error_message:
-        # Serve error page if initial setup failed
-        return render_template_string(ERROR_HTML, error=global_error_message), 500
+    # ROBUSTNESS CHECK: Check if summary exists, not just if an error message was written.
+    if global_summary is None:
+        # If global_summary is None, we failed. Use stored error or a generic one.
+        error = global_error_message if global_error_message else "Analysis failed during startup. Check terminal logs for API or calculation errors."
+        return render_template_string(ERROR_HTML, error=error), 500
 
     return render_template_string(HTML_TEMPLATE, 
                                   equity_plot=global_equity_plot, 
