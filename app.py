@@ -38,7 +38,7 @@ app = Flask(__name__)
 
 def fetch_binance_data(symbol, timeframe, since_date_str):
     """Fetches historical OHLCV data from Binance, handling pagination."""
-    print(f"Connecting to Binance and fetching {symbol} data from {since_date_str}...")
+    print(f"[FETCHING] Connecting to Binance and fetching {symbol} data from {since_date_str}...")
     # NOTE: Fetching 30m data since 2018-01-01 involves a very large number of data points.
     binance = ccxt.binance({
         'enableRateLimit': True,
@@ -63,7 +63,7 @@ def fetch_binance_data(symbol, timeframe, since_date_str):
             
             # Print update on progress
             current_date = binance.iso8601(ohlcv[-1][0])
-            print(f"Fetched {len(ohlcv)} candles. Latest date: {current_date}")
+            print(f"[FETCHING] Fetched {len(ohlcv)} candles. Latest date: {current_date}")
 
             if len(ohlcv) < limit:
                 break
@@ -71,7 +71,7 @@ def fetch_binance_data(symbol, timeframe, since_date_str):
             time.sleep(binance.rateLimit / 1000)
 
         except Exception as e:
-            print(f"An error occurred while fetching data: {e}")
+            print(f"[ERROR] An error occurred while fetching data: {e}")
             raise e
 
     if not all_ohlcv:
@@ -83,7 +83,7 @@ def fetch_binance_data(symbol, timeframe, since_date_str):
     df.drop_duplicates(inplace=True)
     df.sort_index(inplace=True)
     
-    print(f"Total data points fetched: {len(df)}")
+    print(f"[FETCHING] Total data points fetched: {len(df)}")
     return df
 
 # --- Technical Analysis (RSI) ---
@@ -113,6 +113,7 @@ def backtest_strategy(df):
     Applies the RSI strategy with decreasing weighted position size and calculates compounded returns.
     Position decreases linearly: 1 - (periods_since_entry / PLOT_FUTURE_PERIOD).
     """
+    print("[BACKTEST] Calculating RSI...")
     df = calculate_rsi(df, RSI_PERIOD)
     
     # 1. Generate Raw Signals (Crossover Logic)
@@ -126,6 +127,7 @@ def backtest_strategy(df):
     df['Signal'] = df['Long_Signal'] + df['Short_Signal']
     
     # 2. Calculate Decreasing Weighted Position
+    print("[BACKTEST] Applying weighted position logic...")
     df['Position'] = 0.0
     periods_since_entry = 0
     current_signal = 0
@@ -158,15 +160,11 @@ def backtest_strategy(df):
             df.iloc[i, df.columns.get_loc('Position')] = 0.0
 
     # 3. Calculate Cumulative Equity
+    print("[BACKTEST] Calculating returns and equity curve...")
     df['Daily_Return'] = df['close'].pct_change()
-    
-    # Strategy Return: Position on Period T-1 * Asset Return on Period T
     df['Strategy_Return'] = df['Position'].shift(1) * df['Daily_Return']
-    
     df['Strategy_Return'] = df['Strategy_Return'].fillna(0)
     df['Cumulative_Equity'] = (1 + df['Strategy_Return']).cumprod()
-    
-    # Calculate Buy & Hold baseline
     df['Buy_Hold_Equity'] = (1 + df['Daily_Return']).cumprod()
     
     return df.dropna(subset=['RSI']).copy()
@@ -183,6 +181,7 @@ def plot_to_base64(fig):
 
 def create_equity_plot(df):
     """Generates the main equity curve plot."""
+    print("[PLOT] Generating Equity Plot...")
     fig = Figure(figsize=(12, 6))
     ax = fig.add_subplot(111)
     ax.plot(df['Cumulative_Equity'], label='RSI Strategy Equity', color='red') 
@@ -209,6 +208,7 @@ def create_equity_plot(df):
 
 def create_rsi_plot(df):
     """Generates the RSI plot with entry/exit thresholds and signal markers."""
+    print("[PLOT] Generating RSI Plot...")
     fig = Figure(figsize=(12, 4))
     ax = fig.add_subplot(111)
     
@@ -264,6 +264,7 @@ def create_avg_returns_plot(df, period=PLOT_FUTURE_PERIOD):
     Calculates and plots the average cumulative return line for periods 1 to N 
     following a Long or Short signal, using Red for Long and Blue for Short.
     """
+    print("[PLOT] Generating Average Future Returns Plot...")
     long_signals = df[df['Long_Signal'] == 1].index
     short_signals = df[df['Short_Signal'] == -1].index 
     daily_returns = df['Daily_Return']
@@ -302,6 +303,7 @@ def create_last_month_plot(df):
     Generates a plot for the last month (30 calendar days) of data showing price and position shading.
     Uses Red for Long position and Blue for Short position backgrounds.
     """
+    print("[PLOT] Generating Last 30 Days Plot...")
     end_date = df.index.max()
     start_date = end_date - timedelta(days=30)
     last_month_df = df.loc[start_date:end_date].copy()
@@ -349,13 +351,16 @@ def setup_backtest():
     global global_results_df, global_summary, global_equity_plot, global_rsi_plot, global_avg_returns_plot, global_last_month_plot, global_error_message
 
     try:
+        print("[SETUP] Starting data fetching...")
         # Load or Fetch Data
         df = fetch_binance_data(SYMBOL, TIMEFRAME, START_DATE)
         
         # Run Backtest
+        print("[SETUP] Starting backtest calculations...")
         global_results_df = backtest_strategy(df)
         
         # Generate Plots
+        print("[SETUP] Generating plots and metrics...")
         global_equity_plot = create_equity_plot(global_results_df)
         global_rsi_plot = create_rsi_plot(global_results_df) 
         global_avg_returns_plot = create_avg_returns_plot(global_results_df)
@@ -373,11 +378,13 @@ def setup_backtest():
             'end_date': global_results_df.index.max().strftime('%Y-%m-%d %H:%M'),
         }
         global_error_message = None # Clear error on success
+        print("[SETUP] Setup completed successfully.")
 
     except Exception as e:
         # Catch and store the error message
         global_error_message = f"Error during initial setup (Data Fetching/Backtesting): {e}"
-        print(global_error_message)
+        print(f"[CRITICAL FAILURE] {global_error_message}")
+        global_summary = None # Ensure summary is None if setup fails
 
 
 # --- Flask Routes and App Setup ---
@@ -385,7 +392,7 @@ def setup_backtest():
 @app.route('/')
 def home():
     """Serves the pre-calculated results from global cache."""
-    # ROBUSTNESS CHECK: Check if summary exists, not just if an error message was written.
+    # ROBUSTNESS CHECK: Check if summary exists, indicating successful setup.
     if global_summary is None:
         # If global_summary is None, we failed. Use stored error or a generic one.
         error = global_error_message if global_error_message else "Analysis failed during startup. Check terminal logs for API or calculation errors."
@@ -522,9 +529,9 @@ if __name__ == '__main__':
     setup_backtest()
     
     if global_error_message is None:
-        print(f"--- Setup Complete. Starting Web Server on http://127.0.0.1:{PORT} ---")
+        print(f"--- Setup Complete. Starting Web Server in DEBUG Mode on http://127.0.0.1:{PORT} ---")
     else:
         print("--- Setup FAILED. Server will serve error message. ---")
     
-    # Run Flask application
-    app.run(host='0.0.0.0', port=PORT)
+    # Run Flask application in DEBUG mode
+    app.run(host='0.0.0.0', port=PORT, debug=True, use_reloader=False)
