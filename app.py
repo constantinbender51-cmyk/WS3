@@ -115,10 +115,12 @@ def backtest_strategy(df):
     """
     df = calculate_rsi(df, RSI_PERIOD)
     
-    # 1. Generate Raw Signals
-    # Long Signal (1): RSI crosses above 15
+    # 1. Generate Raw Signals (Crossover Logic)
+    
+    # Long Signal (1): RSI crosses UP above 15. Yesterday <= 15 AND Today > 15
     df['Long_Signal'] = ((df['RSI'].shift(1) <= LONG_ENTRY_LEVEL) & (df['RSI'] > LONG_ENTRY_LEVEL)).astype(int)
-    # Short Signal (-1): RSI crosses below 75
+    
+    # Short Signal (-1): RSI crosses DOWN below 75. Yesterday >= 75 AND Today < 75
     df['Short_Signal'] = -((df['RSI'].shift(1) >= SHORT_ENTRY_LEVEL) & (df['RSI'] < SHORT_ENTRY_LEVEL)).astype(int)
 
     # Combine signals and fill gaps to hold position
@@ -164,8 +166,8 @@ def create_equity_plot(df):
     fig = Figure(figsize=(12, 6))
     ax = fig.add_subplot(111)
     
-    # Strategy Equity Curve
-    ax.plot(df['Cumulative_Equity'], label='RSI Strategy Equity', color='red') # Using Red for Strategy (Long/Up bias)
+    # Strategy Equity Curve (RED for a strategy aiming for UP movement/Long)
+    ax.plot(df['Cumulative_Equity'], label='RSI Strategy Equity', color='red') 
     # Buy & Hold Benchmark
     ax.plot(df['Buy_Hold_Equity'], label='Buy & Hold Equity', color='grey', linestyle='--')
     
@@ -189,6 +191,42 @@ def create_equity_plot(df):
             bbox=dict(boxstyle="round,pad=0.5", facecolor='mistyrose', alpha=0.5))
             
     return plot_to_base64(fig)
+
+def create_rsi_plot(df):
+    """Generates the RSI plot with entry/exit thresholds and signal markers."""
+    fig = Figure(figsize=(12, 4))
+    ax = fig.add_subplot(111)
+    
+    # Plot RSI Line
+    ax.plot(df.index, df['RSI'], label=f'RSI ({RSI_PERIOD})', color='purple', linewidth=1.5)
+    
+    # Plot Thresholds (Red for Long Entry, Blue for Short Entry)
+    ax.axhline(LONG_ENTRY_LEVEL, color='red', linestyle='--', linewidth=1.0, label=f'Long Entry ({LONG_ENTRY_LEVEL})')
+    ax.axhline(SHORT_ENTRY_LEVEL, color='blue', linestyle='--', linewidth=1.0, label=f'Short Entry ({SHORT_ENTRY_LEVEL})')
+    
+    # Shade Overbought/Oversold regions
+    ax.fill_between(df.index, SHORT_ENTRY_LEVEL, 100, color='blue', alpha=0.05) # Overbought (Short Entry Zone)
+    ax.fill_between(df.index, 0, LONG_ENTRY_LEVEL, color='red', alpha=0.05)    # Oversold (Long Entry Zone)
+
+    ax.set_title(f"Relative Strength Index (RSI) for {SYMBOL} with Entry Zones")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("RSI Value")
+    ax.set_ylim(0, 100) # Ensure y-axis is 0-100
+    ax.grid(True, linestyle=':', alpha=0.6)
+    
+    # Highlight entry signals on the plot for visualization
+    long_entries = df[df['Long_Signal'] == 1].index
+    short_entries = df[df['Short_Signal'] == -1].index
+    
+    # Chinese convention: Red for Long (Buy), Blue for Short (Sell)
+    ax.scatter(long_entries, df.loc[long_entries, 'RSI'], marker='^', color='red', s=50, label='Long Signal')
+    ax.scatter(short_entries, df.loc[short_entries, 'RSI'], marker='v', color='blue', s=50, label='Short Signal')
+    
+    ax.legend(loc='lower left', bbox_to_anchor=(0.0, 1.05), ncol=4, borderaxespad=0.)
+
+    fig.tight_layout()
+    return plot_to_base64(fig)
+
 
 def calculate_rolling_returns_series(signals, returns_series, days):
     """Calculates the average cumulative return for days 1 to 'days' following signals."""
@@ -243,12 +281,12 @@ def create_avg_returns_plot(df, period=PLOT_FUTURE_PERIOD):
     
     x_days = np.arange(1, period + 1)
     
-    # CHINESE CONVENTION: Long Plot in RED
+    # CHINESE CONVENTION: Long Plot in RED (Price movement after Long signal)
     ax.plot(x_days, long_avg_returns, 
             label=f'Long Signal Price Change (N={long_count})', 
             color='red', linewidth=2, marker='o', markersize=4)
     
-    # CHINESE CONVENTION: Short Plot in BLUE
+    # CHINESE CONVENTION: Short Plot in BLUE (Price movement after Short signal)
     ax.plot(x_days, short_avg_returns, 
             label=f'Short Signal Price Change (N={short_count})', 
             color='blue', linewidth=2, marker='x', markersize=4)
@@ -328,6 +366,7 @@ def home():
         
         # Generate Plots
         equity_plot_base64 = create_equity_plot(results_df)
+        rsi_plot_base64 = create_rsi_plot(results_df)  # NEW RSI Plot
         avg_returns_plot_base64 = create_avg_returns_plot(results_df)
         last_month_plot_base64 = create_last_month_plot(results_df) 
         
@@ -352,6 +391,7 @@ def home():
 
     return render_template_string(HTML_TEMPLATE, 
                                   equity_plot=equity_plot_base64, 
+                                  rsi_plot=rsi_plot_base64,  # Pass new plot data
                                   avg_returns_plot=avg_returns_plot_base64,
                                   last_month_plot=last_month_plot_base64,
                                   summary=summary,
@@ -398,15 +438,26 @@ HTML_TEMPLATE = """
                 <p class="text-3xl font-bold {{ 'text-red-600' if summary.final_benchmark_return[0] != '-' else 'text-blue-600' }}">{{ summary.final_benchmark_return }}</p>
             </div>
         </div>
+        
+        <!-- Plot 4: RSI Indicator Plot -->
+        <div class="card p-6 mb-8">
+            <h2 class="text-xl font-semibold text-gray-700 mb-4">
+                Relative Strength Index (RSI) & Signal Zones
+            </h2>
+            <img src="data:image/png;base64,{{ rsi_plot }}" alt="RSI Indicator Plot" class="w-full h-auto rounded-lg"/>
+            <p class="text-sm text-gray-600 mt-2">
+                RSI thresholds: Long Entry at 15 (Red Zone), Short Entry at 75 (Blue Zone). Signals mark the crossover points.
+            </p>
+        </div>
 
         <!-- Plot 1: Equity Curve -->
         <div class="card p-6 mb-8">
             <h2 class="text-xl font-semibold text-gray-700 mb-4">
-                Strategy Equity (Red=Long) vs. Buy & Hold (Daily Compounding)
+                Strategy Equity (Red=Long Focus) vs. Buy & Hold (Daily Compounding)
             </h2>
             <img src="data:image/png;base64,{{ equity_plot }}" alt="Equity Curve Plot" class="w-full h-auto rounded-lg"/>
             <p class="text-sm text-gray-600 mt-2">
-                RSI Entry Rules: Long > {{ LONG_ENTRY_LEVEL }}, Short < {{ SHORT_ENTRY_LEVEL }}.
+                Strategy equity curve compared to the asset's Buy & Hold return.
             </p>
         </div>
 
