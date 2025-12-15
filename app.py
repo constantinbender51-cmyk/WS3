@@ -13,11 +13,11 @@ from matplotlib.lines import Line2D
 
 # --- Configuration ---
 SYMBOL = 'BTC/USDT'
-TIMEFRAME = '30m' # UPDATED to 30-minute timeframe
+TIMEFRAME = '30m'
 START_DATE = '2018-01-01 00:00:00'
 RSI_PERIOD = 14
-LONG_ENTRY_LEVEL = 15
-SHORT_ENTRY_LEVEL = 75
+LONG_ENTRY_LEVEL = 30 # UPDATED: Long when RSI rises above 30
+SHORT_ENTRY_LEVEL = 70 # UPDATED: Short when RSI drops below 70
 PLOT_FUTURE_PERIOD = 14
 PORT = 8080
 
@@ -112,17 +112,17 @@ def calculate_rsi(data, window=14):
 def backtest_strategy(df):
     """
     Applies the RSI strategy and calculates compounded returns.
-    Strategy: Long when RSI crosses above 15, Short when RSI crosses below 75.
-    Daily compounding: 100% of capital is traded daily.
+    Strategy: Long when RSI crosses above 30, Short when RSI crosses below 70.
+    Daily compounding (per period): 100% of capital is traded every period.
     """
     df = calculate_rsi(df, RSI_PERIOD)
     
     # 1. Generate Raw Signals (Crossover Logic)
     
-    # Long Signal (1): RSI crosses UP above 15. Yesterday <= 15 AND Today > 15
+    # Long Signal (1): RSI crosses UP above 30. Yesterday <= 30 AND Today > 30
     df['Long_Signal'] = ((df['RSI'].shift(1) <= LONG_ENTRY_LEVEL) & (df['RSI'] > LONG_ENTRY_LEVEL)).astype(int)
     
-    # Short Signal (-1): RSI crosses DOWN below 75. Yesterday >= 75 AND Today < 75
+    # Short Signal (-1): RSI crosses DOWN below 70. Yesterday >= 70 AND Today < 70
     df['Short_Signal'] = -((df['RSI'].shift(1) >= SHORT_ENTRY_LEVEL) & (df['RSI'] < SHORT_ENTRY_LEVEL)).astype(int)
 
     # Combine signals and fill gaps to hold position
@@ -133,17 +133,13 @@ def backtest_strategy(df):
     df['Position'] = df['Signal'].replace(0, method='ffill')
     df['Position'] = df['Position'].fillna(0)
     
-    # 2. Calculate Daily Returns
-    # Daily asset return (close-to-close) - now 30-minute return
+    # 2. Calculate Daily Returns (Per 30-minute period)
     df['Daily_Return'] = df['close'].pct_change()
     
-    # Strategy Return: Position on Day T-1 * Asset Return on Day T
-    # The 'Position' is the decision made at the end of the period, applied for the next period's movement.
+    # Strategy Return: Position on Period T-1 * Asset Return on Period T
     df['Strategy_Return'] = df['Position'].shift(1) * df['Daily_Return']
     
     # 3. Calculate Cumulative Equity
-    # Strategy Return is compounded per period (1 + return). Start with $1 (or 100%).
-    # Fill NaN from initial shift with 0 return (since no position was open)
     df['Strategy_Return'] = df['Strategy_Return'].fillna(0)
     df['Cumulative_Equity'] = (1 + df['Strategy_Return']).cumprod()
     
@@ -230,13 +226,11 @@ def create_rsi_plot(df):
     return plot_to_base64(fig)
 
 
-def calculate_rolling_returns_series(signals, returns_series, days):
-    """Calculates the average cumulative return for periods 1 to 'days' following signals."""
+def calculate_rolling_returns_series(signals, returns_series, periods):
+    """Calculates the average cumulative return for periods 1 to 'periods' following signals."""
     trade_returns = []
     
-    # Convert 'days' to the number of 30-minute periods: 14 days * 48 periods/day = 672 periods
-    # We will use the original period variable name for consistency, but note it's now 14 days/672 periods
-    num_periods = days 
+    num_periods = periods
     
     # Iterate through all signal dates
     for signal_date in signals:
@@ -274,7 +268,6 @@ def create_avg_returns_plot(df, period=PLOT_FUTURE_PERIOD):
     
     daily_returns = df['Daily_Return']
     
-    # Note: `period` is now 14 trading periods, not 14 calendar days
     long_avg_returns, long_count = calculate_rolling_returns_series(long_signals, daily_returns, period)
     short_avg_returns, short_count = calculate_rolling_returns_series(short_signals, daily_returns, period)
 
@@ -313,7 +306,6 @@ def create_last_month_plot(df):
     """
     
     # Get data for the last 30 calendar days. 
-    # For 30m candles, this will be up to 1440 candles (48 * 30).
     end_date = df.index.max()
     start_date = end_date - timedelta(days=30)
     last_month_df = df.loc[start_date:end_date].copy()
@@ -523,7 +515,7 @@ ERROR_HTML = """
 
 if __name__ == '__main__':
     print(f"Starting web server on http://127.0.0.1:{PORT}")
-    print("Fetching data (this may take a few minutes for 2018-present)...")
+    print("Fetching data (this may take a long time for 30m since 2018)...")
     
     # Run Flask application
     app.run(host='0.0.0.0', port=PORT)
