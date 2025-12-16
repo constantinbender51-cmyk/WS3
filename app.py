@@ -13,15 +13,18 @@ import time
 START_YEAR = 2021
 SYMBOL = 'BTC/USDT'
 PORT = 8080
-
-TIMEFRAMES = ['30m', '1h', '4h', '1d', '1w']
-DECAY_PERIODS = [1, 2, 4, 8, 16, 32, 64]
+FIXED_DECAY = 16 
 
 # -----------------------------------------------------------------------------
-# 1. Data Fetching
+# 1. Efficient Data Fetching & Resampling
 # -----------------------------------------------------------------------------
-def fetch_data_for_timeframe(symbol, timeframe, start_year):
-    print(f"Fetching {timeframe} data for {symbol} starting {start_year}...")
+def fetch_base_data(symbol, start_year):
+    """
+    Fetches ONLY the base 30m data. 
+    We will calculate all other timeframes from this to save API calls.
+    """
+    timeframe = '30m'
+    print(f"Fetching base {timeframe} data for {symbol} starting {start_year}...")
     exchange = ccxt.binance({'enableRateLimit': True})
     
     start_date = datetime.datetime(start_year, 1, 1)
@@ -40,15 +43,16 @@ def fetch_data_for_timeframe(symbol, timeframe, start_year):
             last_timestamp = ohlcv[-1][0]
             since = last_timestamp + 1
             
+            # Progress indicator
             if len(all_ohlcv) % 10000 == 0:
-                print(f"  {timeframe}: {len(all_ohlcv)} candles...")
+                print(f"  Fetched {len(all_ohlcv)} base candles...")
 
             if last_timestamp > (time.time() * 1000) - 60000:
                 break
             
             time.sleep(0.05) 
         except Exception as e:
-            print(f"  Error fetching {timeframe}: {e}")
+            print(f"  Error fetching base data: {e}")
             break
             
     df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -58,13 +62,37 @@ def fetch_data_for_timeframe(symbol, timeframe, start_year):
         cols = ['open', 'high', 'low', 'close', 'volume']
         df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
     
+    print(f"Base data fetch complete. {len(df)} rows.")
     return df
 
-def fetch_all_timeframes():
-    data_store = {}
-    for tf in TIMEFRAMES:
-        df = fetch_data_for_timeframe(SYMBOL, tf, START_YEAR)
-        data_store[tf] = df
+def resample_data(df_30m):
+    """
+    Generates higher timeframe data from 30m source.
+    """
+    print("Resampling data to higher timeframes...")
+    data_store = {'30m': df_30m.copy()}
+    
+    # Aggregation rules for OHLCV
+    agg_dict = {
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'volume': 'sum'
+    }
+    
+    # 1 Hour
+    data_store['1h'] = df_30m.resample('1h').agg(agg_dict).dropna()
+    
+    # 4 Hour
+    data_store['4h'] = df_30m.resample('4h').agg(agg_dict).dropna()
+    
+    # 1 Day (Daily)
+    data_store['1d'] = df_30m.resample('1D').agg(agg_dict).dropna()
+    
+    # 1 Week (Weekly) - 'W-MON' ensures weeks start on Monday (standard for crypto)
+    data_store['1w'] = df_30m.resample('W-MON').agg(agg_dict).dropna()
+    
     return data_store
 
 # -----------------------------------------------------------------------------
@@ -84,11 +112,8 @@ def run_strategy(df, duration_periods):
     df = df.copy()
     df['rsi'] = calculate_rsi(df['close'], 14)
     
-    # --- STRATEGY: MOMENTUM 50 CROSS ---
-    # Buy when crossing ABOVE 50
+    # Momentum 50 Cross Signals
     long_signals = (df['rsi'] > 50) & (df['rsi'].shift(1) <= 50)
-    
-    # Sell when crossing BELOW 50
     short_signals = (df['rsi'] < 50) & (df['rsi'].shift(1) >= 50)
     
     n = len(df)
@@ -101,7 +126,7 @@ def run_strategy(df, duration_periods):
     short_sig_arr = short_signals.values
     
     for i in range(1, n):
-        # State Machine with Mutual Exclusion
+        # Mutual Exclusion State Machine
         if long_sig_arr[i]:
             long_timer = 1
             short_timer = 0
@@ -112,7 +137,6 @@ def run_strategy(df, duration_periods):
             if long_timer > 0: long_timer += 1
             if short_timer > 0: short_timer += 1
             
-        # Calculate Decaying Weights
         long_weight = 0
         if long_timer > 0 and long_timer <= duration_periods:
             long_weight = 1 - (long_timer / duration_periods)**2
@@ -136,6 +160,7 @@ def run_strategy(df, duration_periods):
 
 def calculate_sharpe(returns, timeframe):
     if returns.std() == 0: return -999
+    # Approximate annualized factors
     factors = {'30m': 365*48, '1h': 365*24, '4h': 365*6, '1d': 365, '1w': 52}
     N = factors.get(timeframe, 365)
     return np.sqrt(N) * (returns.mean() / returns.std())
@@ -160,29 +185,27 @@ def calculate_metrics(df, timeframe):
     }
 
 # -----------------------------------------------------------------------------
-# 3. Grid Search
+# 3. Targeted Analysis (Fixed 16-Period Decay)
 # -----------------------------------------------------------------------------
-def run_grid_search(data_store):
+def run_targeted_analysis(data_store):
     results = []
-    print("\n--- Starting Grid Search (RSI 50 Momentum) ---")
+    print(f"\n--- Running Analysis (Decay: {FIXED_DECAY}) ---")
     
-    for tf in TIMEFRAMES:
-        df_base = data_store.get(tf)
+    for tf, df_base in data_store.items():
         if df_base is None or df_base.empty: continue
             
-        for periods in DECAY_PERIODS:
-            df_res = run_strategy(df_base, periods)
-            metrics = calculate_metrics(df_res, tf)
-            
-            results.append({
-                'Timeframe': tf,
-                'Decay (Candles)': periods,
-                'Sharpe Ratio': metrics['sharpe'],
-                'B&H Sharpe': metrics['bh_sharpe'],
-                'Total Return (%)': metrics['total_ret'],
-                'B&H Return (%)': metrics['bh_total_ret'],
-                'df': df_res
-            })
+        df_res = run_strategy(df_base, FIXED_DECAY)
+        metrics = calculate_metrics(df_res, tf)
+        
+        results.append({
+            'Timeframe': tf,
+            'Decay': FIXED_DECAY,
+            'Sharpe Ratio': metrics['sharpe'],
+            'B&H Sharpe': metrics['bh_sharpe'],
+            'Total Return (%)': metrics['total_ret'],
+            'B&H Return (%)': metrics['bh_total_ret'],
+            'df': df_res
+        })
             
     return sorted(results, key=lambda x: x['Sharpe Ratio'], reverse=True)
 
@@ -201,22 +224,21 @@ def plot_winner(result_dict):
     fig, axes = plt.subplots(nrows=3, ncols=1, figsize=(15, 12), sharex=True, 
                              gridspec_kw={'height_ratios': [2, 1, 1], 'hspace': 0.1})
     
-    # Row 1: Equity Curves
+    # Row 1: Equity
     ax1 = axes[0]
     ax1.plot(df.index, df['bh_equity'], label='Buy & Hold', color='gray', alpha=0.5, linestyle='--')
-    ax1.plot(df.index, df['equity'], label='RSI 50 Momentum', color='#0077B6', linewidth=2)
+    ax1.plot(df.index, df['equity'], label=f'RSI 50 Mom ({FIXED_DECAY} decay)', color='#0077B6', linewidth=2)
     ax1.set_ylabel('Equity')
-    ax1.set_title(f"Best Config: {tf} | Decay {result_dict['Decay (Candles)']} | Sharpe: {sharpe}", fontsize=16)
+    ax1.set_title(f"Performance: {tf} | Sharpe: {sharpe}", fontsize=16)
     ax1.legend()
 
     # Row 2: RSI
     ax2 = axes[1]
     ax2.plot(df.index, df['rsi'], color='#724C9F', linewidth=1)
-    ax2.axhline(50, color='black', linestyle='--', linewidth=1.5, label='50 Pivot')
+    ax2.axhline(50, color='black', linestyle='--', linewidth=1.5)
     ax2.fill_between(df.index, 50, 100, where=(df['rsi']>50), color='green', alpha=0.05)
     ax2.fill_between(df.index, 0, 50, where=(df['rsi']<50), color='red', alpha=0.05)
     ax2.set_ylabel('RSI')
-    ax2.legend(loc='upper right')
 
     # Row 3: Position
     ax3 = axes[2]
@@ -236,15 +258,18 @@ def plot_winner(result_dict):
 # -----------------------------------------------------------------------------
 # 5. Execution
 # -----------------------------------------------------------------------------
-print("Step 1: Fetching Data...")
-data_store = fetch_all_timeframes()
+# Step 1: Fetch 30m ONLY
+df_30m = fetch_base_data(SYMBOL, START_YEAR)
 
-print("Step 2: Running Grid Search...")
-sorted_results = run_grid_search(data_store)
-top_5 = sorted_results[:5]
-winner = top_5[0]
+# Step 2: Resample in memory
+data_store = resample_data(df_30m)
 
-print("\nStep 3: Generating Plot...")
+# Step 3: Run Strategy
+sorted_results = run_targeted_analysis(data_store)
+winner = sorted_results[0]
+
+# Step 4: Plot
+print("\nGenerating Plot...")
 winner_plot_base64 = plot_winner(winner)
 
 # -----------------------------------------------------------------------------
@@ -254,11 +279,10 @@ app = Dash(__name__)
 server = app.server 
 
 table_data = []
-for i, res in enumerate(top_5):
+for i, res in enumerate(sorted_results):
     table_data.append({
         'Rank': i+1,
         'Timeframe': res['Timeframe'],
-        'Decay': res['Decay (Candles)'],
         'Strat Sharpe': res['Sharpe Ratio'],
         'B&H Sharpe': res['B&H Sharpe'],
         'Strat Return': f"{res['Total Return (%)']}%",
@@ -266,8 +290,8 @@ for i, res in enumerate(top_5):
     })
 
 app.layout = html.Div(style={'fontFamily': 'sans-serif', 'padding': '20px'}, children=[
-    html.H1("RSI 50 Momentum Optimization", style={'textAlign': 'center'}),
-    html.P("Strategy: Long > 50, Short < 50. Weight decays over time.", style={'textAlign': 'center'}),
+    html.H1(f"RSI 50 Momentum: Optimized Fetching", style={'textAlign': 'center'}),
+    html.P("Fetching 30m base data -> Resampling to 1h, 4h, 1d, 1w.", style={'textAlign': 'center'}),
     
     html.Div([
         dash_table.DataTable(
