@@ -10,9 +10,9 @@ import datetime
 import time
 
 # --- Configuration ---
-DAYS_BACK = 30           # Context for RSI calculation
-LONG_DURATION_DAYS = 2   # Long trade duration
-SHORT_DURATION_DAYS = 5  # Short trade duration
+DAYS_BACK = 30           
+LONG_DURATION_DAYS = 2   
+SHORT_DURATION_DAYS = 5  
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '30m'
 PORT = 8080
@@ -67,7 +67,6 @@ def fetch_binance_data(symbol=SYMBOL, timeframe=TIMEFRAME, days_back=DAYS_BACK):
 # 2. Strategy Logic
 # -----------------------------------------------------------------------------
 def calculate_rsi(series, period=14):
-    """Calculates RSI using Wilder's Smoothing (EWMA)."""
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -77,67 +76,68 @@ def calculate_rsi(series, period=14):
     
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
-    
     return rsi.fillna(50)
 
 def apply_strategy(df):
-    print(f"Calculating strategy: Long={LONG_DURATION_DAYS}d, Short={SHORT_DURATION_DAYS}d (Reset on Signal)...")
+    print(f"Calculating strategy: Long={LONG_DURATION_DAYS}d, Short={SHORT_DURATION_DAYS}d (Crossover Reset)...")
     df['rsi'] = calculate_rsi(df['close'], 14)
     
-    long_signals = df['rsi'] < 30
-    short_signals = df['rsi'] > 70
+    # --- CROSSOVER LOGIC ---
+    # We only trigger a signal (reset timer to 1) when RSI CROSSES the threshold.
+    # Long: RSI drops below 30 (Current < 30 AND Previous >= 30)
+    long_signals = (df['rsi'] < 30) & (df['rsi'].shift(1) >= 30)
     
-    print(f"Long Signals found: {long_signals.sum()}")
-    print(f"Short Signals found: {short_signals.sum()}")
+    # Short: RSI goes above 70 (Current > 70 AND Previous <= 70)
+    short_signals = (df['rsi'] > 70) & (df['rsi'].shift(1) <= 70)
+    
+    print(f"Long Crossovers found: {long_signals.sum()}")
+    print(f"Short Crossovers found: {short_signals.sum()}")
     
     n = len(df)
     intervals_per_day = 48 # 30m intervals
     step_indices = np.arange(n)
 
-    # --- 1. LONG POSITION LOGIC (2 Days, Reset) ---
+    # --- 1. LONG POSITION ---
     long_steps_max = LONG_DURATION_DAYS * intervals_per_day
     
-    # Identify indices where signals occur. 
-    # Use -1 for non-signal steps so we can use maximum.accumulate to find the "last seen" signal index.
+    # Mark indices where crossover occurred
     long_signal_indices = np.where(long_signals, step_indices, -1)
     
-    # Propagate the max index forward. 
-    # last_long_idx[i] will contain the index of the most recent True signal up to i.
+    # Propagate the index of the last seen crossover
     last_long_idx = np.maximum.accumulate(long_signal_indices)
     
-    # Calculate elapsed steps since the last signal
+    # Calculate elapsed steps
     long_elapsed = step_indices - last_long_idx
     
-    # Calculate weights: 1 - (elapsed/duration)^2
+    # Weight formula: 1 - (elapsed / duration)^2
     long_weights = 1 - (long_elapsed / long_steps_max)**2
     
-    # Filter: Weight is 0 if no signal has occurred yet (-1) OR duration exceeded
-    long_weights = np.where(
-        (last_long_idx != -1) & (long_elapsed < long_steps_max), 
-        long_weights, 
-        0
-    )
+    # Apply filters:
+    # 1. Must have had a signal at least once (last_long_idx != -1)
+    # 2. Must be within duration (long_elapsed < long_steps_max)
+    # 3. Important: Ensure we don't apply weights if last_long_idx is still the initialization -1
+    #    (The -1 check handles this, but accumulated -1 is still -1)
+    long_active_mask = (last_long_idx != -1) & (long_elapsed < long_steps_max)
+    long_weights = np.where(long_active_mask, long_weights, 0)
+    long_weights = np.maximum(long_weights, 0) # Clip any negative values just in case
 
-    # --- 2. SHORT POSITION LOGIC (5 Days, Reset) ---
+    # --- 2. SHORT POSITION ---
     short_steps_max = SHORT_DURATION_DAYS * intervals_per_day
     
     short_signal_indices = np.where(short_signals, step_indices, -1)
     last_short_idx = np.maximum.accumulate(short_signal_indices)
     
     short_elapsed = step_indices - last_short_idx
-    
     short_weights = 1 - (short_elapsed / short_steps_max)**2
     
-    short_weights = np.where(
-        (last_short_idx != -1) & (short_elapsed < short_steps_max), 
-        short_weights, 
-        0
-    )
+    short_active_mask = (last_short_idx != -1) & (short_elapsed < short_steps_max)
+    short_weights = np.where(short_active_mask, short_weights, 0)
+    short_weights = np.maximum(short_weights, 0)
     
     # --- 3. Net Position ---
     df['position'] = long_weights - short_weights
     
-    print(f"Non-zero position candles: {np.count_nonzero(df['position'])}")
+    print(f"Active Position Candles: {np.count_nonzero(df['position'])}")
     
     # Returns & Equity
     df['returns'] = df['close'].pct_change().fillna(0)
@@ -151,18 +151,15 @@ def apply_strategy(df):
 # 3. Event Study
 # -----------------------------------------------------------------------------
 def calculate_event_study(df):
-    """
-    Calculates avg price movement. 
-    Uses the max duration (5 days) to show the full picture for shorts.
-    """
-    # Max duration for the plot x-axis
     max_duration_steps = max(LONG_DURATION_DAYS, SHORT_DURATION_DAYS) * 48
     
     long_moves = []
     short_moves = []
     
-    long_indices = np.where(df['rsi'] < 30)[0]
-    short_indices = np.where(df['rsi'] > 70)[0]
+    # For Event Study, we align strictly with our Crossover Signals
+    long_indices = np.where((df['rsi'] < 30) & (df['rsi'].shift(1) >= 30))[0]
+    short_indices = np.where((df['rsi'] > 70) & (df['rsi'].shift(1) <= 70))[0]
+    
     price_arr = df['close'].values
     n = len(price_arr)
     
@@ -209,10 +206,10 @@ def create_main_plot(df):
     ax1b.set_ylabel('Equity', color='#0077B6')
     ax1b.legend(loc='upper right')
     
-    # Background Shading
+    # Background Shading based on ACTIVE position
     trans = mtransforms.blended_transform_factory(ax1.transData, ax1.transAxes)
-    is_long = df['position'] > 0.1
-    is_short = df['position'] < -0.1
+    is_long = df['position'] > 0.05
+    is_short = df['position'] < -0.05
     
     ax1.fill_between(df.index, 0, 1, where=is_long, transform=trans, color='green', alpha=0.1, linewidth=0)
     ax1.fill_between(df.index, 0, 1, where=is_short, transform=trans, color='red', alpha=0.1, linewidth=0)
@@ -232,12 +229,14 @@ def create_main_plot(df):
 
     # --- Row 3: Net Position ---
     ax3 = axes[2]
-    ax3.fill_between(df.index, df['position'], 0, where=(df['position']>=0), color='green', alpha=0.6, step='mid')
-    ax3.fill_between(df.index, df['position'], 0, where=(df['position']<0), color='red', alpha=0.6, step='mid')
+    # We use fill_between to create a nice area chart showing the decay
+    ax3.fill_between(df.index, df['position'], 0, where=(df['position']>=0), color='green', alpha=0.6, step='mid', label='Long Weight')
+    ax3.fill_between(df.index, df['position'], 0, where=(df['position']<0), color='red', alpha=0.6, step='mid', label='Short Weight')
     
-    ax3.set_ylabel('Net Position')
+    ax3.set_ylabel('Position Weight')
     ax3.set_xlabel('Date')
     ax3.axhline(0, color='black', linewidth=0.5)
+    ax3.legend(loc='upper right')
 
     fig.align_ylabels(axes)
     return fig
@@ -247,10 +246,9 @@ def create_event_plot(avg_long, avg_short):
     fig, ax = plt.subplots(figsize=(15, 6))
     
     days = np.arange(len(avg_long)) / 48 
-    ax.plot(days, avg_long * 100, label=f'Long Signal (Show {max(LONG_DURATION_DAYS, SHORT_DURATION_DAYS)}d)', color='green', linewidth=2)
-    ax.plot(days, avg_short * 100, label=f'Short Signal (Show {max(LONG_DURATION_DAYS, SHORT_DURATION_DAYS)}d)', color='red', linewidth=2)
+    ax.plot(days, avg_long * 100, label=f'Long Signal', color='green', linewidth=2)
+    ax.plot(days, avg_short * 100, label=f'Short Signal', color='red', linewidth=2)
     
-    # Mark the cutoff points for the strategy logic
     ax.axvline(LONG_DURATION_DAYS, color='green', linestyle=':', label='Long Exit')
     ax.axvline(SHORT_DURATION_DAYS, color='red', linestyle=':', label='Short Exit')
     
