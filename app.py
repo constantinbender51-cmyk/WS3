@@ -68,7 +68,7 @@ def fetch_all_timeframes():
     return data_store
 
 # -----------------------------------------------------------------------------
-# 2. Strategy Logic (With Trend Filter)
+# 2. Strategy Logic (RSI 50 Cross Momentum)
 # -----------------------------------------------------------------------------
 def calculate_rsi(series, period=14):
     delta = series.diff()
@@ -82,26 +82,15 @@ def calculate_rsi(series, period=14):
 
 def run_strategy(df, duration_periods):
     df = df.copy()
-    
-    # Indicators
     df['rsi'] = calculate_rsi(df['close'], 14)
-    df['sma200'] = df['close'].rolling(window=200).mean() # Trend Filter
     
-    # --- TREND FILTER LOGIC ---
-    # Only Long if Price > SMA200
-    # Only Short if Price < SMA200
-    is_uptrend = df['close'] > df['sma200']
-    is_downtrend = df['close'] < df['sma200']
+    # --- STRATEGY: MOMENTUM 50 CROSS ---
+    # Buy when crossing ABOVE 50
+    long_signals = (df['rsi'] > 50) & (df['rsi'].shift(1) <= 50)
     
-    # Signals (Crossovers)
-    long_signal_raw = (df['rsi'] < 30) & (df['rsi'].shift(1) >= 30)
-    short_signal_raw = (df['rsi'] > 70) & (df['rsi'].shift(1) <= 70)
+    # Sell when crossing BELOW 50
+    short_signals = (df['rsi'] < 50) & (df['rsi'].shift(1) >= 50)
     
-    # Filtered Signals
-    long_signals = long_signal_raw & is_uptrend
-    short_signals = short_signal_raw & is_downtrend
-    
-    # --- Mutually Exclusive Decay Logic ---
     n = len(df)
     position_weights = np.zeros(n)
     
@@ -112,6 +101,7 @@ def run_strategy(df, duration_periods):
     short_sig_arr = short_signals.values
     
     for i in range(1, n):
+        # State Machine with Mutual Exclusion
         if long_sig_arr[i]:
             long_timer = 1
             short_timer = 0
@@ -122,6 +112,7 @@ def run_strategy(df, duration_periods):
             if long_timer > 0: long_timer += 1
             if short_timer > 0: short_timer += 1
             
+        # Calculate Decaying Weights
         long_weight = 0
         if long_timer > 0 and long_timer <= duration_periods:
             long_weight = 1 - (long_timer / duration_periods)**2
@@ -173,7 +164,7 @@ def calculate_metrics(df, timeframe):
 # -----------------------------------------------------------------------------
 def run_grid_search(data_store):
     results = []
-    print("\n--- Starting Grid Search (With Trend Filter) ---")
+    print("\n--- Starting Grid Search (RSI 50 Momentum) ---")
     
     for tf in TIMEFRAMES:
         df_base = data_store.get(tf)
@@ -213,7 +204,7 @@ def plot_winner(result_dict):
     # Row 1: Equity Curves
     ax1 = axes[0]
     ax1.plot(df.index, df['bh_equity'], label='Buy & Hold', color='gray', alpha=0.5, linestyle='--')
-    ax1.plot(df.index, df['equity'], label='RSI Trend Strategy', color='#0077B6', linewidth=2)
+    ax1.plot(df.index, df['equity'], label='RSI 50 Momentum', color='#0077B6', linewidth=2)
     ax1.set_ylabel('Equity')
     ax1.set_title(f"Best Config: {tf} | Decay {result_dict['Decay (Candles)']} | Sharpe: {sharpe}", fontsize=16)
     ax1.legend()
@@ -221,18 +212,18 @@ def plot_winner(result_dict):
     # Row 2: RSI
     ax2 = axes[1]
     ax2.plot(df.index, df['rsi'], color='#724C9F', linewidth=1)
-    ax2.axhline(70, color='red', linestyle='--')
-    ax2.axhline(30, color='green', linestyle='--')
+    ax2.axhline(50, color='black', linestyle='--', linewidth=1.5, label='50 Pivot')
+    ax2.fill_between(df.index, 50, 100, where=(df['rsi']>50), color='green', alpha=0.05)
+    ax2.fill_between(df.index, 0, 50, where=(df['rsi']<50), color='red', alpha=0.05)
     ax2.set_ylabel('RSI')
+    ax2.legend(loc='upper right')
 
-    # Row 3: Trend Filter (SMA 200) context
+    # Row 3: Position
     ax3 = axes[2]
-    ax3.plot(df.index, df['close'], label='Price', color='black', alpha=0.6)
-    ax3.plot(df.index, df['sma200'], label='SMA 200 Trend', color='orange', linewidth=2)
-    ax3.fill_between(df.index, df['close'].max(), df['close'].min(), 
-                     where=(df['close'] > df['sma200']), color='green', alpha=0.05, label='Uptrend Zone')
-    ax3.fill_between(df.index, df['close'].max(), df['close'].min(), 
-                     where=(df['close'] < df['sma200']), color='red', alpha=0.05, label='Downtrend Zone')
+    ax3.fill_between(df.index, df['position'], 0, where=(df['position']>=0), color='green', alpha=0.6, step='mid', label='Long')
+    ax3.fill_between(df.index, df['position'], 0, where=(df['position']<0), color='red', alpha=0.6, step='mid', label='Short')
+    ax3.set_ylabel('Weight')
+    ax3.set_xlabel('Date')
     ax3.legend()
     
     buf = io.BytesIO()
@@ -275,7 +266,9 @@ for i, res in enumerate(top_5):
     })
 
 app.layout = html.Div(style={'fontFamily': 'sans-serif', 'padding': '20px'}, children=[
-    html.H1("RSI + Trend Filter Optimization", style={'textAlign': 'center'}),
+    html.H1("RSI 50 Momentum Optimization", style={'textAlign': 'center'}),
+    html.P("Strategy: Long > 50, Short < 50. Weight decays over time.", style={'textAlign': 'center'}),
+    
     html.Div([
         dash_table.DataTable(
             data=table_data,
