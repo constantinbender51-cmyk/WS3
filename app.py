@@ -10,8 +10,9 @@ import datetime
 import time
 
 # --- Configuration ---
-DAYS_BACK = 30           # Data fetch duration (kept at 30 days for context)
-DAYS_DURATION = 7        # **STRATEGY DURATION: 7 DAYS**
+DAYS_BACK = 30           # Context for RSI calculation
+LONG_DURATION_DAYS = 2   # Long trade duration
+SHORT_DURATION_DAYS = 5  # Short trade duration
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '30m'
 PORT = 8080
@@ -23,7 +24,6 @@ def fetch_binance_data(symbol=SYMBOL, timeframe=TIMEFRAME, days_back=DAYS_BACK):
     print(f"Fetching {timeframe} data for {symbol} for the last {days_back} days...")
     exchange = ccxt.binance({'enableRateLimit': True})
     
-    # Calculate start time dynamically
     start_date = datetime.datetime.now() - datetime.timedelta(days=days_back)
     since = int(start_date.timestamp() * 1000)
     
@@ -58,7 +58,6 @@ def fetch_binance_data(symbol=SYMBOL, timeframe=TIMEFRAME, days_back=DAYS_BACK):
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
     
-    # CRITICAL: Ensure all numeric columns are floats
     cols = ['open', 'high', 'low', 'close', 'volume']
     df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
     
@@ -82,7 +81,7 @@ def calculate_rsi(series, period=14):
     return rsi.fillna(50)
 
 def apply_strategy(df):
-    print(f"Calculating strategy with {DAYS_DURATION}-day decay...")
+    print(f"Calculating strategy: Long={LONG_DURATION_DAYS}d, Short={SHORT_DURATION_DAYS}d (Reset on Signal)...")
     df['rsi'] = calculate_rsi(df['close'], 14)
     
     long_signals = df['rsi'] < 30
@@ -92,36 +91,53 @@ def apply_strategy(df):
     print(f"Short Signals found: {short_signals.sum()}")
     
     n = len(df)
-    net_position = np.zeros(n)
-    
     intervals_per_day = 48 # 30m intervals
-    # --- UPDATED: 7 days * 48 intervals/day = 336 steps ---
-    total_steps = DAYS_DURATION * intervals_per_day
-    
-    steps = np.arange(total_steps)
-    days_elapsed = steps / intervals_per_day
-    
-    # Weight decay: 1 - (day/DAYS_DURATION)^2
-    weights = 1 - (days_elapsed / DAYS_DURATION)**2
-    weights = np.maximum(weights, 0)
-    
-    # Apply Longs
-    long_indices = np.where(long_signals)[0]
-    for idx in long_indices:
-        end_idx = min(idx + total_steps, n)
-        length = end_idx - idx
-        net_position[idx:end_idx] += weights[:length]
+    step_indices = np.arange(n)
 
-    # Apply Shorts
-    short_indices = np.where(short_signals)[0]
-    for idx in short_indices:
-        end_idx = min(idx + total_steps, n)
-        length = end_idx - idx
-        net_position[idx:end_idx] -= weights[:length]
-        
-    df['position'] = net_position
+    # --- 1. LONG POSITION LOGIC (2 Days, Reset) ---
+    long_steps_max = LONG_DURATION_DAYS * intervals_per_day
     
-    print(f"Non-zero position candles: {np.count_nonzero(net_position)}")
+    # Identify indices where signals occur. 
+    # Use -1 for non-signal steps so we can use maximum.accumulate to find the "last seen" signal index.
+    long_signal_indices = np.where(long_signals, step_indices, -1)
+    
+    # Propagate the max index forward. 
+    # last_long_idx[i] will contain the index of the most recent True signal up to i.
+    last_long_idx = np.maximum.accumulate(long_signal_indices)
+    
+    # Calculate elapsed steps since the last signal
+    long_elapsed = step_indices - last_long_idx
+    
+    # Calculate weights: 1 - (elapsed/duration)^2
+    long_weights = 1 - (long_elapsed / long_steps_max)**2
+    
+    # Filter: Weight is 0 if no signal has occurred yet (-1) OR duration exceeded
+    long_weights = np.where(
+        (last_long_idx != -1) & (long_elapsed < long_steps_max), 
+        long_weights, 
+        0
+    )
+
+    # --- 2. SHORT POSITION LOGIC (5 Days, Reset) ---
+    short_steps_max = SHORT_DURATION_DAYS * intervals_per_day
+    
+    short_signal_indices = np.where(short_signals, step_indices, -1)
+    last_short_idx = np.maximum.accumulate(short_signal_indices)
+    
+    short_elapsed = step_indices - last_short_idx
+    
+    short_weights = 1 - (short_elapsed / short_steps_max)**2
+    
+    short_weights = np.where(
+        (last_short_idx != -1) & (short_elapsed < short_steps_max), 
+        short_weights, 
+        0
+    )
+    
+    # --- 3. Net Position ---
+    df['position'] = long_weights - short_weights
+    
+    print(f"Non-zero position candles: {np.count_nonzero(df['position'])}")
     
     # Returns & Equity
     df['returns'] = df['close'].pct_change().fillna(0)
@@ -129,13 +145,19 @@ def apply_strategy(df):
     df['strategy_returns'] = df['strategy_returns'].fillna(0)
     df['equity'] = (1 + df['strategy_returns']).cumprod() * 100
     
-    return df, total_steps
+    return df
 
 # -----------------------------------------------------------------------------
 # 3. Event Study
 # -----------------------------------------------------------------------------
-def calculate_event_study(df, period_steps):
-    """Calculates the average price movement path over the 7-day period."""
+def calculate_event_study(df):
+    """
+    Calculates avg price movement. 
+    Uses the max duration (5 days) to show the full picture for shorts.
+    """
+    # Max duration for the plot x-axis
+    max_duration_steps = max(LONG_DURATION_DAYS, SHORT_DURATION_DAYS) * 48
+    
     long_moves = []
     short_moves = []
     
@@ -145,20 +167,19 @@ def calculate_event_study(df, period_steps):
     n = len(price_arr)
     
     for idx in long_indices:
-        # NOTE: period_steps is now 7 days, aligning with the trade duration.
-        if idx + period_steps < n:
-            slice_price = price_arr[idx : idx + period_steps]
+        if idx + max_duration_steps < n:
+            slice_price = price_arr[idx : idx + max_duration_steps]
             start_price = slice_price[0] if slice_price[0] != 0 else 1.0
             long_moves.append((slice_price - start_price) / start_price)
             
     for idx in short_indices:
-        if idx + period_steps < n:
-            slice_price = price_arr[idx : idx + period_steps]
+        if idx + max_duration_steps < n:
+            slice_price = price_arr[idx : idx + max_duration_steps]
             start_price = slice_price[0] if slice_price[0] != 0 else 1.0
             short_moves.append((slice_price - start_price) / start_price)
             
-    avg_long = np.mean(long_moves, axis=0) if long_moves else np.zeros(period_steps)
-    avg_short = np.mean(short_moves, axis=0) if short_moves else np.zeros(period_steps)
+    avg_long = np.mean(long_moves, axis=0) if long_moves else np.zeros(max_duration_steps)
+    avg_short = np.mean(short_moves, axis=0) if short_moves else np.zeros(max_duration_steps)
     return avg_long, avg_short
 
 # -----------------------------------------------------------------------------
@@ -188,7 +209,7 @@ def create_main_plot(df):
     ax1b.set_ylabel('Equity', color='#0077B6')
     ax1b.legend(loc='upper right')
     
-    # Optimized Background Shading
+    # Background Shading
     trans = mtransforms.blended_transform_factory(ax1.transData, ax1.transAxes)
     is_long = df['position'] > 0.1
     is_short = df['position'] < -0.1
@@ -196,7 +217,8 @@ def create_main_plot(df):
     ax1.fill_between(df.index, 0, 1, where=is_long, transform=trans, color='green', alpha=0.1, linewidth=0)
     ax1.fill_between(df.index, 0, 1, where=is_short, transform=trans, color='red', alpha=0.1, linewidth=0)
 
-    ax1.set_title(f'{SYMBOL} 30m Strategy ({DAYS_DURATION}-Day Decay | Last {DAYS_BACK} Days)', fontsize=14)
+    title_str = f'{SYMBOL} Strategy: Long {LONG_DURATION_DAYS}d, Short {SHORT_DURATION_DAYS}d (Last {DAYS_BACK} Days)'
+    ax1.set_title(title_str, fontsize=14)
 
     # --- Row 2: RSI ---
     ax2 = axes[1]
@@ -210,7 +232,6 @@ def create_main_plot(df):
 
     # --- Row 3: Net Position ---
     ax3 = axes[2]
-    # Fast Step Plot
     ax3.fill_between(df.index, df['position'], 0, where=(df['position']>=0), color='green', alpha=0.6, step='mid')
     ax3.fill_between(df.index, df['position'], 0, where=(df['position']<0), color='red', alpha=0.6, step='mid')
     
@@ -225,13 +246,16 @@ def create_event_plot(avg_long, avg_short):
     plt.style.use('ggplot')
     fig, ax = plt.subplots(figsize=(15, 6))
     
-    # X-axis now reflects the 7-day duration (336 steps / 48 steps/day)
     days = np.arange(len(avg_long)) / 48 
-    ax.plot(days, avg_long * 100, label='Long', color='green', linewidth=2)
-    ax.plot(days, avg_short * 100, label='Short', color='red', linewidth=2)
+    ax.plot(days, avg_long * 100, label=f'Long Signal (Show {max(LONG_DURATION_DAYS, SHORT_DURATION_DAYS)}d)', color='green', linewidth=2)
+    ax.plot(days, avg_short * 100, label=f'Short Signal (Show {max(LONG_DURATION_DAYS, SHORT_DURATION_DAYS)}d)', color='red', linewidth=2)
+    
+    # Mark the cutoff points for the strategy logic
+    ax.axvline(LONG_DURATION_DAYS, color='green', linestyle=':', label='Long Exit')
+    ax.axvline(SHORT_DURATION_DAYS, color='red', linestyle=':', label='Short Exit')
     
     ax.axhline(0, color='black', linestyle='--', alpha=0.5)
-    ax.set_title(f'Avg Price Move ({DAYS_DURATION} Days Post-Signal)', fontsize=14)
+    ax.set_title(f'Avg Price Move Post-Signal', fontsize=14)
     ax.set_xlabel('Days')
     ax.set_ylabel('% Change')
     ax.legend()
@@ -247,8 +271,8 @@ df = fetch_binance_data(days_back=DAYS_BACK)
 
 # 2. Strategy
 if not df.empty:
-    df, trade_duration_steps = apply_strategy(df)
-    avg_long_path, avg_short_path = calculate_event_study(df, trade_duration_steps)
+    df = apply_strategy(df)
+    avg_long_path, avg_short_path = calculate_event_study(df)
 else:
     print("CRITICAL ERROR: No data fetched. Dashboard will be empty.")
     df = pd.DataFrame({'close': [], 'equity': [], 'rsi': [], 'position': []})
