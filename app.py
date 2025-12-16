@@ -10,9 +10,7 @@ import datetime
 import time
 
 # --- Configuration ---
-# To ensure fair comparison, we try to fetch a consistent time window.
-# 30m data from 2018 is too heavy for a quick script, so we start from 2021.
-START_YEAR = 2021 
+START_YEAR = 2021
 SYMBOL = 'BTC/USDT'
 PORT = 8080
 
@@ -42,11 +40,9 @@ def fetch_data_for_timeframe(symbol, timeframe, start_year):
             last_timestamp = ohlcv[-1][0]
             since = last_timestamp + 1
             
-            # Progress update for large fetches
             if len(all_ohlcv) % 10000 == 0:
                 print(f"  {timeframe}: {len(all_ohlcv)} candles...")
 
-            # Stop if we reach current time
             if last_timestamp > (time.time() * 1000) - 60000:
                 break
             
@@ -72,49 +68,46 @@ def fetch_all_timeframes():
     return data_store
 
 # -----------------------------------------------------------------------------
-# 2. Strategy Logic
+# 2. Strategy Logic (With Trend Filter)
 # -----------------------------------------------------------------------------
 def calculate_rsi(series, period=14):
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
-    
     avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50)
 
-def calculate_decay_weight(elapsed_steps, max_steps):
-    if max_steps == 0: return 0
-    days_elapsed = elapsed_steps # We treat 'steps' as the unit here
-    weight = 1 - (days_elapsed / max_steps)**2
-    return np.maximum(weight, 0)
-
 def run_strategy(df, duration_periods):
-    """
-    Runs the Mutually Exclusive strategy with SYMMETRIC duration.
-    duration_periods: The decay length in candles (1, 2, 4, 8...).
-    """
-    # Create copy to avoid modifying the cached dataframe
     df = df.copy()
     
+    # Indicators
     df['rsi'] = calculate_rsi(df['close'], 14)
+    df['sma200'] = df['close'].rolling(window=200).mean() # Trend Filter
     
-    # Crossover Signals
-    long_signals = (df['rsi'] < 30) & (df['rsi'].shift(1) >= 30)
-    short_signals = (df['rsi'] > 70) & (df['rsi'].shift(1) <= 70)
+    # --- TREND FILTER LOGIC ---
+    # Only Long if Price > SMA200
+    # Only Short if Price < SMA200
+    is_uptrend = df['close'] > df['sma200']
+    is_downtrend = df['close'] < df['sma200']
     
+    # Signals (Crossovers)
+    long_signal_raw = (df['rsi'] < 30) & (df['rsi'].shift(1) >= 30)
+    short_signal_raw = (df['rsi'] > 70) & (df['rsi'].shift(1) <= 70)
+    
+    # Filtered Signals
+    long_signals = long_signal_raw & is_uptrend
+    short_signals = short_signal_raw & is_downtrend
+    
+    # --- Mutually Exclusive Decay Logic ---
     n = len(df)
     position_weights = np.zeros(n)
     
     long_timer = 0
     short_timer = 0
     
-    # Fast loop using numpy arrays for read-access where possible might be faster,
-    # but the state-machine nature requires iteration.
-    # We optimize by extracting numpy arrays first.
     long_sig_arr = long_signals.values
     short_sig_arr = short_signals.values
     
@@ -131,7 +124,6 @@ def run_strategy(df, duration_periods):
             
         long_weight = 0
         if long_timer > 0 and long_timer <= duration_periods:
-            # 1 - (elapsed/duration)^2
             long_weight = 1 - (long_timer / duration_periods)**2
             if long_weight < 0: long_weight = 0
 
@@ -144,68 +136,64 @@ def run_strategy(df, duration_periods):
 
     df['position'] = position_weights
     
-    # Calculate Returns
+    # Returns
     df['returns'] = df['close'].pct_change().fillna(0)
     df['strategy_returns'] = df['position'].shift(1) * df['returns']
     df['strategy_returns'] = df['strategy_returns'].fillna(0)
     
     return df
 
-def calculate_sharpe(df, timeframe):
-    """Calculates Annualized Sharpe Ratio."""
-    if df.empty: return -999
-    
-    returns = df['strategy_returns']
+def calculate_sharpe(returns, timeframe):
     if returns.std() == 0: return -999
-    
-    # Annualization Factors
-    factors = {
-        '30m': 365 * 48,
-        '1h':  365 * 24,
-        '4h':  365 * 6,
-        '1d':  365,
-        '1w':  52
-    }
-    
+    factors = {'30m': 365*48, '1h': 365*24, '4h': 365*6, '1d': 365, '1w': 52}
     N = factors.get(timeframe, 365)
-    sharpe = np.sqrt(N) * (returns.mean() / returns.std())
-    return sharpe
+    return np.sqrt(N) * (returns.mean() / returns.std())
+
+def calculate_metrics(df, timeframe):
+    if df.empty: return {}
+    
+    strat_ret = df['strategy_returns']
+    bh_ret = df['returns']
+    
+    sharpe_strat = calculate_sharpe(strat_ret, timeframe)
+    sharpe_bh = calculate_sharpe(bh_ret, timeframe)
+    
+    total_ret_strat = (1 + strat_ret).cumprod().iloc[-1] - 1
+    total_ret_bh = (1 + bh_ret).cumprod().iloc[-1] - 1
+    
+    return {
+        'sharpe': round(sharpe_strat, 4),
+        'bh_sharpe': round(sharpe_bh, 4),
+        'total_ret': round(total_ret_strat * 100, 2),
+        'bh_total_ret': round(total_ret_bh * 100, 2)
+    }
 
 # -----------------------------------------------------------------------------
 # 3. Grid Search
 # -----------------------------------------------------------------------------
 def run_grid_search(data_store):
     results = []
-    
-    print("\n--- Starting Grid Search ---")
-    print(f"Timeframes: {TIMEFRAMES}")
-    print(f"Decay Periods: {DECAY_PERIODS}")
+    print("\n--- Starting Grid Search (With Trend Filter) ---")
     
     for tf in TIMEFRAMES:
         df_base = data_store.get(tf)
-        if df_base is None or df_base.empty:
-            print(f"Skipping {tf} (No Data)")
-            continue
+        if df_base is None or df_base.empty: continue
             
         for periods in DECAY_PERIODS:
-            # Run Backtest
             df_res = run_strategy(df_base, periods)
-            
-            # Calculate Metrics
-            sharpe = calculate_sharpe(df_res, tf)
-            total_return = (1 + df_res['strategy_returns']).cumprod().iloc[-1] - 1
+            metrics = calculate_metrics(df_res, tf)
             
             results.append({
                 'Timeframe': tf,
                 'Decay (Candles)': periods,
-                'Sharpe Ratio': round(sharpe, 4),
-                'Total Return': round(total_return * 100, 2), # %
-                'df': df_res # Store df for plotting the winner
+                'Sharpe Ratio': metrics['sharpe'],
+                'B&H Sharpe': metrics['bh_sharpe'],
+                'Total Return (%)': metrics['total_ret'],
+                'B&H Return (%)': metrics['bh_total_ret'],
+                'df': df_res
             })
             
-    # Sort by Sharpe Ratio (Descending)
-    sorted_results = sorted(results, key=lambda x: x['Sharpe Ratio'], reverse=True)
-    return sorted_results
+    return sorted(results, key=lambda x: x['Sharpe Ratio'], reverse=True)
 
 # -----------------------------------------------------------------------------
 # 4. Plotting
@@ -213,49 +201,39 @@ def run_grid_search(data_store):
 def plot_winner(result_dict):
     df = result_dict['df']
     tf = result_dict['Timeframe']
-    decay = result_dict['Decay (Candles)']
     sharpe = result_dict['Sharpe Ratio']
     
     df['equity'] = (1 + df['strategy_returns']).cumprod() * 100
+    df['bh_equity'] = (1 + df['returns']).cumprod() * 100
     
     plt.style.use('ggplot') 
     fig, axes = plt.subplots(nrows=3, ncols=1, figsize=(15, 12), sharex=True, 
                              gridspec_kw={'height_ratios': [2, 1, 1], 'hspace': 0.1})
     
-    # Row 1: Price & Equity
+    # Row 1: Equity Curves
     ax1 = axes[0]
-    ax1.plot(df.index, df['close'], label='BTC Price', color='#333333', linewidth=1)
-    ax1.set_ylabel('Price', color='#333333')
-    
-    ax1b = ax1.twinx()
-    ax1b.plot(df.index, df['equity'], label='Equity', color='#0077B6', linewidth=2)
-    ax1b.set_ylabel('Equity (Start=100)', color='#0077B6')
-    
-    # Background Shading
-    trans = mtransforms.blended_transform_factory(ax1.transData, ax1.transAxes)
-    is_long = df['position'] > 0.05
-    is_short = df['position'] < -0.05
-    ax1.fill_between(df.index, 0, 1, where=is_long, transform=trans, color='green', alpha=0.1, linewidth=0)
-    ax1.fill_between(df.index, 0, 1, where=is_short, transform=trans, color='red', alpha=0.1, linewidth=0)
-    
-    ax1.set_title(f"WINNER: {tf} | Decay: {decay} Candles | Sharpe: {sharpe}", fontsize=16)
-    ax1.legend(loc='upper left')
-    ax1b.legend(loc='upper right')
+    ax1.plot(df.index, df['bh_equity'], label='Buy & Hold', color='gray', alpha=0.5, linestyle='--')
+    ax1.plot(df.index, df['equity'], label='RSI Trend Strategy', color='#0077B6', linewidth=2)
+    ax1.set_ylabel('Equity')
+    ax1.set_title(f"Best Config: {tf} | Decay {result_dict['Decay (Candles)']} | Sharpe: {sharpe}", fontsize=16)
+    ax1.legend()
 
     # Row 2: RSI
     ax2 = axes[1]
     ax2.plot(df.index, df['rsi'], color='#724C9F', linewidth=1)
-    ax2.axhline(70, color='red', linestyle='--', alpha=0.5)
-    ax2.axhline(30, color='green', linestyle='--', alpha=0.5)
+    ax2.axhline(70, color='red', linestyle='--')
+    ax2.axhline(30, color='green', linestyle='--')
     ax2.set_ylabel('RSI')
-    ax2.set_ylim(0, 100)
 
-    # Row 3: Position
+    # Row 3: Trend Filter (SMA 200) context
     ax3 = axes[2]
-    ax3.fill_between(df.index, df['position'], 0, where=(df['position']>=0), color='green', alpha=0.6, step='mid')
-    ax3.fill_between(df.index, df['position'], 0, where=(df['position']<0), color='red', alpha=0.6, step='mid')
-    ax3.set_ylabel('Position')
-    ax3.set_xlabel('Date')
+    ax3.plot(df.index, df['close'], label='Price', color='black', alpha=0.6)
+    ax3.plot(df.index, df['sma200'], label='SMA 200 Trend', color='orange', linewidth=2)
+    ax3.fill_between(df.index, df['close'].max(), df['close'].min(), 
+                     where=(df['close'] > df['sma200']), color='green', alpha=0.05, label='Uptrend Zone')
+    ax3.fill_between(df.index, df['close'].max(), df['close'].min(), 
+                     where=(df['close'] < df['sma200']), color='red', alpha=0.05, label='Downtrend Zone')
+    ax3.legend()
     
     buf = io.BytesIO()
     fig.savefig(buf, format='png', bbox_inches='tight', dpi=100)
@@ -272,15 +250,10 @@ data_store = fetch_all_timeframes()
 
 print("Step 2: Running Grid Search...")
 sorted_results = run_grid_search(data_store)
-
 top_5 = sorted_results[:5]
 winner = top_5[0]
 
-print("\n--- TOP 5 RESULTS ---")
-for i, res in enumerate(top_5):
-    print(f"{i+1}. {res['Timeframe']} | Decay: {res['Decay (Candles)']} | Sharpe: {res['Sharpe Ratio']} | Ret: {res['Total Return']}%")
-
-print("\nStep 3: Generating Plot for Winner...")
+print("\nStep 3: Generating Plot...")
 winner_plot_base64 = plot_winner(winner)
 
 # -----------------------------------------------------------------------------
@@ -289,40 +262,32 @@ winner_plot_base64 = plot_winner(winner)
 app = Dash(__name__)
 server = app.server 
 
-# Prepare table data
 table_data = []
 for i, res in enumerate(top_5):
     table_data.append({
         'Rank': i+1,
         'Timeframe': res['Timeframe'],
-        'Decay (Candles)': res['Decay (Candles)'],
-        'Sharpe Ratio': res['Sharpe Ratio'],
-        'Total Return (%)': res['Total Return']
+        'Decay': res['Decay (Candles)'],
+        'Strat Sharpe': res['Sharpe Ratio'],
+        'B&H Sharpe': res['B&H Sharpe'],
+        'Strat Return': f"{res['Total Return (%)']}%",
+        'B&H Return': f"{res['B&H Return (%)']}%"
     })
 
-app.layout = html.Div(style={'fontFamily': 'sans-serif', 'padding': '20px', 'maxWidth': '1000px', 'margin': '0 auto'}, children=[
-    html.H1("RSI Strategy Optimization", style={'textAlign': 'center'}),
-    html.P(f"Backtest Range: {START_YEAR} - Present", style={'textAlign': 'center', 'color': '#666'}),
-    
+app.layout = html.Div(style={'fontFamily': 'sans-serif', 'padding': '20px'}, children=[
+    html.H1("RSI + Trend Filter Optimization", style={'textAlign': 'center'}),
     html.Div([
-        html.H3("Top 5 Configurations (Sharpe Ratio)"),
         dash_table.DataTable(
             data=table_data,
-            columns=[{'name': i, 'id': i} for i in ['Rank', 'Timeframe', 'Decay (Candles)', 'Sharpe Ratio', 'Total Return (%)']],
-            style_cell={'textAlign': 'center', 'padding': '10px'},
-            style_header={'fontWeight': 'bold', 'backgroundColor': '#f2f2f2'},
-            style_data_conditional=[
-                {'if': {'row_index': 0}, 'backgroundColor': '#d1e7dd', 'fontWeight': 'bold'}
-            ]
+            columns=[{'name': k, 'id': k} for k in table_data[0].keys()],
+            style_cell={'textAlign': 'center'},
+            style_header={'fontWeight': 'bold', 'backgroundColor': '#f2f2f2'}
         )
     ], style={'marginBottom': '40px'}),
-    
     html.Div([
-        html.H3(f"Best Performer: {winner['Timeframe']} (Decay {winner['Decay (Candles)']})"),
-        html.Img(src=winner_plot_base64, style={'width': '100%', 'borderRadius': '8px', 'boxShadow': '0 4px 12px rgba(0,0,0,0.1)'})
+        html.Img(src=winner_plot_base64, style={'width': '100%'})
     ])
 ])
 
 if __name__ == '__main__':
-    print("Starting Server...")
     app.run_server(debug=True, port=PORT)
