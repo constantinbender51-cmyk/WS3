@@ -67,6 +67,7 @@ def fetch_binance_data(symbol=SYMBOL, timeframe=TIMEFRAME, days_back=DAYS_BACK):
 # 2. Strategy Logic
 # -----------------------------------------------------------------------------
 def calculate_rsi(series, period=14):
+    """Calculates RSI using Wilder's Smoothing (EWMA)."""
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -78,65 +79,69 @@ def calculate_rsi(series, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50)
 
+def calculate_decay_weight(elapsed_steps, max_steps):
+    """Calculates the decaying weight: 1 - (day/max_days)^2"""
+    # Note: elapsed_steps / steps_per_day = days_elapsed
+    days_elapsed = elapsed_steps / 48 # 48 intervals per day
+    decay_days = max_steps / 48
+    
+    weight = 1 - (days_elapsed / decay_days)**2
+    return np.maximum(weight, 0) # Ensure weight is not negative
+
 def apply_strategy(df):
-    print(f"Calculating strategy: Long={LONG_DURATION_DAYS}d, Short={SHORT_DURATION_DAYS}d (Crossover Reset)...")
+    print(f"Calculating strategy: Long={LONG_DURATION_DAYS}d, Short={SHORT_DURATION_DAYS}d (Mutually Exclusive)...")
     df['rsi'] = calculate_rsi(df['close'], 14)
     
-    # --- CROSSOVER LOGIC ---
-    # We only trigger a signal (reset timer to 1) when RSI CROSSES the threshold.
-    # Long: RSI drops below 30 (Current < 30 AND Previous >= 30)
+    # --- CROSSOVER SIGNALS ---
     long_signals = (df['rsi'] < 30) & (df['rsi'].shift(1) >= 30)
-    
-    # Short: RSI goes above 70 (Current > 70 AND Previous <= 70)
     short_signals = (df['rsi'] > 70) & (df['rsi'].shift(1) <= 70)
+    
+    n = len(df)
+    intervals_per_day = 48
+    
+    long_steps_max = LONG_DURATION_DAYS * intervals_per_day
+    short_steps_max = SHORT_DURATION_DAYS * intervals_per_day
+    
+    # Initialize position tracking arrays
+    position_weights = np.zeros(n)
+    long_timer = 0  # Tracks elapsed steps since last long signal/reset
+    short_timer = 0 # Tracks elapsed steps since last short signal/reset
+
+    # --- STATE MACHINE LOOP (Required for mutually exclusive logic) ---
+    for i in range(1, n):
+        # 1. Handle Crossover Signals (Forces reset and position flip)
+        if long_signals.iloc[i]:
+            long_timer = 1      # Start decay from 1.0 (elapsed is 1)
+            short_timer = 0     # Force short position/decay to zero
+        elif short_signals.iloc[i]:
+            short_timer = 1     # Start decay from 1.0 (elapsed is 1)
+            long_timer = 0      # Force long position/decay to zero
+        else:
+            # 2. If no new signal, increment active timer
+            if long_timer > 0:
+                long_timer += 1
+            if short_timer > 0:
+                short_timer += 1
+
+        # 3. Calculate Weight (Weight is 0 if timer is 0)
+        long_weight = 0
+        if long_timer > 0 and long_timer <= long_steps_max:
+            long_weight = calculate_decay_weight(long_timer, long_steps_max)
+
+        short_weight = 0
+        if short_timer > 0 and short_timer <= short_steps_max:
+            short_weight = calculate_decay_weight(short_timer, short_steps_max)
+
+        # 4. Set Net Position
+        # If both are somehow active (shouldn't happen with the resets above, but safe to check)
+        # we prioritize the latest signal or treat them as exclusive. 
+        # Since the resets happen immediately, we just take the difference.
+        position_weights[i] = long_weight - short_weight
+
+    df['position'] = position_weights
     
     print(f"Long Crossovers found: {long_signals.sum()}")
     print(f"Short Crossovers found: {short_signals.sum()}")
-    
-    n = len(df)
-    intervals_per_day = 48 # 30m intervals
-    step_indices = np.arange(n)
-
-    # --- 1. LONG POSITION ---
-    long_steps_max = LONG_DURATION_DAYS * intervals_per_day
-    
-    # Mark indices where crossover occurred
-    long_signal_indices = np.where(long_signals, step_indices, -1)
-    
-    # Propagate the index of the last seen crossover
-    last_long_idx = np.maximum.accumulate(long_signal_indices)
-    
-    # Calculate elapsed steps
-    long_elapsed = step_indices - last_long_idx
-    
-    # Weight formula: 1 - (elapsed / duration)^2
-    long_weights = 1 - (long_elapsed / long_steps_max)**2
-    
-    # Apply filters:
-    # 1. Must have had a signal at least once (last_long_idx != -1)
-    # 2. Must be within duration (long_elapsed < long_steps_max)
-    # 3. Important: Ensure we don't apply weights if last_long_idx is still the initialization -1
-    #    (The -1 check handles this, but accumulated -1 is still -1)
-    long_active_mask = (last_long_idx != -1) & (long_elapsed < long_steps_max)
-    long_weights = np.where(long_active_mask, long_weights, 0)
-    long_weights = np.maximum(long_weights, 0) # Clip any negative values just in case
-
-    # --- 2. SHORT POSITION ---
-    short_steps_max = SHORT_DURATION_DAYS * intervals_per_day
-    
-    short_signal_indices = np.where(short_signals, step_indices, -1)
-    last_short_idx = np.maximum.accumulate(short_signal_indices)
-    
-    short_elapsed = step_indices - last_short_idx
-    short_weights = 1 - (short_elapsed / short_steps_max)**2
-    
-    short_active_mask = (last_short_idx != -1) & (short_elapsed < short_steps_max)
-    short_weights = np.where(short_active_mask, short_weights, 0)
-    short_weights = np.maximum(short_weights, 0)
-    
-    # --- 3. Net Position ---
-    df['position'] = long_weights - short_weights
-    
     print(f"Active Position Candles: {np.count_nonzero(df['position'])}")
     
     # Returns & Equity
@@ -151,12 +156,13 @@ def apply_strategy(df):
 # 3. Event Study
 # -----------------------------------------------------------------------------
 def calculate_event_study(df):
+    """Calculates avg price movement relative to crossover signals."""
     max_duration_steps = max(LONG_DURATION_DAYS, SHORT_DURATION_DAYS) * 48
     
     long_moves = []
     short_moves = []
     
-    # For Event Study, we align strictly with our Crossover Signals
+    # Use Crossover Signals for analysis
     long_indices = np.where((df['rsi'] < 30) & (df['rsi'].shift(1) >= 30))[0]
     short_indices = np.where((df['rsi'] > 70) & (df['rsi'].shift(1) <= 70))[0]
     
@@ -214,7 +220,7 @@ def create_main_plot(df):
     ax1.fill_between(df.index, 0, 1, where=is_long, transform=trans, color='green', alpha=0.1, linewidth=0)
     ax1.fill_between(df.index, 0, 1, where=is_short, transform=trans, color='red', alpha=0.1, linewidth=0)
 
-    title_str = f'{SYMBOL} Strategy: Long {LONG_DURATION_DAYS}d, Short {SHORT_DURATION_DAYS}d (Last {DAYS_BACK} Days)'
+    title_str = f'{SYMBOL} Strategy: Long {LONG_DURATION_DAYS}d, Short {SHORT_DURATION_DAYS}d (Mutually Exclusive)'
     ax1.set_title(title_str, fontsize=14)
 
     # --- Row 2: RSI ---
@@ -229,7 +235,7 @@ def create_main_plot(df):
 
     # --- Row 3: Net Position ---
     ax3 = axes[2]
-    # We use fill_between to create a nice area chart showing the decay
+    # Position weight decay visualization
     ax3.fill_between(df.index, df['position'], 0, where=(df['position']>=0), color='green', alpha=0.6, step='mid', label='Long Weight')
     ax3.fill_between(df.index, df['position'], 0, where=(df['position']<0), color='red', alpha=0.6, step='mid', label='Short Weight')
     
@@ -245,15 +251,17 @@ def create_event_plot(avg_long, avg_short):
     plt.style.use('ggplot')
     fig, ax = plt.subplots(figsize=(15, 6))
     
+    max_days = max(LONG_DURATION_DAYS, SHORT_DURATION_DAYS)
     days = np.arange(len(avg_long)) / 48 
-    ax.plot(days, avg_long * 100, label=f'Long Signal', color='green', linewidth=2)
-    ax.plot(days, avg_short * 100, label=f'Short Signal', color='red', linewidth=2)
+    
+    ax.plot(days, avg_long * 100, label=f'Long Signal (2d decay)', color='green', linewidth=2)
+    ax.plot(days, avg_short * 100, label=f'Short Signal (5d decay)', color='red', linewidth=2)
     
     ax.axvline(LONG_DURATION_DAYS, color='green', linestyle=':', label='Long Exit')
     ax.axvline(SHORT_DURATION_DAYS, color='red', linestyle=':', label='Short Exit')
     
     ax.axhline(0, color='black', linestyle='--', alpha=0.5)
-    ax.set_title(f'Avg Price Move Post-Signal', fontsize=14)
+    ax.set_title(f'Avg Price Move Post-Crossover Signal (Up to {max_days} Days)', fontsize=14)
     ax.set_xlabel('Days')
     ax.set_ylabel('% Change')
     ax.legend()
@@ -274,7 +282,8 @@ if not df.empty:
 else:
     print("CRITICAL ERROR: No data fetched. Dashboard will be empty.")
     df = pd.DataFrame({'close': [], 'equity': [], 'rsi': [], 'position': []})
-    avg_long_path, avg_short_path = np.zeros(1), np.zeros(1)
+    max_steps = max(LONG_DURATION_DAYS, SHORT_DURATION_DAYS) * 48
+    avg_long_path, avg_short_path = np.zeros(max_steps), np.zeros(max_steps)
 
 # 3. Plots
 print("Generating plots...")
