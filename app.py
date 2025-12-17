@@ -23,6 +23,9 @@ SMA_PERIODS = list(range(10, 401, 10))
 # Decay periods
 DECAY_PERIODS = [1, 2, 4, 8, 16, 32, 64, 128]
 
+# Minimum Signals per Month Filter
+MIN_SIGNALS_PER_MONTH = 10
+
 # -----------------------------------------------------------------------------
 # 1. Efficient Data Fetching & Resampling
 # -----------------------------------------------------------------------------
@@ -129,7 +132,7 @@ def calculate_adx(df, period=14):
 def run_strategy(df, sma_period, decay_period):
     # Ensure sufficient data
     if len(df) < max(sma_period, 50): # 50 buffer for ADX
-        return pd.DataFrame()
+        return pd.DataFrame(), 0
         
     df = df.copy()
     
@@ -141,6 +144,20 @@ def run_strategy(df, sma_period, decay_period):
     long_signals = (df['close'] > df['sma']) & (df['close'].shift(1) <= df['sma'].shift(1))
     short_signals = (df['close'] < df['sma']) & (df['close'].shift(1) >= df['sma'].shift(1))
     
+    # --- FILTER: SIGNAL FREQUENCY ---
+    total_signals = long_signals.sum() + short_signals.sum()
+    duration_days = (df.index[-1] - df.index[0]).days
+    
+    if duration_days <= 0: return pd.DataFrame(), 0
+    months = duration_days / 30.44
+    if months <= 0: return pd.DataFrame(), 0
+    
+    signals_per_month = total_signals / months
+    
+    if signals_per_month < MIN_SIGNALS_PER_MONTH:
+        return pd.DataFrame(), signals_per_month
+
+    # --- POSITION LOGIC ---
     n = len(df)
     position_weights = np.zeros(n)
     
@@ -151,10 +168,7 @@ def run_strategy(df, sma_period, decay_period):
     short_sig_arr = short_signals.values
     
     # --- ADX WEIGHTING FACTOR ---
-    # Normalize ADX: 
-    # ADX 20 -> 0.5 weight
-    # ADX 40 -> 1.0 weight
-    # Capped at 1.0
+    # Normalize ADX: ADX 40 -> 1.0 weight
     adx_arr = np.clip(df['adx'].values / 40.0, 0, 1.0)
     
     for i in range(1, n):
@@ -190,7 +204,7 @@ def run_strategy(df, sma_period, decay_period):
     df['strategy_returns'] = df['position'].shift(1) * df['returns']
     df['strategy_returns'] = df['strategy_returns'].fillna(0)
     
-    return df
+    return df, signals_per_month
 
 def calculate_sharpe(returns, timeframe):
     if len(returns) < 2 or returns.std() == 0: return -999
@@ -226,9 +240,7 @@ def calculate_metrics(df, timeframe):
 def run_full_grid_search(data_store):
     results = []
     
-    # Calculate total combinations roughly
-    # We skip 1w > 50 sma, so actual count is lower
-    print(f"\n--- Running Full Grid Search (ADX Weighted) ---")
+    print(f"\n--- Running Full Grid Search (ADX Weighted + >{MIN_SIGNALS_PER_MONTH} Sig/Mo) ---")
     
     count = 0
     start_time = time.time()
@@ -243,8 +255,9 @@ def run_full_grid_search(data_store):
 
             for decay in DECAY_PERIODS:
                 # Run Strategy
-                df_res = run_strategy(df_base, sma, decay)
+                df_res, sig_per_mo = run_strategy(df_base, sma, decay)
                 
+                # Check if filtered
                 if df_res.empty: continue
 
                 metrics = calculate_metrics(df_res, tf)
@@ -254,6 +267,7 @@ def run_full_grid_search(data_store):
                     'Timeframe': tf,
                     'SMA Period': sma,
                     'Decay Period': decay,
+                    'Signals/Mo': round(sig_per_mo, 1),
                     'Sharpe Ratio': metrics['sharpe'],
                     'B&H Sharpe': metrics['bh_sharpe'],
                     'Total Return (%)': metrics['total_ret'],
@@ -262,7 +276,7 @@ def run_full_grid_search(data_store):
                 })
                 
                 count += 1
-                if count % 200 == 0:
+                if count % 100 == 0:
                     elapsed = time.time() - start_time
                     rate = count / elapsed if elapsed > 0 else 0
                     print(f"  Processed {count} valid combos ({rate:.1f} iter/s)...")
@@ -278,6 +292,7 @@ def plot_winner(result_dict):
     sharpe = result_dict['Sharpe Ratio']
     sma = result_dict['SMA Period']
     decay = result_dict['Decay Period']
+    sig_mo = result_dict['Signals/Mo']
     
     df['equity'] = (1 + df['strategy_returns']).cumprod() * 100
     df['bh_equity'] = (1 + df['returns']).cumprod() * 100
@@ -289,9 +304,9 @@ def plot_winner(result_dict):
     # Row 1: Equity
     ax1 = axes[0]
     ax1.plot(df.index, df['bh_equity'], label='Buy & Hold', color='gray', alpha=0.5, linestyle='--')
-    ax1.plot(df.index, df['equity'], label=f'SMA {sma} | ADX Wgt | Decay {decay}', color='#0077B6', linewidth=2)
+    ax1.plot(df.index, df['equity'], label=f'SMA {sma} | Decay {decay}', color='#0077B6', linewidth=2)
     ax1.set_ylabel('Equity')
-    ax1.set_title(f"Best Config: {tf} | SMA {sma} | Decay {decay} | Sharpe: {sharpe}", fontsize=16)
+    ax1.set_title(f"Best: {tf} | SMA {sma} | Sig/Mo: {sig_mo} | Sharpe: {sharpe}", fontsize=16)
     ax1.legend()
 
     # Row 2: Price, SMA & ADX Overlay
@@ -338,7 +353,7 @@ if sorted_results:
     print("\nStep 3: Generating Plot...")
     winner_plot_base64 = plot_winner(winner)
 else:
-    print("No valid results found.")
+    print("No valid results found. Try lowering MIN_SIGNALS_PER_MONTH.")
     winner_plot_base64 = ""
 
 # -----------------------------------------------------------------------------
@@ -355,14 +370,15 @@ for i, res in enumerate(sorted_results[:20]):
         'Timeframe': res['Timeframe'],
         'SMA': res['SMA Period'],
         'Decay': res['Decay Period'],
+        'Sig/Mo': res['Signals/Mo'],
         'Sharpe': res['Sharpe Ratio'],
         'Return': f"{res['Total Return (%)']}%",
         'B&H Sharpe': res['B&H Sharpe']
     })
 
 app.layout = html.Div(style={'fontFamily': 'sans-serif', 'padding': '20px'}, children=[
-    html.H1(f"SMA + ADX Weighting Grid Search", style={'textAlign': 'center'}),
-    html.P(f"Signal: Cross SMA(X). Weight: Decay * (ADX/40). Range: {START_YEAR}-Present", style={'textAlign': 'center'}),
+    html.H1(f"SMA Grid Search (Active)", style={'textAlign': 'center'}),
+    html.P(f"Signal: Cross SMA(X). Min {MIN_SIGNALS_PER_MONTH} Sig/Mo. Range: {START_YEAR}-Present", style={'textAlign': 'center'}),
     
     html.Div([
         dash_table.DataTable(
