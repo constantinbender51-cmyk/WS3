@@ -16,8 +16,12 @@ PORT = 8080
 
 # Grid Search Parameters
 TIMEFRAMES = ['30m', '1h', '4h', '1d', '1w']
-SMA_PERIODS = [10, 20, 50, 100, 200, 300, 400]
-DECAY_PERIODS = [1, 2, 4, 8, 16, 32, 64]
+
+# Fine-grained SMA: 10, 20, 30 ... up to 400
+SMA_PERIODS = list(range(10, 401, 10)) 
+
+# Added 128 to decay periods
+DECAY_PERIODS = [1, 2, 4, 8, 16, 32, 64, 128]
 
 # -----------------------------------------------------------------------------
 # 1. Efficient Data Fetching & Resampling
@@ -208,9 +212,10 @@ def run_full_grid_search(data_store):
                 })
                 
                 count += 1
-                if count % 50 == 0:
+                if count % 100 == 0:
                     elapsed = time.time() - start_time
-                    print(f"  Processed {count}/{total_combinations} in {elapsed:.1f}s...")
+                    rate = count / elapsed if elapsed > 0 else 0
+                    print(f"  Processed {count}/{total_combinations} ({rate:.1f} iter/s)...")
             
     return sorted(results, key=lambda x: x['Sharpe Ratio'], reverse=True)
 
@@ -305,7 +310,7 @@ for i, res in enumerate(sorted_results[:15]):
     })
 
 app.layout = html.Div(style={'fontFamily': 'sans-serif', 'padding': '20px'}, children=[
-    html.H1(f"SMA Crossover Full Grid Search", style={'textAlign': 'center'}),
+    html.H1(f"SMA Crossover Fine-Grained Search", style={'textAlign': 'center'}),
     html.P(f"Signal: Cross SMA(X). Weight Decays over Y periods. Range: {START_YEAR}-Present", style={'textAlign': 'center'}),
     
     html.Div([
