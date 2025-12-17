@@ -17,10 +17,10 @@ PORT = 8080
 # Grid Search Parameters
 TIMEFRAMES = ['30m', '1h', '4h', '1d', '1w']
 
-# Fine-grained SMA: 10, 20, 30 ... up to 400
+# Fine-grained SMA: 10 to 400
 SMA_PERIODS = list(range(10, 401, 10)) 
 
-# Added 128 to decay periods
+# Decay periods
 DECAY_PERIODS = [1, 2, 4, 8, 16, 32, 64, 128]
 
 # -----------------------------------------------------------------------------
@@ -88,22 +88,57 @@ def resample_data(df_30m):
     return data_store
 
 # -----------------------------------------------------------------------------
-# 2. Strategy Logic (SMA Crossover + Variable Decay)
+# 2. Strategy Logic (SMA Crossover + Decay + ADX Weighting)
 # -----------------------------------------------------------------------------
+def calculate_adx(df, period=14):
+    """Calculates ADX for trend strength."""
+    df = df.copy()
+    df['up_move'] = df['high'] - df['high'].shift(1)
+    df['down_move'] = df['low'].shift(1) - df['low']
+    
+    df['plus_dm'] = np.where((df['up_move'] > df['down_move']) & (df['up_move'] > 0), df['up_move'], 0)
+    df['minus_dm'] = np.where((df['down_move'] > df['up_move']) & (df['down_move'] > 0), df['down_move'], 0)
+    
+    # True Range
+    df['tr'] = np.maximum(
+        df['high'] - df['low'], 
+        np.maximum(
+            abs(df['high'] - df['close'].shift(1)), 
+            abs(df['low'] - df['close'].shift(1))
+        )
+    )
+    
+    # Smoothing (Using EWMA as approximation for Wilder's)
+    df['tr_smooth'] = df['tr'].ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    df['plus_dm_smooth'] = df['plus_dm'].ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    df['minus_dm_smooth'] = df['minus_dm'].ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    
+    # Avoid division by zero
+    df['tr_smooth'] = df['tr_smooth'].replace(0, np.nan)
+    
+    df['plus_di'] = 100 * (df['plus_dm_smooth'] / df['tr_smooth'])
+    df['minus_di'] = 100 * (df['minus_dm_smooth'] / df['tr_smooth'])
+    
+    # DX and ADX
+    denom = df['plus_di'] + df['minus_di']
+    denom = denom.replace(0, np.nan)
+    df['dx'] = 100 * abs(df['plus_di'] - df['minus_di']) / denom
+    
+    return df['dx'].ewm(alpha=1/period, min_periods=period, adjust=False).mean().fillna(0)
+
 def run_strategy(df, sma_period, decay_period):
-    if len(df) < sma_period:
+    # Ensure sufficient data
+    if len(df) < max(sma_period, 50): # 50 buffer for ADX
         return pd.DataFrame()
         
     df = df.copy()
     
-    # Calculate SMA
+    # Indicators
     df['sma'] = df['close'].rolling(window=sma_period).mean()
+    df['adx'] = calculate_adx(df, 14)
     
-    # --- STRATEGY: SMA CROSSOVER ---
-    # Long: Close crosses ABOVE SMA
+    # --- SMA CROSSOVER SIGNALS ---
     long_signals = (df['close'] > df['sma']) & (df['close'].shift(1) <= df['sma'].shift(1))
-    
-    # Short: Close crosses BELOW SMA
     short_signals = (df['close'] < df['sma']) & (df['close'].shift(1) >= df['sma'].shift(1))
     
     n = len(df)
@@ -114,6 +149,13 @@ def run_strategy(df, sma_period, decay_period):
     
     long_sig_arr = long_signals.values
     short_sig_arr = short_signals.values
+    
+    # --- ADX WEIGHTING FACTOR ---
+    # Normalize ADX: 
+    # ADX 20 -> 0.5 weight
+    # ADX 40 -> 1.0 weight
+    # Capped at 1.0
+    adx_arr = np.clip(df['adx'].values / 40.0, 0, 1.0)
     
     for i in range(1, n):
         # Mutual Exclusion State Machine
@@ -127,17 +169,19 @@ def run_strategy(df, sma_period, decay_period):
             if long_timer > 0: long_timer += 1
             if short_timer > 0: short_timer += 1
             
-        long_weight = 0
+        long_decay = 0
         if long_timer > 0 and long_timer <= decay_period:
-            long_weight = 1 - (long_timer / decay_period)**2
-            if long_weight < 0: long_weight = 0
+            long_decay = 1 - (long_timer / decay_period)**2
+            if long_decay < 0: long_decay = 0
 
-        short_weight = 0
+        short_decay = 0
         if short_timer > 0 and short_timer <= decay_period:
-            short_weight = 1 - (short_timer / decay_period)**2
-            if short_weight < 0: short_weight = 0
+            short_decay = 1 - (short_timer / decay_period)**2
+            if short_decay < 0: short_decay = 0
             
-        position_weights[i] = long_weight - short_weight
+        # Apply ADX Weighting to the Decay Weight
+        current_adx_weight = adx_arr[i]
+        position_weights[i] = (long_decay - short_decay) * current_adx_weight
 
     df['position'] = position_weights
     
@@ -177,12 +221,14 @@ def calculate_metrics(df, timeframe):
     }
 
 # -----------------------------------------------------------------------------
-# 3. Full Grid Search (SMA + Decay)
+# 3. Full Grid Search
 # -----------------------------------------------------------------------------
 def run_full_grid_search(data_store):
     results = []
-    total_combinations = len(TIMEFRAMES) * len(SMA_PERIODS) * len(DECAY_PERIODS)
-    print(f"\n--- Running Full Grid Search ({total_combinations} combinations) ---")
+    
+    # Calculate total combinations roughly
+    # We skip 1w > 50 sma, so actual count is lower
+    print(f"\n--- Running Full Grid Search (ADX Weighted) ---")
     
     count = 0
     start_time = time.time()
@@ -191,6 +237,10 @@ def run_full_grid_search(data_store):
         if df_base is None or df_base.empty: continue
             
         for sma in SMA_PERIODS:
+            # EXCLUSION RULE: Skip 1w timeframe if SMA > 50
+            if tf == '1w' and sma > 50:
+                continue
+
             for decay in DECAY_PERIODS:
                 # Run Strategy
                 df_res = run_strategy(df_base, sma, decay)
@@ -212,10 +262,10 @@ def run_full_grid_search(data_store):
                 })
                 
                 count += 1
-                if count % 100 == 0:
+                if count % 200 == 0:
                     elapsed = time.time() - start_time
                     rate = count / elapsed if elapsed > 0 else 0
-                    print(f"  Processed {count}/{total_combinations} ({rate:.1f} iter/s)...")
+                    print(f"  Processed {count} valid combos ({rate:.1f} iter/s)...")
             
     return sorted(results, key=lambda x: x['Sharpe Ratio'], reverse=True)
 
@@ -239,20 +289,21 @@ def plot_winner(result_dict):
     # Row 1: Equity
     ax1 = axes[0]
     ax1.plot(df.index, df['bh_equity'], label='Buy & Hold', color='gray', alpha=0.5, linestyle='--')
-    ax1.plot(df.index, df['equity'], label=f'SMA {sma} (Decay {decay})', color='#0077B6', linewidth=2)
+    ax1.plot(df.index, df['equity'], label=f'SMA {sma} | ADX Wgt | Decay {decay}', color='#0077B6', linewidth=2)
     ax1.set_ylabel('Equity')
     ax1.set_title(f"Best Config: {tf} | SMA {sma} | Decay {decay} | Sharpe: {sharpe}", fontsize=16)
     ax1.legend()
 
-    # Row 2: Price & SMA
+    # Row 2: Price, SMA & ADX Overlay
     ax2 = axes[1]
     ax2.plot(df.index, df['close'], label='Price', color='black', alpha=0.6, linewidth=1)
     ax2.plot(df.index, df['sma'], label=f'SMA {sma}', color='orange', linewidth=2)
-    # Shade zones based on signal state
-    ax2.fill_between(df.index, df['close'].max(), df['close'].min(), 
-                     where=(df['close'] > df['sma']), color='green', alpha=0.05)
-    ax2.fill_between(df.index, df['close'].max(), df['close'].min(), 
-                     where=(df['close'] < df['sma']), color='red', alpha=0.05)
+    
+    # Plot ADX on secondary axis for context
+    ax2b = ax2.twinx()
+    ax2b.fill_between(df.index, df['adx'], 0, color='purple', alpha=0.1, label='ADX')
+    ax2b.set_ylabel('ADX', color='purple')
+    
     ax2.set_ylabel('Price')
     ax2.legend(loc='upper left')
 
@@ -260,7 +311,7 @@ def plot_winner(result_dict):
     ax3 = axes[2]
     ax3.fill_between(df.index, df['position'], 0, where=(df['position']>=0), color='green', alpha=0.6, step='mid', label='Long')
     ax3.fill_between(df.index, df['position'], 0, where=(df['position']<0), color='red', alpha=0.6, step='mid', label='Short')
-    ax3.set_ylabel('Decaying Weight')
+    ax3.set_ylabel('ADX-Weighted Position')
     ax3.set_xlabel('Date')
     ax3.legend()
     
@@ -297,8 +348,8 @@ app = Dash(__name__)
 server = app.server 
 
 table_data = []
-# Show top 15 results
-for i, res in enumerate(sorted_results[:15]):
+# Show top 20 results
+for i, res in enumerate(sorted_results[:20]):
     table_data.append({
         'Rank': i+1,
         'Timeframe': res['Timeframe'],
@@ -310,8 +361,8 @@ for i, res in enumerate(sorted_results[:15]):
     })
 
 app.layout = html.Div(style={'fontFamily': 'sans-serif', 'padding': '20px'}, children=[
-    html.H1(f"SMA Crossover Fine-Grained Search", style={'textAlign': 'center'}),
-    html.P(f"Signal: Cross SMA(X). Weight Decays over Y periods. Range: {START_YEAR}-Present", style={'textAlign': 'center'}),
+    html.H1(f"SMA + ADX Weighting Grid Search", style={'textAlign': 'center'}),
+    html.P(f"Signal: Cross SMA(X). Weight: Decay * (ADX/40). Range: {START_YEAR}-Present", style={'textAlign': 'center'}),
     
     html.Div([
         dash_table.DataTable(
