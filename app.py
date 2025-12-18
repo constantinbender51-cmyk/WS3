@@ -3,13 +3,12 @@ import pandas as pd
 import numpy as np
 import time
 from datetime import datetime
-from flask import Flask, render_template_string
+from flask import Flask
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import os
 
 # --- INITIALIZE FLASK ---
-# Railway expects a variable 'app' or 'server' to bind to.
 app = Flask(__name__)
 
 # -----------------------------------------------------------------------------
@@ -162,31 +161,61 @@ def dashboard():
     
     # Subplots
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, subplot_titles=('SMA 120 Performance', 'SMA 40 Performance'))
-    fig.add_trace(go.Scatter(x=df.index, y=vanilla_120['equity_curve'], name='Vanilla 120', line=dict(color='gray')), 1, 1)
-    fig.add_trace(go.Scatter(x=df.index, y=decay_120['equity_curve'], name=f'Decay 120 (x={best_params_120[0]}, k={best_params_120[1]})', line=dict(color='blue')), 1, 1)
-    fig.add_trace(go.Scatter(x=df.index, y=vanilla_40['equity_curve'], name='Vanilla 40', line=dict(color='silver')), 2, 1)
-    fig.add_trace(go.Scatter(x=df.index, y=decay_40['equity_curve'], name=f'Decay 40 (x={best_params_40[0]}, k={best_params_40[1]})', line=dict(color='orange')), 2, 1)
-    fig.update_layout(height=800, template="plotly_white")
+    
+    # Plot SMA 120
+    fig.add_trace(go.Scatter(x=df.index, y=vanilla_120['equity_curve'], name='Vanilla 120', line=dict(color='gray', width=1)), 1, 1)
+    fig.add_trace(go.Scatter(x=df.index, y=decay_120['equity_curve'], name=f'Decay 120 (x={best_params_120[0]}, k={best_params_120[1]})', line=dict(color='blue', width=2)), 1, 1)
+    
+    # Plot SMA 40
+    fig.add_trace(go.Scatter(x=df.index, y=vanilla_40['equity_curve'], name='Vanilla 40', line=dict(color='silver', width=1)), 2, 1)
+    fig.add_trace(go.Scatter(x=df.index, y=decay_40['equity_curve'], name=f'Decay 40 (x={best_params_40[0]}, k={best_params_40[1]})', line=dict(color='orange', width=2)), 2, 1)
+    
+    fig.update_layout(height=800, template="plotly_white", margin=dict(t=50, b=50, l=50, r=50))
 
+    # Construct HTML manually to avoid Jinja2 parsing Plotly JS
     html = f"""
+    <!DOCTYPE html>
     <html>
-    <body style="font-family: sans-serif; padding: 20px;">
-        <h2>BTC Strategy Optimization</h2>
-        <div style="display: flex; gap: 20px; margin-bottom: 20px;">
-            <div style="padding: 15px; border: 1px solid #ccc; border-radius: 8px;">
-                <strong>SMA 120:</strong> Vanilla: {vanilla_120['total_return']*100:.1f}% | Decay: {decay_120['total_return']*100:.1f}%
+    <head>
+        <title>ADX Decay Strategy Analysis</title>
+        <style>
+            body {{ font-family: -apple-system, sans-serif; padding: 40px; background: #fafafa; color: #333; }}
+            .header {{ margin-bottom: 30px; border-bottom: 2px solid #eee; padding-bottom: 20px; }}
+            .card-container {{ display: flex; gap: 20px; margin-bottom: 30px; }}
+            .card {{ background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); flex: 1; border-top: 4px solid #333; }}
+            .val {{ font-size: 24px; font-weight: bold; margin: 10px 0; }}
+            .label {{ font-size: 12px; text-transform: uppercase; color: #888; letter-spacing: 1px; }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>BTC/USDT Strategy Backtest</h1>
+            <p>Fading high ADX trends with SMA crossovers (Jan 2018 - Present)</p>
+        </div>
+        
+        <div class="card-container">
+            <div class="card" style="border-top-color: blue;">
+                <div class="label">SMA 120 Strategy</div>
+                <div class="val">{(decay_120['total_return'])*100:.1f}%</div>
+                <div class="label" style="color: #666;">Vanilla: {(vanilla_120['total_return'])*100:.1f}%</div>
+                <div style="margin-top:10px; font-size:13px;">x={best_params_120[0]}, k={best_params_120[1]}</div>
             </div>
-            <div style="padding: 15px; border: 1px solid #ccc; border-radius: 8px;">
-                <strong>SMA 40:</strong> Vanilla: {vanilla_40['total_return']*100:.1f}% | Decay: {decay_40['total_return']*100:.1f}%
+            <div class="card" style="border-top-color: orange;">
+                <div class="label">SMA 40 Strategy</div>
+                <div class="val">{(decay_40['total_return'])*100:.1f}%</div>
+                <div class="label" style="color: #666;">Vanilla: {(vanilla_40['total_return'])*100:.1f}%</div>
+                <div style="margin-top:10px; font-size:13px;">x={best_params_40[0]}, k={best_params_40[1]}</div>
             </div>
         </div>
-        {fig.to_html(full_html=False)}
+
+        <div style="background: white; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); overflow: hidden;">
+            {fig.to_html(full_html=False, include_plotlyjs='cdn')}
+        </div>
     </body>
     </html>
     """
-    return render_template_string(html)
+    return html
 
 if __name__ == '__main__':
-    # When running locally or via Railway's start command
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
