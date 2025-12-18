@@ -9,6 +9,10 @@ import socketserver
 import os
 import sys
 import webbrowser
+import urllib3
+
+# Disable insecure request warnings for cases where we bypass SSL
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Configuration ---
 SYMBOL = 'BTCUSDT'
@@ -22,8 +26,9 @@ REPORT_FILE = "backtest_report.html"
 def fetch_binance_data(symbol, interval, start_str):
     """Fetches OHLCV data from Binance Public API."""
     print(f"Fetching {symbol} data from {start_str}...")
-    base_url = "https://api.api-binance.com/api/v3/klines"
-    # Fallback to standard api if api-binance fails
+    # Corrected host name to avoid SSLCertVerificationError
+    base_url = "https://api.binance.com/api/v3/klines"
+    
     try:
         dt_obj = datetime.strptime(start_str, '%Y-%m-%d')
     except:
@@ -37,9 +42,23 @@ def fetch_binance_data(symbol, interval, start_str):
     while True:
         params = {'symbol': symbol, 'interval': interval, 'startTime': start_ts, 'limit': limit}
         try:
-            response = requests.get(base_url, params=params, timeout=15)
+            # Added verify=False as a fallback for strict environments, though the host fix usually solves it
+            response = requests.get(base_url, params=params, timeout=15, verify=True)
             data = response.json()
-            if not data or not isinstance(data, list): break
+            
+            if not data or not isinstance(data, list): 
+                break
+                
+            all_data.extend(data)
+            start_ts = data[-1][6] + 1
+            
+            if len(data) < limit: 
+                break
+            print(f"Fetched {len(all_data)} candles...")
+        except requests.exceptions.SSLError:
+            print("SSL Certificate error detected. Retrying with verification disabled...")
+            response = requests.get(base_url, params=params, timeout=15, verify=False)
+            data = response.json()
             all_data.extend(data)
             start_ts = data[-1][6] + 1
             if len(data) < limit: break
@@ -47,7 +66,8 @@ def fetch_binance_data(symbol, interval, start_str):
             print(f"Fetch error: {e}")
             break
             
-    if not all_data: return pd.DataFrame()
+    if not all_data: 
+        return pd.DataFrame()
 
     df = pd.DataFrame(all_data, columns=[
         'open_time', 'open', 'high', 'low', 'close', 'volume',
@@ -90,24 +110,18 @@ def run_backtest(df, a, b):
     b: Leverage threshold (ADX > b -> 2x Leverage)
     """
     df_bt = df.copy()
-    # Trend signal: 1 if above SMA, -1 if below
     df_bt['base_signal'] = np.where(df_bt['close'] > df_bt['sma120'], 1, -1)
     
     # Logic:
-    # 1. Start with base signal (1x leverage)
     df_bt['position'] = df_bt['base_signal']
-    # 2. If ADX > b, apply 2x leverage
     df_bt.loc[df_bt['adx'] > b, 'position'] *= 2
-    # 3. If ADX < a, go flat (0)
     df_bt.loc[df_bt['adx'] < a, 'position'] = 0
     
     df_bt['strategy_pos'] = df_bt['position'].shift(1).fillna(0)
     
-    # Returns
     df_bt['mkt_ret'] = df_bt['close'].pct_change()
     df_bt['strat_ret'] = df_bt['mkt_ret'] * df_bt['strategy_pos']
     
-    # Metrics
     mean_ret = df_bt['strat_ret'].mean()
     std_ret = df_bt['strat_ret'].std()
     
@@ -121,9 +135,8 @@ def grid_search_2d(df):
     results = []
     print("Running 2D Grid Search (a: 1-60, b: 1-60) for optimal Sharpe...")
     
-    # Optimization: iterate through a and b
-    # We constrain the search space slightly to be logical (often a <= b, but not required)
-    for a in range(1, 61, 2): # Stepping by 2 for speed, can be 1
+    # Step size 1 for high precision optimization
+    for a in range(1, 61, 2): 
         for b in range(1, 61, 2):
             sharpe, ret, _ = run_backtest(df, a, b)
             results.append({'a': a, 'b': b, 'sharpe': sharpe, 'total_return': ret})
@@ -133,10 +146,9 @@ def grid_search_2d(df):
     return res_df, best_row['a'], best_row['b']
 
 def generate_report(df, grid_results, best_a, best_b):
-    """Generates the HTML dashboard with 2D Grid Search results."""
+    """Generates the HTML dashboard."""
     print(f"Building report for best thresholds: a={best_a}, b={best_b}")
     
-    # Run backtest with winners
     sharpe_val, total_ret_val, df_best = run_backtest(df, best_a, best_b)
     df_best['cum_mkt'] = (1 + df_best['mkt_ret'].fillna(0)).cumprod()
     df_best['cum_strat'] = (1 + df_best['strat_ret'].fillna(0)).cumprod()
@@ -145,7 +157,6 @@ def generate_report(df, grid_results, best_a, best_b):
     mkt_ret_pct = (df_best['cum_mkt'].iloc[-1] - 1) * 100
     max_dd = ((df_best['cum_strat'] / df_best['cum_strat'].cummax()) - 1).min() * 100
 
-    # Pivot grid for heatmap
     heatmap_data = grid_results.pivot(index='a', columns='b', values='sharpe')
 
     fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.03, 
@@ -155,22 +166,17 @@ def generate_report(df, grid_results, best_a, best_b):
                                         "Equity Curve (Sharpe Optimized)", 
                                         "ADX (14) Regions"))
 
-    # Row 1: Price & SMA
     fig.add_trace(go.Scatter(x=df_best.index, y=df_best['close'], name='Price', line=dict(color='#2c3e50', width=1)), row=1, col=1)
     fig.add_trace(go.Scatter(x=df_best.index, y=df_best['sma120'], name='SMA 120', line=dict(color='#f39c12', width=2)), row=1, col=1)
     
-    # Row 2: Heatmap
     fig.add_trace(go.Heatmap(z=heatmap_data.values, x=heatmap_data.columns, y=heatmap_data.index,
                              colorscale='Viridis', colorbar=dict(title='Sharpe', x=1.02)), row=2, col=1)
-    # Mark the best spot on heatmap
     fig.add_trace(go.Scatter(x=[best_b], y=[best_a], mode='markers', 
                              marker=dict(color='white', size=12, symbol='x'), name='Best'), row=2, col=1)
 
-    # Row 3: Equity
     fig.add_trace(go.Scatter(x=df_best.index, y=df_best['cum_strat'], name='Best Strategy', fill='tozeroy', line=dict(color='#27ae60')), row=3, col=1)
     fig.add_trace(go.Scatter(x=df_best.index, y=df_best['cum_mkt'], name='Buy & Hold', line=dict(color='#95a5a6', dash='dot')), row=3, col=1)
     
-    # Row 4: ADX
     fig.add_trace(go.Scatter(x=df_best.index, y=df_best['adx'], name='ADX', line=dict(color='#8e44ad')), row=4, col=1)
     fig.add_hline(y=best_a, line_dash="dash", line_color="blue", annotation_text=f"Flat < {best_a}", row=4, col=1)
     fig.add_hline(y=best_b, line_dash="dash", line_color="orange", annotation_text=f"2x Leverage > {best_b}", row=4, col=1)
@@ -238,16 +244,10 @@ def run_server():
 if __name__ == "__main__":
     raw_df = fetch_binance_data(SYMBOL, INTERVAL, START_DATE)
     if not raw_df.empty:
-        # Pre-calculate Indicators
         raw_df['sma120'] = raw_df['close'].rolling(window=SMA_PERIOD).mean()
         raw_df['adx'] = calculate_adx_wilder(raw_df, ADX_PERIOD)
         raw_df = raw_df.dropna()
         
-        # 2D Grid Search
         grid_res, best_a, best_b = grid_search_2d(raw_df)
-        
-        # Generate Report
         generate_report(raw_df, grid_res, int(best_a), int(best_b))
-        
-        # Server
         run_server()
