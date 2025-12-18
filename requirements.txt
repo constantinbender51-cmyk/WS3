@@ -1,9 +1,4 @@
-requests
-ccxt
 pandas
 numpy
-matplotlib
-dash
-gunicorn
-flask
+requests
 plotly
