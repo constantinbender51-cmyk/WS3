@@ -71,89 +71,100 @@ def calculate_indicators(df):
     return df.dropna()
 
 # -----------------------------------------------------------------------------
-# 2. Strategy Engine
+# 2. Strategy Engine (Chop Filter Logic)
 # -----------------------------------------------------------------------------
-def run_strategy(df, sma_col, decay_adx_threshold, decay_k, decay_days, 
-                 entry_mode='immediate', entry_threshold=0):
+def run_strategy(df, sma_col, 
+                 thresh_low, thresh_high, decay_rate, 
+                 entry_mode='immediate', entry_dist=0):
     """
-    Runs the strategy with variable decay parameters and entry logic.
-    
-    entry_mode: 
-      - 'immediate': Enter as soon as SMA is crossed (SMA 120 logic).
-      - 'distance': Enter only when (Price - SMA)/SMA > entry_threshold (SMA 40 logic).
+    thresh_low: ADX below this triggers decay state.
+    thresh_high (v): ADX above this restores full position.
+    decay_rate (p): Daily percent reduction (0.05 = 5%).
+    entry_mode: 'immediate' or 'distance'.
+    entry_dist: % distance required to enter (0.01 = 1%).
     """
     closes = df['close'].values
     smas = df[sma_col].values
     adxs = df['adx'].values
     positions = np.zeros(len(df))
     
-    current_signal = 0 
-    state = 'WAIT_FOR_ENTRY' 
-    decay_start_idx = 0
-    
-    # Pre-calculate signal direction based on pure SMA cross
+    # Pre-calculate pure SMA signal direction
+    # 1 (Long), -1 (Short)
     raw_signals = np.where(closes > smas, 1, -1)
-    current_direction = 0
     
-    # Optimization constant
-    if decay_days > 0:
-        inv_decay_days = 1.0 / decay_days
-    else:
-        inv_decay_days = 0 
+    current_direction = 0
+    current_size = 1.0
+    
+    # State Machine: 'NORMAL' (Size 1.0) or 'DECAY' (Size reducing)
+    # Hysteresis logic:
+    # If in NORMAL and ADX < thresh_low -> switch to DECAY
+    # If in DECAY and ADX > thresh_high -> switch to NORMAL
+    state = 'NORMAL' 
+    
+    # Signal State (for entry logic)
+    signal_state = 'WAIT_FOR_ENTRY' 
     
     for i in range(1, len(df)):
-        new_direction = raw_signals[i]
+        new_raw_direction = raw_signals[i]
         price = closes[i]
         sma = smas[i]
         adx = adxs[i]
         
-        # 1. Detect Core SMA Crossover (Reset Event)
-        if new_direction != current_direction:
-            current_direction = new_direction
-            state = 'WAIT_FOR_ENTRY'
-            
-        # 2. State Machine
-        if state == 'WAIT_FOR_ENTRY':
-            entered = False
-            
+        # --- 1. Signal & Direction Logic ---
+        
+        # New SMA Cross Detected?
+        if new_raw_direction != current_direction:
+            current_direction = new_raw_direction
+            signal_state = 'WAIT_FOR_ENTRY'
+            # Reset sizing state on new trend attempt?
+            # Usually yes. A new cross is a new attempt.
+            state = 'NORMAL' 
+            current_size = 1.0 
+        
+        # Check Entry Conditions
+        in_market = False
+        if signal_state == 'WAIT_FOR_ENTRY':
             if entry_mode == 'immediate':
-                entered = True
+                signal_state = 'IN_MARKET'
+                in_market = True
             elif entry_mode == 'distance':
-                # Check distance percent
-                # If Long (1): (Price - SMA)/SMA > threshold
-                # If Short (-1): (SMA - Price)/SMA > threshold
-                # Unified: direction * (Price - SMA) / SMA > threshold
+                # Check distance
                 dist_pct = (price - sma) / sma
-                if current_direction * dist_pct > entry_threshold:
-                    entered = True
+                # Direction * Dist > Threshold
+                if current_direction * dist_pct > entry_dist:
+                    signal_state = 'IN_MARKET'
+                    in_market = True
+        elif signal_state == 'IN_MARKET':
+            in_market = True
+
+        # --- 2. ADX Decay/Restore Logic (Chop Filter) ---
+        
+        if in_market:
+            # Hysteresis State Machine
+            if state == 'NORMAL':
+                if adx < thresh_low:
+                    state = 'DECAY'
+                    # Apply first day decay immediately? Or wait? 
+                    # Let's apply immediately to react fast to chop.
+                    current_size = current_size * (1.0 - decay_rate)
+                else:
+                    current_size = 1.0
             
-            if entered:
-                state = 'NORMAL'
-                positions[i] = current_direction
-            else:
-                positions[i] = 0.0
-                
-        elif state == 'NORMAL':
-            if adx > decay_adx_threshold:
-                state = 'DECAY'
-                decay_start_idx = i
-                # Assume Day 0 of decay is full position or immediate start?
-                # Using immediate start: 1 - 0 = 1.0
-                positions[i] = current_direction 
-            else:
-                positions[i] = current_direction
-                
-        elif state == 'DECAY':
-            day_count = i - decay_start_idx
-            if day_count < decay_days:
-                decay_factor = 1.0 - (day_count * inv_decay_days) ** decay_k
-                positions[i] = current_direction * decay_factor
-            else:
-                state = 'LOCKED'
-                positions[i] = 0.0
-                
-        elif state == 'LOCKED':
+            elif state == 'DECAY':
+                if adx > thresh_high:
+                    state = 'NORMAL'
+                    current_size = 1.0
+                else:
+                    # Continue decaying
+                    current_size = current_size * (1.0 - decay_rate)
+            
+            # Cap size at 1.0 (safety) and floor at 0.0
+            current_size = max(0.0, min(1.0, current_size))
+            
+            positions[i] = current_direction * current_size
+        else:
             positions[i] = 0.0
+
             
     # Calculate Returns
     market_returns = df['close'].pct_change()
@@ -178,69 +189,81 @@ def run_strategy(df, sma_col, decay_adx_threshold, decay_k, decay_days,
     }
 
 # -----------------------------------------------------------------------------
-# 3. Heavy Grid Search
+# 3. Grid Search
 # -----------------------------------------------------------------------------
 def grid_search_sma120(df):
-    print("Starting Grid Search for SMA 120 (Immediate Entry)...")
+    print("Starting Grid Search for SMA 120 (Chop Filter)...")
     start_time = time.time()
     
-    # Param Space
-    x_values = range(20, 85, 5)              
-    k_values = [0.5, 0.8, 1.0, 1.5, 2.0, 3.0, 5.0]
-    d_values = range(5, 155, 10)             
+    # Params:
+    # low: when to start fading
+    # high (v): when to restore
+    # p: how fast to fade
+    
+    low_values = [10, 15, 20, 25, 30]
+    high_values = [20, 25, 30, 40, 50]
+    p_values = [0.01, 0.03, 0.05, 0.10, 0.20] # 1% to 20% daily decay
     
     best_sharpe = -np.inf
     best_params = {}
     
-    param_grid = list(itertools.product(x_values, k_values, d_values))
-    total_iter = len(param_grid)
+    param_grid = list(itertools.product(low_values, high_values, p_values))
+    count = 0
     
-    for x, k, d in param_grid:
+    for l, h, p in param_grid:
+        # Constraint: High threshold (restore) must be >= Low threshold (decay)
+        if h <= l:
+            continue
+            
+        count += 1
         res = run_strategy(df, 'SMA_120', 
-                           decay_adx_threshold=x, 
-                           decay_k=k, 
-                           decay_days=d, 
+                           thresh_low=l, 
+                           thresh_high=h, 
+                           decay_rate=p, 
                            entry_mode='immediate',
-                           entry_threshold=0)
+                           entry_dist=0)
         
         if res['sharpe'] > best_sharpe:
             best_sharpe = res['sharpe']
-            best_params = {'x': x, 'k': k, 'd': d}
+            best_params = {'low': l, 'high': h, 'p': p}
             
-    print(f"SMA 120 Complete. {total_iter} combinations. Time: {time.time()-start_time:.2f}s")
+    print(f"SMA 120 Complete. {count} combinations. Time: {time.time()-start_time:.2f}s")
     return best_params
 
 def grid_search_sma40(df):
-    print("Starting Grid Search for SMA 40 (Distance Entry)...")
+    print("Starting Grid Search for SMA 40 (Chop Filter + Dist Entry)...")
     start_time = time.time()
     
-    # Param Space
-    # Distance: 0.1%, 0.5%, 1%, 2%, 3%, 5%
-    dist_values = [0.001, 0.005, 0.010, 0.020, 0.030, 0.050] 
+    # Distance: 0.5% to 5%
+    dist_values = [0.005, 0.01, 0.02, 0.03, 0.05]
     
-    x_values = range(20, 85, 5)             # Decay ADX
-    k_values = [1.0, 2.0, 3.0, 5.0]         # Decay K
-    d_values = range(10, 100, 10)           # Decay Days
+    low_values = [10, 15, 20, 25]
+    high_values = [20, 25, 30, 40]
+    p_values = [0.01, 0.05, 0.10, 0.20]
     
     best_sharpe = -np.inf
     best_params = {}
     
-    param_grid = list(itertools.product(dist_values, x_values, k_values, d_values))
-    total_iter = len(param_grid)
+    param_grid = list(itertools.product(dist_values, low_values, high_values, p_values))
+    count = 0
     
-    for dist, x, k, d in param_grid:
+    for d, l, h, p in param_grid:
+        if h <= l:
+            continue
+            
+        count += 1
         res = run_strategy(df, 'SMA_40', 
-                           decay_adx_threshold=x, 
-                           decay_k=k, 
-                           decay_days=d, 
+                           thresh_low=l, 
+                           thresh_high=h, 
+                           decay_rate=p, 
                            entry_mode='distance',
-                           entry_threshold=dist)
+                           entry_dist=d)
         
         if res['sharpe'] > best_sharpe:
             best_sharpe = res['sharpe']
-            best_params = {'dist': dist, 'x': x, 'k': k, 'd': d}
+            best_params = {'dist': d, 'low': l, 'high': h, 'p': p}
             
-    print(f"SMA 40 Complete. {total_iter} combinations. Time: {time.time()-start_time:.2f}s")
+    print(f"SMA 40 Complete. {count} combinations. Time: {time.time()-start_time:.2f}s")
     return best_params
 
 # -----------------------------------------------------------------------------
@@ -262,34 +285,36 @@ def dashboard():
     # Run Scenarios
     # ---------------------------
     
-    # 1. Vanilla Benchmarks
-    vanilla_120 = run_strategy(df, 'SMA_120', 999, 1, 10, 'immediate', 0)
-    # Vanilla 40 also implies no distance check usually, or we can assume dist=0
-    vanilla_40 = run_strategy(df, 'SMA_40', 999, 1, 10, 'distance', 0)
+    # 1. Vanilla Benchmarks (No Decay p=0, Immediate/Distance)
+    vanilla_120 = run_strategy(df, 'SMA_120', 0, 0, 0, 'immediate', 0)
+    vanilla_40 = run_strategy(df, 'SMA_40', 0, 0, 0, 'distance', 0) 
+    # Note: Vanilla 40 usually doesn't have distance, but comparing apples to apples
+    # if we want pure vanilla, dist=0. Let's do pure vanilla for baseline.
+    vanilla_40_pure = run_strategy(df, 'SMA_40', 0, 0, 0, 'immediate', 0)
     
     # 2. Optimized SMA 120
     best_p_120 = grid_search_sma120(df)
     decay_120 = run_strategy(df, 'SMA_120', 
-                             decay_adx_threshold=best_p_120['x'], 
-                             decay_k=best_p_120['k'], 
-                             decay_days=best_p_120['d'],
+                             thresh_low=best_p_120['low'], 
+                             thresh_high=best_p_120['high'], 
+                             decay_rate=best_p_120['p'],
                              entry_mode='immediate',
-                             entry_threshold=0)
+                             entry_dist=0)
     
-    # 3. Optimized SMA 40 (Distance Logic)
+    # 3. Optimized SMA 40
     best_p_40 = grid_search_sma40(df)
     decay_40 = run_strategy(df, 'SMA_40', 
-                            decay_adx_threshold=best_p_40['x'], 
-                            decay_k=best_p_40['k'], 
-                            decay_days=best_p_40['d'], 
+                            thresh_low=best_p_40['low'], 
+                            thresh_high=best_p_40['high'], 
+                            decay_rate=best_p_40['p'], 
                             entry_mode='distance',
-                            entry_threshold=best_p_40['dist'])
+                            entry_dist=best_p_40['dist'])
     
     # ---------------------------
     # Plotting
     # ---------------------------
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                        subplot_titles=('SMA 120 Equity (Immediate Entry)', 'SMA 40 Equity (Distance Entry)'),
+                        subplot_titles=('SMA 120 Equity (Low ADX Decay)', 'SMA 40 Equity (Dist Entry + Low ADX Decay)'),
                         vertical_spacing=0.15)
     
     # SMA 120
@@ -297,15 +322,15 @@ def dashboard():
                              name=f'Vanilla 120 (Sharpe: {vanilla_120["sharpe"]:.2f})', 
                              line=dict(color='gray', width=1)), 1, 1)
     fig.add_trace(go.Scatter(x=df.index, y=decay_120['equity_curve'], 
-                             name=f'Opt Decay 120 (Sharpe: {decay_120["sharpe"]:.2f})', 
+                             name=f'Opt Filter 120 (Sharpe: {decay_120["sharpe"]:.2f})', 
                              line=dict(color='blue', width=2)), 1, 1)
     
     # SMA 40
-    fig.add_trace(go.Scatter(x=df.index, y=vanilla_40['equity_curve'], 
-                             name=f'Vanilla 40 (Sharpe: {vanilla_40["sharpe"]:.2f})', 
+    fig.add_trace(go.Scatter(x=df.index, y=vanilla_40_pure['equity_curve'], 
+                             name=f'Vanilla 40 (Sharpe: {vanilla_40_pure["sharpe"]:.2f})', 
                              line=dict(color='silver', width=1)), 2, 1)
     fig.add_trace(go.Scatter(x=df.index, y=decay_40['equity_curve'], 
-                             name=f'Opt Decay 40 (Sharpe: {decay_40["sharpe"]:.2f})', 
+                             name=f'Opt Filter 40 (Sharpe: {decay_40["sharpe"]:.2f})', 
                              line=dict(color='orange', width=2)), 2, 1)
     
     fig.update_layout(height=1000, template="plotly_white", margin=dict(t=80, b=50, l=50, r=50))
@@ -317,7 +342,7 @@ def dashboard():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Distance Entry Analysis</title>
+        <title>Chop Filter Analysis</title>
         <style>
             body {{ font-family: -apple-system, sans-serif; padding: 20px; background: #fafafa; color: #333; }}
             .header {{ margin-bottom: 20px; border-bottom: 2px solid #eee; padding-bottom: 20px; text-align: center; }}
@@ -333,8 +358,9 @@ def dashboard():
     </head>
     <body>
         <div class="header">
-            <h1>BTC/USDT Strategy: Distance Entry Logic</h1>
+            <h1>BTC/USDT Strategy: Chop Filter Logic</h1>
             <p>Target: <strong>Max Sharpe Ratio</strong> | Data: Jan 2018 - Present</p>
+            <p style="font-size: 0.9em; color: #666;">Logic: Decay position by <em>p</em>% daily when ADX < <em>Low</em>. Restore to 100% when ADX > <em>High</em>.</p>
         </div>
         
         <div class="card-container">
@@ -353,10 +379,9 @@ def dashboard():
 
                 <div class="param-box">
                     <div style="font-weight:bold; margin-bottom:10px; color:#444;">Optimal Parameters:</div>
-                    <div class="param-item"><span>Entry Type:</span> <span>Immediate</span></div>
-                    <div class="param-item"><span>Decay Start (x):</span> <span>{best_p_120['x']}</span></div>
-                    <div class="param-item"><span>Decay Power (k):</span> <span>{best_p_120['k']}</span></div>
-                    <div class="param-item"><span>Decay Days (d):</span> <span>{best_p_120['d']}</span></div>
+                    <div class="param-item"><span>Decay Trigger (Low):</span> <span>{best_p_120['low']}</span></div>
+                    <div class="param-item"><span>Restore Trigger (v):</span> <span>{best_p_120['high']}</span></div>
+                    <div class="param-item"><span>Decay Rate (p):</span> <span>{best_p_120['p']*100:.1f}%</span></div>
                 </div>
             </div>
 
@@ -376,19 +401,15 @@ def dashboard():
                 <div class="param-box">
                     <div style="font-weight:bold; margin-bottom:10px; color:#444;">Optimal Parameters:</div>
                     <div class="param-item"><span>Entry Distance:</span> <span>{best_p_40['dist']*100:.1f}%</span></div>
-                    <div class="param-item"><span>Decay Start (x):</span> <span>{best_p_40['x']}</span></div>
-                    <div class="param-item"><span>Decay Power (k):</span> <span>{best_p_40['k']}</span></div>
-                    <div class="param-item"><span>Decay Days (d):</span> <span>{best_p_40['d']}</span></div>
+                    <div class="param-item"><span>Decay Trigger (Low):</span> <span>{best_p_40['low']}</span></div>
+                    <div class="param-item"><span>Restore Trigger (v):</span> <span>{best_p_40['high']}</span></div>
+                    <div class="param-item"><span>Decay Rate (p):</span> <span>{best_p_40['p']*100:.1f}%</span></div>
                 </div>
             </div>
         </div>
 
         <div style="background: white; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); overflow: hidden; padding: 10px;">
             {fig.to_html(full_html=False, include_plotlyjs='cdn')}
-        </div>
-        
-        <div style="text-align:center; margin-top: 20px; font-size: 12px; color: #888;">
-            Grid Search Scanned Combinations: ~3000 (SMA120) + ~3000 (SMA40).
         </div>
     </body>
     </html>
