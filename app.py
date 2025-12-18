@@ -76,12 +76,6 @@ def calculate_indicators(df):
 def run_strategy(df, sma_col, decay_adx_threshold, decay_k, decay_days, entry_adx_threshold=0):
     """
     Runs the strategy with variable decay parameters.
-    
-    sma_col: 'SMA_120' or 'SMA_40'
-    decay_adx_threshold (x): Level where we start fading out.
-    decay_k (k): Exponent for decay curve.
-    decay_days (d): Duration of the decay.
-    entry_adx_threshold (y): Minimum ADX required to ENTER a trade (used for SMA 40).
     """
     closes = df['close'].values
     smas = df[sma_col].values
@@ -89,45 +83,43 @@ def run_strategy(df, sma_col, decay_adx_threshold, decay_k, decay_days, entry_ad
     positions = np.zeros(len(df))
     
     current_signal = 0 
-    state = 'WAIT_FOR_ENTRY' # States: WAIT_FOR_ENTRY, NORMAL, DECAY, LOCKED
+    state = 'WAIT_FOR_ENTRY' 
     decay_start_idx = 0
     
-    # Pre-calculate signal direction to speed up loop slightly
-    # 1 if Price > SMA, -1 if Price < SMA
+    # Pre-calculate signal direction
     raw_signals = np.where(closes > smas, 1, -1)
-    
     current_direction = 0
+    
+    # Pre-compute constants for the loop
+    if decay_days > 0:
+        inv_decay_days = 1.0 / decay_days
+    else:
+        inv_decay_days = 0 # Should not happen given ranges
     
     for i in range(1, len(df)):
         new_direction = raw_signals[i]
         adx = adxs[i]
         
         # 1. Detect Core SMA Crossover (Reset Event)
-        # "Only reenters on new signal" -> New SMA Cross resets everything
         if new_direction != current_direction:
             current_direction = new_direction
-            # Reset state machine on crossover
             state = 'WAIT_FOR_ENTRY'
             
         # 2. State Machine
         if state == 'WAIT_FOR_ENTRY':
-            # Check Entry Gate (y)
-            # If entry_adx_threshold is 0 (SMA 120), this is always True immediately
             if adx > entry_adx_threshold:
                 state = 'NORMAL'
-                # Fall through to NORMAL logic immediately to check for instant decay trigger?
-                # No, let's take position this bar.
                 positions[i] = current_direction
             else:
                 positions[i] = 0.0
                 
         elif state == 'NORMAL':
-            # Check Decay Trigger (x)
             if adx > decay_adx_threshold:
                 state = 'DECAY'
                 decay_start_idx = i
                 # Immediate decay calc for day 0
-                decay_factor = 1.0 - (0.0 / decay_days) ** decay_k
+                decay_factor = 1.0 # (0/d)^k is 0, so 1-0 is 1. Start full, decay next day? 
+                # Or decay immediately? Let's assume day 0 is 100% position, day 1 drops.
                 positions[i] = current_direction * decay_factor
             else:
                 positions[i] = current_direction
@@ -135,31 +127,28 @@ def run_strategy(df, sma_col, decay_adx_threshold, decay_k, decay_days, entry_ad
         elif state == 'DECAY':
             day_count = i - decay_start_idx
             if day_count < decay_days:
-                decay_factor = 1.0 - (day_count / decay_days) ** decay_k
+                # Decay Function: 1 - (t/T)^k
+                # t starts at 1 here since day 0 was handled in NORMAL transition
+                decay_factor = 1.0 - (day_count * inv_decay_days) ** decay_k
                 positions[i] = current_direction * decay_factor
             else:
-                # Decay finished, entering lockout
                 state = 'LOCKED'
                 positions[i] = 0.0
                 
         elif state == 'LOCKED':
-            # Remain out until SMA crossover event (handled at top of loop)
             positions[i] = 0.0
             
     # Calculate Returns
     market_returns = df['close'].pct_change()
-    # Strategy return depends on position held YESTERDAY
     strategy_returns = market_returns * pd.Series(positions).shift(1).fillna(0).values
     
     cum_ret = (1 + strategy_returns).cumprod()
     total_ret = cum_ret.iloc[-1] - 1 if len(cum_ret) > 0 else 0
     
-    # Calculate Sharpe Ratio (Annualized for Crypto 365 days)
-    # Using 0% risk free rate for simplicity
     mean_daily_ret = strategy_returns.mean()
     std_daily_ret = strategy_returns.std()
     
-    if std_daily_ret > 1e-9: # Avoid division by zero
+    if std_daily_ret > 1e-9:
         sharpe = (mean_daily_ret / std_daily_ret) * np.sqrt(365)
     else:
         sharpe = 0.0
@@ -172,55 +161,67 @@ def run_strategy(df, sma_col, decay_adx_threshold, decay_k, decay_days, entry_ad
     }
 
 # -----------------------------------------------------------------------------
-# 3. Optimization (Targeting Sharpe)
+# 3. Heavy Grid Search
 # -----------------------------------------------------------------------------
 def grid_search_sma120(df):
-    # SMA 120: Entry is immediate (y=0). Optimize x, k, d.
-    x_values = [30, 40, 50, 60, 70]         # Decay Threshold (Start fading)
-    k_values = [1.0, 2.0, 3.0]              # Decay Convexity
-    d_values = [5, 10, 20, 30, 45, 60, 80, 100] # Decay Days
+    print("Starting Heavy Grid Search for SMA 120...")
+    start_time = time.time()
+    
+    # Dense Search Space
+    x_values = range(20, 85, 5)              # [20, 25, ... 80] (13 vals)
+    k_values = [0.5, 0.8, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0] # (8 vals)
+    d_values = range(5, 155, 5)              # [5, 10, ... 150] (30 vals)
+    
+    # Total combinations: ~3,120
     
     best_sharpe = -np.inf
     best_params = {}
     
-    # Itertools for cleaner nested loops
     param_grid = list(itertools.product(x_values, k_values, d_values))
+    total_iter = len(param_grid)
     
-    for x, k, d in param_grid:
+    for idx, (x, k, d) in enumerate(param_grid):
         res = run_strategy(df, 'SMA_120', decay_adx_threshold=x, decay_k=k, decay_days=d, entry_adx_threshold=0)
         
         if res['sharpe'] > best_sharpe:
             best_sharpe = res['sharpe']
             best_params = {'x': x, 'k': k, 'd': d}
             
+    print(f"SMA 120 Search Complete. Tested {total_iter} combinations in {time.time()-start_time:.2f}s")
     return best_params
 
 def grid_search_sma40(df):
-    # SMA 40: Entry depends on y. Optimize y, x, k, d.
-    # Constraints: x (Decay) should ideally be > y (Entry), otherwise we decay immediately upon entry.
+    print("Starting Heavy Grid Search for SMA 40...")
+    start_time = time.time()
     
-    y_values = [15, 20, 25, 30]             # Entry Threshold
-    x_values = [40, 50, 60, 70]             # Decay Threshold
-    k_values = [1.0, 3.0]                   # Decay Convexity (Reduced set for speed)
-    d_values = [10, 30, 60, 90]             # Decay Days (Reduced set for speed)
+    # Dense Search Space
+    y_values = [10, 15, 20, 25, 30, 35]      # Entry Threshold (6 vals)
+    x_values = range(20, 85, 5)              # Decay Threshold (13 vals)
+    k_values = [1.0, 2.0, 3.0, 4.0, 5.0]     # Decay Convexity (5 vals)
+    d_values = range(10, 100, 5)             # Decay Days (18 vals)
+    
+    # Total raw combinations: ~7,000
     
     best_sharpe = -np.inf
     best_params = {}
     
     param_grid = list(itertools.product(y_values, x_values, k_values, d_values))
+    count = 0
     
     for y, x, k, d in param_grid:
-        # Optimization: Don't test if Decay Trigger (x) <= Entry Trigger (y)
-        # Because we would enter DECAY state immediately, skipping NORMAL.
-        if x <= y:
+        # LOGIC CONSTRAINT: Decay trigger (x) must be meaningfully higher than Entry trigger (y).
+        # Otherwise we decay immediately upon entry, which is just noise.
+        if x <= (y + 5):
             continue
             
+        count += 1
         res = run_strategy(df, 'SMA_40', decay_adx_threshold=x, decay_k=k, decay_days=d, entry_adx_threshold=y)
         
         if res['sharpe'] > best_sharpe:
             best_sharpe = res['sharpe']
             best_params = {'y': y, 'x': x, 'k': k, 'd': d}
             
+    print(f"SMA 40 Search Complete. Tested {count} valid combinations in {time.time()-start_time:.2f}s")
     return best_params
 
 # -----------------------------------------------------------------------------
@@ -242,12 +243,11 @@ def dashboard():
     # Run Scenarios
     # ---------------------------
     
-    # 1. Vanilla Benchmarks (No Decay, Immediate Entry)
+    # 1. Vanilla Benchmarks
     vanilla_120 = run_strategy(df, 'SMA_120', 999, 1, 10, 0)
     vanilla_40 = run_strategy(df, 'SMA_40', 999, 1, 10, 0)
     
-    # 2. Optimized SMA 120
-    # Search space: x, k, d
+    # 2. Optimized SMA 120 (Heavy Search)
     best_p_120 = grid_search_sma120(df)
     decay_120 = run_strategy(df, 'SMA_120', 
                              decay_adx_threshold=best_p_120['x'], 
@@ -255,8 +255,7 @@ def dashboard():
                              decay_days=best_p_120['d'],
                              entry_adx_threshold=0)
     
-    # 3. Optimized SMA 40
-    # Search space: y, x, k, d
+    # 3. Optimized SMA 40 (Heavy Search)
     best_p_40 = grid_search_sma40(df)
     decay_40 = run_strategy(df, 'SMA_40', 
                             decay_adx_threshold=best_p_40['x'], 
@@ -296,23 +295,24 @@ def dashboard():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Fine-Grained Strategy Analysis</title>
+        <title>Heavy Grid Search Analysis</title>
         <style>
             body {{ font-family: -apple-system, sans-serif; padding: 20px; background: #fafafa; color: #333; }}
             .header {{ margin-bottom: 20px; border-bottom: 2px solid #eee; padding-bottom: 20px; text-align: center; }}
             .card-container {{ display: flex; gap: 20px; margin-bottom: 30px; justify-content: center; flex-wrap: wrap; }}
-            .card {{ background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); width: 350px; border-top: 4px solid #333; }}
+            .card {{ background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); width: 400px; border-top: 4px solid #333; }}
             .metric-row {{ display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; align-items: center; }}
             .metric-val {{ font-weight: bold; font-family: monospace; font-size: 1.1em; }}
-            .highlight {{ color: #007bff; font-weight: bold; font-size: 1.2em; }}
-            .param-box {{ background: #f0f4f8; padding: 10px; border-radius: 6px; margin-top: 10px; font-size: 0.9em; }}
-            .param-item {{ display: flex; justify-content: space-between; margin-bottom: 4px; }}
+            .highlight {{ color: #007bff; font-weight: bold; font-size: 1.4em; }}
+            .param-box {{ background: #f0f4f8; padding: 15px; border-radius: 6px; margin-top: 15px; font-size: 0.95em; }}
+            .param-item {{ display: flex; justify-content: space-between; margin-bottom: 6px; border-bottom: 1px dotted #ccc; padding-bottom: 2px; }}
+            .param-item:last-child {{ border-bottom: none; }}
         </style>
     </head>
     <body>
         <div class="header">
-            <h1>BTC/USDT Fine-Grained Analysis</h1>
-            <p>Target: <strong>Max Sharpe Ratio</strong> | Data: Jan 2018 - Present</p>
+            <h1>BTC/USDT Strategy: Dense Grid Search</h1>
+            <p>Optimization Target: <strong>Max Sharpe Ratio</strong> | Data: Jan 2018 - Present</p>
         </div>
         
         <div class="card-container">
@@ -322,19 +322,23 @@ def dashboard():
                 
                 <div class="metric-row">
                     <span>Optimized Sharpe:</span>
-                    <span class="highlight">{decay_120['sharpe']:.2f}</span>
+                    <span class="highlight">{decay_120['sharpe']:.3f}</span>
                 </div>
                 <div class="metric-row">
                     <span>Vanilla Sharpe:</span>
-                    <span class="metric-val" style="color: #666;">{vanilla_120['sharpe']:.2f}</span>
+                    <span class="metric-val" style="color: #666;">{vanilla_120['sharpe']:.3f}</span>
                 </div>
                 <div class="metric-row">
                     <span>Total Return:</span>
                     <span class="metric-val">{decay_120['total_return']*100:.1f}%</span>
                 </div>
+                <div class="metric-row">
+                    <span>Vanilla Return:</span>
+                    <span class="metric-val" style="color: #666;">{vanilla_120['total_return']*100:.1f}%</span>
+                </div>
 
                 <div class="param-box">
-                    <div style="font-weight:bold; margin-bottom:5px;">Best Parameters:</div>
+                    <div style="font-weight:bold; margin-bottom:10px; color:#444;">Optimal Parameters:</div>
                     <div class="param-item"><span>Entry ADX (y):</span> <span>N/A (0)</span></div>
                     <div class="param-item"><span>Decay Start (x):</span> <span>{best_p_120['x']}</span></div>
                     <div class="param-item"><span>Decay Power (k):</span> <span>{best_p_120['k']}</span></div>
@@ -348,19 +352,23 @@ def dashboard():
                 
                 <div class="metric-row">
                     <span>Optimized Sharpe:</span>
-                    <span class="highlight">{decay_40['sharpe']:.2f}</span>
+                    <span class="highlight">{decay_40['sharpe']:.3f}</span>
                 </div>
                 <div class="metric-row">
                     <span>Vanilla Sharpe:</span>
-                    <span class="metric-val" style="color: #666;">{vanilla_40['sharpe']:.2f}</span>
+                    <span class="metric-val" style="color: #666;">{vanilla_40['sharpe']:.3f}</span>
                 </div>
                 <div class="metric-row">
                     <span>Total Return:</span>
                     <span class="metric-val">{decay_40['total_return']*100:.1f}%</span>
                 </div>
+                 <div class="metric-row">
+                    <span>Vanilla Return:</span>
+                    <span class="metric-val" style="color: #666;">{vanilla_40['total_return']*100:.1f}%</span>
+                </div>
 
                 <div class="param-box">
-                    <div style="font-weight:bold; margin-bottom:5px;">Best Parameters:</div>
+                    <div style="font-weight:bold; margin-bottom:10px; color:#444;">Optimal Parameters:</div>
                     <div class="param-item"><span>Entry ADX (y):</span> <span>{best_p_40['y']}</span></div>
                     <div class="param-item"><span>Decay Start (x):</span> <span>{best_p_40['x']}</span></div>
                     <div class="param-item"><span>Decay Power (k):</span> <span>{best_p_40['k']}</span></div>
@@ -374,8 +382,8 @@ def dashboard():
         </div>
         
         <div style="text-align:center; margin-top: 20px; font-size: 12px; color: #888;">
-            Grid Search Complete. SMA120 params scanned: {len(list(itertools.product([1]*5, [1]*3, [1]*8)))} | 
-            SMA40 params scanned: {len(list(itertools.product([1]*4, [1]*4, [1]*2, [1]*4)))} (approx)
+            Brute Force Optimization Complete. <br>
+            Note: Curve fitting on historical data does not guarantee future performance.
         </div>
     </body>
     </html>
