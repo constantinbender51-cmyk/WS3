@@ -22,8 +22,14 @@ REPORT_FILE = "backtest_report.html"
 def fetch_binance_data(symbol, interval, start_str):
     """Fetches OHLCV data from Binance Public API."""
     print(f"Fetching {symbol} data from {start_str}...")
-    base_url = "https://api.binance.com/api/v3/klines"
-    start_ts = int(datetime.strptime(start_str, '%Y-%m-%d').timestamp() * 1000)
+    base_url = "https://api.api-binance.com/api/v3/klines"
+    # Fallback to standard api if api-binance fails
+    try:
+        dt_obj = datetime.strptime(start_str, '%Y-%m-%d')
+    except:
+        dt_obj = datetime(2018, 1, 1)
+        
+    start_ts = int(dt_obj.timestamp() * 1000)
     
     all_data = []
     limit = 1000
@@ -77,72 +83,88 @@ def calculate_adx_wilder(df, period=14):
     df['adx'] = df['dx'].fillna(0).ewm(alpha=alpha, adjust=False).mean()
     return df['adx']
 
-def run_backtest(df, adx_threshold):
-    """Runs strategy for a specific ADX threshold and returns metrics."""
+def run_backtest(df, a, b):
+    """
+    Runs strategy for specific thresholds a and b.
+    a: Flat threshold (ADX < a -> Flat)
+    b: Leverage threshold (ADX > b -> 2x Leverage)
+    """
     df_bt = df.copy()
+    # Trend signal: 1 if above SMA, -1 if below
     df_bt['base_signal'] = np.where(df_bt['close'] > df_bt['sma120'], 1, -1)
     
-    # Logic: Flat if ADX < threshold, else use base_signal
-    df_bt['position'] = np.where(df_bt['adx'] < adx_threshold, 0, df_bt['base_signal'])
+    # Logic:
+    # 1. Start with base signal (1x leverage)
+    df_bt['position'] = df_bt['base_signal']
+    # 2. If ADX > b, apply 2x leverage
+    df_bt.loc[df_bt['adx'] > b, 'position'] *= 2
+    # 3. If ADX < a, go flat (0)
+    df_bt.loc[df_bt['adx'] < a, 'position'] = 0
+    
     df_bt['strategy_pos'] = df_bt['position'].shift(1).fillna(0)
     
     # Returns
     df_bt['mkt_ret'] = df_bt['close'].pct_change()
     df_bt['strat_ret'] = df_bt['mkt_ret'] * df_bt['strategy_pos']
     
-    # Sharpe Ratio Calculation (Annualized, 365 days)
+    # Metrics
     mean_ret = df_bt['strat_ret'].mean()
     std_ret = df_bt['strat_ret'].std()
     
-    if std_ret > 0 and not np.isnan(std_ret):
-        sharpe = (mean_ret / std_ret) * np.sqrt(365)
-    else:
-        sharpe = 0
-        
+    sharpe = (mean_ret / std_ret) * np.sqrt(365) if std_ret > 0 else 0
     total_ret = (1 + df_bt['strat_ret'].fillna(0)).prod() - 1
+    
     return sharpe, total_ret, df_bt
 
-def grid_search_adx(df):
-    """Grid search for best ADX threshold from 1 to 60 based on Sharpe Ratio."""
+def grid_search_2d(df):
+    """Performs 2D grid search over 'a' (flat) and 'b' (leverage) thresholds."""
     results = []
-    print("Running Grid Search for ADX Threshold (1-60) based on Sharpe Ratio...")
-    for a in range(1, 61):
-        sharpe, ret, _ = run_backtest(df, a)
-        results.append({'threshold': a, 'sharpe': sharpe, 'total_return': ret})
+    print("Running 2D Grid Search (a: 1-60, b: 1-60) for optimal Sharpe...")
     
+    # Optimization: iterate through a and b
+    # We constrain the search space slightly to be logical (often a <= b, but not required)
+    for a in range(1, 61, 2): # Stepping by 2 for speed, can be 1
+        for b in range(1, 61, 2):
+            sharpe, ret, _ = run_backtest(df, a, b)
+            results.append({'a': a, 'b': b, 'sharpe': sharpe, 'total_return': ret})
+            
     res_df = pd.DataFrame(results)
-    # Optimize based on Sharpe Ratio
     best_row = res_df.loc[res_df['sharpe'].idxmax()]
-    return res_df, best_row['threshold']
+    return res_df, best_row['a'], best_row['b']
 
-def generate_report(df, grid_results, best_a):
-    """Generates the HTML dashboard with Grid Search results."""
-    print(f"Building report for best ADX threshold: {best_a}")
+def generate_report(df, grid_results, best_a, best_b):
+    """Generates the HTML dashboard with 2D Grid Search results."""
+    print(f"Building report for best thresholds: a={best_a}, b={best_b}")
     
-    # Run backtest with the winner
-    sharpe_val, _, df_best = run_backtest(df, best_a)
+    # Run backtest with winners
+    sharpe_val, total_ret_val, df_best = run_backtest(df, best_a, best_b)
     df_best['cum_mkt'] = (1 + df_best['mkt_ret'].fillna(0)).cumprod()
     df_best['cum_strat'] = (1 + df_best['strat_ret'].fillna(0)).cumprod()
     
-    total_ret = (df_best['cum_strat'].iloc[-1] - 1) * 100
-    mkt_ret = (df_best['cum_mkt'].iloc[-1] - 1) * 100
+    total_ret_pct = (df_best['cum_strat'].iloc[-1] - 1) * 100
+    mkt_ret_pct = (df_best['cum_mkt'].iloc[-1] - 1) * 100
     max_dd = ((df_best['cum_strat'] / df_best['cum_strat'].cummax()) - 1).min() * 100
+
+    # Pivot grid for heatmap
+    heatmap_data = grid_results.pivot(index='a', columns='b', values='sharpe')
 
     fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.03, 
                         row_heights=[0.3, 0.25, 0.25, 0.2],
-                        subplot_titles=(f"Price & SMA120 (Best ADX: {best_a})", 
-                                        "Grid Search: Sharpe Ratio vs ADX Threshold", 
-                                        "Equity Curve", 
-                                        "ADX (14)"))
+                        subplot_titles=(f"Price & SMA120 (a={best_a}, b={best_b})", 
+                                        "Grid Search Heatmap: Sharpe Ratio (y=Flat 'a', x=Leverage 'b')", 
+                                        "Equity Curve (Sharpe Optimized)", 
+                                        "ADX (14) Regions"))
 
     # Row 1: Price & SMA
     fig.add_trace(go.Scatter(x=df_best.index, y=df_best['close'], name='Price', line=dict(color='#2c3e50', width=1)), row=1, col=1)
     fig.add_trace(go.Scatter(x=df_best.index, y=df_best['sma120'], name='SMA 120', line=dict(color='#f39c12', width=2)), row=1, col=1)
     
-    # Row 2: Grid Search Results (Sharpe Ratio)
-    fig.add_trace(go.Scatter(x=grid_results['threshold'], y=grid_results['sharpe'], 
-                             name='Sharpe Ratio', mode='lines+markers', line=dict(color='#3498db')), row=2, col=1)
-    fig.add_vline(x=best_a, line_dash="dash", line_color="red", annotation_text=f"Best Sharpe: {best_a}", row=2, col=1)
+    # Row 2: Heatmap
+    fig.add_trace(go.Heatmap(z=heatmap_data.values, x=heatmap_data.columns, y=heatmap_data.index,
+                             colorscale='Viridis', colorbar=dict(title='Sharpe', x=1.02)), row=2, col=1)
+    # Mark the best spot on heatmap
+    fig.add_trace(go.Scatter(x=[best_b], y=[best_a], mode='markers', 
+                             marker=dict(color='white', size=12, symbol='x'), name='Best'), row=2, col=1)
 
     # Row 3: Equity
     fig.add_trace(go.Scatter(x=df_best.index, y=df_best['cum_strat'], name='Best Strategy', fill='tozeroy', line=dict(color='#27ae60')), row=3, col=1)
@@ -150,20 +172,21 @@ def generate_report(df, grid_results, best_a):
     
     # Row 4: ADX
     fig.add_trace(go.Scatter(x=df_best.index, y=df_best['adx'], name='ADX', line=dict(color='#8e44ad')), row=4, col=1)
-    fig.add_hline(y=best_a, line_dash="dash", line_color="red", row=4, col=1)
+    fig.add_hline(y=best_a, line_dash="dash", line_color="blue", annotation_text=f"Flat < {best_a}", row=4, col=1)
+    fig.add_hline(y=best_b, line_dash="dash", line_color="orange", annotation_text=f"2x Leverage > {best_b}", row=4, col=1)
 
-    fig.update_layout(height=1200, template="plotly_white", title=f"Sharpe Optimized Grid Search: ADX Filter for {SYMBOL}")
+    fig.update_layout(height=1400, template="plotly_white", title=f"2D ADX Optimization (Flat/Leverage) for {SYMBOL}")
     
     stats_html = f"""
     <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:15px; margin-bottom:20px; font-family:sans-serif;">
         <div style="padding:20px; border-radius:10px; background:#f8f9fa; border-top:5px solid #3498db; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
-            <div style="color:#7f8c8d; font-size:12px; text-transform:uppercase;">Best Sharpe Ratio</div>
+            <div style="color:#7f8c8d; font-size:12px; text-transform:uppercase;">Best Config (Sharpe)</div>
             <div style="font-size:24px; font-weight:bold; color:#3498db;">{sharpe_val:.3f}</div>
-            <div style="font-size:12px; color:#95a5a6;">at ADX threshold {best_a}</div>
+            <div style="font-size:12px; color:#95a5a6;">Flat below {best_a} | 2x above {best_b}</div>
         </div>
         <div style="padding:20px; border-radius:10px; background:#f8f9fa; border-top:5px solid #27ae60; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
             <div style="color:#7f8c8d; font-size:12px; text-transform:uppercase;">Strategy Return</div>
-            <div style="font-size:24px; font-weight:bold; color:#27ae60;">{total_ret:.2f}%</div>
+            <div style="font-size:24px; font-weight:bold; color:#27ae60;">{total_ret_pct:.2f}%</div>
         </div>
         <div style="padding:20px; border-radius:10px; background:#f8f9fa; border-top:5px solid #e74c3c; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
             <div style="color:#7f8c8d; font-size:12px; text-transform:uppercase;">Max Drawdown</div>
@@ -172,14 +195,14 @@ def generate_report(df, grid_results, best_a):
     </div>
     """
 
-    recent_df = df_best.tail(15)[['close', 'sma120', 'adx', 'position']].copy()
-    recent_df['position'] = recent_df['position'].replace({1: 'LONG', -1: 'SHORT', 0: 'FLAT'})
-    table_html = f"<h3 style='font-family:sans-serif;'>Recent Activity (Sharpe Optimized a={best_a})</h3>{recent_df.to_html(classes='table')}"
+    recent_df = df_best.tail(15)[['close', 'adx', 'position']].copy()
+    recent_df['pos_type'] = recent_df['position'].apply(lambda x: "2x" if abs(x) > 1 else ("1x" if x != 0 else "FLAT"))
+    table_html = f"<h3 style='font-family:sans-serif;'>Recent Activity (a={best_a}, b={best_b})</h3>{recent_df.to_html(classes='table')}"
 
     full_page = f"""
     <html>
     <head>
-        <title>Sharpe Grid Search Results</title>
+        <title>2D Optimization Results</title>
         <style>
             body {{ padding: 30px; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background:#fff; color:#333; }}
             .table {{ width: 100%; border-collapse: collapse; margin-top: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
@@ -215,16 +238,16 @@ def run_server():
 if __name__ == "__main__":
     raw_df = fetch_binance_data(SYMBOL, INTERVAL, START_DATE)
     if not raw_df.empty:
-        # Pre-calculate Indicators once
+        # Pre-calculate Indicators
         raw_df['sma120'] = raw_df['close'].rolling(window=SMA_PERIOD).mean()
         raw_df['adx'] = calculate_adx_wilder(raw_df, ADX_PERIOD)
         raw_df = raw_df.dropna()
         
-        # Grid Search based on Sharpe
-        grid_res, best_a = grid_search_adx(raw_df)
+        # 2D Grid Search
+        grid_res, best_a, best_b = grid_search_2d(raw_df)
         
-        # Generate Report for the best 'a'
-        generate_report(raw_df, grid_res, int(best_a))
+        # Generate Report
+        generate_report(raw_df, grid_res, int(best_a), int(best_b))
         
         # Server
         run_server()
