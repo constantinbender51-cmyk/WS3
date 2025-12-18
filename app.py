@@ -1,397 +1,331 @@
 import ccxt
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.transforms as mtransforms
-import io
-import base64
-from dash import Dash, dcc, html, dash_table
-import datetime
 import time
-
-# --- Configuration ---
-START_YEAR = 2017
-SYMBOL = 'BTC/USDT'
-PORT = 8080
-
-# Grid Search Parameters
-TIMEFRAMES = ['30m', '1h', '4h', '1d', '1w']
-
-# Fine-grained SMA: 10 to 400
-SMA_PERIODS = list(range(10, 401, 10)) 
-
-# Decay periods
-DECAY_PERIODS = [1, 2, 4, 8, 16, 32, 64, 128]
-
-# Minimum Signals per Month Filter
-MIN_SIGNALS_PER_MONTH = 10
+from datetime import datetime
+from flask import Flask, render_template_string
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # -----------------------------------------------------------------------------
-# 1. Efficient Data Fetching & Resampling
+# 1. Data Acquisition & Processing
 # -----------------------------------------------------------------------------
-def fetch_base_data(symbol, start_year):
-    timeframe = '30m'
-    print(f"Fetching base {timeframe} data for {symbol} starting {start_year}...")
-    exchange = ccxt.binance({'enableRateLimit': True})
-    
-    start_date = datetime.datetime(start_year, 1, 1)
-    since = int(start_date.timestamp() * 1000)
-    
+def fetch_binance_data(symbol='BTC/USDT', timeframe='1d', since_year=2018):
+    """
+    Fetches full historical OHLCV data from Binance using CCXT with pagination.
+    """
+    print(f"Fetching data for {symbol} since {since_year}...")
+    exchange = ccxt.binance()
+    since = exchange.parse8601(f'{since_year}-01-01T00:00:00Z')
     all_ohlcv = []
-    limit = 1000
     
+    # Retry logic and pagination
     while True:
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
             if not ohlcv:
                 break
             
             all_ohlcv.extend(ohlcv)
-            last_timestamp = ohlcv[-1][0]
-            since = last_timestamp + 1
+            since = ohlcv[-1][0] + 1 # Advance timestamp
             
-            if len(all_ohlcv) % 20000 == 0:
-                print(f"  Fetched {len(all_ohlcv)} base candles...")
-
-            if last_timestamp > (time.time() * 1000) - 60000:
+            # Rate limit sleep
+            time.sleep(0.1)
+            
+            # Break if we reached current time (roughly)
+            if len(ohlcv) < 1000:
                 break
-            
-            time.sleep(0.05) 
+                
         except Exception as e:
-            print(f"  Error fetching base data: {e}")
-            break
-            
+            print(f"Error fetching data: {e}")
+            time.sleep(1)
+            continue
+
     df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    if not df.empty:
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        cols = ['open', 'high', 'low', 'close', 'volume']
-        df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
     
-    print(f"Base data fetch complete. {len(df)} rows.")
+    # Drop potential duplicates from pagination overlap
+    df = df[~df.index.duplicated(keep='first')]
+    
+    print(f"Fetched {len(df)} rows.")
     return df
 
-def resample_data(df_30m):
-    print("Resampling data to higher timeframes...")
-    data_store = {'30m': df_30m.copy()}
-    
-    agg_dict = {
-        'open': 'first',
-        'high': 'max',
-        'low': 'min',
-        'close': 'last',
-        'volume': 'sum'
-    }
-    
-    data_store['1h'] = df_30m.resample('1h').agg(agg_dict).dropna()
-    data_store['4h'] = df_30m.resample('4h').agg(agg_dict).dropna()
-    data_store['1d'] = df_30m.resample('1D').agg(agg_dict).dropna()
-    data_store['1w'] = df_30m.resample('W-MON').agg(agg_dict).dropna()
-    
-    return data_store
-
-# -----------------------------------------------------------------------------
-# 2. Strategy Logic (SMA Crossover + Decay + ADX Weighting)
-# -----------------------------------------------------------------------------
-def calculate_adx(df, period=14):
-    """Calculates ADX for trend strength."""
+def calculate_indicators(df):
+    """
+    Calculates SMA and ADX manually to avoid external heavy dependencies like talib/pandas_ta.
+    """
     df = df.copy()
+    
+    # SMAs
+    df['SMA_120'] = df['close'].rolling(window=120).mean()
+    df['SMA_40'] = df['close'].rolling(window=40).mean()
+    
+    # ADX Calculation (Wilder's Smoothing)
+    window = 14
+    
+    # True Range
+    df['h-l'] = df['high'] - df['low']
+    df['h-pc'] = abs(df['high'] - df['close'].shift(1))
+    df['l-pc'] = abs(df['low'] - df['close'].shift(1))
+    df['tr'] = df[['h-l', 'h-pc', 'l-pc']].max(axis=1)
+    
+    # Directional Movement
     df['up_move'] = df['high'] - df['high'].shift(1)
     df['down_move'] = df['low'].shift(1) - df['low']
     
-    df['plus_dm'] = np.where((df['up_move'] > df['down_move']) & (df['up_move'] > 0), df['up_move'], 0)
-    df['minus_dm'] = np.where((df['down_move'] > df['up_move']) & (df['down_move'] > 0), df['down_move'], 0)
+    df['plus_dm'] = np.where((df['up_move'] > df['down_move']) & (df['up_move'] > 0), df['up_move'], 0.0)
+    df['minus_dm'] = np.where((df['down_move'] > df['up_move']) & (df['down_move'] > 0), df['down_move'], 0.0)
     
-    # True Range
-    df['tr'] = np.maximum(
-        df['high'] - df['low'], 
-        np.maximum(
-            abs(df['high'] - df['close'].shift(1)), 
-            abs(df['low'] - df['close'].shift(1))
-        )
-    )
-    
-    # Smoothing (Using EWMA as approximation for Wilder's)
-    df['tr_smooth'] = df['tr'].ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    df['plus_dm_smooth'] = df['plus_dm'].ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    df['minus_dm_smooth'] = df['minus_dm'].ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    
-    # Avoid division by zero
-    df['tr_smooth'] = df['tr_smooth'].replace(0, np.nan)
-    
-    df['plus_di'] = 100 * (df['plus_dm_smooth'] / df['tr_smooth'])
-    df['minus_di'] = 100 * (df['minus_dm_smooth'] / df['tr_smooth'])
-    
-    # DX and ADX
-    denom = df['plus_di'] + df['minus_di']
-    denom = denom.replace(0, np.nan)
-    df['dx'] = 100 * abs(df['plus_di'] - df['minus_di']) / denom
-    
-    return df['dx'].ewm(alpha=1/period, min_periods=period, adjust=False).mean().fillna(0)
+    # Wilder's Smoothing Function
+    def wilder_smooth(series, period):
+        res = np.zeros_like(series)
+        # Initialize with SMA
+        res[period-1] = series.iloc[0:period].mean() 
+        for i in range(period, len(series)):
+            res[i] = res[i-1] * (period - 1) / period + series.iloc[i] / period
+        return res
 
-def run_strategy(df, sma_period, decay_period):
-    # Ensure sufficient data
-    if len(df) < max(sma_period, 50): # 50 buffer for ADX
-        return pd.DataFrame(), 0
+    # Apply smoothing (using simple EWMA as approximation for speed in vector, 
+    # but strictly Wilder's is preferred. Using pandas ewm with alpha=1/window mimics Wilder)
+    alpha = 1 / window
+    df['tr_s'] = df['tr'].ewm(alpha=alpha, adjust=False).mean()
+    df['plus_dm_s'] = df['plus_dm'].ewm(alpha=alpha, adjust=False).mean()
+    df['minus_dm_s'] = df['minus_dm'].ewm(alpha=alpha, adjust=False).mean()
+    
+    df['plus_di'] = 100 * (df['plus_dm_s'] / df['tr_s'])
+    df['minus_di'] = 100 * (df['minus_dm_s'] / df['tr_s'])
+    
+    df['dx'] = 100 * abs(df['plus_di'] - df['minus_di']) / (df['plus_di'] + df['minus_di'])
+    df['adx'] = df['dx'].ewm(alpha=alpha, adjust=False).mean()
+    
+    # Cleanup temp columns
+    df.drop(['h-l', 'h-pc', 'l-pc', 'tr', 'up_move', 'down_move', 
+             'plus_dm', 'minus_dm', 'tr_s', 'plus_dm_s', 'minus_dm_s', 'dx'], axis=1, inplace=True)
+    
+    return df.dropna()
+
+# -----------------------------------------------------------------------------
+# 2. Strategy Engine
+# -----------------------------------------------------------------------------
+def run_strategy(df, sma_col, adx_threshold, decay_k):
+    """
+    Runs the logic:
+    1. Cross SMA -> Entry (Long/Short)
+    2. If ADX > x -> Decay position size 1-(day/10)^k for 10 days
+    3. After 10 days -> Lockout (Pos=0) until NEW crossover signal
+    """
+    closes = df['close'].values
+    smas = df[sma_col].values
+    adxs = df['adx'].values
+    dates = df.index
+    
+    # States
+    positions = np.zeros(len(df))
+    
+    # State tracking
+    current_signal = 0 # 1 (Long) or -1 (Short)
+    state = 'NORMAL'   # NORMAL, DECAY, LOCKED
+    decay_start_idx = 0
+    
+    # Iterate (iterating is safer for this complex state machine than vectorizing)
+    for i in range(1, len(df)):
+        price = closes[i]
+        sma = smas[i]
+        adx = adxs[i]
         
-    df = df.copy()
-    
-    # Indicators
-    df['sma'] = df['close'].rolling(window=sma_period).mean()
-    df['adx'] = calculate_adx(df, 14)
-    
-    # --- SMA CROSSOVER SIGNALS ---
-    long_signals = (df['close'] > df['sma']) & (df['close'].shift(1) <= df['sma'].shift(1))
-    short_signals = (df['close'] < df['sma']) & (df['close'].shift(1) >= df['sma'].shift(1))
-    
-    # --- FILTER: SIGNAL FREQUENCY ---
-    total_signals = long_signals.sum() + short_signals.sum()
-    duration_days = (df.index[-1] - df.index[0]).days
-    
-    if duration_days <= 0: return pd.DataFrame(), 0
-    months = duration_days / 30.44
-    if months <= 0: return pd.DataFrame(), 0
-    
-    signals_per_month = total_signals / months
-    
-    if signals_per_month < MIN_SIGNALS_PER_MONTH:
-        return pd.DataFrame(), signals_per_month
-
-    # --- POSITION LOGIC ---
-    n = len(df)
-    position_weights = np.zeros(n)
-    
-    long_timer = 0
-    short_timer = 0
-    
-    long_sig_arr = long_signals.values
-    short_sig_arr = short_signals.values
-    
-    # --- ADX WEIGHTING FACTOR ---
-    # Normalize ADX: ADX 40 -> 1.0 weight
-    adx_arr = np.clip(df['adx'].values / 40.0, 0, 1.0)
-    
-    for i in range(1, n):
-        # Mutual Exclusion State Machine
-        if long_sig_arr[i]:
-            long_timer = 1
-            short_timer = 0
-        elif short_sig_arr[i]:
-            short_timer = 1
-            long_timer = 0
-        else:
-            if long_timer > 0: long_timer += 1
-            if short_timer > 0: short_timer += 1
+        # 1. Determine Core Signal (Crossover)
+        # We check if a NEW crossover happened compared to the *held* signal logic
+        # However, the user said "goes long when price crosses SMA". 
+        new_signal = 1 if price > sma else -1
+        
+        # Detect Crossover Event (Change in core signal direction)
+        crossover_event = (new_signal != current_signal)
+        
+        if crossover_event:
+            # RESET everything on new cross
+            current_signal = new_signal
+            state = 'NORMAL'
             
-        long_decay = 0
-        if long_timer > 0 and long_timer <= decay_period:
-            long_decay = 1 - (long_timer / decay_period)**2
-            if long_decay < 0: long_decay = 0
-
-        short_decay = 0
-        if short_timer > 0 and short_timer <= decay_period:
-            short_decay = 1 - (short_timer / decay_period)**2
-            if short_decay < 0: short_decay = 0
+        # 2. Handle Decay Logic
+        if state == 'NORMAL':
+            # Check trigger
+            if adx > adx_threshold:
+                state = 'DECAY'
+                decay_start_idx = i
+                # Immediate decay calc for day 0
+                day_count = 0
+                decay_factor = 1 - (day_count/10)**decay_k
+                positions[i] = current_signal * decay_factor
+            else:
+                positions[i] = current_signal
+                
+        elif state == 'DECAY':
+            day_count = i - decay_start_idx
+            if day_count < 10:
+                decay_factor = 1 - (day_count/10)**decay_k
+                positions[i] = current_signal * decay_factor
+            else:
+                # Decay finished, entering lockout
+                state = 'LOCKED'
+                positions[i] = 0.0
+                
+        elif state == 'LOCKED':
+            # Remain out until crossover_event (handled at top of loop)
+            positions[i] = 0.0
             
-        # Apply ADX Weighting to the Decay Weight
-        current_adx_weight = adx_arr[i]
-        position_weights[i] = (long_decay - short_decay) * current_adx_weight
-
-    df['position'] = position_weights
+    # Calculate returns
+    # position is the position held at the END of day i (simplified)
+    # Strategy Return = Position(t-1) * (Price(t)/Price(t-1) - 1)
+    # We shift positions by 1 to align with next day's return
+    market_returns = df['close'].pct_change()
+    strategy_returns = market_returns * pd.Series(positions).shift(1).fillna(0).values
     
-    # Returns
-    df['returns'] = df['close'].pct_change().fillna(0)
-    df['strategy_returns'] = df['position'].shift(1) * df['returns']
-    df['strategy_returns'] = df['strategy_returns'].fillna(0)
-    
-    return df, signals_per_month
-
-def calculate_sharpe(returns, timeframe):
-    if len(returns) < 2 or returns.std() == 0: return -999
-    factors = {'30m': 365*48, '1h': 365*24, '4h': 365*6, '1d': 365, '1w': 52}
-    N = factors.get(timeframe, 365)
-    return np.sqrt(N) * (returns.mean() / returns.std())
-
-def calculate_metrics(df, timeframe):
-    if df.empty: return {}
-    
-    valid_df = df.dropna(subset=['sma', 'strategy_returns'])
-    if valid_df.empty: return {}
-    
-    strat_ret = valid_df['strategy_returns']
-    bh_ret = valid_df['returns']
-    
-    sharpe_strat = calculate_sharpe(strat_ret, timeframe)
-    sharpe_bh = calculate_sharpe(bh_ret, timeframe)
-    
-    total_ret_strat = (1 + strat_ret).cumprod().iloc[-1] - 1
-    total_ret_bh = (1 + bh_ret).cumprod().iloc[-1] - 1
+    # Stats
+    cum_ret = (1 + strategy_returns).cumprod()
+    total_ret = cum_ret.iloc[-1] - 1 if len(cum_ret) > 0 else 0
     
     return {
-        'sharpe': round(sharpe_strat, 4),
-        'bh_sharpe': round(sharpe_bh, 4),
-        'total_ret': round(total_ret_strat * 100, 2),
-        'bh_total_ret': round(total_ret_bh * 100, 2)
+        'positions': positions,
+        'equity_curve': cum_ret,
+        'total_return': total_ret
     }
 
 # -----------------------------------------------------------------------------
-# 3. Full Grid Search
+# 3. Optimization
 # -----------------------------------------------------------------------------
-def run_full_grid_search(data_store):
+def grid_search(df, sma_col):
+    x_values = [20, 25, 30, 40, 50]       # ADX Thresholds
+    k_values = [0.5, 1.0, 2.0, 3.0]       # Decay Exponents (Concave to Convex)
+    
+    best_perf = -np.inf
+    best_params = (None, None)
     results = []
     
-    print(f"\n--- Running Full Grid Search (ADX Weighted + >{MIN_SIGNALS_PER_MONTH} Sig/Mo) ---")
-    
-    count = 0
-    start_time = time.time()
-    
-    for tf, df_base in data_store.items():
-        if df_base is None or df_base.empty: continue
+    for x in x_values:
+        for k in k_values:
+            res = run_strategy(df, sma_col, x, k)
+            perf = res['total_return']
+            results.append({'x': x, 'k': k, 'return': perf})
             
-        for sma in SMA_PERIODS:
-            # EXCLUSION RULE: Skip 1w timeframe if SMA > 50
-            if tf == '1w' and sma > 50:
-                continue
+            if perf > best_perf:
+                best_perf = perf
+                best_params = (x, k)
+                
+    return best_params, results
 
-            for decay in DECAY_PERIODS:
-                # Run Strategy
-                df_res, sig_per_mo = run_strategy(df_base, sma, decay)
-                
-                # Check if filtered
-                if df_res.empty: continue
+# -----------------------------------------------------------------------------
+# 4. Web Application
+# -----------------------------------------------------------------------------
+app = Flask(__name__)
 
-                metrics = calculate_metrics(df_res, tf)
-                if not metrics: continue
-                
-                results.append({
-                    'Timeframe': tf,
-                    'SMA Period': sma,
-                    'Decay Period': decay,
-                    'Signals/Mo': round(sig_per_mo, 1),
-                    'Sharpe Ratio': metrics['sharpe'],
-                    'B&H Sharpe': metrics['bh_sharpe'],
-                    'Total Return (%)': metrics['total_ret'],
-                    'B&H Return (%)': metrics['bh_total_ret'],
-                    'df': df_res
-                })
-                
-                count += 1
-                if count % 100 == 0:
-                    elapsed = time.time() - start_time
-                    rate = count / elapsed if elapsed > 0 else 0
-                    print(f"  Processed {count} valid combos ({rate:.1f} iter/s)...")
+# Global cache for data to avoid re-fetching on every request
+CACHE = {
+    'df': None,
+    'last_fetch': None
+}
+
+def get_data():
+    if CACHE['df'] is None:
+        raw_df = fetch_binance_data()
+        CACHE['df'] = calculate_indicators(raw_df)
+    return CACHE['df']
+
+@app.route('/')
+def dashboard():
+    df = get_data()
+    
+    # --- SMA 120 Analysis ---
+    # 1. Vanilla SMA 120 (Benchmark) - No Decay
+    # We simulate "No Decay" by setting threshold > 100 (impossible ADX)
+    vanilla_120 = run_strategy(df, 'SMA_120', 999, 1)
+    
+    # 2. Optimized Decay SMA 120
+    best_params_120, grid_120 = grid_search(df, 'SMA_120')
+    decay_120 = run_strategy(df, 'SMA_120', best_params_120[0], best_params_120[1])
+    
+    # --- SMA 40 Analysis ---
+    # 1. Vanilla SMA 40
+    vanilla_40 = run_strategy(df, 'SMA_40', 999, 1)
+    
+    # 2. Optimized Decay SMA 40
+    best_params_40, grid_40 = grid_search(df, 'SMA_40')
+    decay_40 = run_strategy(df, 'SMA_40', best_params_40[0], best_params_40[1])
+    
+    # --- Plotting ---
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                        vertical_spacing=0.1, subplot_titles=('Performance: SMA 120', 'Performance: SMA 40'))
+
+    # Subplot 1: SMA 120
+    fig.add_trace(go.Scatter(x=df.index, y=vanilla_120['equity_curve'], 
+                             name='Vanilla SMA 120', line=dict(color='gray')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=decay_120['equity_curve'], 
+                             name=f'Decay SMA 120 (x={best_params_120[0]}, k={best_params_120[1]})', 
+                             line=dict(color='blue')), row=1, col=1)
+    
+    # Subplot 2: SMA 40
+    fig.add_trace(go.Scatter(x=df.index, y=vanilla_40['equity_curve'], 
+                             name='Vanilla SMA 40', line=dict(color='silver')), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=decay_40['equity_curve'], 
+                             name=f'Decay SMA 40 (x={best_params_40[0]}, k={best_params_40[1]})', 
+                             line=dict(color='orange')), row=2, col=1)
+
+    fig.update_layout(height=800, title_text="Strategy Backtest Analysis (BTC/USDT)", template="plotly_white")
+    graph_html = fig.to_html(full_html=False)
+    
+    # --- Stats Table ---
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Crypto Strategy Analysis</title>
+        <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 20px; background: #f0f2f5; }}
+            .container {{ max_width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+            h1 {{ color: #1a1a1a; }}
+            .stats-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }}
+            .card {{ background: #f8f9fa; padding: 15px; border-radius: 6px; border-left: 4px solid #333; }}
+            .warning {{ background: #fff3cd; color: #856404; padding: 10px; border-radius: 4px; margin-bottom: 20px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Binance BTC/USDT Strategy Analysis</h1>
             
-    return sorted(results, key=lambda x: x['Sharpe Ratio'], reverse=True)
+            <div class="warning">
+                <strong>Critical Analysis:</strong> This strategy "fades" high ADX trends. In crypto, high ADX usually signifies the most profitable "parabolic" phase. 
+                By decaying position size during these phases and entering a lockout period, the strategy risks exiting early on massive winners.
+                The graphs below often show the "Vanilla" (Standard Hold) strategy outperforming the "Decay" strategy during bull runs.
+            </div>
 
-# -----------------------------------------------------------------------------
-# 4. Plotting
-# -----------------------------------------------------------------------------
-def plot_winner(result_dict):
-    df = result_dict['df']
-    tf = result_dict['Timeframe']
-    sharpe = result_dict['Sharpe Ratio']
-    sma = result_dict['SMA Period']
-    decay = result_dict['Decay Period']
-    sig_mo = result_dict['Signals/Mo']
-    
-    df['equity'] = (1 + df['strategy_returns']).cumprod() * 100
-    df['bh_equity'] = (1 + df['returns']).cumprod() * 100
-    
-    plt.style.use('ggplot') 
-    fig, axes = plt.subplots(nrows=3, ncols=1, figsize=(15, 12), sharex=True, 
-                             gridspec_kw={'height_ratios': [2, 1, 1], 'hspace': 0.1})
-    
-    # Row 1: Equity
-    ax1 = axes[0]
-    ax1.plot(df.index, df['bh_equity'], label='Buy & Hold', color='gray', alpha=0.5, linestyle='--')
-    ax1.plot(df.index, df['equity'], label=f'SMA {sma} | Decay {decay}', color='#0077B6', linewidth=2)
-    ax1.set_ylabel('Equity')
-    ax1.set_title(f"Best: {tf} | SMA {sma} | Sig/Mo: {sig_mo} | Sharpe: {sharpe}", fontsize=16)
-    ax1.legend()
+            <div class="stats-grid">
+                <div class="card" style="border-left-color: blue;">
+                    <h3>SMA 120 Analysis</h3>
+                    <p><strong>Vanilla Return:</strong> {vanilla_120['total_return']*100:.2f}%</p>
+                    <p><strong>Best Decay Return:</strong> {decay_120['total_return']*100:.2f}%</p>
+                    <p><strong>Optimal Parameters:</strong> ADX Threshold (x): {best_params_120[0]}, Decay Power (k): {best_params_120[1]}</p>
+                </div>
+                <div class="card" style="border-left-color: orange;">
+                    <h3>SMA 40 Analysis</h3>
+                    <p><strong>Vanilla Return:</strong> {vanilla_40['total_return']*100:.2f}%</p>
+                    <p><strong>Best Decay Return:</strong> {decay_40['total_return']*100:.2f}%</p>
+                    <p><strong>Optimal Parameters:</strong> ADX Threshold (x): {best_params_40[0]}, Decay Power (k): {best_params_40[1]}</p>
+                </div>
+            </div>
 
-    # Row 2: Price, SMA & ADX Overlay
-    ax2 = axes[1]
-    ax2.plot(df.index, df['close'], label='Price', color='black', alpha=0.6, linewidth=1)
-    ax2.plot(df.index, df['sma'], label=f'SMA {sma}', color='orange', linewidth=2)
-    
-    # Plot ADX on secondary axis for context
-    ax2b = ax2.twinx()
-    ax2b.fill_between(df.index, df['adx'], 0, color='purple', alpha=0.1, label='ADX')
-    ax2b.set_ylabel('ADX', color='purple')
-    
-    ax2.set_ylabel('Price')
-    ax2.legend(loc='upper left')
-
-    # Row 3: Position Weight
-    ax3 = axes[2]
-    ax3.fill_between(df.index, df['position'], 0, where=(df['position']>=0), color='green', alpha=0.6, step='mid', label='Long')
-    ax3.fill_between(df.index, df['position'], 0, where=(df['position']<0), color='red', alpha=0.6, step='mid', label='Short')
-    ax3.set_ylabel('ADX-Weighted Position')
-    ax3.set_xlabel('Date')
-    ax3.legend()
-    
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', bbox_inches='tight', dpi=100)
-    buf.seek(0)
-    img_base64 = base64.b64encode(buf.read()).decode('utf-8')
-    plt.close(fig) 
-    return f'data:image/png;base64,{img_base64}'
-
-# -----------------------------------------------------------------------------
-# 5. Execution
-# -----------------------------------------------------------------------------
-print("Step 1: Fetching Data...")
-df_30m = fetch_base_data(SYMBOL, START_YEAR)
-data_store = resample_data(df_30m)
-
-print("Step 2: Running Full Grid Search...")
-sorted_results = run_full_grid_search(data_store)
-
-if sorted_results:
-    winner = sorted_results[0]
-    print(f"\nWinner found: {winner['Timeframe']} SMA {winner['SMA Period']} Decay {winner['Decay Period']} (Sharpe: {winner['Sharpe Ratio']})")
-    print("\nStep 3: Generating Plot...")
-    winner_plot_base64 = plot_winner(winner)
-else:
-    print("No valid results found. Try lowering MIN_SIGNALS_PER_MONTH.")
-    winner_plot_base64 = ""
-
-# -----------------------------------------------------------------------------
-# 6. Web Server
-# -----------------------------------------------------------------------------
-app = Dash(__name__)
-server = app.server 
-
-table_data = []
-# Show top 20 results
-for i, res in enumerate(sorted_results[:20]):
-    table_data.append({
-        'Rank': i+1,
-        'Timeframe': res['Timeframe'],
-        'SMA': res['SMA Period'],
-        'Decay': res['Decay Period'],
-        'Sig/Mo': res['Signals/Mo'],
-        'Sharpe': res['Sharpe Ratio'],
-        'Return': f"{res['Total Return (%)']}%",
-        'B&H Sharpe': res['B&H Sharpe']
-    })
-
-app.layout = html.Div(style={'fontFamily': 'sans-serif', 'padding': '20px'}, children=[
-    html.H1(f"SMA Grid Search (Active)", style={'textAlign': 'center'}),
-    html.P(f"Signal: Cross SMA(X). Min {MIN_SIGNALS_PER_MONTH} Sig/Mo. Range: {START_YEAR}-Present", style={'textAlign': 'center'}),
-    
-    html.Div([
-        dash_table.DataTable(
-            data=table_data,
-            columns=[{'name': k, 'id': k} for k in table_data[0].keys()],
-            style_cell={'textAlign': 'center'},
-            style_header={'fontWeight': 'bold', 'backgroundColor': '#f2f2f2'}
-        )
-    ], style={'marginBottom': '40px'}),
-    html.Div([
-        html.Img(src=winner_plot_base64, style={'width': '100%'})
-    ])
-])
+            {graph_html}
+            
+            <p style="text-align: center; color: #666; font-size: 0.9em;">
+                Data source: Binance (Jan 2018 - Present) | Powered by Python/Flask/Plotly
+            </p>
+        </div>
+    </body>
+    </html>
+    """
+    return render_template_string(html)
 
 if __name__ == '__main__':
-    app.run_server(debug=True, port=PORT)
+    # Fetch data once on startup to ensure it works
+    get_data()
+    # Run on port 8080 for Railway/Cloud environments
+    app.run(host='0.0.0.0', port=8080, debug=False)
