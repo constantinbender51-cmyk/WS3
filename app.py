@@ -132,5 +132,99 @@ def generate_report(df, grid_results, best_a):
                         row_heights=[0.3, 0.25, 0.25, 0.2],
                         subplot_titles=(f"Price & SMA120 (Best ADX: {best_a})", 
                                         "Grid Search: Sharpe Ratio vs ADX Threshold", 
-                                        "Equity
+                                        "Equity Curve", 
+                                        "ADX (14)"))
 
+    # Row 1: Price & SMA
+    fig.add_trace(go.Scatter(x=df_best.index, y=df_best['close'], name='Price', line=dict(color='#2c3e50', width=1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df_best.index, y=df_best['sma120'], name='SMA 120', line=dict(color='#f39c12', width=2)), row=1, col=1)
+    
+    # Row 2: Grid Search Results (Sharpe Ratio)
+    fig.add_trace(go.Scatter(x=grid_results['threshold'], y=grid_results['sharpe'], 
+                             name='Sharpe Ratio', mode='lines+markers', line=dict(color='#3498db')), row=2, col=1)
+    fig.add_vline(x=best_a, line_dash="dash", line_color="red", annotation_text=f"Best Sharpe: {best_a}", row=2, col=1)
+
+    # Row 3: Equity
+    fig.add_trace(go.Scatter(x=df_best.index, y=df_best['cum_strat'], name='Best Strategy', fill='tozeroy', line=dict(color='#27ae60')), row=3, col=1)
+    fig.add_trace(go.Scatter(x=df_best.index, y=df_best['cum_mkt'], name='Buy & Hold', line=dict(color='#95a5a6', dash='dot')), row=3, col=1)
+    
+    # Row 4: ADX
+    fig.add_trace(go.Scatter(x=df_best.index, y=df_best['adx'], name='ADX', line=dict(color='#8e44ad')), row=4, col=1)
+    fig.add_hline(y=best_a, line_dash="dash", line_color="red", row=4, col=1)
+
+    fig.update_layout(height=1200, template="plotly_white", title=f"Sharpe Optimized Grid Search: ADX Filter for {SYMBOL}")
+    
+    stats_html = f"""
+    <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:15px; margin-bottom:20px; font-family:sans-serif;">
+        <div style="padding:20px; border-radius:10px; background:#f8f9fa; border-top:5px solid #3498db; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
+            <div style="color:#7f8c8d; font-size:12px; text-transform:uppercase;">Best Sharpe Ratio</div>
+            <div style="font-size:24px; font-weight:bold; color:#3498db;">{sharpe_val:.3f}</div>
+            <div style="font-size:12px; color:#95a5a6;">at ADX threshold {best_a}</div>
+        </div>
+        <div style="padding:20px; border-radius:10px; background:#f8f9fa; border-top:5px solid #27ae60; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
+            <div style="color:#7f8c8d; font-size:12px; text-transform:uppercase;">Strategy Return</div>
+            <div style="font-size:24px; font-weight:bold; color:#27ae60;">{total_ret:.2f}%</div>
+        </div>
+        <div style="padding:20px; border-radius:10px; background:#f8f9fa; border-top:5px solid #e74c3c; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
+            <div style="color:#7f8c8d; font-size:12px; text-transform:uppercase;">Max Drawdown</div>
+            <div style="font-size:24px; font-weight:bold; color:#e74c3c;">{max_dd:.2f}%</div>
+        </div>
+    </div>
+    """
+
+    recent_df = df_best.tail(15)[['close', 'sma120', 'adx', 'position']].copy()
+    recent_df['position'] = recent_df['position'].replace({1: 'LONG', -1: 'SHORT', 0: 'FLAT'})
+    table_html = f"<h3 style='font-family:sans-serif;'>Recent Activity (Sharpe Optimized a={best_a})</h3>{recent_df.to_html(classes='table')}"
+
+    full_page = f"""
+    <html>
+    <head>
+        <title>Sharpe Grid Search Results</title>
+        <style>
+            body {{ padding: 30px; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background:#fff; color:#333; }}
+            .table {{ width: 100%; border-collapse: collapse; margin-top: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+            .table th, .table td {{ padding: 12px; border: 1px solid #eee; text-align: left; }}
+            .table th {{ background: #fcfcfc; color: #666; font-weight:600; }}
+            .table tr:nth-child(even) {{ background: #fafafa; }}
+        </style>
+    </head>
+    <body>
+        {stats_html}
+        {fig.to_html(full_html=False, include_plotlyjs='cdn')}
+        {table_html}
+    </body>
+    </html>
+    """
+    
+    with open(REPORT_FILE, "w", encoding='utf-8') as f:
+        f.write(full_page)
+
+class RequestHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/': self.path = f"/{REPORT_FILE}"
+        return super().do_GET()
+
+def run_server():
+    print(f"Starting web server on port {PORT}...")
+    with socketserver.TCPServer(("", PORT), RequestHandler) as httpd:
+        httpd.allow_reuse_address = True
+        if "PORT" not in os.environ:
+            webbrowser.open(f"http://localhost:{PORT}")
+        httpd.serve_forever()
+
+if __name__ == "__main__":
+    raw_df = fetch_binance_data(SYMBOL, INTERVAL, START_DATE)
+    if not raw_df.empty:
+        # Pre-calculate Indicators once
+        raw_df['sma120'] = raw_df['close'].rolling(window=SMA_PERIOD).mean()
+        raw_df['adx'] = calculate_adx_wilder(raw_df, ADX_PERIOD)
+        raw_df = raw_df.dropna()
+        
+        # Grid Search based on Sharpe
+        grid_res, best_a = grid_search_adx(raw_df)
+        
+        # Generate Report for the best 'a'
+        generate_report(raw_df, grid_res, int(best_a))
+        
+        # Server
+        run_server()
