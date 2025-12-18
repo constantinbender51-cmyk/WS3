@@ -71,15 +71,15 @@ def calculate_indicators(df):
     return df.dropna()
 
 # -----------------------------------------------------------------------------
-# 2. Strategy Engine (Chop Filter Logic)
+# 2. Strategy Engine (Static Chop Filter Logic)
 # -----------------------------------------------------------------------------
 def run_strategy(df, sma_col, 
-                 thresh_low, thresh_high, decay_rate, 
+                 thresh_low, thresh_high, reduced_size_p, 
                  entry_mode='immediate', entry_dist=0):
     """
-    thresh_low: ADX below this triggers decay state.
-    thresh_high (v): ADX above this restores full position.
-    decay_rate (p): Daily percent reduction (0.05 = 5%).
+    thresh_low: ADX below this triggers REDUCED state.
+    thresh_high (v): ADX above this restores NORMAL (1.0) state.
+    reduced_size_p (p): The static position size when in chop (e.g., 0.0 for flat, 0.5 for half).
     entry_mode: 'immediate' or 'distance'.
     entry_dist: % distance required to enter (0.01 = 1%).
     """
@@ -95,10 +95,7 @@ def run_strategy(df, sma_col,
     current_direction = 0
     current_size = 1.0
     
-    # State Machine: 'NORMAL' (Size 1.0) or 'DECAY' (Size reducing)
-    # Hysteresis logic:
-    # If in NORMAL and ADX < thresh_low -> switch to DECAY
-    # If in DECAY and ADX > thresh_high -> switch to NORMAL
+    # State Machine: 'NORMAL' (Size 1.0) or 'REDUCED' (Size p)
     state = 'NORMAL' 
     
     # Signal State (for entry logic)
@@ -116,8 +113,7 @@ def run_strategy(df, sma_col,
         if new_raw_direction != current_direction:
             current_direction = new_raw_direction
             signal_state = 'WAIT_FOR_ENTRY'
-            # Reset sizing state on new trend attempt?
-            # Usually yes. A new cross is a new attempt.
+            # Reset sizing state on new trend attempt
             state = 'NORMAL' 
             current_size = 1.0 
         
@@ -137,26 +133,23 @@ def run_strategy(df, sma_col,
         elif signal_state == 'IN_MARKET':
             in_market = True
 
-        # --- 2. ADX Decay/Restore Logic (Chop Filter) ---
+        # --- 2. Static Chop Filter Logic ---
         
         if in_market:
             # Hysteresis State Machine
             if state == 'NORMAL':
                 if adx < thresh_low:
-                    state = 'DECAY'
-                    # Apply first day decay immediately? Or wait? 
-                    # Let's apply immediately to react fast to chop.
-                    current_size = current_size * (1.0 - decay_rate)
+                    state = 'REDUCED'
+                    current_size = reduced_size_p # Immediate switch to static size p
                 else:
                     current_size = 1.0
             
-            elif state == 'DECAY':
+            elif state == 'REDUCED':
                 if adx > thresh_high:
                     state = 'NORMAL'
                     current_size = 1.0
                 else:
-                    # Continue decaying
-                    current_size = current_size * (1.0 - decay_rate)
+                    current_size = reduced_size_p # Stay at size p
             
             # Cap size at 1.0 (safety) and floor at 0.0
             current_size = max(0.0, min(1.0, current_size))
@@ -192,17 +185,17 @@ def run_strategy(df, sma_col,
 # 3. Grid Search
 # -----------------------------------------------------------------------------
 def grid_search_sma120(df):
-    print("Starting Grid Search for SMA 120 (Chop Filter)...")
+    print("Starting Grid Search for SMA 120 (Static Chop Filter)...")
     start_time = time.time()
     
     # Params:
-    # low: when to start fading
+    # low: when to start reducing
     # high (v): when to restore
-    # p: how fast to fade
+    # p: Reduced Size (0.0 = Flat, 0.5 = Half size)
     
     low_values = [10, 15, 20, 25, 30]
     high_values = [20, 25, 30, 40, 50]
-    p_values = [0.01, 0.03, 0.05, 0.10, 0.20] # 1% to 20% daily decay
+    p_values = [0.0, 0.25, 0.50, 0.75] # Static sizes
     
     best_sharpe = -np.inf
     best_params = {}
@@ -211,7 +204,7 @@ def grid_search_sma120(df):
     count = 0
     
     for l, h, p in param_grid:
-        # Constraint: High threshold (restore) must be >= Low threshold (decay)
+        # Constraint: High threshold (restore) must be >= Low threshold (reduce)
         if h <= l:
             continue
             
@@ -219,7 +212,7 @@ def grid_search_sma120(df):
         res = run_strategy(df, 'SMA_120', 
                            thresh_low=l, 
                            thresh_high=h, 
-                           decay_rate=p, 
+                           reduced_size_p=p, 
                            entry_mode='immediate',
                            entry_dist=0)
         
@@ -231,7 +224,7 @@ def grid_search_sma120(df):
     return best_params
 
 def grid_search_sma40(df):
-    print("Starting Grid Search for SMA 40 (Chop Filter + Dist Entry)...")
+    print("Starting Grid Search for SMA 40 (Static Chop Filter + Dist Entry)...")
     start_time = time.time()
     
     # Distance: 0.5% to 5%
@@ -239,7 +232,7 @@ def grid_search_sma40(df):
     
     low_values = [10, 15, 20, 25]
     high_values = [20, 25, 30, 40]
-    p_values = [0.01, 0.05, 0.10, 0.20]
+    p_values = [0.0, 0.25, 0.50] # Static sizes
     
     best_sharpe = -np.inf
     best_params = {}
@@ -255,7 +248,7 @@ def grid_search_sma40(df):
         res = run_strategy(df, 'SMA_40', 
                            thresh_low=l, 
                            thresh_high=h, 
-                           decay_rate=p, 
+                           reduced_size_p=p, 
                            entry_mode='distance',
                            entry_dist=d)
         
@@ -285,19 +278,16 @@ def dashboard():
     # Run Scenarios
     # ---------------------------
     
-    # 1. Vanilla Benchmarks (No Decay p=0, Immediate/Distance)
-    vanilla_120 = run_strategy(df, 'SMA_120', 0, 0, 0, 'immediate', 0)
-    vanilla_40 = run_strategy(df, 'SMA_40', 0, 0, 0, 'distance', 0) 
-    # Note: Vanilla 40 usually doesn't have distance, but comparing apples to apples
-    # if we want pure vanilla, dist=0. Let's do pure vanilla for baseline.
-    vanilla_40_pure = run_strategy(df, 'SMA_40', 0, 0, 0, 'immediate', 0)
+    # 1. Vanilla Benchmarks (p=1.0 for No Reduction, Immediate/Distance)
+    vanilla_120 = run_strategy(df, 'SMA_120', 0, 0, 1.0, 'immediate', 0)
+    vanilla_40_pure = run_strategy(df, 'SMA_40', 0, 0, 1.0, 'immediate', 0)
     
     # 2. Optimized SMA 120
     best_p_120 = grid_search_sma120(df)
     decay_120 = run_strategy(df, 'SMA_120', 
                              thresh_low=best_p_120['low'], 
                              thresh_high=best_p_120['high'], 
-                             decay_rate=best_p_120['p'],
+                             reduced_size_p=best_p_120['p'],
                              entry_mode='immediate',
                              entry_dist=0)
     
@@ -306,7 +296,7 @@ def dashboard():
     decay_40 = run_strategy(df, 'SMA_40', 
                             thresh_low=best_p_40['low'], 
                             thresh_high=best_p_40['high'], 
-                            decay_rate=best_p_40['p'], 
+                            reduced_size_p=best_p_40['p'], 
                             entry_mode='distance',
                             entry_dist=best_p_40['dist'])
     
@@ -314,7 +304,7 @@ def dashboard():
     # Plotting
     # ---------------------------
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                        subplot_titles=('SMA 120 Equity (Low ADX Decay)', 'SMA 40 Equity (Dist Entry + Low ADX Decay)'),
+                        subplot_titles=('SMA 120 Equity (Static Chop Filter)', 'SMA 40 Equity (Dist Entry + Chop Filter)'),
                         vertical_spacing=0.15)
     
     # SMA 120
@@ -342,7 +332,7 @@ def dashboard():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Chop Filter Analysis</title>
+        <title>Static Chop Filter Analysis</title>
         <style>
             body {{ font-family: -apple-system, sans-serif; padding: 20px; background: #fafafa; color: #333; }}
             .header {{ margin-bottom: 20px; border-bottom: 2px solid #eee; padding-bottom: 20px; text-align: center; }}
@@ -358,9 +348,9 @@ def dashboard():
     </head>
     <body>
         <div class="header">
-            <h1>BTC/USDT Strategy: Chop Filter Logic</h1>
+            <h1>BTC/USDT Strategy: Static Chop Filter</h1>
             <p>Target: <strong>Max Sharpe Ratio</strong> | Data: Jan 2018 - Present</p>
-            <p style="font-size: 0.9em; color: #666;">Logic: Decay position by <em>p</em>% daily when ADX < <em>Low</em>. Restore to 100% when ADX > <em>High</em>.</p>
+            <p style="font-size: 0.9em; color: #666;">Logic: Position = <em>p</em> (Static Size) when ADX < <em>Low</em>. Restore to 1.0 when ADX > <em>High</em>.</p>
         </div>
         
         <div class="card-container">
@@ -379,9 +369,9 @@ def dashboard():
 
                 <div class="param-box">
                     <div style="font-weight:bold; margin-bottom:10px; color:#444;">Optimal Parameters:</div>
-                    <div class="param-item"><span>Decay Trigger (Low):</span> <span>{best_p_120['low']}</span></div>
-                    <div class="param-item"><span>Restore Trigger (v):</span> <span>{best_p_120['high']}</span></div>
-                    <div class="param-item"><span>Decay Rate (p):</span> <span>{best_p_120['p']*100:.1f}%</span></div>
+                    <div class="param-item"><span>Reduce Trigger (Low):</span> <span>{best_p_120['low']}</span></div>
+                    <div class="param-item"><span>Restore Trigger (High):</span> <span>{best_p_120['high']}</span></div>
+                    <div class="param-item"><span>Reduced Size (p):</span> <span>{best_p_120['p']*100:.1f}%</span></div>
                 </div>
             </div>
 
@@ -401,9 +391,9 @@ def dashboard():
                 <div class="param-box">
                     <div style="font-weight:bold; margin-bottom:10px; color:#444;">Optimal Parameters:</div>
                     <div class="param-item"><span>Entry Distance:</span> <span>{best_p_40['dist']*100:.1f}%</span></div>
-                    <div class="param-item"><span>Decay Trigger (Low):</span> <span>{best_p_40['low']}</span></div>
-                    <div class="param-item"><span>Restore Trigger (v):</span> <span>{best_p_40['high']}</span></div>
-                    <div class="param-item"><span>Decay Rate (p):</span> <span>{best_p_40['p']*100:.1f}%</span></div>
+                    <div class="param-item"><span>Reduce Trigger (Low):</span> <span>{best_p_40['low']}</span></div>
+                    <div class="param-item"><span>Restore Trigger (High):</span> <span>{best_p_40['high']}</span></div>
+                    <div class="param-item"><span>Reduced Size (p):</span> <span>{best_p_40['p']*100:.1f}%</span></div>
                 </div>
             </div>
         </div>
