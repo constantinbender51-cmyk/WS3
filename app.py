@@ -16,7 +16,6 @@ INTERVAL = '1d'
 START_DATE = '2018-01-01'
 SMA_PERIOD = 120
 ADX_PERIOD = 14
-ADX_THRESHOLD = 30 # Only flatten if ADX > 30, only enter if ADX < 30
 PORT = int(os.environ.get("PORT", 8080))
 REPORT_FILE = "backtest_report.html"
 
@@ -78,151 +77,60 @@ def calculate_adx_wilder(df, period=14):
     df['adx'] = df['dx'].fillna(0).ewm(alpha=alpha, adjust=False).mean()
     return df['adx']
 
-def apply_strategy(df):
-    """
-    Implements:
-    - Long if Price > SMA 120, Short if Price < SMA 120
-    - Only enter new position if ADX < 30
-    - Only flatten if ADX > 30 AND derivative is negative
-    """
-    df = df.copy()
-    df['sma120'] = df['close'].rolling(window=SMA_PERIOD).mean()
-    df['adx'] = calculate_adx_wilder(df, ADX_PERIOD)
-    df['adx_deriv'] = df['adx'].diff()
+def run_backtest(df, adx_threshold):
+    """Runs strategy for a specific ADX threshold and returns metrics."""
+    df_bt = df.copy()
+    df_bt['base_signal'] = np.where(df_bt['close'] > df_bt['sma120'], 1, -1)
     
-    # Base signal from SMA
-    df['base_signal'] = np.where(df['close'] > df['sma120'], 1, -1)
+    # Logic: Flat if ADX < threshold, else use base_signal
+    df_bt['position'] = np.where(df_bt['adx'] < adx_threshold, 0, df_bt['base_signal'])
+    df_bt['strategy_pos'] = df_bt['position'].shift(1).fillna(0)
     
-    # State machine for positions
-    positions = []
-    current_pos = 0 # 0: Flat, 1: Long, -1: Short
+    # Returns
+    df_bt['mkt_ret'] = df_bt['close'].pct_change()
+    df_bt['strat_ret'] = df_bt['mkt_ret'] * df_bt['strategy_pos']
     
-    for i in range(len(df)):
-        row = df.iloc[i]
-        adx = row['adx']
-        deriv = row['adx_deriv']
-        base = row['base_signal']
+    # Sharpe Ratio Calculation (Annualized, 365 days)
+    mean_ret = df_bt['strat_ret'].mean()
+    std_ret = df_bt['strat_ret'].std()
+    
+    if std_ret > 0 and not np.isnan(std_ret):
+        sharpe = (mean_ret / std_ret) * np.sqrt(365)
+    else:
+        sharpe = 0
         
-        # 1. Exit Logic (Flatten)
-        # Only flatten if ADX > 30 and derivative is negative
-        if current_pos != 0 and adx > ADX_THRESHOLD and deriv < 0:
-            current_pos = 0
-            
-        # 2. Entry Logic
-        # Only enter if we are currently Flat and ADX is below 30
-        elif current_pos == 0 and adx < ADX_THRESHOLD:
-            current_pos = base
-            
-        # 3. Position Maintenance / Flip
-        # If we are already in a position and it's still "trending" (ADX < 30 or deriv >= 0)
-        # we check if the SMA signal has flipped.
-        elif current_pos != 0:
-            # If the underlying trend changes while we are in a position
-            if current_pos != base:
-                # Flip only if ADX is still in "entry" range
-                if adx < ADX_THRESHOLD:
-                    current_pos = base
-        
-        positions.append(current_pos)
-        
-    df['position'] = positions
-    df['strategy_pos'] = df['position'].shift(1)
+    total_ret = (1 + df_bt['strat_ret'].fillna(0)).prod() - 1
+    return sharpe, total_ret, df_bt
+
+def grid_search_adx(df):
+    """Grid search for best ADX threshold from 1 to 60 based on Sharpe Ratio."""
+    results = []
+    print("Running Grid Search for ADX Threshold (1-60) based on Sharpe Ratio...")
+    for a in range(1, 61):
+        sharpe, ret, _ = run_backtest(df, a)
+        results.append({'threshold': a, 'sharpe': sharpe, 'total_return': ret})
     
-    # Performance Calculation
-    df['mkt_ret'] = df['close'].pct_change()
-    df['strat_ret'] = df['mkt_ret'] * df['strategy_pos'].fillna(0)
-    df['cum_mkt'] = (1 + df['mkt_ret'].fillna(0)).cumprod()
-    df['cum_strat'] = (1 + df['strat_ret'].fillna(0)).cumprod()
+    res_df = pd.DataFrame(results)
+    # Optimize based on Sharpe Ratio
+    best_row = res_df.loc[res_df['sharpe'].idxmax()]
+    return res_df, best_row['threshold']
+
+def generate_report(df, grid_results, best_a):
+    """Generates the HTML dashboard with Grid Search results."""
+    print(f"Building report for best ADX threshold: {best_a}")
     
-    return df.dropna()
-
-def generate_report(df):
-    """Generates the HTML dashboard."""
-    print("Building report...")
-    total_ret = (df['cum_strat'].iloc[-1] - 1) * 100
-    mkt_ret = (df['cum_mkt'].iloc[-1] - 1) * 100
-    max_dd = ((df['cum_strat'] / df['cum_strat'].cummax()) - 1).min() * 100
-
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03, 
-                        row_heights=[0.5, 0.25, 0.25],
-                        subplot_titles=(f"{SYMBOL} Price & SMA", "Equity Curve", "ADX (14) & Logic Regions"))
-
-    # Price & SMA
-    fig.add_trace(go.Scatter(x=df.index, y=df['close'], name='Price', line=dict(color='#2c3e50', width=1)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['sma120'], name='SMA 120', line=dict(color='#f39c12', width=2)), row=1, col=1)
+    # Run backtest with the winner
+    sharpe_val, _, df_best = run_backtest(df, best_a)
+    df_best['cum_mkt'] = (1 + df_best['mkt_ret'].fillna(0)).cumprod()
+    df_best['cum_strat'] = (1 + df_best['strat_ret'].fillna(0)).cumprod()
     
-    # Equity
-    fig.add_trace(go.Scatter(x=df.index, y=df['cum_strat'], name='Strategy', fill='tozeroy', line=dict(color='#27ae60')), row=2, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['cum_mkt'], name='Buy & Hold', line=dict(color='#95a5a6', dash='dot')), row=2, col=1)
-    
-    # ADX with Threshold Line
-    fig.add_trace(go.Scatter(x=df.index, y=df['adx'], name='ADX', line=dict(color='#8e44ad')), row=3, col=1)
-    fig.add_hline(y=ADX_THRESHOLD, line_dash="dash", line_color="gray", row=3, col=1)
-    fig.add_trace(go.Bar(x=df.index, y=df['adx_deriv'], name='ADX Slope', 
-                         marker_color=np.where(df['adx_deriv'] < 0, '#e74c3c', '#2ecc71')), row=3, col=1)
+    total_ret = (df_best['cum_strat'].iloc[-1] - 1) * 100
+    mkt_ret = (df_best['cum_mkt'].iloc[-1] - 1) * 100
+    max_dd = ((df_best['cum_strat'] / df_best['cum_strat'].cummax()) - 1).min() * 100
 
-    fig.update_layout(height=900, template="plotly_white", title=f"Strategy: SMA120 Crossover + ADX Threshold ({ADX_THRESHOLD}) Filter")
-    
-    stats_html = f"""
-    <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:15px; margin-bottom:20px; font-family:sans-serif;">
-        <div style="padding:20px; border-radius:10px; background:#f8f9fa; border-top:5px solid #27ae60; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
-            <div style="color:#7f8c8d; font-size:12px; text-transform:uppercase;">Strategy Return</div>
-            <div style="font-size:24px; font-weight:bold; color:#27ae60;">{total_ret:.2f}%</div>
-        </div>
-        <div style="padding:20px; border-radius:10px; background:#f8f9fa; border-top:5px solid #e74c3c; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
-            <div style="color:#7f8c8d; font-size:12px; text-transform:uppercase;">Max Drawdown</div>
-            <div style="font-size:24px; font-weight:bold; color:#e74c3c;">{max_dd:.2f}%</div>
-        </div>
-        <div style="padding:20px; border-radius:10px; background:#f8f9fa; border-top:5px solid #95a5a6; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
-            <div style="color:#7f8c8d; font-size:12px; text-transform:uppercase;">Market Return</div>
-            <div style="font-size:24px; font-weight:bold;">{mkt_ret:.2f}%</div>
-        </div>
-    </div>
-    """
+    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.03, 
+                        row_heights=[0.3, 0.25, 0.25, 0.2],
+                        subplot_titles=(f"Price & SMA120 (Best ADX: {best_a})", 
+                                        "Grid Search: Sharpe Ratio vs ADX Threshold", 
+                                        "Equity
 
-    recent_df = df.tail(20)[['close', 'sma120', 'adx', 'adx_deriv', 'position']].copy()
-    recent_df['position'] = recent_df['position'].replace({1: 'LONG', -1: 'SHORT', 0: 'FLAT'})
-    table_html = f"<h3 style='font-family:sans-serif;'>Recent Activity Log</h3>{recent_df.to_html(classes='table')}"
-
-    full_page = f"""
-    <html>
-    <head>
-        <title>Strategy Report</title>
-        <style>
-            body {{ padding: 30px; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background:#fff; color:#333; }}
-            .table {{ width: 100%; border-collapse: collapse; margin-top: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-            .table th, .table td {{ padding: 12px; border: 1px solid #eee; text-align: left; }}
-            .table th {{ background: #fcfcfc; color: #666; font-weight:600; }}
-            .table tr:nth-child(even) {{ background: #fafafa; }}
-        </style>
-    </head>
-    <body>
-        {stats_html}
-        {fig.to_html(full_html=False, include_plotlyjs='cdn')}
-        {table_html}
-    </body>
-    </html>
-    """
-    
-    with open(REPORT_FILE, "w", encoding='utf-8') as f:
-        f.write(full_page)
-
-class RequestHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/': self.path = f"/{REPORT_FILE}"
-        return super().do_GET()
-
-def run_server():
-    print(f"Starting web server on port {PORT}...")
-    with socketserver.TCPServer(("", PORT), RequestHandler) as httpd:
-        httpd.allow_reuse_address = True
-        if "PORT" not in os.environ:
-            webbrowser.open(f"http://localhost:{PORT}")
-        httpd.serve_forever()
-
-if __name__ == "__main__":
-    raw_df = fetch_binance_data(SYMBOL, INTERVAL, START_DATE)
-    if not raw_df.empty:
-        processed_df = apply_strategy(raw_df)
-        generate_report(processed_df)
-        run_server()
