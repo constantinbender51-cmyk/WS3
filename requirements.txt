@@ -3,4 +3,4 @@ numpy
 requests
 plotly
 Flask
-nmatplotlib
+matplotlib
