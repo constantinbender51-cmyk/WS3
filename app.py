@@ -1,336 +1,427 @@
-import requests
+import ccxt
 import pandas as pd
 import numpy as np
-import matplotlib
-matplotlib.use('Agg') # Non-interactive backend for server
 import matplotlib.pyplot as plt
-import io
-import base64
-from flask import Flask, render_template_string, jsonify
-from itertools import product
 from datetime import datetime
-import time
-import threading
+from flask import Flask, send_file
+import os
+import itertools
+
+# 1. CONFIGURATION
+symbol = 'BTC/USDT'
+timeframe = '1d'
+start_date_str = '2018-01-01 00:00:00'
+
+# Strategy Params (SMA periods fixed at 40 and 120, not part of grid search)
+SMA_FAST = 40
+SMA_SLOW = 120
+SL_PCT = 0.02
+TP_PCT = 0.16
+III_WINDOW = 14 
+
+# --- GRID SEARCH SPACE DEFINITION (6 VARIABLES) ---
+
+# Threshold Search Space (T_Low, T_High) adjusted based on user input
+# Centered around 0.15 and 0.2, with +/- 10% range and 0.05 step
+T_LOW_CENTER = 0.15
+T_HIGH_CENTER = 0.2
+T_RANGE_HALF_WIDTH = 0.1 * T_HIGH_CENTER # +/- 10% of T_High
+THRESH_RANGE = np.arange(T_LOW_CENTER - T_RANGE_HALF_WIDTH, T_LOW_CENTER + T_RANGE_HALF_WIDTH + 0.05, 0.05)
+THRESH_RANGE = np.round(THRESH_RANGE, 2)
+# Ensure T_High is covered and adjust slightly if needed for consistency
+THRESH_RANGE_HIGH = np.arange(T_HIGH_CENTER - T_RANGE_HALF_WIDTH, T_HIGH_CENTER + T_RANGE_HALF_WIDTH + 0.05, 0.05)
+THRESH_RANGE_HIGH = np.round(THRESH_RANGE_HIGH, 2)
+# Combine and ensure unique values, also ensuring T_LOW < T_HIGH is handled later
+THRESH_RANGE = np.unique(np.concatenate([THRESH_RANGE, THRESH_RANGE_HIGH]))
+
+# Leverage Search Space (L_Low, L_Mid, L_High) adjusted based on user input
+# User specified 0.5, 4.5, 2 and granularity of 0.05
+LEV_RANGE = np.arange(0.5, 4.51, 0.05)
+LEV_RANGE = np.round(LEV_RANGE, 2)
+
+# III Period Search Space adjusted based on user input
+# Centered around 36, with +/- 10% range and 0.5 step
+III_CENTER = 36
+III_RANGE_HALF_WIDTH = 0.1 * III_CENTER # +/- 10%
+III_RANGE = np.arange(III_CENTER - III_RANGE_HALF_WIDTH, III_CENTER + III_RANGE_HALF_WIDTH + 0.5, 0.5)
+III_RANGE = np.round(III_RANGE, 1)
+# Ensure III_RANGE is within reasonable bounds (e.g., min 1, max 60)
+III_RANGE = III_RANGE[(III_RANGE >= 1) & (III_RANGE <= 60)]
+III_RANGE = np.unique(III_RANGE.astype(int))
+
+# SMA Periods fixed at 40 and 120 (removed from grid search) 
+
+# MDD Constraint
+MAX_MDD_CONSTRAINT = -0.70 # Must be less than 70% drawdown
+
+def fetch_binance_history(symbol, start_str):
+    print(f"Fetching data for {symbol} starting from {start_str}...")
+    exchange = ccxt.binance()
+    since = exchange.parse8601(start_str)
+    all_ohlcv = []
+    while True:
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
+            if not ohlcv: break
+            all_ohlcv.extend(ohlcv)
+            since = ohlcv[-1][0] + 1
+            if since > exchange.milliseconds(): break
+        except Exception as e:
+            print(f"Error fetching: {e}")
+            break
+    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
+    df = df[~df.index.duplicated(keep='first')]
+    return df
+
+# 2. DATA PREP & BASE RETURNS
+df = fetch_binance_history(symbol, start_date_str)
+
+# Calculate III
+df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+df['net_direction'] = df['log_ret'].rolling(III_WINDOW).sum().abs()
+df['path_length'] = df['log_ret'].abs().rolling(III_WINDOW).sum()
+epsilon = 1e-8
+df['iii'] = df['net_direction'] / (df['path_length'] + epsilon)
+
+# Indicators
+df['sma_fast'] = df['close'].rolling(SMA_FAST).mean()
+df['sma_slow'] = df['close'].rolling(SMA_SLOW).mean()
+
+# Pre-calculate 1x Strategy Returns
+print("Pre-calculating base strategy returns...")
+base_returns = []
+start_idx = max(SMA_SLOW, III_WINDOW)
+
+for i in range(len(df)):
+    if i < start_idx:
+        base_returns.append(0.0)
+        continue
+    
+    prev_close = df['close'].iloc[i-1]
+    prev_fast = df['sma_fast'].iloc[i-1]
+    prev_slow = df['sma_slow'].iloc[i-1]
+    
+    open_p = df['open'].iloc[i]
+    high_p = df['high'].iloc[i]
+    low_p = df['low'].iloc[i]
+    close_p = df['close'].iloc[i]
+    
+    daily_ret = 0.0
+    
+    # Trend Logic
+    if prev_close > prev_fast and prev_close > prev_slow:
+        entry = open_p
+        sl = entry * (1 - SL_PCT)
+        tp = entry * (1 + TP_PCT)
+        if low_p <= sl: daily_ret = -SL_PCT
+        elif high_p >= tp: daily_ret = TP_PCT
+        else: daily_ret = (close_p - entry) / entry
+        
+    elif prev_close < prev_fast and prev_close < prev_slow:
+        entry = open_p
+        sl = entry * (1 + SL_PCT)
+        tp = entry * (1 - TP_PCT)
+        if high_p >= sl: daily_ret = -SL_PCT
+        elif low_p <= tp: daily_ret = TP_PCT
+        else: daily_ret = (entry - close_p) / entry
+        
+    base_returns.append(daily_ret)
+
+df['base_ret'] = base_returns
+
+# Create aligned arrays for grid search
+base_ret_arr = np.array(base_returns)
+iii_prev = df['iii'].shift(1).fillna(0).values
+
+# 3. GRID SEARCH (Vectorized for Speed)
+total_iterations = len(THRESH_RANGE) * len(THRESH_RANGE) * len(LEV_RANGE)**3 * len(III_RANGE)
+print(f"Starting Exhaustive 6-Variable Grid Search ({total_iterations} total combinations)...")
+
+# Use the base returns from DataFrame to ensure consistency
+base_ret_arr = df['base_ret'].values
+iii_prev = df['iii'].shift(1).fillna(0).values
+
+best_sharpe = -999
+best_combo = (0.0, 0.0, 0.0, 0.0, 0.0, 1) # T_Low, T_High, L_Low, L_Mid, L_High, III_WINDOW (SMA_FAST and SMA_SLOW fixed at 40 and 120)
+best_mdd = 0
+iteration_count = 0
+
+# Metrics function optimized for arrays
+def calculate_sharpe_mdd(returns):
+    if returns.empty or returns.size == 0:
+        return 0, 0
+    cum_ret = np.cumprod(1 + returns.values)
+    if cum_ret.size == 0 or cum_ret[0] == 0:
+        return 0, 0
+    
+    # Sharpe
+    mean_ret = np.mean(returns)
+    std_ret = np.std(returns)
+    sharpe = (mean_ret / std_ret) * np.sqrt(365) if std_ret > 0 else 0
+    
+    # MDD
+    roll_max = np.maximum.accumulate(cum_ret)
+    drawdown = (cum_ret - roll_max) / roll_max
+    max_dd = drawdown.min()
+    
+    return sharpe, max_dd
+
+# Helper function to get final metrics from equity curve
+def get_final_metrics(equity_series):
+    if equity_series.empty or equity_series.iloc[0] == 0:
+        return 0, 0, 0, 0
+
+    # Total Return
+    s_tot = equity_series.iloc[-1] - 1
+
+    # CAGR
+    num_years = (equity_series.index[-1] - equity_series.index[0]).days / 365.25
+    if num_years == 0 or equity_series.iloc[0] <= 0:
+        s_cagr = 0
+    else:
+        s_cagr = (equity_series.iloc[-1] / equity_series.iloc[0])**(1/num_years) - 1
+
+    # Daily Returns for Sharpe
+    daily_returns = equity_series.pct_change().dropna()
+    
+    if daily_returns.empty:
+        s_sharpe = 0
+    else:
+        mean_ret = daily_returns.mean()
+        std_ret = daily_returns.std()
+        s_sharpe = (mean_ret / std_ret) * np.sqrt(365) if std_ret > 0 else 0
+
+    # Max Drawdown
+    roll_max = equity_series.cummax()
+    drawdown = (equity_series - roll_max) / roll_max
+    s_mdd = drawdown.min()
+
+    return s_tot, s_cagr, s_mdd, s_sharpe
+
+# Threshold loops (SMA periods fixed at 40 and 120, not in grid search)
+for t_low, t_high in itertools.product(THRESH_RANGE, repeat=2):
+    # Enforce logical constraint
+    if t_low >= t_high: continue 
+    
+    # III period loop
+    for iii_window in III_RANGE:
+        # Calculate III for this window
+        df_temp = df.copy()
+        df_temp['log_ret'] = np.log(df_temp['close'] / df_temp['close'].shift(1))
+        df_temp['net_direction'] = df_temp['log_ret'].rolling(iii_window).sum().abs()
+        df_temp['path_length'] = df_temp['log_ret'].abs().rolling(iii_window).sum()
+        epsilon = 1e-8
+        df_temp['iii'] = df_temp['net_direction'] / (df_temp['path_length'] + epsilon)
+        iii_prev_temp = df_temp['iii'].shift(1).fillna(0).values
+        
+        # Create Tier Mask for this specific threshold combo
+        # 0 = Low Tier (III < T_Low)
+        # 1 = Mid Tier (T_Low <= III < T_High)
+        # 2 = High Tier (III >= T_High)
+        
+        # Vectorized mask creation
+        tier_mask = np.full(len(df_temp), 2, dtype=int) # Default High
+        tier_mask[iii_prev_temp < t_high] = 1 # Mid
+        tier_mask[iii_prev_temp < t_low] = 0  # Low
+        
+        # Ensure mask aligns with base_ret_arr (same length)
+        if len(tier_mask) != len(base_ret_arr):
+            tier_mask = tier_mask[:len(base_ret_arr)]
+
+        # Inner loop: Leverages (L_Low, L_Mid, L_High)
+        for l_low, l_mid, l_high in itertools.product(LEV_RANGE, repeat=3):
+            iteration_count += 1
+            
+            # Progress logging every 100,000 iterations
+            if iteration_count % 100000 == 0:
+                print(f"Progress: {iteration_count:,} / {total_iterations:,} iterations ({iteration_count/total_iterations*100:.1f}%)")
+                print(f"  Current best Sharpe: {best_sharpe:.2f}")
+                print(f"  Current params: T_Low={t_low:.2f}, T_High={t_high:.2f}, L_Low={l_low:.2f}, L_Mid={l_mid:.2f}, L_High={l_high:.2f}, III_WINDOW={iii_window}")
+            
+            # Construct leverage array using the calculated tiers
+            lookup = np.array([l_low, l_mid, l_high])
+            lev_arr = lookup[tier_mask]
+            
+            # Ensure lev_arr aligns with base_ret_arr
+            if len(lev_arr) != len(base_ret_arr):
+                lev_arr = lev_arr[:len(base_ret_arr)]
+            
+            final_rets = base_ret_arr * lev_arr
+            
+            # Calculate Sharpe and MDD (Only analyze period where strategy is active)
+            sharpe, mdd = calculate_sharpe_mdd(pd.Series(final_rets[start_idx:]))
+            
+            # Check against MDD constraint
+            if mdd > MAX_MDD_CONSTRAINT: 
+                if sharpe > best_sharpe:
+                    best_sharpe = sharpe
+                    best_combo = (round(t_low, 2), round(t_high, 2), round(l_low, 2), round(l_mid, 2), round(l_high, 2), iii_window)
+                    best_mdd = mdd
+
+
+# 4. FINAL BACKTEST WITH BEST PARAMS
+OPT_T_LOW, OPT_T_HIGH, OPT_L_LOW, OPT_L_MID, OPT_L_HIGH, OPT_III_WINDOW = best_combo
+OPT_SMA_FAST = SMA_FAST  # Fixed at 40
+OPT_SMA_SLOW = SMA_SLOW  # Fixed at 120
+
+# Recalculate III with optimal window
+epsilon = 1e-8
+df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+df['net_direction'] = df['log_ret'].rolling(OPT_III_WINDOW).sum().abs()
+df['path_length'] = df['log_ret'].abs().rolling(OPT_III_WINDOW).sum()
+df['iii'] = df['net_direction'] / (df['path_length'] + epsilon)
+
+# Recalculate base returns for final backtest
+start_idx = max(OPT_SMA_SLOW, OPT_III_WINDOW)
+# Ensure we create a list with the same length as df
+final_base_returns = [0.0] * len(df)
+
+for i in range(start_idx, len(df)):
+    prev_close = df['close'].iloc[i-1]
+    prev_fast = df['sma_fast'].iloc[i-1]
+    prev_slow = df['sma_slow'].iloc[i-1]
+    
+    open_p = df['open'].iloc[i]
+    high_p = df['high'].iloc[i]
+    low_p = df['low'].iloc[i]
+    close_p = df['close'].iloc[i]
+    
+    daily_ret = 0.0
+    
+    # Trend Logic
+    if prev_close > prev_fast and prev_close > prev_slow:
+        entry = open_p
+        sl = entry * (1 - SL_PCT)
+        tp = entry * (1 + TP_PCT)
+        if low_p <= sl: daily_ret = -SL_PCT
+        elif high_p >= tp: daily_ret = TP_PCT
+        else: daily_ret = (close_p - entry) / entry
+        
+    elif prev_close < prev_fast and prev_close < prev_slow:
+        entry = open_p
+        sl = entry * (1 + SL_PCT)
+        tp = entry * (1 - TP_PCT)
+        if high_p >= sl: daily_ret = -SL_PCT
+        elif low_p <= tp: daily_ret = TP_PCT
+        else: daily_ret = (entry - close_p) / entry
+        
+    final_base_returns[i] = daily_ret
+
+# Assign to DataFrame and update base_ret_arr
+df['base_ret'] = final_base_returns
+base_ret_arr = df['base_ret'].values
+
+# Recalculate tier mask for the final run
+iii_prev = df['iii'].shift(1).fillna(0).values
+tier_mask_final = np.full(len(df), 2, dtype=int) 
+tier_mask_final[iii_prev < OPT_T_HIGH] = 1
+tier_mask_final[iii_prev < OPT_T_LOW] = 0
+
+# Ensure mask aligns with base_ret_arr
+if len(tier_mask_final) != len(base_ret_arr):
+    tier_mask_final = tier_mask_final[:len(base_ret_arr)]
+
+# Final optimized leverage array
+lookup_final = np.array([OPT_L_LOW, OPT_L_MID, OPT_L_HIGH])
+lev_arr_final = lookup_final[tier_mask_final]
+
+# Ensure lev_arr_final aligns with base_ret_arr
+if len(lev_arr_final) != len(base_ret_arr):
+    lev_arr_final = lev_arr_final[:len(base_ret_arr)]
+
+final_rets_final = base_ret_arr * lev_arr_final
+
+# Backtest simulation for plot data
+df['strategy_equity'] = 1.0
+df['leverage_used'] = 0.0
+equity = 1.0
+is_busted = False
+
+# Ensure start_idx is consistent with final_rets_final length
+if start_idx >= len(final_rets_final):
+    start_idx = len(final_rets_final) - 1
+
+for i in range(start_idx, len(df)):
+    # Ensure index is within bounds
+    if i >= len(final_rets_final):
+        break
+    daily_ret = final_rets_final[i]
+    leverage = lev_arr_final[i]
+    
+    if not is_busted:
+        equity *= (1 + daily_ret)
+        if equity <= 0.05:
+            equity = 0
+            is_busted = True
+            
+    df.at[df.index[i], 'strategy_equity'] = equity
+    df.at[df.index[i], 'leverage_used'] = leverage
+
+# 5. METRICS & PLOT
+plot_data = df.iloc[start_idx:].copy()
+s_tot, s_cagr, s_mdd, s_sharpe = get_final_metrics(plot_data['strategy_equity'])
+# Calculate buy-and-hold equity for comparison
+plot_data['buy_hold_equity'] = (plot_data['close'] / plot_data['close'].iloc[0])
+
+print("\n" + "="*45)
+print(f"BEST 6-VARIABLE OPTIMIZATION (Constrained MDD < {MAX_MDD_CONSTRAINT*100:.0f}%)")
+print(f"SMA Periods (Fixed): {OPT_SMA_FAST} (Fast) / {OPT_SMA_SLOW} (Slow)")
+print(f"Optimal Thresholds: {OPT_T_LOW:.2f} (Low) / {OPT_T_HIGH:.2f} (High)")
+print(f"Optimal Leverages: {OPT_L_LOW:.1f}x / {OPT_L_MID:.1f}x / {OPT_L_HIGH:.1f}x")
+print(f"Optimal III Period: {OPT_III_WINDOW}")
+print("-" * 45)
+print(f"{'Sharpe Ratio':<15} | {s_sharpe:>10.2f}")
+print(f"{'Max Drawdown':<15} | {s_mdd*100:>10.1f}%")
+print(f"{'CAGR':<15} | {s_cagr*100:>10.1f}%")
+print("="*45 + "\n")
+
+plt.figure(figsize=(12, 10))
+
+ax1 = plt.subplot(3, 1, 1)
+ax1.plot(plot_data.index, plot_data['strategy_equity'], label=f'Best Strategy (Sharpe: {s_sharpe:.2f})', color='blue')
+ax1.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
+ax1.set_yscale('log')
+ax1.set_title(f'Final Optimized Strategy (SMA Fixed: {OPT_SMA_FAST}/{OPT_SMA_SLOW} | T: {OPT_T_LOW}/{OPT_T_HIGH} | L: {OPT_L_LOW}x/{OPT_L_MID}x/{OPT_L_HIGH}x | III: {OPT_III_WINDOW})')
+ax1.legend()
+ax1.grid(True, which='both', linestyle='--', alpha=0.3)
+
+# Add Stats Box
+stats = f"CAGR: {s_cagr*100:.1f}%\nMaxDD: {s_mdd*100:.1f}%\nSharpe: {s_sharpe:.2f}"
+ax1.text(0.02, 0.85, stats, transform=ax1.transAxes, bbox=dict(facecolor='white', alpha=0.8))
+
+ax2 = plt.subplot(3, 1, 2, sharex=ax1)
+ax2.step(plot_data.index, plot_data['leverage_used'], where='post', color='purple', linewidth=1)
+ax2.fill_between(plot_data.index, 0, plot_data['leverage_used'], step='post', color='purple', alpha=0.2)
+ax2.set_title('Leverage Deployed')
+ax2.set_yticks(np.unique(plot_data['leverage_used']))
+ax2.set_ylabel('Leverage (x)')
+ax2.grid(True, axis='x', alpha=0.3)
+
+ax3 = plt.subplot(3, 1, 3, sharex=ax1)
+# Drawdown
+roll_max = plot_data['strategy_equity'].cummax()
+dd = (plot_data['strategy_equity'] - roll_max) / roll_max
+ax3.plot(plot_data.index, dd, color='red')
+ax3.fill_between(plot_data.index, dd, 0, color='red', alpha=0.1)
+ax3.axhline(MAX_MDD_CONSTRAINT, color='black', linestyle='--')
+ax3.set_title('Drawdown Profile (Constrained < 50%)')
+ax3.set_ylabel('Drawdown')
+ax3.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plot_dir = '/app/static'
+if not os.path.exists(plot_dir): os.makedirs(plot_dir)
+plot_path = os.path.join(plot_dir, 'plot.png')
+plt.savefig(plot_path, dpi=300, bbox_inches='tight')
 
 app = Flask(__name__)
-
-# --- CONFIGURATION ---
-SYMBOL = 'BTCUSDT'
-START_YEAR = 2018
-SMA_START = 10
-SMA_END = 400
-SMA_STEP = 10
-# Weights are grid searched from 0 to 1.
-WEIGHT_STEPS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
-
-# --- GLOBAL STATE ---
-# Stores the current progress and results of the background task
-GLOBAL_STATE = {
-    'status': 'Waiting to start...',
-    'progress': 0,
-    'done': False,
-    'results': [],
-    'plot': None,
-    'error': None
-}
-
-# --- DATA FETCHING ---
-def fetch_binance_data(symbol, interval, start_year):
-    """
-    Fetches historical OHLC data from Binance API with pagination.
-    """
-    base_url = "https://api.binance.com/api/v3/klines"
-    start_ts = int(datetime(start_year, 1, 1).timestamp() * 1000)
-    end_ts = int(time.time() * 1000)
-    limit = 1000
-    
-    all_data = []
-    current_start = start_ts
-    
-    req_count = 0
-    while current_start < end_ts and req_count < 1000:
-        params = {'symbol': symbol, 'interval': interval, 'startTime': current_start, 'limit': limit}
-        try:
-            response = requests.get(base_url, params=params)
-            data = response.json()
-            if not data: break
-            all_data.extend(data)
-            current_start = data[-1][0] + 1
-            req_count += 1
-            time.sleep(0.05)
-        except: break
-            
-    df = pd.DataFrame(all_data, columns=['open_time', 'open', 'high', 'low', 'close', 'volume', 'ct', 'qav', 'nt', 'tbv', 'tqv', 'i'])
-    df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
-    df['close'] = df['close'].astype(float)
-    df.set_index('open_time', inplace=True)
-    return df[['close']]
-
-# --- BACKTESTING ENGINE ---
-def calculate_sharpe_ratio(returns, periods_per_year):
-    std = returns.std()
-    if std == 0 or np.isnan(std): return -10.0
-    return (returns.mean() / std) * np.sqrt(periods_per_year)
-
-def run_grid_search(df, timeframe_label, progress_start, progress_end):
-    """
-    Runs grid search and updates GLOBAL_STATE progress.
-    progress_start: Percentage to start at (e.g., 0)
-    progress_end: Percentage to end at (e.g., 33)
-    """
-    prices = df['close'].values
-    returns = df['close'].pct_change().fillna(0).values
-    
-    periods = list(range(SMA_START, SMA_END + 1, SMA_STEP))
-    
-    # Pre-calculate signals (Vectorized)
-    signals_matrix = []
-    for p in periods:
-        sma = pd.Series(prices).rolling(window=p).mean().values
-        sig = np.where(prices > sma, 1.0, -1.0)
-        sig = np.concatenate(([0], sig[:-1]))
-        signals_matrix.append(sig)
-    
-    signals_matrix = np.array(signals_matrix)
-    
-    # Space generation
-    weight_opts = list(product(WEIGHT_STEPS, repeat=3))
-    weight_opts = [w for w in weight_opts if sum(w) > 0]
-    
-    num_p = len(periods)
-    sma_idx_opts = [(i, j, k) for i, j, k in product(range(num_p), repeat=3) if i < j < k]
-    
-    best_sharpe = -999
-    best_params = None
-    best_signal = None
-
-    if timeframe_label == '1H': factor = 365*24
-    elif timeframe_label == '4H': factor = 365*6
-    else: factor = 365
-
-    total_iters = len(sma_idx_opts)
-    
-    # Optimized search loop
-    for idx, (i, j, k) in enumerate(sma_idx_opts):
-        # Update progress roughly every 100 iterations to avoid locking overhead
-        if idx % 100 == 0:
-            current_chunk_progress = idx / total_iters
-            total_progress = progress_start + (current_chunk_progress * (progress_end - progress_start))
-            GLOBAL_STATE['progress'] = int(total_progress)
-            GLOBAL_STATE['status'] = f"Optimizing {timeframe_label}... ({int(current_chunk_progress * 100)}%)"
-
-        s1, s2, s3 = signals_matrix[i], signals_matrix[j], signals_matrix[k]
-        p1, p2, p3 = periods[i], periods[j], periods[k]
-        
-        for w1, w2, w3 in weight_opts:
-            total_w = w1 + w2 + w3
-            pos = (w1*s1 + w2*s2 + w3*s3) / total_w
-            
-            strat_rets = pos * returns
-            sharpe = calculate_sharpe_ratio(strat_rets, factor)
-            
-            if sharpe > best_sharpe:
-                best_sharpe = sharpe
-                best_params = {
-                    'smas': (p1, p2, p3),
-                    'weights': (w1, w2, w3),
-                    'sharpe': round(sharpe, 4),
-                    'return': round((np.prod(1 + strat_rets) - 1) * 100, 2)
-                }
-                best_signal = pos
-
-    best_curve = pd.Series(np.cumprod(1 + (best_signal * returns)), index=df.index)
-    return best_params, best_curve
-
-# --- PLOTTING ---
-def create_plot(curves_data):
-    fig, axes = plt.subplots(len(curves_data), 1, figsize=(12, 5 * len(curves_data)))
-    if len(curves_data) == 1: axes = [axes]
-    
-    for ax, (label, base_df, strat_curve) in zip(axes, curves_data):
-        base_curve = (1 + base_df['close'].pct_change().fillna(0)).cumprod()
-        ax.plot(base_curve.index, base_curve, label='BTC Buy & Hold', color='black', alpha=0.3)
-        ax.plot(strat_curve.index, strat_curve, label='Opt. Triple SMA', color='forestgreen', linewidth=1.5)
-        ax.set_title(f"Equity Curve: {label}")
-        ax.set_yscale('log')
-        ax.legend()
-        ax.grid(True, which="both", ls="-", alpha=0.2)
-
-    plt.tight_layout()
-    img = io.BytesIO()
-    plt.savefig(img, format='png', dpi=150)
-    img.seek(0)
-    return base64.b64encode(img.getvalue()).decode()
-
-# --- WORKER THREAD ---
-def background_worker():
-    """
-    Main function for the background thread.
-    Fetches data and runs grid search sequentially.
-    """
-    try:
-        GLOBAL_STATE['status'] = "Fetching Binance Data..."
-        GLOBAL_STATE['progress'] = 5
-        
-        # 1. Get Base Data (1H)
-        df_1h = fetch_binance_data(SYMBOL, '1h', START_YEAR)
-        if df_1h.empty:
-            raise Exception("No data fetched")
-            
-        # 2. Resample
-        df_4h = df_1h.resample('4h').last().dropna()
-        df_1d = df_1h.resample('1D').last().dropna()
-        
-        # 3. Run search (Split progress bar: 10%->40%, 40%->70%, 70%->95%)
-        GLOBAL_STATE['status'] = "Starting 1H Grid Search..."
-        res_1h, curve_1h = run_grid_search(df_1h, '1H', 10, 40)
-        
-        GLOBAL_STATE['status'] = "Starting 4H Grid Search..."
-        res_4h, curve_4h = run_grid_search(df_4h, '4H', 40, 70)
-        
-        GLOBAL_STATE['status'] = "Starting 1D Grid Search..."
-        res_1d, curve_1d = run_grid_search(df_1d, '1D', 70, 95)
-        
-        # 4. Create Plot
-        GLOBAL_STATE['status'] = "Generating Plots..."
-        plot_b64 = create_plot([
-            ('1 Hour', df_1h, curve_1h),
-            ('4 Hour', df_4h, curve_4h),
-            ('1 Day', df_1d, curve_1d)
-        ])
-        
-        GLOBAL_STATE['results'] = [
-            {'tf': '1H', 'smas': str(res_1h['smas']), 'weights': str(res_1h['weights']), 'sharpe': res_1h['sharpe'], 'ret': res_1h['return']},
-            {'tf': '4H', 'smas': str(res_4h['smas']), 'weights': str(res_4h['weights']), 'sharpe': res_4h['sharpe'], 'ret': res_4h['return']},
-            {'tf': '1D', 'smas': str(res_1d['smas']), 'weights': str(res_1d['weights']), 'sharpe': res_1d['sharpe'], 'ret': res_1d['return']}
-        ]
-        GLOBAL_STATE['plot'] = plot_b64
-        GLOBAL_STATE['progress'] = 100
-        GLOBAL_STATE['status'] = "Optimization Completed"
-        GLOBAL_STATE['done'] = True
-        
-    except Exception as e:
-        GLOBAL_STATE['error'] = str(e)
-        GLOBAL_STATE['status'] = "Error Occurred"
-        print(f"Background Worker Error: {e}")
-
-# --- FLASK APP ---
 @app.route('/')
-def index():
-    return render_template_string("""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Triple SMA Optimization</title>
-        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-        <style>
-            body { background: #121212; color: #e0e0e0; font-family: sans-serif; }
-            .container { max-width: 1000px; margin-top: 50px; }
-            .card { background: #1e1e1e; border: 1px solid #333; margin-bottom: 20px; }
-            .progress { height: 25px; background-color: #333; }
-            .progress-bar { transition: width 0.5s ease; }
-            .table { color: #e0e0e0; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h2 class="mb-4">Triple SMA Optimizer (2018 - Present)</h2>
-            
-            <div id="progressSection" class="card p-4">
-                <h5 class="card-title">Optimization Status</h5>
-                <p id="statusText">Initializing...</p>
-                <div class="progress mb-3">
-                    <div id="progressBar" class="progress-bar progress-bar-striped progress-bar-animated bg-primary" 
-                         role="progressbar" style="width: 0%">0%</div>
-                </div>
-            </div>
-
-            <div id="results" style="display:none;">
-                <div class="card p-3">
-                    <h5 class="mb-3">Optimization Results</h5>
-                    <table class="table table-dark table-hover">
-                        <thead>
-                            <tr>
-                                <th>Timeframe</th>
-                                <th>Best SMA Periods</th>
-                                <th>Best Weights (a, b, c)</th>
-                                <th>Sharpe Ratio</th>
-                                <th>Total Return (%)</th>
-                            </tr>
-                        </thead>
-                        <tbody id="resBody"></tbody>
-                    </table>
-                </div>
-                <div class="card p-2 text-center">
-                    <img id="perfPlot" style="max-width:100%">
-                </div>
-            </div>
-        </div>
-
-        <script>
-            function pollStatus() {
-                fetch('/status')
-                .then(response => response.json())
-                .then(data => {
-                    // Update Progress Bar
-                    const progressBar = document.getElementById('progressBar');
-                    const statusText = document.getElementById('statusText');
-                    
-                    progressBar.style.width = data.progress + '%';
-                    progressBar.textContent = data.progress + '%';
-                    statusText.textContent = data.status;
-
-                    if (data.error) {
-                        statusText.textContent = "Error: " + data.error;
-                        progressBar.classList.add('bg-danger');
-                        return; // Stop polling on error
-                    }
-
-                    if (data.done) {
-                        // Show Results
-                        document.getElementById('progressSection').style.display = 'none';
-                        const results = document.getElementById('results');
-                        const tbody = document.getElementById('resBody');
-                        
-                        if (results.style.display === 'none') {
-                            tbody.innerHTML = '';
-                            data.results.forEach(r => {
-                                tbody.innerHTML += `<tr>
-                                    <td>${r.tf}</td>
-                                    <td>${r.smas}</td>
-                                    <td>${r.weights}</td>
-                                    <td>${r.sharpe}</td>
-                                    <td>${r.ret}%</td>
-                                </tr>`;
-                            });
-                            document.getElementById('perfPlot').src = 'data:image/png;base64,' + data.plot;
-                            results.style.display = 'block';
-                        }
-                    } else {
-                        // Continue polling every second
-                        setTimeout(pollStatus, 1000);
-                    }
-                })
-                .catch(err => console.error(err));
-            }
-
-            // Start polling on page load
-            window.onload = pollStatus;
-        </script>
-    </body>
-    </html>
-    """)
-
-@app.route('/status')
-def get_status():
-    return jsonify(GLOBAL_STATE)
+def serve_plot(): return send_file(plot_path, mimetype='image/png')
+@app.route('/health')
+def health(): return 'OK', 200
 
 if __name__ == '__main__':
-    # Start the optimization thread before the server
-    print("Starting Background Optimization Thread...")
-    t = threading.Thread(target=background_worker)
-    t.daemon = True # Thread dies when main app dies
-    t.start()
-    
-    # use_reloader=False prevents the script (and thus the thread) from running twice in debug mode
-    app.run(host='0.0.0.0', port=8080, debug=True, use_reloader=False)
+    print("Starting Web Server...")
+    app.run(host='0.0.0.0', port=8080, debug=False)
