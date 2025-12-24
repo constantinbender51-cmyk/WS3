@@ -5,54 +5,29 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from flask import Flask, send_file
 import os
-import itertools
 
-# 1. CONFIGURATION
-symbol = 'BTC/USDT'
-timeframe = '1d'
-start_date_str = '2018-01-01 00:00:00'
+# 1. PERMANENT CONFIGURATION (Statically Applied)
+SYMBOL = 'BTC/USDT'
+TIMEFRAME = '1d'
+START_DATE = '2018-01-01 00:00:00'
 
-# Strategy Params (SMA periods fixed at 40 and 120, not part of grid search)
-SMA_FAST = 40
-SMA_SLOW = 120
-SL_PCT = 0.02
-TP_PCT = 0.16
-III_WINDOW = 14 
+# Strategy Parameters
+SMA_FAST = 32
+SMA_SLOW = 114
+III_WINDOW = 27
+TP_PCT = 0.126
+SL_PCT = 0.043
 
-# --- GRID SEARCH SPACE DEFINITION (6 VARIABLES) ---
+# Regime / Filter Parameters
+U_FLAT_THRESH = 0.356  # Flat regime threshold
+Y_BAND_WIDTH = 0.077   # 7.7% Band width for SMA filters
 
-# Threshold Search Space (T_Low, T_High) adjusted based on user input
-# Centered around 0.15 and 0.2, with +/- 10% range and 0.05 step
-T_LOW_CENTER = 0.15
-T_HIGH_CENTER = 0.2
-T_RANGE_HALF_WIDTH = 0.1 * T_HIGH_CENTER # +/- 10% of T_High
-THRESH_RANGE = np.arange(T_LOW_CENTER - T_RANGE_HALF_WIDTH, T_LOW_CENTER + T_RANGE_HALF_WIDTH + 0.05, 0.05)
-THRESH_RANGE = np.round(THRESH_RANGE, 2)
-# Ensure T_High is covered and adjust slightly if needed for consistency
-THRESH_RANGE_HIGH = np.arange(T_HIGH_CENTER - T_RANGE_HALF_WIDTH, T_HIGH_CENTER + T_RANGE_HALF_WIDTH + 0.05, 0.05)
-THRESH_RANGE_HIGH = np.round(THRESH_RANGE_HIGH, 2)
-# Combine and ensure unique values, also ensuring T_LOW < T_HIGH is handled later
-THRESH_RANGE = np.unique(np.concatenate([THRESH_RANGE, THRESH_RANGE_HIGH]))
-
-# Leverage Search Space (L_Low, L_Mid, L_High) adjusted based on user input
-# User specified 0.5, 4.5, 2 and granularity of 0.05
-LEV_RANGE = np.arange(0.5, 4.51, 0.05)
-LEV_RANGE = np.round(LEV_RANGE, 2)
-
-# III Period Search Space adjusted based on user input
-# Centered around 36, with +/- 10% range and 0.5 step
-III_CENTER = 36
-III_RANGE_HALF_WIDTH = 0.1 * III_CENTER # +/- 10%
-III_RANGE = np.arange(III_CENTER - III_RANGE_HALF_WIDTH, III_CENTER + III_RANGE_HALF_WIDTH + 0.5, 0.5)
-III_RANGE = np.round(III_RANGE, 1)
-# Ensure III_RANGE is within reasonable bounds (e.g., min 1, max 60)
-III_RANGE = III_RANGE[(III_RANGE >= 1) & (III_RANGE <= 60)]
-III_RANGE = np.unique(III_RANGE.astype(int))
-
-# SMA Periods fixed at 40 and 120 (removed from grid search) 
-
-# MDD Constraint
-MAX_MDD_CONSTRAINT = -0.70 # Must be less than 70% drawdown
+# Leverage Tier Parameters
+LEV_THRESH_LOW = 0.058
+LEV_THRESH_HIGH = 0.259
+LEV_LOW = 0.079
+LEV_MID = 4.327
+LEV_HIGH = 3.868
 
 def fetch_binance_history(symbol, start_str):
     print(f"Fetching data for {symbol} starting from {start_str}...")
@@ -75,353 +50,164 @@ def fetch_binance_history(symbol, start_str):
     df = df[~df.index.duplicated(keep='first')]
     return df
 
-# 2. DATA PREP & BASE RETURNS
-df = fetch_binance_history(symbol, start_date_str)
-
-# Calculate III
-df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
-df['net_direction'] = df['log_ret'].rolling(III_WINDOW).sum().abs()
-df['path_length'] = df['log_ret'].abs().rolling(III_WINDOW).sum()
-epsilon = 1e-8
-df['iii'] = df['net_direction'] / (df['path_length'] + epsilon)
+# 2. DATA PREPARATION
+df = fetch_binance_history(SYMBOL, START_DATE)
 
 # Indicators
 df['sma_fast'] = df['close'].rolling(SMA_FAST).mean()
 df['sma_slow'] = df['close'].rolling(SMA_SLOW).mean()
 
-# Pre-calculate 1x Strategy Returns
-print("Pre-calculating base strategy returns...")
-base_returns = []
+# Intrinsic Intensity Index (III)
+df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+df['net_direction'] = df['log_ret'].rolling(III_WINDOW).sum().abs()
+df['path_length'] = df['log_ret'].abs().rolling(III_WINDOW).sum()
+df['iii'] = df['net_direction'] / (df['path_length'] + 1e-8)
+
+# 3. BACKTEST LOGIC
+print("Running backtest with optimized parameters...")
+results = []
 start_idx = max(SMA_SLOW, III_WINDOW)
 
+# Pre-calculate Tier-based Leverages
+iii_vals = df['iii'].shift(1).fillna(0).values
+lev_assignments = np.zeros(len(df))
+
 for i in range(len(df)):
-    if i < start_idx:
-        base_returns.append(0.0)
-        continue
-    
-    prev_close = df['close'].iloc[i-1]
-    prev_fast = df['sma_fast'].iloc[i-1]
-    prev_slow = df['sma_slow'].iloc[i-1]
-    
-    open_p = df['open'].iloc[i]
-    high_p = df['high'].iloc[i]
-    low_p = df['low'].iloc[i]
-    close_p = df['close'].iloc[i]
-    
-    daily_ret = 0.0
-    
-    # Trend Logic
-    if prev_close > prev_fast and prev_close > prev_slow:
-        entry = open_p
-        sl = entry * (1 - SL_PCT)
-        tp = entry * (1 + TP_PCT)
-        if low_p <= sl: daily_ret = -SL_PCT
-        elif high_p >= tp: daily_ret = TP_PCT
-        else: daily_ret = (close_p - entry) / entry
-        
-    elif prev_close < prev_fast and prev_close < prev_slow:
-        entry = open_p
-        sl = entry * (1 + SL_PCT)
-        tp = entry * (1 - TP_PCT)
-        if high_p >= sl: daily_ret = -SL_PCT
-        elif low_p <= tp: daily_ret = TP_PCT
-        else: daily_ret = (entry - close_p) / entry
-        
-    base_returns.append(daily_ret)
-
-df['base_ret'] = base_returns
-
-# Create aligned arrays for grid search
-base_ret_arr = np.array(base_returns)
-iii_prev = df['iii'].shift(1).fillna(0).values
-
-# 3. GRID SEARCH (Vectorized for Speed)
-total_iterations = len(THRESH_RANGE) * len(THRESH_RANGE) * len(LEV_RANGE)**3 * len(III_RANGE)
-print(f"Starting Exhaustive 6-Variable Grid Search ({total_iterations} total combinations)...")
-
-# Use the base returns from DataFrame to ensure consistency
-base_ret_arr = df['base_ret'].values
-iii_prev = df['iii'].shift(1).fillna(0).values
-
-best_sharpe = -999
-best_combo = (0.0, 0.0, 0.0, 0.0, 0.0, 1) # T_Low, T_High, L_Low, L_Mid, L_High, III_WINDOW (SMA_FAST and SMA_SLOW fixed at 40 and 120)
-best_mdd = 0
-iteration_count = 0
-
-# Metrics function optimized for arrays
-def calculate_sharpe_mdd(returns):
-    if returns.empty or returns.size == 0:
-        return 0, 0
-    cum_ret = np.cumprod(1 + returns.values)
-    if cum_ret.size == 0 or cum_ret[0] == 0:
-        return 0, 0
-    
-    # Sharpe
-    mean_ret = np.mean(returns)
-    std_ret = np.std(returns)
-    sharpe = (mean_ret / std_ret) * np.sqrt(365) if std_ret > 0 else 0
-    
-    # MDD
-    roll_max = np.maximum.accumulate(cum_ret)
-    drawdown = (cum_ret - roll_max) / roll_max
-    max_dd = drawdown.min()
-    
-    return sharpe, max_dd
-
-# Helper function to get final metrics from equity curve
-def get_final_metrics(equity_series):
-    if equity_series.empty or equity_series.iloc[0] == 0:
-        return 0, 0, 0, 0
-
-    # Total Return
-    s_tot = equity_series.iloc[-1] - 1
-
-    # CAGR
-    num_years = (equity_series.index[-1] - equity_series.index[0]).days / 365.25
-    if num_years == 0 or equity_series.iloc[0] <= 0:
-        s_cagr = 0
+    val = iii_vals[i]
+    if val < LEV_THRESH_LOW:
+        lev_assignments[i] = LEV_LOW
+    elif val < LEV_THRESH_HIGH:
+        lev_assignments[i] = LEV_MID
     else:
-        s_cagr = (equity_series.iloc[-1] / equity_series.iloc[0])**(1/num_years) - 1
+        lev_assignments[i] = LEV_HIGH
 
-    # Daily Returns for Sharpe
-    daily_returns = equity_series.pct_change().dropna()
-    
-    if daily_returns.empty:
-        s_sharpe = 0
-    else:
-        mean_ret = daily_returns.mean()
-        std_ret = daily_returns.std()
-        s_sharpe = (mean_ret / std_ret) * np.sqrt(365) if std_ret > 0 else 0
+df['base_ret'] = 0.0
+df['strategy_ret'] = 0.0
+df['equity'] = 1.0
+df['active_leverage'] = 0.0
 
-    # Max Drawdown
-    roll_max = equity_series.cummax()
-    drawdown = (equity_series - roll_max) / roll_max
-    s_mdd = drawdown.min()
-
-    return s_tot, s_cagr, s_mdd, s_sharpe
-
-# Threshold loops (SMA periods fixed at 40 and 120, not in grid search)
-for t_low, t_high in itertools.product(THRESH_RANGE, repeat=2):
-    # Enforce logical constraint
-    if t_low >= t_high: continue 
-    
-    # III period loop
-    for iii_window in III_RANGE:
-        # Calculate III for this window
-        df_temp = df.copy()
-        df_temp['log_ret'] = np.log(df_temp['close'] / df_temp['close'].shift(1))
-        df_temp['net_direction'] = df_temp['log_ret'].rolling(iii_window).sum().abs()
-        df_temp['path_length'] = df_temp['log_ret'].abs().rolling(iii_window).sum()
-        epsilon = 1e-8
-        df_temp['iii'] = df_temp['net_direction'] / (df_temp['path_length'] + epsilon)
-        iii_prev_temp = df_temp['iii'].shift(1).fillna(0).values
-        
-        # Create Tier Mask for this specific threshold combo
-        # 0 = Low Tier (III < T_Low)
-        # 1 = Mid Tier (T_Low <= III < T_High)
-        # 2 = High Tier (III >= T_High)
-        
-        # Vectorized mask creation
-        tier_mask = np.full(len(df_temp), 2, dtype=int) # Default High
-        tier_mask[iii_prev_temp < t_high] = 1 # Mid
-        tier_mask[iii_prev_temp < t_low] = 0  # Low
-        
-        # Ensure mask aligns with base_ret_arr (same length)
-        if len(tier_mask) != len(base_ret_arr):
-            tier_mask = tier_mask[:len(base_ret_arr)]
-
-        # Inner loop: Leverages (L_Low, L_Mid, L_High)
-        for l_low, l_mid, l_high in itertools.product(LEV_RANGE, repeat=3):
-            iteration_count += 1
-            
-            # Progress logging every 100,000 iterations
-            if iteration_count % 100000 == 0:
-                print(f"Progress: {iteration_count:,} / {total_iterations:,} iterations ({iteration_count/total_iterations*100:.1f}%)")
-                print(f"  Current best Sharpe: {best_sharpe:.2f}")
-                print(f"  Current params: T_Low={t_low:.2f}, T_High={t_high:.2f}, L_Low={l_low:.2f}, L_Mid={l_mid:.2f}, L_High={l_high:.2f}, III_WINDOW={iii_window}")
-            
-            # Construct leverage array using the calculated tiers
-            lookup = np.array([l_low, l_mid, l_high])
-            lev_arr = lookup[tier_mask]
-            
-            # Ensure lev_arr aligns with base_ret_arr
-            if len(lev_arr) != len(base_ret_arr):
-                lev_arr = lev_arr[:len(base_ret_arr)]
-            
-            final_rets = base_ret_arr * lev_arr
-            
-            # Calculate Sharpe and MDD (Only analyze period where strategy is active)
-            sharpe, mdd = calculate_sharpe_mdd(pd.Series(final_rets[start_idx:]))
-            
-            # Check against MDD constraint
-            if mdd > MAX_MDD_CONSTRAINT: 
-                if sharpe > best_sharpe:
-                    best_sharpe = sharpe
-                    best_combo = (round(t_low, 2), round(t_high, 2), round(l_low, 2), round(l_mid, 2), round(l_high, 2), iii_window)
-                    best_mdd = mdd
-
-
-# 4. FINAL BACKTEST WITH BEST PARAMS
-OPT_T_LOW, OPT_T_HIGH, OPT_L_LOW, OPT_L_MID, OPT_L_HIGH, OPT_III_WINDOW = best_combo
-OPT_SMA_FAST = SMA_FAST  # Fixed at 40
-OPT_SMA_SLOW = SMA_SLOW  # Fixed at 120
-
-# Recalculate III with optimal window
-epsilon = 1e-8
-df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
-df['net_direction'] = df['log_ret'].rolling(OPT_III_WINDOW).sum().abs()
-df['path_length'] = df['log_ret'].abs().rolling(OPT_III_WINDOW).sum()
-df['iii'] = df['net_direction'] / (df['path_length'] + epsilon)
-
-# Recalculate base returns for final backtest
-start_idx = max(OPT_SMA_SLOW, OPT_III_WINDOW)
-# Ensure we create a list with the same length as df
-final_base_returns = [0.0] * len(df)
-
-for i in range(start_idx, len(df)):
-    prev_close = df['close'].iloc[i-1]
-    prev_fast = df['sma_fast'].iloc[i-1]
-    prev_slow = df['sma_slow'].iloc[i-1]
-    
-    open_p = df['open'].iloc[i]
-    high_p = df['high'].iloc[i]
-    low_p = df['low'].iloc[i]
-    close_p = df['close'].iloc[i]
-    
-    daily_ret = 0.0
-    
-    # Trend Logic
-    if prev_close > prev_fast and prev_close > prev_slow:
-        entry = open_p
-        sl = entry * (1 - SL_PCT)
-        tp = entry * (1 + TP_PCT)
-        if low_p <= sl: daily_ret = -SL_PCT
-        elif high_p >= tp: daily_ret = TP_PCT
-        else: daily_ret = (close_p - entry) / entry
-        
-    elif prev_close < prev_fast and prev_close < prev_slow:
-        entry = open_p
-        sl = entry * (1 + SL_PCT)
-        tp = entry * (1 - TP_PCT)
-        if high_p >= sl: daily_ret = -SL_PCT
-        elif low_p <= tp: daily_ret = TP_PCT
-        else: daily_ret = (entry - close_p) / entry
-        
-    final_base_returns[i] = daily_ret
-
-# Assign to DataFrame and update base_ret_arr
-df['base_ret'] = final_base_returns
-base_ret_arr = df['base_ret'].values
-
-# Recalculate tier mask for the final run
-iii_prev = df['iii'].shift(1).fillna(0).values
-tier_mask_final = np.full(len(df), 2, dtype=int) 
-tier_mask_final[iii_prev < OPT_T_HIGH] = 1
-tier_mask_final[iii_prev < OPT_T_LOW] = 0
-
-# Ensure mask aligns with base_ret_arr
-if len(tier_mask_final) != len(base_ret_arr):
-    tier_mask_final = tier_mask_final[:len(base_ret_arr)]
-
-# Final optimized leverage array
-lookup_final = np.array([OPT_L_LOW, OPT_L_MID, OPT_L_HIGH])
-lev_arr_final = lookup_final[tier_mask_final]
-
-# Ensure lev_arr_final aligns with base_ret_arr
-if len(lev_arr_final) != len(base_ret_arr):
-    lev_arr_final = lev_arr_final[:len(base_ret_arr)]
-
-final_rets_final = base_ret_arr * lev_arr_final
-
-# Backtest simulation for plot data
-df['strategy_equity'] = 1.0
-df['leverage_used'] = 0.0
 equity = 1.0
 is_busted = False
 
-# Ensure start_idx is consistent with final_rets_final length
-if start_idx >= len(final_rets_final):
-    start_idx = len(final_rets_final) - 1
-
 for i in range(start_idx, len(df)):
-    # Ensure index is within bounds
-    if i >= len(final_rets_final):
-        break
-    daily_ret = final_rets_final[i]
-    leverage = lev_arr_final[i]
+    prev_close = df['close'].iloc[i-1]
+    prev_fast = df['sma_fast'].iloc[i-1]
+    prev_slow = df['sma_slow'].iloc[i-1]
+    prev_iii = df['iii'].iloc[i-1]
+    
+    open_p = df['open'].iloc[i]
+    high_p = df['high'].iloc[i]
+    low_p = df['low'].iloc[i]
+    close_p = df['close'].iloc[i]
+    
+    daily_base_ret = 0.0
+    
+    # 1. Band Filter Logic (using y)
+    # Price must be outside the band of both SMAs to trend
+    upper_band_fast = prev_fast * (1 + Y_BAND_WIDTH)
+    lower_band_fast = prev_fast * (1 - Y_BAND_WIDTH)
+    upper_band_slow = prev_slow * (1 + Y_BAND_WIDTH)
+    lower_band_slow = prev_slow * (1 - Y_BAND_WIDTH)
+    
+    # 2. Flat Regime Filter (using u)
+    is_flat_regime = prev_iii < U_FLAT_THRESH
+    
+    # Execution Logic
+    if not is_flat_regime:
+        # Bullish Trend
+        if prev_close > upper_band_fast and prev_close > upper_band_slow:
+            entry = open_p
+            sl = entry * (1 - SL_PCT)
+            tp = entry * (1 + TP_PCT)
+            if low_p <= sl: daily_base_ret = -SL_PCT
+            elif high_p >= tp: daily_base_ret = TP_PCT
+            else: daily_base_ret = (close_p - entry) / entry
+            
+        # Bearish Trend
+        elif prev_close < lower_band_fast and prev_close < lower_band_slow:
+            entry = open_p
+            sl = entry * (1 + SL_PCT)
+            tp = entry * (1 - TP_PCT)
+            if high_p >= sl: daily_base_ret = -SL_PCT
+            elif low_p <= tp: daily_base_ret = TP_PCT
+            else: daily_base_ret = (entry - close_p) / entry
+    
+    # Apply Leverage Tiers
+    leverage = lev_assignments[i]
+    strategy_ret = daily_base_ret * leverage
     
     if not is_busted:
-        equity *= (1 + daily_ret)
-        if equity <= 0.05:
+        equity *= (1 + strategy_ret)
+        if equity <= 0.01:
             equity = 0
             is_busted = True
             
-    df.at[df.index[i], 'strategy_equity'] = equity
-    df.at[df.index[i], 'leverage_used'] = leverage
+    df.at[df.index[i], 'base_ret'] = daily_base_ret
+    df.at[df.index[i], 'strategy_ret'] = strategy_ret
+    df.at[df.index[i], 'equity'] = equity
+    df.at[df.index[i], 'active_leverage'] = leverage if daily_base_ret != 0 else 0
 
-# 5. METRICS & PLOT
-plot_data = df.iloc[start_idx:].copy()
-s_tot, s_cagr, s_mdd, s_sharpe = get_final_metrics(plot_data['strategy_equity'])
-# Calculate buy-and-hold equity for comparison
-plot_data['buy_hold_equity'] = (plot_data['close'] / plot_data['close'].iloc[0])
+# 4. METRICS CALCULATION
+plot_df = df.iloc[start_idx:].copy()
+days = (plot_df.index[-1] - plot_df.index[0]).days
+cagr = (plot_df['equity'].iloc[-1]**(365/days)) - 1 if plot_df['equity'].iloc[-1] > 0 else -1
 
-print("\n" + "="*45)
-print(f"BEST 6-VARIABLE OPTIMIZATION (Constrained MDD < {MAX_MDD_CONSTRAINT*100:.0f}%)")
-print(f"SMA Periods (Fixed): {OPT_SMA_FAST} (Fast) / {OPT_SMA_SLOW} (Slow)")
-print(f"Optimal Thresholds: {OPT_T_LOW:.2f} (Low) / {OPT_T_HIGH:.2f} (High)")
-print(f"Optimal Leverages: {OPT_L_LOW:.1f}x / {OPT_L_MID:.1f}x / {OPT_L_HIGH:.1f}x")
-print(f"Optimal III Period: {OPT_III_WINDOW}")
-print("-" * 45)
-print(f"{'Sharpe Ratio':<15} | {s_sharpe:>10.2f}")
-print(f"{'Max Drawdown':<15} | {s_mdd*100:>10.1f}%")
-print(f"{'CAGR':<15} | {s_cagr*100:>10.1f}%")
-print("="*45 + "\n")
+# Sharpe
+daily_rets = plot_df['strategy_ret'][plot_df['strategy_ret'] != 0]
+sharpe = (daily_rets.mean() / daily_rets.std() * np.sqrt(365)) if len(daily_rets) > 0 else 0
 
-plt.figure(figsize=(12, 10))
+# Max Drawdown
+roll_max = plot_df['equity'].cummax()
+drawdown = (plot_df['equity'] - roll_max) / roll_max
+max_dd = drawdown.min()
 
+print("\n" + "="*50)
+print("FINAL STATIC BACKTEST RESULTS")
+print("="*50)
+print(f"Total Return:    {(plot_df['equity'].iloc[-1]-1)*100:.2f}%")
+print(f"CAGR:            {cagr*100:.2f}%")
+print(f"Max Drawdown:    {max_dd*100:.2f}%")
+print(f"Sharpe Ratio:    {sharpe:.2f}")
+print("-" * 50)
+print(f"SMA Fast/Slow:   {SMA_FAST} / {SMA_SLOW}")
+print(f"TP/SL %:         {TP_PCT*100}% / {SL_PCT*100}%")
+print(f"Leverage Tiers:  {LEV_LOW}x / {LEV_MID}x / {LEV_HIGH}x")
+print("="*50 + "\n")
+
+# 5. VISUALIZATION
+plt.figure(figsize=(12, 12))
+
+# Equity Curve
 ax1 = plt.subplot(3, 1, 1)
-ax1.plot(plot_data.index, plot_data['strategy_equity'], label=f'Best Strategy (Sharpe: {s_sharpe:.2f})', color='blue')
-ax1.plot(plot_data.index, plot_data['buy_hold_equity'], label='Buy & Hold', color='gray', alpha=0.5)
+ax1.plot(plot_df.index, plot_df['equity'], label='Strategy Equity', color='#2ecc71', linewidth=2)
 ax1.set_yscale('log')
-ax1.set_title(f'Final Optimized Strategy (SMA Fixed: {OPT_SMA_FAST}/{OPT_SMA_SLOW} | T: {OPT_T_LOW}/{OPT_T_HIGH} | L: {OPT_L_LOW}x/{OPT_L_MID}x/{OPT_L_HIGH}x | III: {OPT_III_WINDOW})')
+ax1.set_title(f'Optimized Strategy Performance (CAGR: {cagr*100:.1f}%)')
+ax1.grid(True, alpha=0.3)
 ax1.legend()
-ax1.grid(True, which='both', linestyle='--', alpha=0.3)
 
-# Add Stats Box
-stats = f"CAGR: {s_cagr*100:.1f}%\nMaxDD: {s_mdd*100:.1f}%\nSharpe: {s_sharpe:.2f}"
-ax1.text(0.02, 0.85, stats, transform=ax1.transAxes, bbox=dict(facecolor='white', alpha=0.8))
-
+# Leverage and III
 ax2 = plt.subplot(3, 1, 2, sharex=ax1)
-ax2.step(plot_data.index, plot_data['leverage_used'], where='post', color='purple', linewidth=1)
-ax2.fill_between(plot_data.index, 0, plot_data['leverage_used'], step='post', color='purple', alpha=0.2)
-ax2.set_title('Leverage Deployed')
-ax2.set_yticks(np.unique(plot_data['leverage_used']))
-ax2.set_ylabel('Leverage (x)')
-ax2.grid(True, axis='x', alpha=0.3)
+ax2.fill_between(plot_df.index, 0, plot_df['active_leverage'], color='#9b59b6', alpha=0.3, label='Active Leverage')
+ax2.plot(plot_df.index, plot_df['iii'], color='#3498db', alpha=0.5, linewidth=0.5, label='III Value')
+ax2.axhline(U_FLAT_THRESH, color='red', linestyle='--', alpha=0.6, label='Flat Thresh (u)')
+ax2.set_title('Leverage Exposure & Intensity Index')
+ax2.legend(loc='upper left')
 
-ax3 = plt.subplot(3, 1, 3, sharex=ax1)
 # Drawdown
-roll_max = plot_data['strategy_equity'].cummax()
-dd = (plot_data['strategy_equity'] - roll_max) / roll_max
-ax3.plot(plot_data.index, dd, color='red')
-ax3.fill_between(plot_data.index, dd, 0, color='red', alpha=0.1)
-ax3.axhline(MAX_MDD_CONSTRAINT, color='black', linestyle='--')
-ax3.set_title('Drawdown Profile (Constrained < 50%)')
-ax3.set_ylabel('Drawdown')
-ax3.grid(True, alpha=0.3)
+ax3 = plt.subplot(3, 1, 3, sharex=ax1)
+ax3.fill_between(plot_df.index, drawdown, 0, color='#e74c3c', alpha=0.3)
+ax3.plot(plot_df.index, drawdown, color='#c0392b', linewidth=1)
+ax3.set_title(f'Drawdown Profile (Max: {max_dd*100:.1f}%)')
+ax3.set_ylabel('DD %')
 
 plt.tight_layout()
-plot_dir = '/app/static'
-if not os.path.exists(plot_dir): os.makedirs(plot_dir)
-plot_path = os.path.join(plot_dir, 'plot.png')
-plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+os.makedirs('/app/static', exist_ok=True)
+plot_path = '/app/static/plot.png'
+plt.savefig(plot_path, dpi=300)
 
 app = Flask(__name__)
 @app.route('/')
 def serve_plot(): return send_file(plot_path, mimetype='image/png')
-@app.route('/health')
-def health(): return 'OK', 200
 
 if __name__ == '__main__':
-    print("Starting Web Server...")
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    app.run(host='0.0.0.0', port=8080)
