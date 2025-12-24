@@ -4,3 +4,4 @@ requests
 plotly
 Flask
 matplotlib
+ccxt
