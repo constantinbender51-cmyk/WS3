@@ -1,3 +1,5 @@
 pandas
-yfinance 
+requests
+tqdm
 lxml
+# Note: Python 3.6+ required for f-strings and other features used in app.py
