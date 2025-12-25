@@ -8,7 +8,7 @@ import os
 
 # 1. PERMANENT CONFIGURATION (Statically Applied)
 SYMBOL = 'BTC/USDT'
-TIMEFRAME = '1d'
+TIMEFRAME = '1d'  # This is the variable the error was referring to
 START_DATE = '2018-01-01 00:00:00'
 
 # Strategy Parameters
@@ -36,7 +36,8 @@ def fetch_binance_history(symbol, start_str):
     all_ohlcv = []
     while True:
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
+            # Fixed: Using the global TIMEFRAME variable
+            ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, since, limit=1000)
             if not ohlcv: break
             all_ohlcv.extend(ohlcv)
             since = ohlcv[-1][0] + 1
@@ -44,6 +45,10 @@ def fetch_binance_history(symbol, start_str):
         except Exception as e:
             print(f"Error fetching: {e}")
             break
+    
+    if not all_ohlcv:
+        raise Exception("No data fetched from Binance. Check your symbol or connection.")
+        
     df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
@@ -65,7 +70,6 @@ df['iii'] = df['net_direction'] / (df['path_length'] + 1e-8)
 
 # 3. BACKTEST LOGIC
 print("Running backtest with optimized parameters...")
-results = []
 start_idx = max(SMA_SLOW, III_WINDOW)
 
 # Pre-calculate Tier-based Leverages
@@ -103,7 +107,6 @@ for i in range(start_idx, len(df)):
     daily_base_ret = 0.0
     
     # 1. Band Filter Logic (using y)
-    # Price must be outside the band of both SMAs to trend
     upper_band_fast = prev_fast * (1 + Y_BAND_WIDTH)
     lower_band_fast = prev_fast * (1 - Y_BAND_WIDTH)
     upper_band_slow = prev_slow * (1 + Y_BAND_WIDTH)
@@ -153,8 +156,8 @@ days = (plot_df.index[-1] - plot_df.index[0]).days
 cagr = (plot_df['equity'].iloc[-1]**(365/days)) - 1 if plot_df['equity'].iloc[-1] > 0 else -1
 
 # Sharpe
-daily_rets = plot_df['strategy_ret'][plot_df['strategy_ret'] != 0]
-sharpe = (daily_rets.mean() / daily_rets.std() * np.sqrt(365)) if len(daily_rets) > 0 else 0
+active_rets = plot_df['strategy_ret'][plot_df['strategy_ret'] != 0]
+sharpe = (active_rets.mean() / active_rets.std() * np.sqrt(365)) if len(active_rets) > 1 else 0
 
 # Max Drawdown
 roll_max = plot_df['equity'].cummax()
