@@ -1,7 +1,2 @@
 pandas
-numpy
-requests
-plotly
-Flask
-matplotlib
-ccxt
+yfinance 
