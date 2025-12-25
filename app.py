@@ -3,6 +3,7 @@ import time
 import requests
 import pandas as pd
 from tqdm import tqdm # Professional progress bar
+from io import StringIO # Added for robust string handling
 
 # Configuration
 API_KEY = "YOUR_FINNHUB_API_KEY"  # Replace this or set env variable
@@ -16,7 +17,16 @@ def get_sp500_tickers():
     """
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     try:
-        tables = pd.read_html(url)
+        # Wikipedia blocks simple scripts, so we need to set a User-Agent
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        response = requests.get(url, headers=headers)
+        response.raise_for_status() # Check for HTTP errors
+        
+        # Use StringIO to avoid pandas FutureWarning about passing literal html strings
+        tables = pd.read_html(StringIO(response.text))
+        
         # The first table usually contains the tickers
         df = tables[0]
         # Wikipedia uses dots (BRK.B) but APIs usually use dashes (BRK-B) or just dots
@@ -74,7 +84,7 @@ def get_financial_metrics(ticker, api_key):
 
 def main():
     # 1. Setup
-    if API_KEY == "d4g6br9r01qm5b344ro0d4g6br9r01qm5b344rog":
+    if API_KEY == "YOUR_FINNHUB_API_KEY":
         print("⚠️ Please edit the script and add your Finnhub API Key.")
         return
 
