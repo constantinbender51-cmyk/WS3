@@ -6,7 +6,7 @@ from tqdm import tqdm # Professional progress bar
 from io import StringIO # Added for robust string handling
 
 # Configuration
-API_KEY = "YOUR_FINNHUB_API_KEY"  # Replace this or set env variable
+API_KEY = "d4g6br9r01qm5b344ro0d4g6br9r01qm5b344rog"  # Replace this or set env variable
 BASE_URL = "https://finnhub.io/api/v1"
 
 def get_sp500_tickers():
