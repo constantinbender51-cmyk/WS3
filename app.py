@@ -62,33 +62,55 @@ class FredEngine:
         df_rate.rename(columns={'value': 'interest_rate'}, inplace=True)
         df_bs.rename(columns={'value': 'balance_sheet'}, inplace=True)
 
+        # Merge Monthly Rate into Weekly Balance Sheet
         df_merged = pd.merge_asof(df_bs, df_rate, on='date', direction='backward')
-        df_merged['bs_change'] = df_merged['balance_sheet'].diff()
         
+        # Latest Data Point
         latest_date = df_merged['date'].max()
-        cutoff_date = latest_date - timedelta(days=365 * 10)
-        df_10y = df_merged[df_merged['date'] >= cutoff_date].dropna().copy()
+        current = df_merged.iloc[-1]
 
-        avg_rate_10y = df_10y['interest_rate'].mean()
-        current = df_10y.iloc[-1]
+        # --- NEW LOGIC START ---
         
-        high_rate = current['interest_rate'] > avg_rate_10y
-        growing_bs = current['bs_change'] >= 0
+        # 1. Interest Rate Logic: Compare Current to 5-Year Average
+        cutoff_5y = latest_date - timedelta(days=365 * 5)
+        df_5y = df_merged[df_merged['date'] >= cutoff_5y].dropna()
+        avg_rate_5y = df_5y['interest_rate'].mean()
         
-        # Mapping to Categories
-        if high_rate and growing_bs:
-            cat_id, name = 1, "High Rate / Growing BS"
-        elif high_rate and not growing_bs:
-            cat_id, name = 2, "High Rate / Shrinking BS"
-        elif not high_rate and growing_bs:
-            cat_id, name = 3, "Low Rate / Growing BS"
-        else:
-            cat_id, name = 4, "Low Rate / Shrinking BS"
+        high_rate = current['interest_rate'] > avg_rate_5y
+
+        # 2. Balance Sheet Logic: Compare Current to 1-Year Average
+        cutoff_1y = latest_date - timedelta(days=365 * 1)
+        df_1y = df_merged[df_merged['date'] >= cutoff_1y].dropna()
+        avg_bs_1y = df_1y['balance_sheet'].mean()
+
+        # "If bs is above 1 year average it's rising or high"
+        high_bs = current['balance_sheet'] > avg_bs_1y
+
+        # --- CATEGORY MAPPING ---
+        
+        if high_rate and high_bs:
+            # High Rate / High BS
+            cat_id, name = 1, "High Rate / High Liquidity"
+            
+        elif high_rate and not high_bs:
+            # High Rate / Low BS
+            cat_id, name = 2, "High Rate / Low Liquidity"
+            
+        elif not high_rate and high_bs:
+            # Low Rate / High BS
+            cat_id, name = 3, "Low Rate / High Liquidity"
+            
+        else: # not high_rate and not high_bs
+            # Low Rate / Low BS
+            cat_id, name = 4, "Low Rate / Low Liquidity"
 
         return {
-            "category_id": cat_id, "category_name": name,
+            "category_id": cat_id, 
+            "category_name": name,
             "current_rate": current['interest_rate'],
-            "avg_rate_10y": avg_rate_10y, "bs_change": current['bs_change'],
+            "avg_rate_5y": avg_rate_5y,
+            "current_bs": current['balance_sheet'],
+            "avg_bs_1y": avg_bs_1y,
             "date": current['date']
         }
 
@@ -119,7 +141,6 @@ class StockEngine:
         try:
             response = requests.get(f"{BASE_URL_FINNHUB}/stock/metric", params=params)
             
-            # Rate Limit Logic
             if response.status_code == 429:
                 print(f"⚠️ Rate limit hit for {ticker}. Retrying in 30s...")
                 time.sleep(30) 
@@ -168,11 +189,11 @@ def run_analysis_logic():
         if i % 10 == 0: print(f"Processing {i}/{len(tickers)}...")
         m = stock_engine.get_metrics(t)
         if m: stock_data.append(m)
-        time.sleep(1.1) # 1.1s delay for rate limits
+        time.sleep(1.1)
 
     df = pd.DataFrame(stock_data)
 
-    # 3. Optimize based on specific prompt logic
+    # 3. Optimize based on logic
     cat_id = economy['category_id']
     
     # Pre-clean
@@ -183,31 +204,29 @@ def run_analysis_logic():
     df['Growth_PE_Ratio'] = df['Growth'] / df['PE']
 
     if cat_id == 3:
-        # "if ie low and bs rising pick the best in terms of growth"
+        # Low Rate / High BS (Rising) -> Best Growth
         df = df.sort_values(by='Growth', ascending=False)
         strategy_name = "Aggressive Growth"
         metric_used = "EPS Growth (5Y)"
         
     elif cat_id == 4:
-        # "if ie low and bs falling pick the best in terms of growth/(p/e)"
+        # Low Rate / Low BS (Falling) -> Growth / PE
         df = df.sort_values(by='Growth_PE_Ratio', ascending=False)
         strategy_name = "Growth at Reasonable Price"
         metric_used = "Growth / PE Ratio"
         
     elif cat_id == 1:
-        # "if ie high and vs rising also growth/(p/e)"
+        # High Rate / High BS (Rising) -> Growth / PE
         df = df.sort_values(by='Growth_PE_Ratio', ascending=False)
         strategy_name = "Balanced Growth"
         metric_used = "Growth / PE Ratio"
         
     elif cat_id == 2:
-        # "if ie high and vs falling pick the best in terms of p/e"
-        # Best P/E in a crash scenario is the Lowest P/E (Cheap)
+        # High Rate / Low BS (Falling) -> Lowest P/E
         df = df.sort_values(by='PE', ascending=True)
         strategy_name = "Deep Value (Safety)"
         metric_used = "P/E Ratio (Lowest)"
 
-    # Generate Output Data
     APP_DATA = {
         "economy": economy,
         "strategy": {"name": strategy_name, "metric": metric_used},
