@@ -28,6 +28,102 @@
         
         .border-danger-custom { border-color: #000 !important; background-image: repeating-linear-gradient(45deg, transparent, transparent 10px, #f0f0f0 10px, #f0f0f0 20px); }
         .text-danger-custom { color: #000 !important; text-decoration: line-through; }
+
+        /* --- MATRIX STYLES --- */
+        .matrix-container {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 1/1; /* Keep it square */
+            border: 2px solid #000;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            grid-template-rows: 1fr 1fr;
+            margin: 0 auto;
+            max-width: 250px; /* Constrain size */
+        }
+        
+        .matrix-cell {
+            border: 1px solid #ccc;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            font-family: 'Roboto Mono', monospace;
+            font-size: 0.65rem;
+            text-transform: uppercase;
+            padding: 5px;
+            color: #999;
+            position: relative;
+            z-index: 1;
+        }
+
+        /* Dark borders for the crosshair */
+        .matrix-cell:nth-child(1) { border-right: 1px solid #000; border-bottom: 1px solid #000; } /* TL */
+        .matrix-cell:nth-child(2) { border-left: 1px solid #000; border-bottom: 1px solid #000; } /* TR */
+        .matrix-cell:nth-child(3) { border-right: 1px solid #000; border-top: 1px solid #000; } /* BL */
+        .matrix-cell:nth-child(4) { border-left: 1px solid #000; border-top: 1px solid #000; } /* BR */
+
+        .matrix-cell.active {
+            color: #000;
+            font-weight: 700;
+            background-color: #f8f8f8;
+        }
+
+        /* Axis Labels */
+        .axis-label-y {
+            position: absolute;
+            left: -25px;
+            top: 50%;
+            transform: translateY(-50%) rotate(-90deg);
+            font-family: 'Roboto Mono', monospace;
+            font-size: 0.6rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        .axis-label-x {
+            position: absolute;
+            bottom: -20px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-family: 'Roboto Mono', monospace;
+            font-size: 0.6rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        /* The Arrow */
+        .arrow-wrapper {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 0;
+            height: 0;
+            z-index: 10;
+            /* Rotation will be applied inline via Jinja */
+            transition: transform 1s ease-in-out;
+        }
+
+        .arrow-line {
+            position: absolute;
+            bottom: 0;
+            left: -1px; /* Center the 2px width */
+            width: 2px;
+            height: 60px; /* Length of arrow from center */
+            background-color: #000;
+            transform-origin: bottom center;
+        }
+
+        .arrow-head {
+            position: absolute;
+            top: -68px; /* Position at tip of line */
+            left: -6px;
+            width: 0; 
+            height: 0; 
+            border-left: 6px solid transparent;
+            border-right: 6px solid transparent;
+            border-bottom: 10px solid #000;
+        }
+
     </style>
 </head>
 <body>
@@ -45,21 +141,14 @@
         </div>
     </div>
 
-    <!-- Dashboard -->
+    <!-- Dashboard Main Row -->
     <div class="row mb-5 gx-5">
-        <div class="col-md-4">
-            <div class="card h-100">
-                <div class="card-header">Economic Regime</div>
-                <div class="card-body text-center d-flex flex-column justify-content-center py-5">
-                    <h3 class="mb-3">{{ data.economy.category_name }}</h3>
-                    <div><span class="badge">Cat ID: {{ data.economy.category_id }}</span></div>
-                </div>
-            </div>
-        </div>
+        
+        <!-- COL 1: Metrics (Left) -->
         <div class="col-md-4">
             <div class="card h-100">
                 <div class="card-header">Macro Metrics</div>
-                <div class="card-body py-4">
+                <div class="card-body py-4 d-flex flex-column justify-content-center">
                     <div class="row text-center mb-4">
                         <div class="col-6 border-end border-dark">
                             <div class="metric-value">{{ data.economy.current_rate }}%</div>
@@ -73,7 +162,6 @@
                     <hr class="my-4" style="border-color:#000;">
                     <div class="text-center">
                         <small class="text-uppercase d-block mb-2 mono-data">Balance Sheet vs 1Y Avg</small>
-                        <!-- Check if current BS > 1Y Avg -->
                         {% if data.economy.current_bs > data.economy.avg_bs_1y %}
                             <span class="fs-5 fw-bold fst-italic">High / Rising (Above Avg)</span>
                         {% else %}
@@ -83,12 +171,66 @@
                 </div>
             </div>
         </div>
+
+        <!-- COL 2: 2x2 Matrix (Center) -->
+        <div class="col-md-4">
+            <div class="card h-100">
+                <div class="card-header text-center">Economic Regime Matrix</div>
+                <div class="card-body py-4 d-flex align-items-center justify-content-center">
+                    
+                    <div class="matrix-container">
+                        <div class="axis-label-y">Interest Rate</div>
+                        <div class="axis-label-x">Balance Sheet</div>
+
+                        <!-- 
+                            Matrix Logic:
+                            Top Left (2): High Rate / Low BS
+                            Top Right (1): High Rate / High BS
+                            Bottom Left (4): Low Rate / Low BS
+                            Bottom Right (3): Low Rate / High BS
+                        -->
+                        <div class="matrix-cell {{ 'active' if data.economy.category_id == 2 }}">
+                            TIGHTENING<br>(High Rates, Low BS)
+                        </div>
+                        <div class="matrix-cell {{ 'active' if data.economy.category_id == 1 }}">
+                            INFLATIONARY<br>(High Rates, High BS)
+                        </div>
+                        <div class="matrix-cell {{ 'active' if data.economy.category_id == 4 }}">
+                            DEFLATIONARY<br>(Low Rates, Low BS)
+                        </div>
+                        <div class="matrix-cell {{ 'active' if data.economy.category_id == 3 }}">
+                            STIMULUS<br>(Low Rates, High BS)
+                        </div>
+
+                        <!-- Arrow Logic 
+                             Cat 1 (TR): 45deg
+                             Cat 2 (TL): -45deg
+                             Cat 3 (BR): 135deg
+                             Cat 4 (BL): -135deg
+                        -->
+                        {% set rotation_map = {1: 45, 2: -45, 3: 135, 4: -135} %}
+                        {% set rotation = rotation_map.get(data.economy.category_id, 0) %}
+                        
+                        <div class="arrow-wrapper" style="transform: rotate({{ rotation }}deg);">
+                            <div class="arrow-line"></div>
+                            <div class="arrow-head"></div>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+        </div>
+
+        <!-- COL 3: Strategy (Right) -->
         <div class="col-md-4">
             <div class="card h-100">
                 <div class="card-header">Active Strategy</div>
                 <div class="card-body text-center d-flex flex-column justify-content-center py-5">
                     <h4 class="mb-3">{{ data.strategy.name }}</h4>
-                    <p class="mb-0 mono-data">METRIC: <br><span class="fw-bold text-decoration-underline">{{ data.strategy.metric }}</span></p>
+                    <p class="mb-0 mono-data">OPTIMIZATION METRIC: <br><span class="fw-bold text-decoration-underline">{{ data.strategy.metric }}</span></p>
+                    <div class="mt-4">
+                        <span class="badge">Cat ID: {{ data.economy.category_id }}</span>
+                    </div>
                 </div>
             </div>
         </div>
