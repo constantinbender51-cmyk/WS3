@@ -16,7 +16,7 @@ FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
 BASE_URL_FRED = "https://api.stlouisfed.org/fred/series/observations"
 BASE_URL_FINNHUB = "https://finnhub.io/api/v1"
 
-# ✅ UPDATED: Set to 500 to fetch everything
+# 500 = Fetch all. 40 = Fast boot for testing.
 STOCK_FETCH_LIMIT = 500
 
 APP_DATA = None
@@ -75,6 +75,7 @@ class FredEngine:
         high_rate = current['interest_rate'] > avg_rate_10y
         growing_bs = current['bs_change'] >= 0
         
+        # Mapping to Categories
         if high_rate and growing_bs:
             cat_id, name = 1, "High Rate / Growing BS"
         elif high_rate and not growing_bs:
@@ -118,7 +119,7 @@ class StockEngine:
         try:
             response = requests.get(f"{BASE_URL_FINNHUB}/stock/metric", params=params)
             
-            # Rate Limit Retry Logic
+            # Rate Limit Logic
             if response.status_code == 429:
                 print(f"⚠️ Rate limit hit for {ticker}. Retrying in 30s...")
                 time.sleep(30) 
@@ -163,39 +164,53 @@ def run_analysis_logic():
     stock_data = []
     print(f"📥 Fetching {len(tickers)} stocks...")
     
-    # ✅ UPDATED: Slower loop to respect API limits
     for i, t in enumerate(tickers):
         if i % 10 == 0: print(f"Processing {i}/{len(tickers)}...")
         m = stock_engine.get_metrics(t)
         if m: stock_data.append(m)
-        
-        # ✅ CRITICAL: Sleep 1.1s to stay under 60 calls/min
-        time.sleep(1.1)
+        time.sleep(1.1) # 1.1s delay for rate limits
 
     df = pd.DataFrame(stock_data)
 
-    # 3. Optimize
+    # 3. Optimize based on specific prompt logic
     cat_id = economy['category_id']
+    
+    # Pre-clean
     df = df.dropna(subset=['PE', 'Growth']).copy()
     df = df[df['PE'] > 0]
+    
+    # Calculate Custom Ratio: Growth / PE (High is better)
     df['Growth_PE_Ratio'] = df['Growth'] / df['PE']
 
     if cat_id == 3:
+        # "if ie low and bs rising pick the best in terms of growth"
         df = df.sort_values(by='Growth', ascending=False)
-        strategy, metric = "Aggressive Growth", "EPS Growth (5Y)"
+        strategy_name = "Aggressive Growth"
+        metric_used = "EPS Growth (5Y)"
+        
     elif cat_id == 4:
+        # "if ie low and bs falling pick the best in terms of growth/(p/e)"
         df = df.sort_values(by='Growth_PE_Ratio', ascending=False)
-        strategy, metric = "Growth at Reasonable Price", "Growth / PE Ratio"
+        strategy_name = "Growth at Reasonable Price"
+        metric_used = "Growth / PE Ratio"
+        
     elif cat_id == 1:
+        # "if ie high and vs rising also growth/(p/e)"
         df = df.sort_values(by='Growth_PE_Ratio', ascending=False)
-        strategy, metric = "Balanced Growth", "Growth / PE Ratio"
-    else:
+        strategy_name = "Balanced Growth"
+        metric_used = "Growth / PE Ratio"
+        
+    elif cat_id == 2:
+        # "if ie high and vs falling pick the best in terms of p/e"
+        # Best P/E in a crash scenario is the Lowest P/E (Cheap)
         df = df.sort_values(by='PE', ascending=True)
-        strategy, metric = "Deep Value", "P/E Ratio"
+        strategy_name = "Deep Value (Safety)"
+        metric_used = "P/E Ratio (Lowest)"
 
+    # Generate Output Data
     APP_DATA = {
         "economy": economy,
-        "strategy": {"name": strategy, "metric": metric},
+        "strategy": {"name": strategy_name, "metric": metric_used},
         "top_5": df.head(5).to_dict('records'),
         "bottom_5": df.tail(5).to_dict('records'),
         "full_table": df.to_dict('records'),
@@ -212,7 +227,6 @@ app = Flask(__name__)
 @app.route('/')
 def dashboard():
     if not IS_READY or APP_DATA is None:
-        # Simple auto-refresh page while loading
         return """
         <!DOCTYPE html>
         <html>
