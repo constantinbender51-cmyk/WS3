@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Market Optimizer Pro</title>
+    <!-- Bootstrap 5 CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <!-- DataTables CSS -->
+    <link rel="stylesheet" href="https://cdn.datatables.net/1.13.4/css/dataTables.bootstrap5.min.css">
+    
+    <style>
+        :root { --bs-body-bg: #ffffff; --bs-body-color: #000000; }
+        body { font-family: 'Playfair Display', serif; background-color: var(--bs-body-bg); color: var(--bs-body-color); letter-spacing: 0.05em; }
+        h1, h2, h3, h4, h5, h6 { font-weight: 700; text-transform: uppercase; letter-spacing: 0.15em; color: #000; }
+        .mono-data { font-family: 'Roboto Mono', monospace; letter-spacing: -0.05em; }
+
+        .card { background-color: #fff; border: 1px solid #000; box-shadow: none; border-radius: 0 !important; margin-bottom: 1.5rem; }
+        .card-header { background-color: #fff; border-bottom: 1px solid #000; font-weight: 700; text-transform: uppercase; letter-spacing: 0.2em; border-radius: 0 !important; padding: 1rem 1.25rem; }
+
+        .metric-value { font-family: 'Playfair Display', serif; font-size: 2.5rem; font-weight: 700; border-bottom: 1px solid #000; display: inline-block; line-height: 1.1; margin-bottom: 0.5rem; padding-bottom: 0.2rem; }
+        .metric-label { font-family: 'Roboto Mono', monospace; font-size: 0.7rem; text-transform: uppercase; color: #333; letter-spacing: 0.1em; margin-top: 0.5rem; }
+
+        .badge { border: 1px solid #000; background-color: transparent !important; color: #000 !important; border-radius: 0 !important; font-family: 'Roboto Mono', monospace; font-weight: 500; padding: 6px 10px; }
+        
+        .table { color: #000; border-color: #000; font-family: 'Roboto Mono', monospace; font-size: 0.9rem; }
+        .table > :not(caption) > * > * { border-bottom-width: 1px; border-bottom-color: #000; background-color: #fff !important; color: #000 !important; }
+        .table thead th { font-family: 'Playfair Display', serif; text-transform: uppercase; letter-spacing: 0.1em; border-bottom: 2px solid #000; font-weight: 700; }
+        
+        .border-danger-custom { border-color: #000 !important; background-image: repeating-linear-gradient(45deg, transparent, transparent 10px, #f0f0f0 10px, #f0f0f0 20px); }
+        .text-danger-custom { color: #000 !important; text-decoration: line-through; }
+    </style>
+</head>
+<body>
+
+<div class="container-fluid p-5">
+    <div class="d-flex justify-content-between align-items-end mb-5 border-bottom border-dark pb-4">
+        <div>
+            <h1 class="display-4 mb-0">Market Optimizer <span style="font-style: italic;">AI</span></h1>
+            <p class="text-uppercase mt-2 mb-0 mono-data">Live Economic Analysis & Portfolio Optimization</p>
+        </div>
+        <div class="text-end">
+            <small class="text-uppercase mono-data">Last Updated</small>
+            <div class="fw-bold fs-5">{{ data.timestamp }}</div>
+            <div class="mono-data mt-1" style="font-size:0.75rem;">Stocks Analyzed: {{ data.full_table|length }}</div>
+        </div>
+    </div>
+
+    <!-- Dashboard -->
+    <div class="row mb-5 gx-5">
+        <div class="col-md-4">
+            <div class="card h-100">
+                <div class="card-header">Economic Regime</div>
+                <div class="card-body text-center d-flex flex-column justify-content-center py-5">
+                    <h3 class="mb-3">{{ data.economy.category_name }}</h3>
+                    <div><span class="badge">Cat ID: {{ data.economy.category_id }}</span></div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="card h-100">
+                <div class="card-header">Macro Metrics</div>
+                <div class="card-body py-4">
+                    <div class="row text-center">
+                        <div class="col-6 border-end border-dark">
+                            <div class="metric-value">{{ data.economy.current_rate }}%</div>
+                            <div class="metric-label">Fed Rate</div>
+                        </div>
+                        <div class="col-6">
+                            <div class="metric-value">{{ "%.2f"|format(data.economy.avg_rate_10y) }}%</div>
+                            <div class="metric-label">10Y Avg</div>
+                        </div>
+                    </div>
+                    <hr class="my-4" style="border-color:#000;">
+                    <div class="text-center">
+                        <small class="text-uppercase d-block mb-2 mono-data">Balance Sheet Trend</small>
+                        <span class="fs-5 fw-bold fst-italic">{{ "Expansionary" if data.economy.bs_change >= 0 else "Contractionary" }}</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="card h-100">
+                <div class="card-header">Active Strategy</div>
+                <div class="card-body text-center d-flex flex-column justify-content-center py-5">
+                    <h4 class="mb-3">{{ data.strategy.name }}</h4>
+                    <p class="mb-0 mono-data">METRIC: <br><span class="fw-bold text-decoration-underline">{{ data.strategy.metric }}</span></p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Top Picks -->
+    <div class="d-flex align-items-center mb-4">
+        <h4 class="mb-0 me-3">Top 5 Recommendations</h4>
+        <div class="flex-grow-1 border-bottom border-dark"></div>
+    </div>
+    
+    <div class="row mb-5 gx-4">
+        {% for stock in data.top_5 %}
+        <div class="col-md">
+            <div class="card h-100">
+                <div class="card-body text-center">
+                    <h2 class="fw-bold mb-3">{{ stock.Ticker }}</h2>
+                    <div class="border-top border-dark pt-3">
+                        <div class="d-flex justify-content-between mb-2 mono-data">
+                            <span class="text-muted">P/E</span>
+                            <span class="fw-bold">{{ "%.2f"|format(stock.PE) if stock.PE else 'N/A' }}</span>
+                        </div>
+                        <div class="d-flex justify-content-between mb-2 mono-data">
+                            <span class="text-muted">Growth</span>
+                            <span class="fw-bold">{{ "%.2f"|format(stock.Growth) if stock.Growth else 'N/A' }}%</span>
+                        </div>
+                        <div class="d-flex justify-content-between mono-data">
+                            <span class="text-muted">Growth/PE</span>
+                            <span class="fw-bold">{{ "%.2f"|format(stock.Growth_PE_Ratio) if stock.Growth_PE_Ratio else 'N/A' }}</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+
+    <!-- Bottom Picks -->
+    <div class="d-flex align-items-center mb-4 mt-5">
+        <h4 class="mb-0 me-3 text-muted">Least Optimized (Avoid)</h4>
+        <div class="flex-grow-1 border-bottom border-dark" style="border-style: dashed !important;"></div>
+    </div>
+
+    <div class="row mb-5 gx-4">
+        {% for stock in data.bottom_5|reverse %}
+        <div class="col-md">
+            <div class="card h-100 border-danger-custom">
+                <div class="card-body text-center opacity-75">
+                    <h4 class="fw-bold text-danger-custom">{{ stock.Ticker }}</h4>
+                    <hr>
+                    <small class="d-block text-uppercase mono-data mb-2">Algorithm Rank: Low</small>
+                    <div class="fw-bold mono-data">Growth/PE: {{ "%.2f"|format(stock.Growth_PE_Ratio) if stock.Growth_PE_Ratio else 'N/A' }}</div>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+
+    <!-- Full Table -->
+    <div class="card">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <span>Detailed Performance Sheet</span>
+            <span class="mono-data" style="font-size: 0.7rem;">DATA SOURCE: FINNHUB</span>
+        </div>
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table id="stocksTable" class="table table-hover mb-0">
+                    <thead>
+                        <tr>
+                            <th>Ticker</th>
+                            <th>Price</th>
+                            <th>P/E (TTM)</th>
+                            <th>Growth (5Y)</th>
+                            <th>Growth/PE (High is Better)</th>
+                            <th>Yield</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for row in data.full_table %}
+                        <tr>
+                            <td class="fw-bold">{{ row.Ticker }}</td>
+                            <td>{{ row.Price }}</td>
+                            <td>{{ "%.2f"|format(row.PE) if row.PE else '-' }}</td>
+                            <td>{{ "%.2f"|format(row.Growth) if row.Growth else '-' }}%</td>
+                            <td class="fw-bold">{{ "%.2f"|format(row.Growth_PE_Ratio) if row.Growth_PE_Ratio else '-' }}</td>
+                            <td>{{ "%.2f"|format(row.Yield) if row.Yield else '-' }}%</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.4/js/jquery.dataTables.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.4/js/dataTables.bootstrap5.min.js"></script>
+<script>
+    $(document).ready(function () {
+        $('#stocksTable').DataTable({
+            "order": [], // Respect Python sorting (which changes based on strategy)
+            "pageLength": 25,
+            "language": { "search": "SEARCH:", "searchPlaceholder": "AAPL..." }
+        });
+    });
+</script>
+
+</body>
+</html>
+
+
