@@ -8,7 +8,7 @@ from flask import Flask, render_template
 from io import StringIO
 
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION f
 # ==========================================
 FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
