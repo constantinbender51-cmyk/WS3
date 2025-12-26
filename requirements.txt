@@ -1,6 +1,8 @@
 flask
 pandas
 requests
-lxml
 gunicorn
+yfinance
+numpy
+pandas-datareader
 # Note: Python 3.6+ required for f-strings and other features used in app.py
