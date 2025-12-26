@@ -22,7 +22,7 @@ FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
 # SIMULATION PARAMETERS
 DEV_STOCK_LIMIT = 60  # Set to None for full S&P 500
 TOP_N = 15            # Number of Longs and Shorts (Total portfolio = 2 * TOP_N)
-YEARS_HISTORY = 4
+BACKTEST_START_DATE = datetime(2025, 9, 1) # Hardcoded start as requested
 INITIAL_CAPITAL = 100000.0
 
 # GLOBAL STORAGE FOR SERVER
@@ -98,6 +98,7 @@ class FredHistoricalEngine:
 
     def get_regimes(self):
         logger.info("Building Economic Regimes...")
+        # Still fetch 9 years to calculate rolling averages correctly
         start = (datetime.now() - timedelta(days=365*9)).strftime('%Y-%m-%d')
         rate = self.fetch("FEDFUNDS").rename(columns={'value': 'ir'})
         bs = self.fetch("WALCL").rename(columns={'value': 'bs'})
@@ -114,13 +115,16 @@ class FredHistoricalEngine:
         df.loc[v & (~hr) & (~hb), 'regime'] = "B"
         df.loc[v & hr & hb, 'regime'] = "C"
         df.loc[v & hr & (~hb), 'regime'] = "D"
-        return df[df.index >= (datetime.now() - timedelta(days=365*YEARS_HISTORY))]
+        
+        # SLICE FOR BACKTEST START: September 2025
+        return df[df.index >= BACKTEST_START_DATE]
 
 class StockEngine:
     def process(self, ticker, dates):
         try:
             s = yf.Ticker(ticker)
-            h = s.history(period="5y", interval="1wk")
+            # Fetch enough history for quarterly calculations
+            h = s.history(start="2024-01-01", interval="1wk")
             if h.empty: return None
             h = h[['Close']].rename(columns={'Close': 'price'})
             h.index = h.index.tz_localize(None)
@@ -152,7 +156,6 @@ def run_backtest():
         logger.error("No Economic Data. Check FRED Key.")
         return
     
-    # Store global econ data
     ECON_REGIME_DATA = econ.reset_index()
     ECON_REGIME_DATA['date'] = ECON_REGIME_DATA['date'].dt.strftime('%Y-%m-%d')
 
@@ -161,12 +164,11 @@ def run_backtest():
     ts = [t.replace('.','-') for t in ts][:DEV_STOCK_LIMIT]
 
     cache = {}
-    logger.info(f"Loading {len(ts)} stocks...")
+    logger.info(f"Loading {len(ts)} stocks for timeline starting {BACKTEST_START_DATE.date()}...")
     for t in ts:
         d = StockEngine().process(t, econ.index)
         if d is not None: 
             cache[t] = d
-            # Prepare for global display (limit size slightly to avoid crash)
             display_df = d.reset_index().copy()
             display_df['date'] = display_df['date'].dt.strftime('%Y-%m-%d')
             FETCHED_STOCK_DATA[t] = display_df.to_dict(orient='records')
@@ -247,7 +249,7 @@ DASHBOARD_HTML = """
 <body>
     <div class="container">
         <div class="card">
-            <h1>Regime Strategy Analysis</h1>
+            <h1>Regime Strategy Analysis (From Sept 2025)</h1>
             <div class="stats">
                 <div class="stat-card">
                     <div class="stat-label">Initial Capital</div>
@@ -355,7 +357,6 @@ DASHBOARD_HTML = """
         const chartDataRaw = {{ chart_data_raw | tojson }};
         const stockCache = {{ stock_data | tojson }};
 
-        // Initialize Chart
         const ctx = document.getElementById('mainChart').getContext('2d');
         new Chart(ctx, {
             type: 'line',
@@ -399,8 +400,6 @@ DASHBOARD_HTML = """
                 </tr>
             `).join('');
         }
-
-        // Init table
         updateStockTable();
     </script>
 </body>
@@ -412,7 +411,7 @@ def index():
     if BACKTEST_RESULTS is None:
         return """<body style="font-family:sans-serif; text-align:center; padding:50px;">
                     <h2>Backtest in progress...</h2>
-                    <p>Fetching 4 years of weekly data. This takes 1-2 minutes.</p>
+                    <p>Starting Sept 2025. Data is limited, results will appear shortly.</p>
                     <script>setTimeout(() => location.reload(), 5000);</script>
                   </body>"""
     
@@ -433,19 +432,10 @@ def index():
 def start_server():
     app.run(host='0.0.0.0', port=8080)
 
-# ==========================================
-# MAIN
-# ==========================================
 if __name__ == "__main__":
-    # Start server in a background thread
     server_thread = threading.Thread(target=start_server, daemon=True)
     server_thread.start()
-    
     logger.info("Backtest starting... dashboard will be available at http://localhost:8080")
-    
-    # Run simulation
     run_backtest()
-    
-    # Keep the main thread alive for the server
     while True:
         time.sleep(1)
