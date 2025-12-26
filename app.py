@@ -22,7 +22,6 @@ logger = logging.getLogger(__name__)
 FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
 
 # DEVELOPMENT LIMIT: Set to an integer (e.g., 5 or 10) to limit stocks processed.
-# Set to None to run the full list.
 DEV_STOCK_LIMIT = 10 
 
 # List of tickers to analyze. 
@@ -278,6 +277,36 @@ def generate_analysis():
     first_ticker = TICKERS[0]
     first_stock_data = master_df[master_df['ticker'] == first_ticker]
     
+    # --- DATA COVERAGE ANALYSIS ---
+    time.sleep(0.2)
+    print("\n---------------------------------------------------")
+    print(" 🕵️ DATA COVERAGE REPORT")
+    print("---------------------------------------------------")
+    time.sleep(0.2)
+    
+    # Identify the first date where fundamentals are NOT nan
+    fund_cols = ['gross_margin', 'operating_margin', 'revenue_growth_yoy']
+    available_fund_cols = [c for c in fund_cols if c in first_stock_data.columns]
+    
+    if available_fund_cols:
+        # Find first row where at least one fundamental metric is present
+        valid_start = first_stock_data[available_fund_cols].dropna(how='all').index.min()
+        
+        if pd.notna(valid_start):
+            print(f"Ticker Analysed:    {first_ticker}")
+            time.sleep(0.2)
+            print(f"Price History From: {first_stock_data.index.min().date()}")
+            time.sleep(0.2)
+            print(f"Fundamentals From:  {valid_start.date()}  <-- Data starts providing metrics here")
+            time.sleep(0.2)
+            print(f"Wait Period:        {(valid_start - first_stock_data.index.min()).days} days of leading NaN values")
+        else:
+            print(f"⚠️ Warning: No valid fundamental data found for {first_ticker} in the requested window.")
+    else:
+        print("❌ Error: Fundamental columns not found in dataset.")
+    
+    print("---------------------------------------------------\n")
+
     time.sleep(0.2)
     print("\n---------------------------------------------------")
     time.sleep(0.2)
