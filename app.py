@@ -285,6 +285,13 @@ def generate_analysis():
 
     categories = master_df['category_id'].unique()
     
+    # --- PRINT SAMPLE CSV OUTPUT ---
+    print("\n=======================================================")
+    print(" SAMPLE CSV OUTPUT (First 5 Rows)")
+    print("=======================================================")
+    print(master_df[['ticker', 'price', 'weekly_return', 'category_name', 'gross_margin']].head().to_string())
+    print("=======================================================\n")
+
     for cat_id in sorted(categories):
         if cat_id == 0: continue
         
