@@ -4,6 +4,7 @@ import yfinance as yf
 import requests
 import numpy as np
 import logging
+import time
 from datetime import datetime, timedelta
 from io import StringIO
 
@@ -283,8 +284,12 @@ def generate_analysis():
         return
 
     logger.info(f"✅ Economic Regime Built ({len(economy_df)} weeks)")
-    print("\nRegime Distribution:")
-    print(economy_df['category_name'].value_counts())
+    
+    time.sleep(0.1)
+    print("\n---------------------------------------------------")
+    print(" FULL ECONOMIC REGIME DATA (ALL WEEKS)")
+    print("---------------------------------------------------")
+    print(economy_df.to_string())
     print("\n---------------------------------------------------\n")
 
     # 2. Process Stocks
@@ -304,20 +309,31 @@ def generate_analysis():
 
     master_df = pd.concat(all_data)
     
-    # 3. Group by Regime and Calculate Metrics
+    # --- PRINT FULL DATA FOR FIRST TICKER ---
+    first_ticker = TICKERS[0]
+    first_stock_data = master_df[master_df['ticker'] == first_ticker]
     
+    time.sleep(0.1)
+    print("\n---------------------------------------------------")
+    print(f" FULL DATA FOR TICKER: {first_ticker}")
+    print("---------------------------------------------------")
+    # Columns of interest
+    cols = ['price', 'weekly_return', 'category_name', 'gross_margin', 'operating_margin', 'revenue_growth_yoy']
+    # Filter valid columns (in case some are missing)
+    valid_cols = [c for c in cols if c in first_stock_data.columns]
+    
+    print(first_stock_data[valid_cols].to_string())
+    print("\n---------------------------------------------------\n")
+
+    
+    # 3. Group by Regime and Calculate Metrics
+    time.sleep(0.1) # Buffer flush
     print("\n📊 ANALYSIS RESULTS BY REGIME")
+    time.sleep(0.1) # Buffer flush
     print("Metrics: Average Weekly Return per category based on Fundamental traits\n")
 
     categories = master_df['category_id'].unique()
     
-    # --- PRINT SAMPLE CSV OUTPUT ---
-    print("\n=======================================================")
-    print(" SAMPLE CSV OUTPUT (First 5 Rows)")
-    print("=======================================================")
-    print(master_df[['ticker', 'price', 'weekly_return', 'category_name', 'gross_margin']].head().to_string())
-    print("=======================================================\n")
-
     for cat_id in sorted(categories):
         if cat_id == 0: continue
         
@@ -325,7 +341,9 @@ def generate_analysis():
         cat_name = subset['category_name'].iloc[0]
         weeks_count = subset.index.nunique()
         
+        time.sleep(0.1) # Buffer flush
         print(f"=== {cat_name} (n={weeks_count} weeks) ===")
+        time.sleep(0.1) # Buffer flush
         print(f"Avg Weekly Market Return: {subset['weekly_return'].mean()*100:.2f}%")
         
         # Check Gross Margin Impact
@@ -333,8 +351,12 @@ def generate_analysis():
             median_gm = subset['gross_margin'].median()
             high_gm = subset[subset['gross_margin'] > median_gm]['weekly_return'].mean()
             low_gm = subset[subset['gross_margin'] <= median_gm]['weekly_return'].mean()
+            
+            time.sleep(0.1) # Buffer flush
             print(f"  > High Gross Margin Stocks Return: {high_gm*100:.3f}%")
+            time.sleep(0.1) # Buffer flush
             print(f"  > Low Gross Margin Stocks Return:  {low_gm*100:.3f}%")
+            time.sleep(0.1) # Buffer flush
             print(f"  > Spread: {(high_gm - low_gm)*100:.3f}%")
         
         # Check Operating Margin Impact
@@ -342,9 +364,13 @@ def generate_analysis():
             median_om = subset['operating_margin'].median()
             high_om = subset[subset['operating_margin'] > median_om]['weekly_return'].mean()
             low_om = subset[subset['operating_margin'] <= median_om]['weekly_return'].mean()
+            
+            time.sleep(0.1) # Buffer flush
             print(f"  > High Operating Margin Stocks Return: {high_om*100:.3f}%")
+            time.sleep(0.1) # Buffer flush
             print(f"  > Low Operating Margin Stocks Return:  {low_om*100:.3f}%")
 
+        time.sleep(0.1) # Buffer flush
         print("")
 
     # 4. Export Raw Data
