@@ -15,17 +15,17 @@ FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
 DEV_STOCK_LIMIT = 10 
 
 # List of tickers to analyze. 
-TICKERS = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META", 
-    "JPM", "V", "JNJ", "WMT", "PG", "XOM", "MA", "HD",
-    "CVX", "MRK", "ABBV", "KO", "PEP", "LLY", "BAC", "COST"
-]
+TICKERS = []
 
-# If you want the full S&P 500 and DEV_STOCK_LIMIT is None, uncomment this:
-# try:
-#     sp500 = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-#     TICKERS = [t.replace('.', '-') for t in sp500['Symbol'].tolist()]
-# except: pass
+# Fetch S&P 500 tickers dynamically
+try:
+    print("Fetching S&P 500 tickers from Wikipedia...")
+    sp500 = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+    TICKERS = [t.replace('.', '-') for t in sp500['Symbol'].tolist()]
+except Exception as e:
+    print(f"Error fetching S&P 500 list: {e}")
+    # Minimal fallback to ensure script runs if scraping fails
+    TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
 
 if DEV_STOCK_LIMIT:
     print(f"⚠️ DEV MODE: Limiting analysis to first {DEV_STOCK_LIMIT} stocks.")
