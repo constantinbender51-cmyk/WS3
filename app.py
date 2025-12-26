@@ -10,18 +10,15 @@ from io import StringIO
 # ==========================================
 # CONFIGURATION
 # ==========================================
-# Try to get keys from Environment (Railway), otherwise use empty string
 FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
 
 BASE_URL_FRED = "https://api.stlouisfed.org/fred/series/observations"
 BASE_URL_FINNHUB = "https://finnhub.io/api/v1"
 
-# Limit to first 40 stocks to prevent Railway timeouts during boot
-# Set to None or 500 if you have a paid plan or longer timeout
-STOCK_FETCH_LIMIT = 40
+# ✅ UPDATED: Set to 500 to fetch everything
+STOCK_FETCH_LIMIT = 500
 
-# Global storage for the app
 APP_DATA = None
 IS_READY = False
 
@@ -120,9 +117,13 @@ class StockEngine:
         
         try:
             response = requests.get(f"{BASE_URL_FINNHUB}/stock/metric", params=params)
+            
+            # Rate Limit Retry Logic
             if response.status_code == 429:
-                time.sleep(1) # Quick sleep for rate limit
-                return None
+                print(f"⚠️ Rate limit hit for {ticker}. Retrying in 30s...")
+                time.sleep(30) 
+                return self.get_metrics(ticker)
+
             if response.status_code != 200: return None
             data = response.json()
             m = data.get('metric', {})
@@ -137,7 +138,7 @@ class StockEngine:
         except: return None
 
 # ==========================================
-# 3. ANALYSIS THREAD
+# 3. BACKGROUND WORKER
 # ==========================================
 def run_analysis_logic():
     global APP_DATA, IS_READY
@@ -161,10 +162,15 @@ def run_analysis_logic():
 
     stock_data = []
     print(f"📥 Fetching {len(tickers)} stocks...")
-    for t in tickers:
+    
+    # ✅ UPDATED: Slower loop to respect API limits
+    for i, t in enumerate(tickers):
+        if i % 10 == 0: print(f"Processing {i}/{len(tickers)}...")
         m = stock_engine.get_metrics(t)
         if m: stock_data.append(m)
-        time.sleep(0.1) # Slight delay to be polite
+        
+        # ✅ CRITICAL: Sleep 1.1s to stay under 60 calls/min
+        time.sleep(1.1)
 
     df = pd.DataFrame(stock_data)
 
@@ -199,33 +205,40 @@ def run_analysis_logic():
     print("✅ Analysis Complete.")
 
 # ==========================================
-# 4. WEB SERVER
+# 4. SERVER
 # ==========================================
 app = Flask(__name__)
 
 @app.route('/')
 def dashboard():
-    # If analysis isn't done yet, show a loading message
     if not IS_READY or APP_DATA is None:
+        # Simple auto-refresh page while loading
         return """
-        <div style="font-family: monospace; padding: 50px; text-align: center;">
-            <h1>ANALYZING MARKET DATA...</h1>
-            <p>Please refresh this page in 30-60 seconds.</p>
-            <p>Fetching S&P 500 metrics and FRED data.</p>
-        </div>
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta http-equiv="refresh" content="30">
+            <style>
+                body { font-family: monospace; display: flex; justify-content: center; align-items: center; height: 100vh; background: #f4f4f4; }
+                .box { text-align: center; border: 1px solid #000; padding: 40px; background: #fff; }
+            </style>
+        </head>
+        <body>
+            <div class="box">
+                <h1>ANALYZING S&P 500</h1>
+                <p>Fetching full dataset (500 stocks)...</p>
+                <p>This process takes approx 8-10 minutes due to API limits.</p>
+                <p><strong>This page will auto-refresh.</strong></p>
+            </div>
+        </body>
+        </html>
         """
     return render_template('index.html', data=APP_DATA)
 
 if __name__ == "__main__":
-    # Start analysis in a background thread so the server boots immediately
-    # This prevents Railway from timing out while we fetch stocks
     t = threading.Thread(target=run_analysis_logic)
     t.daemon = True
     t.start()
-
-    # Get PORT from Railway environment variable
-    port = int(os.environ.get("PORT", 5000))
     
-    # ⚠️ Host set to 0.0.0.0 as requested
-    print(f"🚀 Starting Flask on 0.0.0.0:{port}")
+    port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
