@@ -11,7 +11,6 @@ from io import StringIO
 # ==========================================
 # CONFIGURATION
 # ==========================================
-# Configure Logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -20,37 +19,25 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
-
-# DEVELOPMENT LIMIT: Set to an integer (e.g., 5 or 10) to limit stocks processed.
-# Set to None to run the full list.
 DEV_STOCK_LIMIT = 10 
+YEARS_HISTORY = 4
 
-# List of tickers to analyze. 
-TICKERS = []
-
-# Fetch S&P 500 tickers dynamically
+# Fetch Tickers
 try:
-    logger.info("Fetching S&P 500 tickers from Wikipedia...")
+    logger.info("Fetching S&P 500 tickers...")
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     headers = {"User-Agent": "Mozilla/5.0"}
     response = requests.get(url, headers=headers)
-    
     tables = pd.read_html(StringIO(response.text))
-    sp500 = tables[0]
-    TICKERS = [t.replace('.', '-') for t in sp500['Symbol'].tolist()]
-    logger.info(f"Successfully fetched {len(TICKERS)} tickers.")
+    TICKERS = [t.replace('.', '-') for t in tables[0]['Symbol'].tolist()]
+    if DEV_STOCK_LIMIT:
+        TICKERS = TICKERS[:DEV_STOCK_LIMIT]
 except Exception as e:
-    logger.error(f"Error fetching S&P 500 list: {e}")
+    logger.error(f"Ticker fetch failed: {e}")
     TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
 
-if DEV_STOCK_LIMIT:
-    logger.warning(f"⚠️ DEV MODE: Limiting analysis to first {DEV_STOCK_LIMIT} stocks.")
-    TICKERS = TICKERS[:DEV_STOCK_LIMIT]
-
-YEARS_HISTORY = 4
-
 # ==========================================
-# 1. FRED HISTORICAL ENGINE
+# 1. FRED ENGINE
 # ==========================================
 class FredHistoricalEngine:
     def __init__(self, api_key):
@@ -58,211 +45,131 @@ class FredHistoricalEngine:
         self.base_url = "https://api.stlouisfed.org/fred/series/observations"
 
     def fetch_series(self, series_id, start_date=None):
-        """Fetches data from FRED or mocks it if no key provided."""
         if not self.api_key:
-            logger.warning(f"⚠️ No FRED Key provided. Generating mock data for {series_id}...")
             dates = pd.date_range(end=datetime.now(), periods=52*10, freq='W-FRI')
-            return pd.DataFrame({'value': np.random.uniform(2, 5, len(dates))}, index=dates)
-
-        params = {
-            "series_id": series_id, "api_key": self.api_key,
-            "file_type": "json", "sort_order": "asc"
-        }
-        if start_date:
-            params["observation_start"] = start_date
-
+            return pd.DataFrame({'date': dates, 'value': np.random.uniform(2, 5, len(dates))})
+        
+        params = {"series_id": series_id, "api_key": self.api_key, "file_type": "json", "sort_order": "asc"}
+        if start_date: params["observation_start"] = start_date
+        
         try:
-            logger.info(f"Fetching {series_id} from FRED...")
-            response = requests.get(self.base_url, params=params)
-            
-            if response.status_code != 200:
-                logger.error(f"FRED API Error {response.status_code} for {series_id}: {response.text[:200]}")
-            
-            response.raise_for_status()
-            data = response.json().get("observations", [])
-            
-            if not data:
-                logger.warning(f"FRED returned no observations for {series_id}")
-                return pd.DataFrame()
-            
+            r = requests.get(self.base_url, params=params)
+            data = r.json().get("observations", [])
             df = pd.DataFrame(data)
             df['date'] = pd.to_datetime(df['date'])
             df['value'] = pd.to_numeric(df['value'], errors='coerce')
-            
-            df = df[['date', 'value']].dropna().sort_values('date')
-            logger.info(f"Successfully fetched {len(df)} rows for {series_id}")
-            return df
-        except Exception as e:
-            logger.error(f"Exception fetching {series_id}: {e}", exc_info=True)
-            return pd.DataFrame()
+            return df[['date', 'value']].dropna().sort_values('date')
+        except: return pd.DataFrame()
 
     def get_economic_regime(self):
-        logger.info("📊 Building Historical Economic Regime...")
-        
         start_date = (datetime.now() - timedelta(days=365*9)).strftime('%Y-%m-%d')
+        df_rate = self.fetch_series("FEDFUNDS", start_date).rename(columns={'value': 'interest_rate'})
+        df_bs = self.fetch_series("WALCL", start_date).rename(columns={'value': 'balance_sheet'})
         
-        df_rate = self.fetch_series("FEDFUNDS", start_date) 
-        df_bs = self.fetch_series("WALCL", start_date) 
+        if df_rate.empty or df_bs.empty: return pd.DataFrame()
 
-        if df_rate.empty or df_bs.empty:
-            logger.error("❌ Critical: Missing FRED data. Cannot build economic regime.")
-            return pd.DataFrame()
-
-        df_rate = df_rate.rename(columns={'value': 'interest_rate'})
-        df_bs = df_bs.rename(columns={'value': 'balance_sheet'})
-
-        logger.info("Merging datasets using merge_asof...")
-        df = pd.merge_asof(
-            df_bs, 
-            df_rate, 
-            on='date', 
-            direction='backward'
-        )
-
-        df = df.set_index('date').sort_index()
-
+        df = pd.merge_asof(df_bs, df_rate, on='date', direction='backward').set_index('date')
         df['avg_rate_5y'] = df['interest_rate'].rolling(window=260, min_periods=50).mean()
         df['avg_bs_1y'] = df['balance_sheet'].rolling(window=52, min_periods=20).mean()
-
-        df['category_id'] = 0
-        df['category_name'] = "Insuff Data"
 
         valid = df['avg_rate_5y'].notna() & df['avg_bs_1y'].notna()
         high_rate = df['interest_rate'] > df['avg_rate_5y']
         high_bs = df['balance_sheet'] > df['avg_bs_1y']
 
-        c1 = valid & high_rate & high_bs
-        df.loc[c1, 'category_id'] = 1
-        df.loc[c1, 'category_name'] = "High Rate / Liquidity Rising"
-
-        c2 = valid & high_rate & (~high_bs)
-        df.loc[c2, 'category_id'] = 2
-        df.loc[c2, 'category_name'] = "High Rate / Liquidity Falling"
-
-        c3 = valid & (~high_rate) & high_bs
-        df.loc[c3, 'category_id'] = 3
-        df.loc[c3, 'category_name'] = "Low Rate / Liquidity Rising"
-
-        c4 = valid & (~high_rate) & (~high_bs)
-        df.loc[c4, 'category_id'] = 4
-        df.loc[c4, 'category_name'] = "Low Rate / Liquidity Falling"
-
-        cutoff = datetime.now() - timedelta(days=365*YEARS_HISTORY)
-        result = df[df.index >= cutoff]
+        df['category_id'] = 0
+        df.loc[valid & high_rate & high_bs, 'category_id'] = 1
+        df.loc[valid & high_rate & (~high_bs), 'category_id'] = 2
+        df.loc[valid & (~high_rate) & high_bs, 'category_id'] = 3
+        df.loc[valid & (~high_rate) & (~high_bs), 'category_id'] = 4
         
-        logger.info(f"Economic Regime built successfully. Rows: {len(result)}")
-        return result
+        names = {1: "High Rate / Liq Rising", 2: "High Rate / Liq Falling", 
+                 3: "Low Rate / Liq Rising", 4: "Low Rate / Liq Falling", 0: "N/A"}
+        df['category_name'] = df['category_id'].map(names)
+        
+        return df[df.index >= (datetime.now() - timedelta(days=365*YEARS_HISTORY))]
 
 # ==========================================
-# 2. STOCK DATA ENGINE (YFINANCE)
+# 2. STOCK ENGINE
 # ==========================================
 class StockHistoricalEngine:
     def process_ticker(self, ticker, economic_df):
         try:
             stock = yf.Ticker(ticker)
             ohlc = stock.history(period="5y", interval="1wk")
-            if ohlc.empty: 
-                logger.warning(f"No price data found for {ticker}")
-                return None
+            if ohlc.empty: return None
             
-            ohlc = ohlc[['Close', 'Volume']].copy()
-            ohlc.columns = ['price', 'volume']
-            ohlc.index = ohlc.index.tz_localize(None) 
-            ohlc.index.name = 'date' 
-
-            fin = stock.quarterly_financials.T 
+            ohlc = ohlc[['Close']].rename(columns={'Close': 'price'})
+            ohlc.index = ohlc.index.tz_localize(None)
             
-            if fin.empty:
-                fund_data = pd.DataFrame(index=ohlc.index) 
-                logger.debug(f"No fundamental data for {ticker}. Using price only.")
-            else:
-                fin.columns = fin.columns.str.strip() 
-                fin = fin.apply(pd.to_numeric, errors='coerce') 
-                
-                fin = fin.sort_index()
-                fin = fin[~fin.index.duplicated(keep='last')]
-                fund_data = pd.DataFrame(index=fin.index)
-                
-                if 'Total Revenue' in fin.columns and 'Cost Of Revenue' in fin.columns:
-                    fund_data['gross_margin'] = (fin['Total Revenue'] - fin['Cost Of Revenue']) / fin['Total Revenue']
-                elif 'Gross Profit' in fin.columns and 'Total Revenue' in fin.columns:
-                     fund_data['gross_margin'] = fin['Gross Profit'] / fin['Total Revenue']
-                
-                if 'Operating Income' in fin.columns and 'Total Revenue' in fin.columns:
-                    fund_data['operating_margin'] = fin['Operating Income'] / fin['Total Revenue']
-                    
-                if 'Net Income' in fin.columns and 'Total Revenue' in fin.columns:
-                    fund_data['net_margin'] = fin['Net Income'] / fin['Total Revenue']
-
-                if 'Total Revenue' in fin.columns:
-                    fund_data['revenue_growth_yoy'] = fin['Total Revenue'].pct_change(periods=4) 
-
-                fund_data.index = pd.to_datetime(fund_data.index).tz_localize(None)
-                fund_data = fund_data.sort_index()
-
-            aligned_funds = fund_data.reindex(ohlc.index, method='ffill')
-            df = ohlc.join(aligned_funds)
-
-            df = df.sort_index()
-            economic_df = economic_df.sort_index()
+            fin = stock.quarterly_financials.T
+            if fin.empty: return None
             
-            df_reset = df.reset_index()
+            fin.columns = fin.columns.str.strip()
+            fin = fin.apply(pd.to_numeric, errors='coerce')
+            fin = fin.sort_index()
+            
+            fund_data = pd.DataFrame(index=fin.index)
+            
+            # Growth Metric
+            if 'Total Revenue' in fin.columns:
+                fund_data['rev_growth'] = fin['Total Revenue'].pct_change(periods=4)
+            
+            # Profitability Metric Components
+            if 'Operating Income' in fin.columns and 'Total Revenue' in fin.columns:
+                fund_data['op_margin'] = fin['Operating Income'] / fin['Total Revenue']
+            
+            if 'Basic EPS' in fin.columns:
+                fund_data['eps_ttm'] = fin['Basic EPS'].rolling(window=4).sum()
+
+            fund_data.index = pd.to_datetime(fund_data.index).tz_localize(None)
+            aligned = fund_data.reindex(ohlc.index, method='ffill')
+            
+            df = ohlc.join(aligned)
+            
+            # Calculate Combined Profitability Score: (Margin * Earnings Yield)
+            # Earnings Yield = EPS / Price
+            if 'eps_ttm' in df.columns and 'op_margin' in df.columns:
+                df['profit_score'] = df['op_margin'] * (df['eps_ttm'] / df['price'])
+
+            # Merge Economics
             econ_reset = economic_df[['category_id', 'category_name']].reset_index()
+            df_reset = df.reset_index()
             
-            if 'date' not in df_reset.columns:
-                df_reset = df_reset.rename(columns={'index': 'date'})
-            if 'date' not in econ_reset.columns:
-                econ_reset = econ_reset.rename(columns={'index': 'date'})
-
-            df_merged = pd.merge_asof(
-                df_reset,
-                econ_reset,
-                on='date',
-                direction='backward',
-                tolerance=pd.Timedelta(days=14) 
-            )
+            df_final = pd.merge_asof(df_reset.sort_values('date'), 
+                                     econ_reset.sort_values('date'), 
+                                     on='date', direction='backward')
             
-            df_merged = df_merged.set_index('date')
-            df_merged['weekly_return'] = df_merged['price'].pct_change()
-            df_merged['ticker'] = ticker
+            df_final['weekly_return'] = df_final['price'].pct_change()
+            df_final['ticker'] = ticker
             
-            df_final = df_merged.dropna(subset=['category_id'])
+            # TRIMMING: Start only when rev_growth is available
+            df_final = df_final.dropna(subset=['rev_growth', 'category_id']).set_index('date')
+            
             return df_final
 
         except Exception as e:
-            logger.error(f"Error processing {ticker}: {e}") 
             return None
 
 # ==========================================
-# 3. ANALYSIS & REPORTING
+# 3. RUNNER
 # ==========================================
 def generate_analysis():
-    logger.info("Starting Market Regime Analysis...")
-    
     fred = FredHistoricalEngine(FRED_API_KEY)
     economy_df = fred.get_economic_regime()
-    
-    if economy_df.empty:
-        logger.error("❌ Failed to generate economic data. Check logs above for API errors.")
-        return
-
-    logger.info(f"✅ Economic Regime Built ({len(economy_df)} weeks)")
+    if economy_df.empty: return
 
     engine = StockHistoricalEngine()
     all_data = []
 
     time.sleep(0.2)
     print("\n---------------------------------------------------")
-    print(" 📦 PROCESSING STOCKS")
+    print(" 📦 PROCESSING STOCKS (Syncing to Revenue Growth Start)")
     print("---------------------------------------------------")
-    time.sleep(0.2)
 
-    for i, t in enumerate(TICKERS):
+    for t in TICKERS:
         df = engine.process_ticker(t, economy_df)
         if df is not None and not df.empty:
             all_data.append(df)
-            
-            # Formatted Per-Stock Log
             time.sleep(0.2)
             print(f"Stock: {t}")
             time.sleep(0.2)
@@ -270,61 +177,39 @@ def generate_analysis():
             time.sleep(0.2)
             print(f"Timeframe: weekly")
             time.sleep(0.2)
+            print(f"Data Starts: {df.index.min().date()}")
+            time.sleep(0.2)
             print("-" * 15)
-    
-    if not all_data:
-        logger.error("❌ No stock data processed. (All DataFrames were empty)")
-        return
 
+    if not all_data: return
     master_df = pd.concat(all_data)
-    
-    time.sleep(0.2)
-    print("\n📊 ANALYSIS RESULTS BY REGIME")
-    time.sleep(0.2)
-    print("Metrics: Average Weekly Return per category based on Fundamental traits\n")
 
-    categories = master_df['category_id'].unique()
+    time.sleep(0.2)
+    print("\n📊 REGIME ANALYSIS (Growth & Combined Profitability Score)")
     
-    for cat_id in sorted(categories):
+    for cat_id in sorted(master_df['category_id'].unique()):
         if cat_id == 0: continue
-        
-        subset = master_df[master_df['category_id'] == cat_id]
-        cat_name = subset['category_name'].iloc[0]
-        weeks_count = subset.index.nunique()
+        sub = master_df[master_df['category_id'] == cat_id]
+        cat_name = sub['category_name'].iloc[0]
         
         time.sleep(0.2)
-        print(f"=== {cat_name} (n={weeks_count} weeks) ===")
+        print(f"=== {cat_name} (n={len(sub)}) ===")
         time.sleep(0.2)
-        print(f"Avg Weekly Market Return: {subset['weekly_return'].mean()*100:.2f}%")
+        print(f"Market Avg Weekly Return: {sub['weekly_return'].mean()*100:.2f}%")
         
-        if 'gross_margin' in subset.columns and subset['gross_margin'].notna().sum() > 10:
-            median_gm = subset['gross_margin'].median()
-            high_gm = subset[subset['gross_margin'] > median_gm]['weekly_return'].mean()
-            low_gm = subset[subset['gross_margin'] <= median_gm]['weekly_return'].mean()
-            
-            time.sleep(0.2)
-            print(f"  > High Gross Margin Stocks Return: {high_gm*100:.3f}%")
-            time.sleep(0.2)
-            print(f"  > Low Gross Margin Stocks Return:  {low_gm*100:.3f}%")
-            time.sleep(0.2)
-            print(f"  > Spread: {(high_gm - low_gm)*100:.3f}%")
-        
-        if 'operating_margin' in subset.columns and subset['operating_margin'].notna().sum() > 10:
-            median_om = subset['operating_margin'].median()
-            high_om = subset[subset['operating_margin'] > median_om]['weekly_return'].mean()
-            low_om = subset[subset['operating_margin'] <= median_om]['weekly_return'].mean()
-            
-            time.sleep(0.2)
-            print(f"  > High Operating Margin Stocks Return: {high_om*100:.3f}%")
-            time.sleep(0.2)
-            print(f"  > Low Operating Margin Stocks Return:  {low_om*100:.3f}%")
-
+        # Growth Impact
+        median_g = sub['rev_growth'].median()
+        high_g = sub[sub['rev_growth'] > median_g]['weekly_return'].mean()
         time.sleep(0.2)
+        print(f"  > High Rev Growth Returns: {high_g*100:.3f}%")
+        
+        # Profitability Score Impact
+        if 'profit_score' in sub.columns:
+            median_p = sub['profit_score'].median()
+            high_p = sub[sub['profit_score'] > median_p]['weekly_return'].mean()
+            time.sleep(0.2)
+            print(f"  > High Profitability Score Returns: {high_p*100:.3f}%")
         print("")
-
-    filename = "market_regime_analysis.csv"
-    master_df.to_csv(filename)
-    logger.info(f"✅ Full analysis saved to {filename}")
 
 if __name__ == "__main__":
     generate_analysis()
