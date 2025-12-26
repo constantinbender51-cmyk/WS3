@@ -3,11 +3,21 @@ import pandas as pd
 import yfinance as yf
 import requests
 import numpy as np
+import logging
 from datetime import datetime, timedelta
+from io import StringIO
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
+# Configure Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
 FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
 
 # DEVELOPMENT LIMIT: Set to an integer (e.g., 5 or 10) to limit stocks processed.
@@ -17,18 +27,24 @@ DEV_STOCK_LIMIT = 10
 # List of tickers to analyze. 
 TICKERS = []
 
-# Fetch S&P 500 tickers dynamically
+# Fetch S&P 500 tickers dynamically (Restored Robust Method)
 try:
-    print("Fetching S&P 500 tickers from Wikipedia...")
-    sp500 = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+    logger.info("Fetching S&P 500 tickers from Wikipedia...")
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(url, headers=headers)
+    
+    tables = pd.read_html(StringIO(response.text))
+    sp500 = tables[0]
     TICKERS = [t.replace('.', '-') for t in sp500['Symbol'].tolist()]
+    logger.info(f"Successfully fetched {len(TICKERS)} tickers.")
 except Exception as e:
-    print(f"Error fetching S&P 500 list: {e}")
+    logger.error(f"Error fetching S&P 500 list: {e}")
     # Minimal fallback to ensure script runs if scraping fails
     TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
 
 if DEV_STOCK_LIMIT:
-    print(f"⚠️ DEV MODE: Limiting analysis to first {DEV_STOCK_LIMIT} stocks.")
+    logger.warning(f"⚠️ DEV MODE: Limiting analysis to first {DEV_STOCK_LIMIT} stocks.")
     TICKERS = TICKERS[:DEV_STOCK_LIMIT]
 
 YEARS_HISTORY = 4
@@ -44,7 +60,7 @@ class FredHistoricalEngine:
     def fetch_series(self, series_id, start_date=None):
         """Fetches data from FRED or mocks it if no key provided."""
         if not self.api_key:
-            print(f"⚠️ No FRED Key. Generating mock data for {series_id}...")
+            logger.warning(f"⚠️ No FRED Key provided. Generating mock data for {series_id}...")
             dates = pd.date_range(end=datetime.now(), periods=52*10, freq='W-FRI')
             return pd.DataFrame({'value': np.random.uniform(2, 5, len(dates))}, index=dates)
 
@@ -56,12 +72,21 @@ class FredHistoricalEngine:
             params["observation_start"] = start_date
 
         try:
+            logger.info(f"Fetching {series_id} from FRED...")
             response = requests.get(self.base_url, params=params)
+            
+            # Enhanced Error Logging for API Responses
+            if response.status_code != 200:
+                logger.error(f"FRED API Error {response.status_code} for {series_id}: {response.text[:200]}")
+            
             response.raise_for_status()
             data = response.json().get("observations", [])
             
+            if not data:
+                logger.warning(f"FRED returned no observations for {series_id}")
+                return pd.DataFrame()
+            
             df = pd.DataFrame(data)
-            if df.empty: return pd.DataFrame()
             
             # --- FIX: STRICT COLUMN SELECTION ---
             df['date'] = pd.to_datetime(df['date'])
@@ -69,13 +94,14 @@ class FredHistoricalEngine:
             
             # Drop metadata columns (realtime_start, etc) to prevent join errors
             df = df[['date', 'value']].dropna().set_index('date').sort_index()
+            logger.info(f"Successfully fetched {len(df)} rows for {series_id}")
             return df
         except Exception as e:
-            print(f"Error fetching {series_id}: {e}")
+            logger.error(f"Exception fetching {series_id}: {e}", exc_info=True)
             return pd.DataFrame()
 
     def get_economic_regime(self):
-        print("📊 Building Historical Economic Regime...")
+        logger.info("📊 Building Historical Economic Regime...")
         
         # We need 9 years of data to calculate a 5-year rolling average for the last 4 years
         start_date = (datetime.now() - timedelta(days=365*9)).strftime('%Y-%m-%d')
@@ -85,7 +111,7 @@ class FredHistoricalEngine:
         balance_sheet = self.fetch_series("WALCL", start_date) # Weekly
 
         if fed_funds.empty or balance_sheet.empty:
-            print("❌ Critical: Missing FRED data.")
+            logger.error("❌ Critical: Missing FRED data. Cannot build economic regime.")
             return pd.DataFrame()
 
         # 2. Resample to Weekly (Friday) to align both
@@ -144,7 +170,9 @@ class FredHistoricalEngine:
 
         # Trim to requested history (last 4 years)
         cutoff = datetime.now() - timedelta(days=365*YEARS_HISTORY)
-        return df[df.index >= cutoff]
+        result = df[df.index >= cutoff]
+        logger.info(f"Economic Regime built successfully. Rows: {len(result)}")
+        return result
 
 # ==========================================
 # 2. STOCK DATA ENGINE (YFINANCE)
@@ -152,12 +180,15 @@ class FredHistoricalEngine:
 class StockHistoricalEngine:
     def process_ticker(self, ticker, economic_df):
         try:
+            # logger.info(f"Processing {ticker}...") # Optional: Comment out to reduce noise
             stock = yf.Ticker(ticker)
             
             # 1. Get Price Data (Weekly)
             # We fetch 5y to ensure we have enough for the 4y window
             ohlc = stock.history(period="5y", interval="1wk")
-            if ohlc.empty: return None
+            if ohlc.empty: 
+                logger.warning(f"No price data found for {ticker}")
+                return None
             
             # Clean columns
             ohlc = ohlc[['Close', 'Volume']].copy()
@@ -171,6 +202,7 @@ class StockHistoricalEngine:
             # Handle empty fundamentals gracefully
             if fin.empty:
                 fund_data = pd.DataFrame(index=ohlc.index) # Empty placeholder
+                logger.debug(f"No fundamental data for {ticker}. Using price only.")
             else:
                 # FIX: Sort index ascending to ensure pct_change works correctly (Past -> Future)
                 fin = fin.sort_index()
@@ -224,22 +256,25 @@ class StockHistoricalEngine:
             return df
 
         except Exception as e:
-            # print(f"Error processing {ticker}: {e}") 
+            logger.error(f"Error processing {ticker}: {e}") 
             return None
 
 # ==========================================
 # 3. ANALYSIS & REPORTING
 # ==========================================
 def generate_analysis():
+    logger.info("Starting Market Regime Analysis...")
+    
     # 1. Prepare Economy
     fred = FredHistoricalEngine(FRED_API_KEY)
     economy_df = fred.get_economic_regime()
     
     if economy_df.empty:
-        print("❌ Failed to generate economic data. Check API key or connection.")
+        logger.error("❌ Failed to generate economic data. Check logs above for API errors.")
         return
 
-    print(f"✅ Economic Regime Built ({len(economy_df)} weeks)")
+    logger.info(f"✅ Economic Regime Built ({len(economy_df)} weeks)")
+    print("\nRegime Distribution:")
     print(economy_df['category_name'].value_counts())
     print("\n---------------------------------------------------\n")
 
@@ -247,15 +282,15 @@ def generate_analysis():
     engine = StockHistoricalEngine()
     all_data = []
 
-    print(f"📥 Processing {len(TICKERS)} stocks...")
+    logger.info(f"📥 Processing {len(TICKERS)} stocks...")
     for i, t in enumerate(TICKERS):
-        print(f"  > [{i+1}/{len(TICKERS)}] {t}...")
+        if (i+1) % 5 == 0: logger.info(f"  > Processed [{i+1}/{len(TICKERS)}] stocks...")
         df = engine.process_ticker(t, economy_df)
         if df is not None:
             all_data.append(df)
     
     if not all_data:
-        print("❌ No stock data processed.")
+        logger.error("❌ No stock data processed.")
         return
 
     master_df = pd.concat(all_data)
@@ -299,7 +334,7 @@ def generate_analysis():
     # 4. Export Raw Data
     filename = "market_regime_analysis.csv"
     master_df.to_csv(filename)
-    print(f"✅ Full analysis saved to {filename}")
+    logger.info(f"✅ Full analysis saved to {filename}")
 
 if __name__ == "__main__":
     generate_analysis()
