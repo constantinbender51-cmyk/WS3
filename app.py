@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
 
 # DEVELOPMENT LIMIT: Set to an integer (e.g., 5 or 10) to limit stocks processed.
+# Set to None to run the full list.
 DEV_STOCK_LIMIT = 10 
 
 # List of tickers to analyze. 
@@ -246,27 +247,30 @@ def generate_analysis():
         return
 
     logger.info(f"✅ Economic Regime Built ({len(economy_df)} weeks)")
-    
-    time.sleep(0.2)
-    print("\n---------------------------------------------------")
-    time.sleep(0.2)
-    print(" FULL ECONOMIC REGIME DATA (ALL WEEKS)")
-    time.sleep(0.2)
-    print("---------------------------------------------------")
-    time.sleep(0.2)
-    print(economy_df.to_string())
-    time.sleep(0.2)
-    print("\n---------------------------------------------------\n")
 
     engine = StockHistoricalEngine()
     all_data = []
 
-    logger.info(f"📥 Processing {len(TICKERS)} stocks...")
+    time.sleep(0.2)
+    print("\n---------------------------------------------------")
+    print(" 📦 PROCESSING STOCKS")
+    print("---------------------------------------------------")
+    time.sleep(0.2)
+
     for i, t in enumerate(TICKERS):
-        if (i+1) % 5 == 0: logger.info(f"  > Processed [{i+1}/{len(TICKERS)}] stocks...")
         df = engine.process_ticker(t, economy_df)
         if df is not None and not df.empty:
             all_data.append(df)
+            
+            # Formatted Per-Stock Log
+            time.sleep(0.2)
+            print(f"Stock: {t}")
+            time.sleep(0.2)
+            print(f"Count: {len(df)}")
+            time.sleep(0.2)
+            print(f"Timeframe: weekly")
+            time.sleep(0.2)
+            print("-" * 15)
     
     if not all_data:
         logger.error("❌ No stock data processed. (All DataFrames were empty)")
@@ -274,59 +278,6 @@ def generate_analysis():
 
     master_df = pd.concat(all_data)
     
-    first_ticker = TICKERS[0]
-    first_stock_data = master_df[master_df['ticker'] == first_ticker]
-    
-    # --- DATA COVERAGE ANALYSIS ---
-    time.sleep(0.2)
-    print("\n---------------------------------------------------")
-    print(" 🕵️ DATA COVERAGE REPORT")
-    print("---------------------------------------------------")
-    time.sleep(0.2)
-    
-    # Identify the first date where fundamentals are NOT nan
-    fund_cols = ['gross_margin', 'operating_margin', 'revenue_growth_yoy']
-    available_fund_cols = [c for c in fund_cols if c in first_stock_data.columns]
-    
-    if available_fund_cols:
-        # Find first row where at least one fundamental metric is present
-        valid_start = first_stock_data[available_fund_cols].dropna(how='all').index.min()
-        
-        if pd.notna(valid_start):
-            print(f"Ticker Analysed:    {first_ticker}")
-            time.sleep(0.2)
-            print(f"Price History From: {first_stock_data.index.min().date()}")
-            time.sleep(0.2)
-            print(f"Fundamentals From:  {valid_start.date()}  <-- Data starts providing metrics here")
-            time.sleep(0.2)
-            print(f"Wait Period:        {(valid_start - first_stock_data.index.min()).days} days of leading NaN values")
-        else:
-            print(f"⚠️ Warning: No valid fundamental data found for {first_ticker} in the requested window.")
-    else:
-        print("❌ Error: Fundamental columns not found in dataset.")
-    
-    print("---------------------------------------------------\n")
-
-    time.sleep(0.2)
-    print("\n---------------------------------------------------")
-    time.sleep(0.2)
-    print(f" FULL DATA FOR TICKER: {first_ticker}")
-    time.sleep(0.2)
-    print("---------------------------------------------------")
-    cols = ['price', 'weekly_return', 'category_name', 'gross_margin', 'operating_margin', 'revenue_growth_yoy']
-    valid_cols = [c for c in cols if c in first_stock_data.columns]
-    
-    time.sleep(0.2)
-    print("--- HEAD (First 5 Rows) ---")
-    time.sleep(0.2)
-    print(first_stock_data[valid_cols].head().to_string())
-    time.sleep(0.2)
-    print("\n--- TAIL (Last 5 Rows) ---")
-    time.sleep(0.2)
-    print(first_stock_data[valid_cols].tail().to_string())
-    time.sleep(0.2)
-    print("\n---------------------------------------------------\n")
-
     time.sleep(0.2)
     print("\n📊 ANALYSIS RESULTS BY REGIME")
     time.sleep(0.2)
