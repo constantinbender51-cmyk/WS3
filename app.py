@@ -22,7 +22,7 @@ FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
 # SIMULATION PARAMETERS
 DEV_STOCK_LIMIT = 60  # Set to None for full S&P 500
 TOP_N = 15            # Number of Longs and Shorts (Total portfolio = 2 * TOP_N)
-BACKTEST_START_DATE = datetime(2025, 9, 1) # Hardcoded start as requested
+BACKTEST_START_DATE = datetime(2025, 10, 8) # Hardcoded start: October 8th, 2025
 INITIAL_CAPITAL = 100000.0
 
 # GLOBAL STORAGE FOR SERVER
@@ -116,7 +116,7 @@ class FredHistoricalEngine:
         df.loc[v & hr & hb, 'regime'] = "C"
         df.loc[v & hr & (~hb), 'regime'] = "D"
         
-        # SLICE FOR BACKTEST START: September 2025
+        # SLICE FOR BACKTEST START: October 8th, 2025
         return df[df.index >= BACKTEST_START_DATE]
 
 class StockEngine:
@@ -249,7 +249,7 @@ DASHBOARD_HTML = """
 <body>
     <div class="container">
         <div class="card">
-            <h1>Regime Strategy Analysis (From Sept 2025)</h1>
+            <h1>Regime Strategy Analysis (From Oct 2025)</h1>
             <div class="stats">
                 <div class="stat-card">
                     <div class="stat-label">Initial Capital</div>
@@ -411,7 +411,7 @@ def index():
     if BACKTEST_RESULTS is None:
         return """<body style="font-family:sans-serif; text-align:center; padding:50px;">
                     <h2>Backtest in progress...</h2>
-                    <p>Starting Sept 2025. Data is limited, results will appear shortly.</p>
+                    <p>Starting Oct 2025. Data is limited, results will appear shortly.</p>
                     <script>setTimeout(() => location.reload(), 5000);</script>
                   </body>"""
     
