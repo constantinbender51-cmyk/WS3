@@ -190,7 +190,7 @@ class StockHistoricalEngine:
             ohlc = ohlc[['Close', 'Volume']].copy()
             ohlc.columns = ['price', 'volume']
             ohlc.index = ohlc.index.tz_localize(None) 
-            ohlc.index.name = 'date' # Ensure index is named 'date' for merge
+            ohlc.index.name = 'date' 
 
             # 2. Get Fundamentals (Quarterly)
             fin = stock.quarterly_financials.T 
@@ -199,22 +199,34 @@ class StockHistoricalEngine:
                 fund_data = pd.DataFrame(index=ohlc.index) 
                 logger.debug(f"No fundamental data for {ticker}. Using price only.")
             else:
+                # FIX: Clean column names and force numeric conversion
+                # yfinance often returns objects/strings which causes NaN in math
+                fin.columns = fin.columns.str.strip() # Remove hidden whitespace
+                fin = fin.apply(pd.to_numeric, errors='coerce') # Convert to numbers
+                
                 fin = fin.sort_index()
                 fin = fin[~fin.index.duplicated(keep='last')]
                 fund_data = pd.DataFrame(index=fin.index)
-            
+                
+                # Debug: Print available columns if margins are failing
+                # logger.info(f"Available columns for {ticker}: {fin.columns.tolist()}")
+
                 # --- PROFITABILITY & MARGINS ---
+                # Calculate Gross Margin
                 if 'Total Revenue' in fin.columns and 'Cost Of Revenue' in fin.columns:
                     fund_data['gross_margin'] = (fin['Total Revenue'] - fin['Cost Of Revenue']) / fin['Total Revenue']
                 elif 'Gross Profit' in fin.columns and 'Total Revenue' in fin.columns:
                      fund_data['gross_margin'] = fin['Gross Profit'] / fin['Total Revenue']
                 
+                # Calculate Operating Margin
                 if 'Operating Income' in fin.columns and 'Total Revenue' in fin.columns:
                     fund_data['operating_margin'] = fin['Operating Income'] / fin['Total Revenue']
                     
+                # Calculate Net Margin
                 if 'Net Income' in fin.columns and 'Total Revenue' in fin.columns:
                     fund_data['net_margin'] = fin['Net Income'] / fin['Total Revenue']
 
+                # Calculate Growth
                 if 'Total Revenue' in fin.columns:
                     fund_data['revenue_growth_yoy'] = fin['Total Revenue'].pct_change(periods=4) 
 
@@ -222,46 +234,40 @@ class StockHistoricalEngine:
                 fund_data = fund_data.sort_index()
 
             # 3. Merge Price and Fundamentals
+            # Using reindex with ffill to map quarterly data to weekly price points
             aligned_funds = fund_data.reindex(ohlc.index, method='ffill')
             df = ohlc.join(aligned_funds)
 
-            # 4. Merge with Economic Data (Using merge_asof to fix "Empty Index" issue)
-            # Reset indices to columns for merge_asof
+            # 4. Merge with Economic Data
             df = df.sort_index()
             economic_df = economic_df.sort_index()
             
-            # Prepare for merge (reset index to use 'date' column)
             df_reset = df.reset_index()
             econ_reset = economic_df[['category_id', 'category_name']].reset_index()
             
-            # Rename economic date to avoid collision if needed, though on='date' handles it
-            # Assuming both have 'date' or index name 'date'
             if 'date' not in df_reset.columns:
                 df_reset = df_reset.rename(columns={'index': 'date'})
             if 'date' not in econ_reset.columns:
                 econ_reset = econ_reset.rename(columns={'index': 'date'})
 
-            # FIX: merge_asof handles mismatched dates (e.g. Wed vs Fri)
             df_merged = pd.merge_asof(
                 df_reset,
                 econ_reset,
                 on='date',
                 direction='backward',
-                tolerance=pd.Timedelta(days=14) # Allow 2 weeks gap max
+                tolerance=pd.Timedelta(days=14) 
             )
             
-            # Restore index
             df_merged = df_merged.set_index('date')
 
             # 5. Calculate Weekly Returns
             df_merged['weekly_return'] = df_merged['price'].pct_change()
             df_merged['ticker'] = ticker
             
-            # Drop rows where we don't have an economic category
             df_final = df_merged.dropna(subset=['category_id'])
             
             if df_final.empty:
-                logger.debug(f"Dataframe empty after economic merge for {ticker}. Dates might be out of range.")
+                logger.debug(f"Dataframe empty after economic merge for {ticker}.")
                 
             return df_final
 
@@ -317,19 +323,21 @@ def generate_analysis():
     print("\n---------------------------------------------------")
     print(f" FULL DATA FOR TICKER: {first_ticker}")
     print("---------------------------------------------------")
-    # Columns of interest
     cols = ['price', 'weekly_return', 'category_name', 'gross_margin', 'operating_margin', 'revenue_growth_yoy']
-    # Filter valid columns (in case some are missing)
     valid_cols = [c for c in cols if c in first_stock_data.columns]
     
-    print(first_stock_data[valid_cols].to_string())
+    # Print head AND tail to see if data fills in later
+    print("--- HEAD (First 5 Rows) ---")
+    print(first_stock_data[valid_cols].head().to_string())
+    print("\n--- TAIL (Last 5 Rows) ---")
+    print(first_stock_data[valid_cols].tail().to_string())
     print("\n---------------------------------------------------\n")
 
     
     # 3. Group by Regime and Calculate Metrics
-    time.sleep(0.1) # Buffer flush
+    time.sleep(0.1) 
     print("\n📊 ANALYSIS RESULTS BY REGIME")
-    time.sleep(0.1) # Buffer flush
+    time.sleep(0.1)
     print("Metrics: Average Weekly Return per category based on Fundamental traits\n")
 
     categories = master_df['category_id'].unique()
@@ -341,9 +349,9 @@ def generate_analysis():
         cat_name = subset['category_name'].iloc[0]
         weeks_count = subset.index.nunique()
         
-        time.sleep(0.1) # Buffer flush
+        time.sleep(0.1) 
         print(f"=== {cat_name} (n={weeks_count} weeks) ===")
-        time.sleep(0.1) # Buffer flush
+        time.sleep(0.1) 
         print(f"Avg Weekly Market Return: {subset['weekly_return'].mean()*100:.2f}%")
         
         # Check Gross Margin Impact
@@ -352,11 +360,11 @@ def generate_analysis():
             high_gm = subset[subset['gross_margin'] > median_gm]['weekly_return'].mean()
             low_gm = subset[subset['gross_margin'] <= median_gm]['weekly_return'].mean()
             
-            time.sleep(0.1) # Buffer flush
+            time.sleep(0.1)
             print(f"  > High Gross Margin Stocks Return: {high_gm*100:.3f}%")
-            time.sleep(0.1) # Buffer flush
+            time.sleep(0.1)
             print(f"  > Low Gross Margin Stocks Return:  {low_gm*100:.3f}%")
-            time.sleep(0.1) # Buffer flush
+            time.sleep(0.1)
             print(f"  > Spread: {(high_gm - low_gm)*100:.3f}%")
         
         # Check Operating Margin Impact
@@ -365,12 +373,12 @@ def generate_analysis():
             high_om = subset[subset['operating_margin'] > median_om]['weekly_return'].mean()
             low_om = subset[subset['operating_margin'] <= median_om]['weekly_return'].mean()
             
-            time.sleep(0.1) # Buffer flush
+            time.sleep(0.1)
             print(f"  > High Operating Margin Stocks Return: {high_om*100:.3f}%")
-            time.sleep(0.1) # Buffer flush
+            time.sleep(0.1)
             print(f"  > Low Operating Margin Stocks Return:  {low_om*100:.3f}%")
 
-        time.sleep(0.1) # Buffer flush
+        time.sleep(0.1)
         print("")
 
     # 4. Export Raw Data
