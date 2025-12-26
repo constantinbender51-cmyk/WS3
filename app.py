@@ -189,6 +189,7 @@ class StockHistoricalEngine:
             ohlc = ohlc[['Close', 'Volume']].copy()
             ohlc.columns = ['price', 'volume']
             ohlc.index = ohlc.index.tz_localize(None) 
+            ohlc.index.name = 'date' # Ensure index is named 'date' for merge
 
             # 2. Get Fundamentals (Quarterly)
             fin = stock.quarterly_financials.T 
@@ -202,22 +203,17 @@ class StockHistoricalEngine:
                 fund_data = pd.DataFrame(index=fin.index)
             
                 # --- PROFITABILITY & MARGINS ---
-                # Gross Margin
                 if 'Total Revenue' in fin.columns and 'Cost Of Revenue' in fin.columns:
                     fund_data['gross_margin'] = (fin['Total Revenue'] - fin['Cost Of Revenue']) / fin['Total Revenue']
                 elif 'Gross Profit' in fin.columns and 'Total Revenue' in fin.columns:
                      fund_data['gross_margin'] = fin['Gross Profit'] / fin['Total Revenue']
                 
-                # Operating Margin
                 if 'Operating Income' in fin.columns and 'Total Revenue' in fin.columns:
                     fund_data['operating_margin'] = fin['Operating Income'] / fin['Total Revenue']
                     
-                # Net Margin
                 if 'Net Income' in fin.columns and 'Total Revenue' in fin.columns:
                     fund_data['net_margin'] = fin['Net Income'] / fin['Total Revenue']
 
-                # --- GROWTH PROXIES ---
-                # YoY Revenue Growth
                 if 'Total Revenue' in fin.columns:
                     fund_data['revenue_growth_yoy'] = fin['Total Revenue'].pct_change(periods=4) 
 
@@ -228,15 +224,45 @@ class StockHistoricalEngine:
             aligned_funds = fund_data.reindex(ohlc.index, method='ffill')
             df = ohlc.join(aligned_funds)
 
-            # 4. Merge with Economic Data
-            df = df.join(economic_df[['category_id', 'category_name']])
+            # 4. Merge with Economic Data (Using merge_asof to fix "Empty Index" issue)
+            # Reset indices to columns for merge_asof
+            df = df.sort_index()
+            economic_df = economic_df.sort_index()
+            
+            # Prepare for merge (reset index to use 'date' column)
+            df_reset = df.reset_index()
+            econ_reset = economic_df[['category_id', 'category_name']].reset_index()
+            
+            # Rename economic date to avoid collision if needed, though on='date' handles it
+            # Assuming both have 'date' or index name 'date'
+            if 'date' not in df_reset.columns:
+                df_reset = df_reset.rename(columns={'index': 'date'})
+            if 'date' not in econ_reset.columns:
+                econ_reset = econ_reset.rename(columns={'index': 'date'})
+
+            # FIX: merge_asof handles mismatched dates (e.g. Wed vs Fri)
+            df_merged = pd.merge_asof(
+                df_reset,
+                econ_reset,
+                on='date',
+                direction='backward',
+                tolerance=pd.Timedelta(days=14) # Allow 2 weeks gap max
+            )
+            
+            # Restore index
+            df_merged = df_merged.set_index('date')
 
             # 5. Calculate Weekly Returns
-            df['weekly_return'] = df['price'].pct_change()
-            df['ticker'] = ticker
+            df_merged['weekly_return'] = df_merged['price'].pct_change()
+            df_merged['ticker'] = ticker
             
-            df = df.dropna(subset=['category_id'])
-            return df
+            # Drop rows where we don't have an economic category
+            df_final = df_merged.dropna(subset=['category_id'])
+            
+            if df_final.empty:
+                logger.debug(f"Dataframe empty after economic merge for {ticker}. Dates might be out of range.")
+                
+            return df_final
 
         except Exception as e:
             logger.error(f"Error processing {ticker}: {e}") 
@@ -269,11 +295,11 @@ def generate_analysis():
     for i, t in enumerate(TICKERS):
         if (i+1) % 5 == 0: logger.info(f"  > Processed [{i+1}/{len(TICKERS)}] stocks...")
         df = engine.process_ticker(t, economy_df)
-        if df is not None:
+        if df is not None and not df.empty:
             all_data.append(df)
     
     if not all_data:
-        logger.error("❌ No stock data processed.")
+        logger.error("❌ No stock data processed. (All DataFrames were empty)")
         return
 
     master_df = pd.concat(all_data)
