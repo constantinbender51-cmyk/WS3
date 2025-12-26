@@ -6,6 +6,7 @@ import numpy as np
 import logging
 import time
 import threading
+import json
 from datetime import datetime, timedelta
 from io import StringIO
 from flask import Flask, render_template_string, jsonify
@@ -26,6 +27,8 @@ INITIAL_CAPITAL = 100000.0
 
 # GLOBAL STORAGE FOR SERVER
 BACKTEST_RESULTS = None
+ECON_REGIME_DATA = None
+FETCHED_STOCK_DATA = {} # Ticker -> List of dicts
 
 # ==========================================
 # 1. RISK & POSITION MANAGEMENT
@@ -142,12 +145,16 @@ class StockEngine:
 # 3. BACKTEST EXECUTION
 # ==========================================
 def run_backtest():
-    global BACKTEST_RESULTS
+    global BACKTEST_RESULTS, ECON_REGIME_DATA, FETCHED_STOCK_DATA
     fred = FredHistoricalEngine(FRED_API_KEY)
     econ = fred.get_regimes()
     if econ.empty: 
         logger.error("No Economic Data. Check FRED Key.")
         return
+    
+    # Store global econ data
+    ECON_REGIME_DATA = econ.reset_index()
+    ECON_REGIME_DATA['date'] = ECON_REGIME_DATA['date'].dt.strftime('%Y-%m-%d')
 
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     ts = pd.read_html(StringIO(requests.get(url, headers={"User-Agent":"Mozilla"}).text))[0]['Symbol'].tolist()
@@ -157,7 +164,12 @@ def run_backtest():
     logger.info(f"Loading {len(ts)} stocks...")
     for t in ts:
         d = StockEngine().process(t, econ.index)
-        if d is not None: cache[t] = d
+        if d is not None: 
+            cache[t] = d
+            # Prepare for global display (limit size slightly to avoid crash)
+            display_df = d.reset_index().copy()
+            display_df['date'] = display_df['date'].dt.strftime('%Y-%m-%d')
+            FETCHED_STOCK_DATA[t] = display_df.to_dict(orient='records')
 
     val = INITIAL_CAPITAL
     ps = []
@@ -208,65 +220,188 @@ DASHBOARD_HTML = """
     <title>Regime Backtest Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 40px; background: #f5f7f9; color: #333; }
-        .container { max-width: 1000px; margin: auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-        h1 { margin-top: 0; color: #1a202c; }
-        .stats { display: flex; gap: 20px; margin-bottom: 30px; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 40px; background: #f5f7f9; color: #333; line-height: 1.5; }
+        .container { max-width: 1200px; margin: auto; }
+        .card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 25px; }
+        h1, h2 { margin-top: 0; color: #1a202c; }
+        .stats { display: flex; gap: 20px; margin-bottom: 25px; }
         .stat-card { flex: 1; padding: 20px; background: #edf2f7; border-radius: 8px; }
-        .stat-label { font-size: 12px; text-transform: uppercase; color: #718096; letter-spacing: 0.05em; }
+        .stat-label { font-size: 11px; text-transform: uppercase; color: #718096; letter-spacing: 0.05em; font-weight: bold; }
         .stat-value { font-size: 24px; font-weight: bold; color: #2d3748; }
-        .regime-A { color: #48bb78; } .regime-B { color: #4299e1; } .regime-C { color: #ed8936; } .regime-D { color: #f56565; }
+        
+        .tabs { display: flex; gap: 10px; margin-bottom: 15px; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; }
+        .tab-btn { padding: 10px 20px; border: none; background: transparent; cursor: pointer; font-weight: bold; color: #718096; border-radius: 6px; }
+        .tab-btn.active { background: #3182ce; color: white; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th { text-align: left; background: #f8fafc; padding: 12px; border-bottom: 2px solid #edf2f7; color: #4a5568; }
+        td { padding: 10px 12px; border-bottom: 1px solid #edf2f7; }
+        tr:hover { background: #fdfdfd; }
+        .scroll-box { max-height: 500px; overflow-y: auto; border: 1px solid #edf2f7; border-radius: 6px; }
+        
+        select { padding: 8px 12px; border-radius: 6px; border: 1px solid #cbd5e0; background: white; font-size: 14px; margin-bottom: 15px; width: 200px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Portfolio Performance</h1>
-        <div class="stats">
-            <div class="stat-card">
-                <div class="stat-label">Initial Capital</div>
-                <div class="stat-value">${{ "{:,.2f}".format(initial_cap) }}</div>
+        <div class="card">
+            <h1>Regime Strategy Analysis</h1>
+            <div class="stats">
+                <div class="stat-card">
+                    <div class="stat-label">Initial Capital</div>
+                    <div class="stat-value">${{ "{:,.2f}".format(initial_cap) }}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Final Value</div>
+                    <div class="stat-value">${{ "{:,.2f}".format(final_val) }}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Total Return</div>
+                    <div class="stat-value">{{ "{:.2f}%".format(total_ret) }}</div>
+                </div>
             </div>
-            <div class="stat-card">
-                <div class="stat-label">Final Value</div>
-                <div class="stat-value">${{ "{:,.2f}".format(final_val) }}</div>
+            <canvas id="mainChart" width="800" height="300"></canvas>
+        </div>
+
+        <div class="card">
+            <div class="tabs">
+                <button class="tab-btn active" onclick="showTab('stock-data')">Individual Stock Data</button>
+                <button class="tab-btn" onclick="showTab('regime-data')">Economic Regimes</button>
+                <button class="tab-btn" onclick="showTab('performance-data')">Performance History</button>
             </div>
-            <div class="stat-card">
-                <div class="stat-label">Total Return</div>
-                <div class="stat-value">{{ "{:.2f}%".format(total_ret) }}</div>
+
+            <div id="stock-data" class="tab-content active">
+                <h2>Stock Data Explorer</h2>
+                <select id="tickerSelect" onchange="updateStockTable()">
+                    {% for ticker in tickers %}
+                    <option value="{{ ticker }}">{{ ticker }}</option>
+                    {% endfor %}
+                </select>
+                <div class="scroll-box">
+                    <table id="stockTable">
+                        <thead>
+                            <tr>
+                                <th>Date</th>
+                                <th>Price</th>
+                                <th>Rev Growth</th>
+                                <th>Op Margin</th>
+                                <th>Profit Score</th>
+                            </tr>
+                        </thead>
+                        <tbody id="stockTableBody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div id="regime-data" class="tab-content">
+                <h2>Economic Regime History</h2>
+                <div class="scroll-box">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Date</th>
+                                <th>Int Rate (IR)</th>
+                                <th>IR 5Y Avg</th>
+                                <th>Bal Sheet (BS)</th>
+                                <th>BS 1Y Avg</th>
+                                <th>Regime</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in econ_data %}
+                            <tr>
+                                <td>{{ row.date }}</td>
+                                <td>{{ "%.4f"|format(row.ir) }}</td>
+                                <td>{{ "%.4f"|format(row.ir_avg) }}</td>
+                                <td>{{ "{:,.0f}".format(row.bs) }}</td>
+                                <td>{{ "{:,.0f}".format(row.bs_avg) }}</td>
+                                <td><strong>{{ row.regime }}</strong></td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div id="performance-data" class="tab-content">
+                <h2>Strategy PnL History</h2>
+                <div class="scroll-box">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Date</th>
+                                <th>Regime</th>
+                                <th>Portfolio Value</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in chart_data_raw %}
+                            <tr>
+                                <td>{{ row.date }}</td>
+                                <td>{{ row.reg }}</td>
+                                <td>${{ "{:,.2f}".format(row.val) }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
             </div>
         </div>
-        <canvas id="mainChart" width="800" height="400"></canvas>
     </div>
 
     <script>
-        const rawData = {{ chart_data | safe }};
+        const chartDataRaw = {{ chart_data_raw | tojson }};
+        const stockCache = {{ stock_data | tojson }};
+
+        // Initialize Chart
         const ctx = document.getElementById('mainChart').getContext('2d');
-        
         new Chart(ctx, {
             type: 'line',
             data: {
-                labels: rawData.map(d => d.date),
+                labels: chartDataRaw.map(d => d.date),
                 datasets: [{
                     label: 'Portfolio Value ($)',
-                    data: rawData.map(d => d.val),
+                    data: chartDataRaw.map(d => d.val),
                     borderColor: '#3182ce',
                     backgroundColor: 'rgba(49, 130, 206, 0.1)',
                     fill: true,
-                    tension: 0.2,
+                    tension: 0.1,
                     pointRadius: 0
                 }]
             },
             options: {
                 responsive: true,
-                plugins: {
-                    legend: { display: false }
-                },
-                scales: {
-                    x: { grid: { display: false } },
-                    y: { beginAtZero: false }
-                }
+                plugins: { legend: { display: false } },
+                scales: { x: { grid: { display: false } }, y: { beginAtZero: false } }
             }
         });
+
+        function showTab(tabId) {
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.getElementById(tabId).classList.add('active');
+            event.target.classList.add('active');
+        }
+
+        function updateStockTable() {
+            const ticker = document.getElementById('tickerSelect').value;
+            const data = stockCache[ticker] || [];
+            const body = document.getElementById('stockTableBody');
+            body.innerHTML = data.map(row => `
+                <tr>
+                    <td>${row.date}</td>
+                    <td>$${(row.price || 0).toFixed(2)}</td>
+                    <td>${row.growth ? (row.growth * 100).toFixed(2) + '%' : 'N/A'}</td>
+                    <td>${row.margin ? (row.margin * 100).toFixed(2) + '%' : 'N/A'}</td>
+                    <td>${row.profit ? row.profit.toFixed(6) : 'N/A'}</td>
+                </tr>
+            `).join('');
+        }
+
+        // Init table
+        updateStockTable();
     </script>
 </body>
 </html>
@@ -275,7 +410,11 @@ DASHBOARD_HTML = """
 @app.route('/')
 def index():
     if BACKTEST_RESULTS is None:
-        return "Backtest still running, please refresh in a moment..."
+        return """<body style="font-family:sans-serif; text-align:center; padding:50px;">
+                    <h2>Backtest in progress...</h2>
+                    <p>Fetching 4 years of weekly data. This takes 1-2 minutes.</p>
+                    <script>setTimeout(() => location.reload(), 5000);</script>
+                  </body>"""
     
     final_val = BACKTEST_RESULTS['val'].iloc[-1]
     total_ret = ((final_val / INITIAL_CAPITAL) - 1) * 100
@@ -285,7 +424,10 @@ def index():
         initial_cap=INITIAL_CAPITAL,
         final_val=final_val,
         total_ret=total_ret,
-        chart_data=BACKTEST_RESULTS.to_json(orient='records')
+        chart_data_raw=BACKTEST_RESULTS.to_dict(orient='records'),
+        econ_data=ECON_REGIME_DATA.to_dict(orient='records'),
+        stock_data=FETCHED_STOCK_DATA,
+        tickers=sorted(FETCHED_STOCK_DATA.keys())
     )
 
 def start_server():
