@@ -1,7 +1,6 @@
-streamlit
+flask
 pandas
-yfinance
 requests
-plotly
 lxml
+gunicorn
 # Note: Python 3.6+ required for f-strings and other features used in app.py
