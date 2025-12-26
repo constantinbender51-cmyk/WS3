@@ -9,20 +9,27 @@ from datetime import datetime, timedelta
 # CONFIGURATION
 # ==========================================
 FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
-# If empty, the script will mock FRED data for testing purposes
-# Get a key here: https://fred.stlouisfed.org/docs/api/api_key.html
+
+# DEVELOPMENT LIMIT: Set to an integer (e.g., 5 or 10) to limit stocks processed.
+# Set to None to run the full list.
+DEV_STOCK_LIMIT = 10 
 
 # List of tickers to analyze. 
-# Full S&P 500 takes a long time. specific list for demo:
 TICKERS = [
     "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META", 
     "JPM", "V", "JNJ", "WMT", "PG", "XOM", "MA", "HD",
-    "CVX", "MRK", "ABBV", "KO", "PEP"
+    "CVX", "MRK", "ABBV", "KO", "PEP", "LLY", "BAC", "COST"
 ]
-# To use full S&P 500, uncomment below (WARNING: Takes 20+ mins):
-# import pandas_datareader as pdr
-# TICKERS = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]['Symbol'].tolist()
-# TICKERS = [t.replace('.', '-') for t in TICKERS]
+
+# If you want the full S&P 500 and DEV_STOCK_LIMIT is None, uncomment this:
+# try:
+#     sp500 = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+#     TICKERS = [t.replace('.', '-') for t in sp500['Symbol'].tolist()]
+# except: pass
+
+if DEV_STOCK_LIMIT:
+    print(f"⚠️ DEV MODE: Limiting analysis to first {DEV_STOCK_LIMIT} stocks.")
+    TICKERS = TICKERS[:DEV_STOCK_LIMIT]
 
 YEARS_HISTORY = 4
 
@@ -52,10 +59,16 @@ class FredHistoricalEngine:
             response = requests.get(self.base_url, params=params)
             response.raise_for_status()
             data = response.json().get("observations", [])
+            
             df = pd.DataFrame(data)
+            if df.empty: return pd.DataFrame()
+            
+            # --- FIX: STRICT COLUMN SELECTION ---
             df['date'] = pd.to_datetime(df['date'])
             df['value'] = pd.to_numeric(df['value'], errors='coerce')
-            df = df.dropna().set_index('date').sort_index()
+            
+            # Drop metadata columns (realtime_start, etc) to prevent join errors
+            df = df[['date', 'value']].dropna().set_index('date').sort_index()
             return df
         except Exception as e:
             print(f"Error fetching {series_id}: {e}")
@@ -71,11 +84,21 @@ class FredHistoricalEngine:
         fed_funds = self.fetch_series("FEDFUNDS", start_date) # Monthly
         balance_sheet = self.fetch_series("WALCL", start_date) # Weekly
 
+        if fed_funds.empty or balance_sheet.empty:
+            print("❌ Critical: Missing FRED data.")
+            return pd.DataFrame()
+
         # 2. Resample to Weekly (Friday) to align both
-        # Forward fill monthly rates to weekly
+        # We create a master index based on the weekly balance sheet
         df = pd.DataFrame(index=balance_sheet.index)
+        
+        # Join Balance Sheet (rename value to avoid collision)
         df = df.join(balance_sheet.rename(columns={'value': 'balance_sheet'}))
-        df = df.join(fed_funds.rename(columns={'value': 'interest_rate'}).resample('W-FRI').ffill())
+        
+        # Join Interest Rate (Resample monthly to weekly and forward fill)
+        # using 'how=left' to keep the structure of the weekly balance sheet
+        fed_weekly = fed_funds.rename(columns={'value': 'interest_rate'}).resample('W-FRI').ffill()
+        df = df.join(fed_weekly, how='left')
         
         df = df.ffill().dropna()
 
@@ -128,40 +151,40 @@ class StockHistoricalEngine:
             # 2. Get Fundamentals (Quarterly)
             # yfinance returns these with columns as dates
             fin = stock.quarterly_financials.T 
-            bs = stock.quarterly_balance_sheet.T
+            # bs = stock.quarterly_balance_sheet.T # Not strictly used in this logic but available
             
-            # Note: Free yfinance usually provides limited history (last 4-5 quarters).
-            # We will calculate what we can and fill the rest.
+            # Handle empty fundamentals gracefully
+            if fin.empty:
+                fund_data = pd.DataFrame(index=ohlc.index) # Empty placeholder
+            else:
+                fund_data = pd.DataFrame(index=fin.index)
             
-            fund_data = pd.DataFrame(index=fin.index)
-            
-            # --- PROFITABILITY & MARGINS ---
-            # Gross Margin = (Total Revenue - Cost of Revenue) / Total Revenue
-            if 'Total Revenue' in fin.columns and 'Cost Of Revenue' in fin.columns:
-                fund_data['gross_margin'] = (fin['Total Revenue'] - fin['Cost Of Revenue']) / fin['Total Revenue']
-            elif 'Gross Profit' in fin.columns and 'Total Revenue' in fin.columns:
-                 fund_data['gross_margin'] = fin['Gross Profit'] / fin['Total Revenue']
-            
-            # Operating Margin = Operating Income / Total Revenue
-            if 'Operating Income' in fin.columns and 'Total Revenue' in fin.columns:
-                fund_data['operating_margin'] = fin['Operating Income'] / fin['Total Revenue']
+                # --- PROFITABILITY & MARGINS ---
+                # Gross Margin
+                if 'Total Revenue' in fin.columns and 'Cost Of Revenue' in fin.columns:
+                    fund_data['gross_margin'] = (fin['Total Revenue'] - fin['Cost Of Revenue']) / fin['Total Revenue']
+                elif 'Gross Profit' in fin.columns and 'Total Revenue' in fin.columns:
+                     fund_data['gross_margin'] = fin['Gross Profit'] / fin['Total Revenue']
                 
-            # Net Margin = Net Income / Total Revenue
-            if 'Net Income' in fin.columns and 'Total Revenue' in fin.columns:
-                fund_data['net_margin'] = fin['Net Income'] / fin['Total Revenue']
+                # Operating Margin
+                if 'Operating Income' in fin.columns and 'Total Revenue' in fin.columns:
+                    fund_data['operating_margin'] = fin['Operating Income'] / fin['Total Revenue']
+                    
+                # Net Margin
+                if 'Net Income' in fin.columns and 'Total Revenue' in fin.columns:
+                    fund_data['net_margin'] = fin['Net Income'] / fin['Total Revenue']
 
-            # --- GROWTH PROXIES ---
-            # YoY Revenue Growth
-            if 'Total Revenue' in fin.columns:
-                fund_data['revenue_growth_yoy'] = fin['Total Revenue'].pct_change(periods=4) # 4 quarters ago
+                # --- GROWTH PROXIES ---
+                # YoY Revenue Growth
+                if 'Total Revenue' in fin.columns:
+                    fund_data['revenue_growth_yoy'] = fin['Total Revenue'].pct_change(periods=4) # 4 quarters ago
 
-            # Ensure index is datetime
-            fund_data.index = pd.to_datetime(fund_data.index).tz_localize(None)
-            fund_data = fund_data.sort_index()
+                # Ensure index is datetime
+                fund_data.index = pd.to_datetime(fund_data.index).tz_localize(None)
+                fund_data = fund_data.sort_index()
 
             # 3. Merge Price and Fundamentals
             # We reindex fundamentals to the weekly price index and forward fill
-            # Meaning: The margins from Q1 report apply to all weeks until Q2 report comes out
             aligned_funds = fund_data.reindex(ohlc.index, method='ffill')
             
             df = ohlc.join(aligned_funds)
@@ -181,7 +204,7 @@ class StockHistoricalEngine:
             return df
 
         except Exception as e:
-            # print(f"Error processing {ticker}: {e}") # Uncomment to debug
+            # print(f"Error processing {ticker}: {e}") 
             return None
 
 # ==========================================
@@ -193,7 +216,7 @@ def generate_analysis():
     economy_df = fred.get_economic_regime()
     
     if economy_df.empty:
-        print("❌ Failed to generate economic data.")
+        print("❌ Failed to generate economic data. Check API key or connection.")
         return
 
     print(f"✅ Economic Regime Built ({len(economy_df)} weeks)")
@@ -205,7 +228,8 @@ def generate_analysis():
     all_data = []
 
     print(f"📥 Processing {len(TICKERS)} stocks...")
-    for t in TICKERS:
+    for i, t in enumerate(TICKERS):
+        print(f"  > [{i+1}/{len(TICKERS)}] {t}...")
         df = engine.process_ticker(t, economy_df)
         if df is not None:
             all_data.append(df)
@@ -217,9 +241,8 @@ def generate_analysis():
     master_df = pd.concat(all_data)
     
     # 3. Group by Regime and Calculate Metrics
-    # We want to know: Under Regime X, what correlated with high returns?
     
-    print("📊 ANALYSIS RESULTS BY REGIME")
+    print("\n📊 ANALYSIS RESULTS BY REGIME")
     print("Metrics: Average Weekly Return per category based on Fundamental traits\n")
 
     categories = master_df['category_id'].unique()
@@ -233,9 +256,6 @@ def generate_analysis():
         
         print(f"=== {cat_name} (n={weeks_count} weeks) ===")
         print(f"Avg Weekly Market Return: {subset['weekly_return'].mean()*100:.2f}%")
-        
-        # Split into High vs Low Margin companies for this period
-        # Note: We use median of the *subset* to determine high/low relative to peers at that time
         
         # Check Gross Margin Impact
         if 'gross_margin' in subset.columns and subset['gross_margin'].notna().sum() > 10:
