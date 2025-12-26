@@ -109,23 +109,38 @@ class FredHistoricalEngine:
         # 1 Year Average for Balance Sheet (approx 52 weeks)
         df['avg_bs_1y'] = df['balance_sheet'].rolling(window=52, min_periods=20).mean()
 
-        # 4. Determine Categories
-        def classify(row):
-            if pd.isna(row['avg_rate_5y']) or pd.isna(row['avg_bs_1y']):
-                return 0, "Insuff Data"
-            
-            high_rate = row['interest_rate'] > row['avg_rate_5y']
-            high_bs = row['balance_sheet'] > row['avg_bs_1y']
+        # 4. Determine Categories (Vectorized Approach - Fixes ValueError)
+        # Initialize default values
+        df['category_id'] = 0
+        df['category_name'] = "Insuff Data"
 
-            if high_rate and high_bs: return 1, "High Rate / Liquidity Rising"
-            if high_rate and not high_bs: return 2, "High Rate / Liquidity Falling"
-            if not high_rate and high_bs: return 3, "Low Rate / Liquidity Rising"
-            if not high_rate and not high_bs: return 4, "Low Rate / Liquidity Falling"
+        # Define valid data mask (rows where we have enough history)
+        valid = df['avg_rate_5y'].notna() & df['avg_bs_1y'].notna()
 
-        # FIX: Added result_type='expand' to ensure it returns a DataFrame with 2 columns
-        df[['category_id', 'category_name']] = df.apply(
-            lambda x: pd.Series(classify(x)), axis=1, result_type='expand'
-        )
+        # Create boolean conditions for the whole dataframe at once
+        high_rate = df['interest_rate'] > df['avg_rate_5y']
+        high_bs = df['balance_sheet'] > df['avg_bs_1y']
+
+        # Apply logic using masks
+        # Case 1: High Rate / High Liquidity
+        c1 = valid & high_rate & high_bs
+        df.loc[c1, 'category_id'] = 1
+        df.loc[c1, 'category_name'] = "High Rate / Liquidity Rising"
+
+        # Case 2: High Rate / Low Liquidity
+        c2 = valid & high_rate & (~high_bs)
+        df.loc[c2, 'category_id'] = 2
+        df.loc[c2, 'category_name'] = "High Rate / Liquidity Falling"
+
+        # Case 3: Low Rate / High Liquidity
+        c3 = valid & (~high_rate) & high_bs
+        df.loc[c3, 'category_id'] = 3
+        df.loc[c3, 'category_name'] = "Low Rate / Liquidity Rising"
+
+        # Case 4: Low Rate / Low Liquidity
+        c4 = valid & (~high_rate) & (~high_bs)
+        df.loc[c4, 'category_id'] = 4
+        df.loc[c4, 'category_name'] = "Low Rate / Liquidity Falling"
 
         # Trim to requested history (last 4 years)
         cutoff = datetime.now() - timedelta(days=365*YEARS_HISTORY)
