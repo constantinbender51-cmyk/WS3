@@ -122,8 +122,9 @@ class FredHistoricalEngine:
             if not high_rate and high_bs: return 3, "Low Rate / Liquidity Rising"
             if not high_rate and not high_bs: return 4, "Low Rate / Liquidity Falling"
 
+        # FIX: Added result_type='expand' to ensure it returns a DataFrame with 2 columns
         df[['category_id', 'category_name']] = df.apply(
-            lambda x: pd.Series(classify(x)), axis=1
+            lambda x: pd.Series(classify(x)), axis=1, result_type='expand'
         )
 
         # Trim to requested history (last 4 years)
@@ -151,12 +152,16 @@ class StockHistoricalEngine:
             # 2. Get Fundamentals (Quarterly)
             # yfinance returns these with columns as dates
             fin = stock.quarterly_financials.T 
-            # bs = stock.quarterly_balance_sheet.T # Not strictly used in this logic but available
             
             # Handle empty fundamentals gracefully
             if fin.empty:
                 fund_data = pd.DataFrame(index=ohlc.index) # Empty placeholder
             else:
+                # FIX: Sort index ascending to ensure pct_change works correctly (Past -> Future)
+                fin = fin.sort_index()
+                # Remove duplicate dates if any exist to prevent reindexing errors
+                fin = fin[~fin.index.duplicated(keep='last')]
+                
                 fund_data = pd.DataFrame(index=fin.index)
             
                 # --- PROFITABILITY & MARGINS ---
