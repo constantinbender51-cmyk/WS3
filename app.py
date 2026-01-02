@@ -22,9 +22,11 @@ MODEL_FILENAME = 'lstm_regularized.pth'
 PAIR = 'XBTUSD'
 KRAKEN_INTERVAL = 10080  # Weekly
 SEQ_LENGTH = 60          # 5 Years of Monthly data
+
+# UPDATED HYPERPARAMETERS TO MATCH CHECKPOINT
 INPUT_DIM = 1
-HIDDEN_DIM = 128
-NUM_LAYERS = 2
+HIDDEN_DIM = 64       # Changed from 128 to 64
+NUM_LAYERS = 1        # Changed from 2 to 1
 DROPOUT = 0.2
 NUM_CLASSES = 3
 
@@ -33,7 +35,7 @@ class LSTMClassifier(nn.Module):
         super().__init__()
         self.lstm = nn.LSTM(INPUT_DIM, HIDDEN_DIM, NUM_LAYERS, 
                             batch_first=True, dropout=DROPOUT)
-        # FIX: Added BatchNorm1d to match "lstm_regularized.pth" structure
+        # BatchNorm matches hidden_dim (64)
         self.bn = nn.BatchNorm1d(HIDDEN_DIM)
         self.fc = nn.Linear(HIDDEN_DIM, NUM_CLASSES)
         
