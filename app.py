@@ -7,15 +7,15 @@ import json
 # ==========================================
 # CONFIGURATION PARAMETERS
 # ==========================================
-# Asset pair for Kraken (e.g., 'XXBTZUSD' for BTC/USD, 'XETHZUSD' for ETH/USD)
-PAIR = 'XXBTZUSD'
+# The asset pair name for Kraken
+PAIR = 'XBT/USD' 
 
 # Size of the optimization window (number of prices)
-# Note: 12 is manageable (3^11 = 177k combinations). 
-# Increasing this significantly will slow down the script.
-WINDOW_SIZE = 10 
+# 10 provides a good balance between depth and performance (3^9 combinations).
+WINDOW_SIZE = 12
 
-# Penalty for switching from one action to another (Increased to 25 as requested)
+# Penalty for switching actions (Increased to 25 as requested)
+# This strongly favors long-term positions over frequent trading.
 SWITCHING_PENALTY_WEIGHT = 25.0 
 
 # Actions available at each step
@@ -25,35 +25,54 @@ ACTIONS = ['Long', 'Hold', 'Short']
 
 def get_kraken_monthly_close(pair):
     """
-    Fetches monthly OHLC data from Kraken's public API and returns closing prices.
-    Monthly interval code is 43200 (minutes in a 30-day month approx).
+    Fetches monthly OHLC data from Kraken's public API.
+    Uses interval 43200 (minutes in a 30-day month).
     """
+    # URL encode the pair for safety (especially with slashes)
+    encoded_pair = urllib.parse.quote(pair)
     print(f"Fetching monthly data for {pair} from Kraken...")
-    url = f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval=43200"
+    url = f"https://api.kraken.com/0/public/OHLC?pair={encoded_pair}&interval=43200"
     
     try:
-        with urllib.request.urlopen(url) as response:
+        # Standard headers to prevent rejection
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json'
+        }
+        req = urllib.request.Request(url, headers=headers)
+        
+        with urllib.request.urlopen(req) as response:
             data = json.loads(response.read().decode())
             
             if data.get('error'):
-                print(f"Error from Kraken: {data['error']}")
+                print(f"Error from Kraken API: {data['error']}")
                 return None
             
-            # Kraken returns a dictionary where the key is the pair name
-            # The result list contains: [time, open, high, low, close, vwap, volume, count]
-            result_key = list(data['result'].keys())[0]
-            ohlc_data = data['result'][result_key]
+            # Extract the actual data list. 
+            # Kraken returns a dict with the pair name as the key and a 'last' timestamp key.
+            result = data.get('result', {})
+            data_keys = [k for k in result.keys() if k != 'last']
             
-            # Extract close prices (index 4) and convert to float
-            closes = [float(day[4]) for day in ohlc_data]
+            if not data_keys:
+                print("No OHLC data found in the response result.")
+                return None
+            
+            # Access the first available data key (usually the pair name in Kraken's internal format)
+            ohlc_entries = result[data_keys[0]]
+            
+            # Kraken OHLC format: [time, open, high, low, close, vwap, volume, count]
+            # Index 4 is the Close price.
+            closes = [float(entry[4]) for entry in ohlc_entries]
             return closes
+
     except Exception as e:
-        print(f"Failed to fetch data: {e}")
+        print(f"Connection error: {e}")
         return None
 
 def optimize_segment(segment_prices, last_action=None):
     """
-    Optimizes a single segment of prices using brute force.
+    Optimizes a single segment of prices to maximize risk-adjusted returns
+    while minimizing switches based on the penalty weight.
     """
     n_intervals = len(segment_prices) - 1
     price_diffs = np.diff(segment_prices)
@@ -61,20 +80,21 @@ def optimize_segment(segment_prices, last_action=None):
     best_score = -float('inf')
     best_seq = None
     
-    # Iterate through all combinations for this window (3^(n_intervals))
+    # Iterate through all combinations for this window
     for sequence in itertools.product(ACTIONS, repeat=n_intervals):
-        # Map actions to multipliers
+        # Numeric mapping for vector math: Long=1, Short=-1, Hold=0
         multipliers = np.array([1 if a == 'Long' else (-1 if a == 'Short' else 0) for a in sequence])
         strategy_returns = price_diffs * multipliers
         
-        # 1. Return/Risk (Sharpe-like ratio)
+        # Metric 1: Risk-Adjusted Return (Mean / Std Dev)
         total_return = np.sum(strategy_returns)
         std_dev = np.std(strategy_returns)
-        # Handle zero volatility cases
+        # Add epsilon to avoid division by zero
         risk_adj_return = total_return / (std_dev + 1e-9)
         
-        # 2. Switching Penalty
+        # Metric 2: Switching Penalty
         switches = 0
+        # Check transition from the previous window's state
         if last_action and sequence[0] != last_action:
             switches += 1
             
@@ -82,10 +102,11 @@ def optimize_segment(segment_prices, last_action=None):
             if sequence[i] != sequence[i-1]:
                 switches += 1
         
-        # Calculate penalty: (Switches * Weight) / intervals
-        # High weight (25) will significantly penalize any change in action
-        penalty = (switches * SWITCHING_PENALTY_WEIGHT) / n_intervals
-        current_score = risk_adj_return - penalty
+        # Normalize penalty by interval count
+        penalty_score = (switches * SWITCHING_PENALTY_WEIGHT) / n_intervals
+        
+        # Combine metrics
+        current_score = risk_adj_return - penalty_score
         
         if current_score > best_score:
             best_score = current_score
@@ -93,67 +114,63 @@ def optimize_segment(segment_prices, last_action=None):
             
     return best_seq
 
-def solve_windowed_trading():
+def run_backtest():
     """
-    Processes the full price list using overlapping windows.
+    Main execution loop: Fetch data -> Run Windowed Optimization -> Report Results
     """
-    # Fetch real data
     prices = get_kraken_monthly_close(PAIR)
     
     if not prices or len(prices) < 2:
-        print("Insufficient data to run optimization.")
+        print("Aborting: Not enough price data.")
         return
 
-    print(f"Data loaded: {len(prices)} monthly periods.")
+    print(f"Data received. Analyzing {len(prices)} months of closing prices.")
     
     full_sequence = []
     last_action = None
     start_time = time.time()
     
-    # Step size to overlap windows (keeping the last price of window N as the first of N+1)
-    step = WINDOW_SIZE - 1
+    # Process windows with overlap to maintain continuity
+    step_size = WINDOW_SIZE - 1
     
-    print(f"Starting windowed optimization (Window Size: {WINDOW_SIZE}, Penalty: {SWITCHING_PENALTY_WEIGHT})")
-    
-    for i in range(0, len(prices) - 1, step):
+    for i in range(0, len(prices) - 1, step_size):
         end_idx = min(i + WINDOW_SIZE, len(prices))
         segment = prices[i:end_idx]
         
         if len(segment) < 2:
             break
             
-        print(f"  Optimizing window: Index {i} to {end_idx-1}...")
         window_best_seq = optimize_segment(segment, last_action)
-        
         full_sequence.extend(window_best_seq)
         last_action = window_best_seq[-1]
 
-    end_time = time.time()
+    execution_time = time.time() - start_time
     
     # Final Statistics
-    price_diffs = np.diff(prices[:len(full_sequence)+1])
+    # Trim prices to match the length of actions generated
+    price_slice = prices[:len(full_sequence)+1]
+    diffs = np.diff(price_slice)
     multipliers = np.array([1 if a == 'Long' else (-1 if a == 'Short' else 0) for a in full_sequence])
-    strategy_returns = price_diffs * multipliers
+    returns = diffs * multipliers
     
     total_switches = sum(1 for i in range(1, len(full_sequence)) if full_sequence[i] != full_sequence[i-1])
     
-    print("\n" + "="*40)
-    print("OPTIMAL TRADING SEQUENCE FOUND (KRAKEN DATA)")
-    print("="*40)
-    print(f"Asset Pair:       {PAIR}")
-    print(f"Total Periods:    {len(full_sequence)}")
-    print(f"Total Return:     {np.sum(strategy_returns):.2f}")
-    print(f"Volatility (Std): {np.std(strategy_returns):.2f}")
+    print("\n" + "="*50)
+    print(f"TRADING STRATEGY REPORT: {PAIR}")
+    print("="*50)
+    print(f"Total Periods:    {len(full_sequence)} months")
+    print(f"Total Net Return: {np.sum(returns):.2f}")
+    print(f"Strategy StdDev:  {np.std(returns):.2f}")
     print(f"Total Switches:   {total_switches}")
-    print(f"Execution Time:   {end_time - start_time:.2f}s")
-    print("-" * 40)
+    print(f"Penalty Weight:   {SWITCHING_PENALTY_WEIGHT}")
+    print(f"Execution Time:   {execution_time:.2f}s")
+    print("-" * 50)
     
-    # Print the last 12 months of the strategy for brevity
-    print("Recent Strategy Action Plan (Last 12 months):")
-    recent = full_sequence[-12:]
-    for i, action in enumerate(recent):
-        idx = len(full_sequence) - len(recent) + i
-        print(f"Month Index {idx}: {action}")
+    print("Action Log (Last 12 Months):")
+    recent_actions = full_sequence[-12:]
+    for i, action in enumerate(recent_actions):
+        month_idx = len(full_sequence) - len(recent_actions) + i + 1
+        print(f"Month {month_idx:03}: {action}")
 
 if __name__ == "__main__":
-    solve_windowed_trading()
+    run_backtest()
