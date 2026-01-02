@@ -13,18 +13,18 @@ from sklearn.preprocessing import RobustScaler
 import matplotlib
 matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 # ==========================================
 # 1. CONFIGURATION & MODEL SPECS
 # ==========================================
-# Updated based on 'gru_full_dataset.pth' training script
 MODEL_FILENAME = 'gru_full_dataset.pth'
 SYMBOL = 'BTCUSDT'       
-SEQ_LENGTH = 20          # Updated from 30
-INPUT_DIM = 2            # Updated from 1 (Feat 1: LogRet, Feat 2: Month)
-HIDDEN_DIM = 256         # Updated from 128
-NUM_LAYERS = 3           # Updated from 2
-DROPOUT = 0.2            # Updated from 0.4
+SEQ_LENGTH = 20          
+INPUT_DIM = 2            # Feat 1: LogRet, Feat 2: Month
+HIDDEN_DIM = 256         
+NUM_LAYERS = 3           
+DROPOUT = 0.2            
 NUM_CLASSES = 3       
 
 # Global storage for pre-calculated results
@@ -51,9 +51,7 @@ class GRUClassifier(nn.Module):
         self.fc = nn.Linear(HIDDEN_DIM, NUM_CLASSES)
         
     def forward(self, x):
-        # Input shape: (Batch, Seq, Feature)
         out, _ = self.gru(x)
-        # Take the last time step
         out = out[:, -1, :] 
         out = self.bn(out)
         out = torch.relu(out)
@@ -64,10 +62,9 @@ class GRUClassifier(nn.Module):
 # ==========================================
 # 2. DATA UTILITIES
 # ==========================================
-def fetch_binance_data(symbol, interval, limit=1000, start_time=None):
+def fetch_binance_data(symbol, interval, limit=1000):
     url = "https://api.binance.com/api/v3/klines"
     params = {'symbol': symbol, 'interval': interval, 'limit': limit}
-    if start_time: params['startTime'] = int(start_time)
     resp = requests.get(url, params=params, timeout=15)
     resp.raise_for_status()
     data = resp.json()
@@ -82,46 +79,37 @@ def fetch_binance_data(symbol, interval, limit=1000, start_time=None):
 def run_startup_backtest():
     global cache
     cache["status"] = "processing"
-    print(f"Startup: Beginning 1-Year Hourly Backtest for {SYMBOL} using GRU...")
+    print(f"Startup: Beginning Full History Monthly Backtest for {SYMBOL}...")
     
     try:
-        # 1. Fetch 1 Year of Hourly Data
-        # We need enough history to fit the scaler reasonably well
-        all_hourly = []
-        start_ts = (time.time() - (365 * 24 * 3600)) * 1000
-        for _ in range(9): # Fetch chunks to get ~8760 rows
-            chunk = fetch_binance_data(SYMBOL, '1h', limit=1000, start_time=start_ts)
-            if chunk.empty: break
-            all_hourly.append(chunk)
-            start_ts = (chunk['dt'].iloc[-1].timestamp() * 1000) + 1
+        # 1. Fetch Monthly Data
+        df = fetch_binance_data(SYMBOL, '1M', limit=1000)
+        df = df.sort_values('dt').reset_index(drop=True)
         
-        df_hourly = pd.concat(all_hourly).drop_duplicates().sort_values('dt').reset_index(drop=True)
+        # 2. Pre-calculate Features
+        df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+        df['month'] = df['dt'].dt.month
         
-        # 2. Pre-calculate Features for the whole history (to fit scalers)
-        # Log Returns
-        df_hourly['log_ret'] = np.log(df_hourly['close'] / df_hourly['close'].shift(1))
-        # Month
-        df_hourly['month'] = df_hourly['dt'].dt.month
-        
-        # Drop initial NaN from shift
-        df_hourly = df_hourly.dropna().reset_index(drop=True)
+        # Drop initial NaN
+        df = df.dropna().reset_index(drop=True)
 
-        # 3. Fit Scalers (Global Fit based on history)
-        # The training script used RobustScaler on Returns and Z-Score on Month
+        if len(df) < SEQ_LENGTH + 1:
+            raise ValueError(f"Not enough monthly data. Need > {SEQ_LENGTH} months, got {len(df)}.")
+
+        # 3. Fit Scalers (Global Fit)
         scaler_ret = RobustScaler()
-        scaler_ret.fit(df_hourly['log_ret'].values.reshape(-1, 1))
+        scaler_ret.fit(df['log_ret'].values.reshape(-1, 1))
         
-        month_mean = df_hourly['month'].mean()
-        month_std = df_hourly['month'].std()
+        month_mean = df['month'].mean()
+        month_std = df['month'].std()
         if month_std == 0: month_std = 1.0
 
         # 4. Model Loading
         device = torch.device('cpu')
         model = GRUClassifier().to(device)
         
-        # Check for model file
         if not os.path.exists(MODEL_FILENAME):
-            print(f"Warning: {MODEL_FILENAME} not found. Running with initialized weights (random) for demo.")
+            print(f"Warning: {MODEL_FILENAME} not found. Using random weights.")
         else:
             try:
                 model.load_state_dict(torch.load(MODEL_FILENAME, map_location=device))
@@ -137,72 +125,94 @@ def run_startup_backtest():
         returns = []
         equity_curve = []
         
-        # We start the loop after SEQ_LENGTH to ensure we have enough context
-        # We simulate "walking forward" through the data
+        # Start simulation after the first full sequence
         start_index = SEQ_LENGTH
         
-        for i in range(start_index, len(df_hourly)):
-            curr_row = df_hourly.iloc[i]
+        for i in range(start_index, len(df)):
+            curr_row = df.iloc[i]
             curr_time = curr_row['dt']
             curr_price = curr_row['close']
 
-            # Calculate PnL from previous step
+            # Calculate PnL (Monthly)
             if i > start_index:
-                prev_price = df_hourly.iloc[i-1]['close']
-                h_ret = (curr_price - prev_price) / prev_price
-                period_pnl = position * h_ret
+                prev_price = df.iloc[i-1]['close']
+                m_ret = (curr_price - prev_price) / prev_price
+                period_pnl = position * m_ret
                 capital *= (1 + period_pnl)
                 returns.append(period_pnl)
 
-            # Prepare Input Sequence
-            # We need the LAST 20 rows of data up to this point
-            window = df_hourly.iloc[i-SEQ_LENGTH+1 : i+1].copy()
+            # Prepare Input Sequence (Last 20 Months)
+            window = df.iloc[i-SEQ_LENGTH+1 : i+1].copy()
             
-            # 1. Get raw features
+            # Feature Prep
             raw_rets = window['log_ret'].values.reshape(-1, 1)
             raw_months = window['month'].values.reshape(-1, 1)
             
-            # 2. Scale features (using the pre-fitted stats to prevent lookahead bias)
             scaled_rets = scaler_ret.transform(raw_rets)
             scaled_months = (raw_months - month_mean) / month_std
             
-            # 3. Stack [LogRet, Month] -> Shape (20, 2)
             seq_data = np.hstack([scaled_rets, scaled_months])
             
-            # Inference
             with torch.no_grad():
                 tensor_seq = torch.from_numpy(seq_data).float().unsqueeze(0).to(device)
                 logits = model(tensor_seq)
                 _, pred_idx = torch.max(logits, 1)
+                
+                # New Position Calculation
                 # Map 0->Short, 1->Neutral, 2->Long
-                position = {0: -1, 1: 0, 2: 1}[pred_idx.item()]
+                new_position = {0: -1, 1: 0, 2: 1}[pred_idx.item()]
 
-            # Record Equity Curve
-            if i % 24 == 0 or i == len(df_hourly) - 1:
-                equity_curve.append({'date': curr_time, 'equity': capital, 'price': curr_price})
+            # Store current state and the signal that will be ACTIVE for the next period
+            equity_curve.append({
+                'date': curr_time, 
+                'equity': capital, 
+                'price': curr_price,
+                'signal': new_position 
+            })
+            
+            # Update position for next iteration
+            position = new_position
 
         # 6. Stats & Plotting
         returns = np.array(returns)
-        sharpe = (np.mean(returns) / np.std(returns)) * np.sqrt(8760) if len(returns) > 0 and np.std(returns) > 0 else 0
+        sharpe = (np.mean(returns) / np.std(returns)) * np.sqrt(12) if len(returns) > 0 and np.std(returns) > 0 else 0
         
         dates = [d['date'] for d in equity_curve]
         equity_vals = [d['equity'] for d in equity_curve]
-        # Normalize BTC price to start at 1.0 for comparison
         base_price = equity_curve[0]['price'] if equity_curve else 1.0
         price_norm = [d['price'] / base_price for d in equity_curve]
+        signals = [d['signal'] for d in equity_curve]
 
-        plt.figure(figsize=(12, 6))
-        plt.plot(dates, equity_vals, color='#8b5cf6', linewidth=2, label='GRU Strategy')
-        plt.plot(dates, price_norm, color='#94a3b8', linestyle='--', alpha=0.6, label='BTC Buy & Hold')
-        plt.title(f"Annual Strategy Performance: {SYMBOL} (GRU)")
-        plt.legend()
-        plt.grid(alpha=0.2)
+        fig, ax = plt.subplots(figsize=(12, 6))
         
+        # Plot Background Colors for Signals
+        # Iterate through dates and color the span to the next date based on the current signal
+        for k in range(len(dates) - 1):
+            start_date = dates[k]
+            end_date = dates[k+1]
+            sig = signals[k]
+            
+            if sig == 1:
+                ax.axvspan(start_date, end_date, color='#dcfce7', alpha=0.6, lw=0) # Green for Long
+            elif sig == -1:
+                ax.axvspan(start_date, end_date, color='#fee2e2', alpha=0.6, lw=0) # Red for Short
+        
+        ax.plot(dates, equity_vals, color='#8b5cf6', linewidth=2, label='GRU Strategy')
+        ax.plot(dates, price_norm, color='#64748b', linestyle='--', alpha=0.6, label='BTC Buy & Hold')
+        
+        ax.set_title(f"Strategy Performance: {SYMBOL} (Monthly)")
+        ax.legend(loc='upper left')
+        ax.grid(alpha=0.2)
+        
+        # Formatting Date Axis
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        fig.autofmt_xdate()
+
         buf = io.BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight')
         buf.seek(0)
         img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-        plt.close()
+        plt.close(fig)
 
         cache.update({
             "status": "complete",
@@ -210,7 +220,7 @@ def run_startup_backtest():
             "plot_img": img_base64,
             "timestamp": time.strftime('%Y-%m-%d %H:%M:%S')
         })
-        print("Startup: Backtest complete. Cache populated.")
+        print("Startup: Monthly Backtest complete.")
 
     except Exception as e:
         print(f"Startup Error: {e}")
@@ -227,7 +237,7 @@ HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>GRU Lab - Startup Report</title>
+    <title>GRU Lab - Monthly Report</title>
     <meta http-equiv="refresh" content="{{ '10' if status == 'processing' or status == 'initializing' else '3600' }}">
     <style>
         body { font-family: system-ui, -apple-system, sans-serif; background: #f8fafc; color: #1e293b; padding: 40px; }
@@ -239,17 +249,19 @@ HTML_TEMPLATE = """
         .loader { border: 4px solid #f3f3f3; border-top: 4px solid #8b5cf6; border-radius: 50%; width: 30px; height: 30px; animation: spin 2s linear infinite; display: inline-block; vertical-align: middle; margin-right: 10px; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
         .badge { background: #f3e8ff; color: #6b21a8; padding: 4px 12px; border-radius: 9999px; font-size: 12px; font-weight: 600; }
+        .legend-box { margin-top: 10px; display: flex; gap: 15px; justify-content: center; font-size: 13px; color: #64748b; }
+        .dot { width: 10px; height: 10px; display: inline-block; border-radius: 2px; margin-right: 5px; }
     </style>
 </head>
 <body>
     <div class="card">
-        <h1>GRU Archival Analysis</h1>
+        <h1>GRU Monthly Analysis</h1>
         
         {% if status == 'processing' or status == 'initializing' %}
             <div style="padding: 100px 0; text-align: center;">
                 <div class="loader"></div>
-                <h2 style="display:inline-block;">Executing 1-Year Backtest...</h2>
-                <p style="color: #64748b;">The engine is running ~8,760 inferences on startup using the GRU model (2-Feature). This page will refresh automatically.</p>
+                <h2 style="display:inline-block;">Running Monthly Simulation...</h2>
+                <p style="color: #64748b;">Processing monthly candles for {{ symbol }}.</p>
             </div>
         {% elif status == 'error' %}
             <div style="background: #fef2f2; color: #991b1b; padding: 20px; border-radius: 8px;">
@@ -258,7 +270,7 @@ HTML_TEMPLATE = """
         {% else %}
             <div style="display: flex; justify-content: space-between; align-items: center;">
                 <span class="badge">Last Computed: {{ timestamp }}</span>
-                <span style="font-size: 14px; color: #64748b;">{{ symbol }} / Hourly Resolution</span>
+                <span style="font-size: 14px; color: #64748b;">{{ symbol }} / Monthly Resolution</span>
             </div>
 
             <div class="stat-grid">
@@ -274,7 +286,13 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <img src="data:image/png;base64,{{ plot_img }}" style="width: 100%; border-radius: 8px; border: 1px solid #e2e8f0;">
+            <div style="position: relative;">
+                <img src="data:image/png;base64,{{ plot_img }}" style="width: 100%; border-radius: 8px; border: 1px solid #e2e8f0;">
+                <div class="legend-box">
+                    <span><span class="dot" style="background:#dcfce7;"></span>Long Zone</span>
+                    <span><span class="dot" style="background:#fee2e2;"></span>Short Zone</span>
+                </div>
+            </div>
         {% endif %}
     </div>
 </body>
@@ -294,8 +312,6 @@ def index():
     )
 
 if __name__ == "__main__":
-    # Start the backtest thread before launching the web server
     threading.Thread(target=run_startup_backtest, daemon=True).start()
-    
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
