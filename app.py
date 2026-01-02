@@ -16,7 +16,7 @@ PRICES = [
 WINDOW_SIZE = 12 
 
 # Penalty for switching from one action to another
-SWITCHING_PENALTY_WEIGHT = 10
+SWITCHING_PENALTY_WEIGHT = 100
 
 # Actions available at each step
 ACTIONS = ['Long', 'Hold', 'Short']
