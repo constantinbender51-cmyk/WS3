@@ -2,6 +2,7 @@ import os
 import io
 import base64
 import time
+import threading
 import requests
 import numpy as np
 import pandas as pd
@@ -12,22 +13,27 @@ from sklearn.preprocessing import StandardScaler
 import matplotlib
 matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
-from matplotlib.dates import DateFormatter
 
 # ==========================================
-# 1. CONFIGURATION
+# 1. CONFIGURATION & MODEL
 # ==========================================
 MODEL_FILENAME = 'lstm_optimized.pth'
 SYMBOL = 'BTCUSDT'       
-INTERVAL = '1M'
-SEQ_LENGTH = 30          
-
-# --- MODEL PARAMETERS ---
+SEQ_LENGTH = 30 # This script assumes the model expects a sequence of 30 log-returns
 INPUT_DIM = 1         
 HIDDEN_DIM = 128         
 NUM_LAYERS = 2           
 DROPOUT = 0.4            
 NUM_CLASSES = 3       
+
+# Global storage for pre-calculated results
+cache = {
+    "status": "initializing",
+    "summary": None,
+    "plot_img": None,
+    "error": None,
+    "timestamp": None
+}
 
 class LSTMClassifier(nn.Module):
     def __init__(self):
@@ -50,155 +56,123 @@ class LSTMClassifier(nn.Module):
         return out
 
 # ==========================================
-# 2. DATA ENGINE (Full History Fetch)
+# 2. DATA UTILITIES
 # ==========================================
-def fetch_all_monthly_binance(symbol):
-    """Fetches every monthly candle available on Binance for the symbol."""
+def fetch_binance_data(symbol, interval, limit=1000, start_time=None):
     url = "https://api.binance.com/api/v3/klines"
-    all_data = []
-    start_time = 0 # Start from the beginning of time
-    
-    print(f"Starting full history fetch for {symbol}...", flush=True)
-    
-    while True:
-        params = {
-            'symbol': symbol,
-            'interval': INTERVAL,
-            'startTime': start_time,
-            'limit': 1000
-        }
-        try:
-            resp = requests.get(url, params=params, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-            
-            if not data:
-                break
-                
-            all_data.extend(data)
-            # Set start_time to the end of the last candle + 1ms
-            start_time = data[-1][6] + 1
-            
-            # If we received fewer than 1000 candles, we've reached the present
-            if len(data) < 1000:
-                break
-                
-            time.sleep(0.1) # Respectful rate limiting
-        except Exception as e:
-            return None, f"Full History Fetch Failed: {e}"
-            
-    return all_data, None
+    params = {'symbol': symbol, 'interval': interval, 'limit': limit}
+    if start_time: params['startTime'] = int(start_time)
+    resp = requests.get(url, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    df = pd.DataFrame(data, columns=['ot','o','h','l','close','v','ct','q','n','tb','tq','i'])
+    df['close'] = pd.to_numeric(df['close'])
+    df['dt'] = pd.to_datetime(df['ot'], unit='ms')
+    return df[['dt', 'close']]
 
-def get_analysis_data():
-    """Processes full history and runs LSTM inference."""
-    raw_data, error = fetch_all_monthly_binance(SYMBOL)
-    if error: return None, error
-        
+# ==========================================
+# 3. BACKTEST ENGINE (BACKGROUND TASK)
+# ==========================================
+def run_startup_backtest():
+    global cache
+    cache["status"] = "processing"
+    print(f"Startup: Beginning 1-Year Hourly Backtest for {SYMBOL}...")
+    
     try:
-        df = pd.DataFrame(raw_data, columns=[
-            'open_time', 'open', 'high', 'low', 'close', 'volume', 
-            'close_time', 'qav', 'num_trades', 'taker_base', 'taker_quote', 'ignore'
-        ])
+        # 1. Fetch Context (Monthly) - Need context to form sequences
+        # We need 31 months to get 30 log returns
+        df_monthly = fetch_binance_data(SYMBOL, '1M', limit=60)
         
-        df['close'] = pd.to_numeric(df['close'])
-        df['dt'] = pd.to_datetime(df['open_time'], unit='ms')
-        df.set_index('dt', inplace=True)
+        # 2. Fetch 1 Year of Hourly Data
+        all_hourly = []
+        start_ts = (time.time() - (365 * 24 * 3600)) * 1000
+        for _ in range(9):
+            chunk = fetch_binance_data(SYMBOL, '1h', limit=1000, start_time=start_ts)
+            if chunk.empty: break
+            all_hourly.append(chunk)
+            start_ts = (chunk['dt'].iloc[-1].timestamp() * 1000) + 1
         
-        # Calculate log returns
-        df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
-        df.dropna(inplace=True)
+        df_hourly = pd.concat(all_hourly).drop_duplicates().sort_values('dt')
         
-        if len(df) < SEQ_LENGTH:
-            return None, f"Insufficient historical data. Found: {len(df)} months."
-
-        scaler = StandardScaler()
-        scaled_vals = scaler.fit_transform(df['log_ret'].values.reshape(-1, 1))
-        
-        # Load Model
+        # 3. Model Loading
         device = torch.device('cpu')
         model = LSTMClassifier().to(device)
-        
         if not os.path.exists(MODEL_FILENAME):
-            return None, f"Checkpoint '{MODEL_FILENAME}' not found."
-            
+            raise FileNotFoundError(f"{MODEL_FILENAME} not found on Railway disk.")
+        
         model.load_state_dict(torch.load(MODEL_FILENAME, map_location=device))
         model.eval()
-        
-        results = []
-        # Inference Loop across the entire history
-        for i in range(SEQ_LENGTH, len(df)):
-            window = scaled_vals[i-SEQ_LENGTH : i]
-            tensor_seq = torch.from_numpy(window).float().unsqueeze(0).to(device)
+
+        # 4. Simulation
+        capital = 1.0
+        position = 0
+        returns = []
+        equity_curve = []
+        scaler = StandardScaler()
+
+        for i in range(len(df_hourly)):
+            curr_row = df_hourly.iloc[i]
+            curr_time, curr_price = curr_row['dt'], curr_row['close']
+
+            if i > 0:
+                h_ret = (curr_price - df_hourly.iloc[i-1]['close']) / df_hourly.iloc[i-1]['close']
+                period_pnl = position * h_ret
+                capital *= (1 + period_pnl)
+                returns.append(period_pnl)
+            
+            # Sequence: last SEQ_LENGTH closed months + current price
+            # We need SEQ_LENGTH + 1 price points to get SEQ_LENGTH returns
+            context = df_monthly[df_monthly['dt'] < curr_time].tail(SEQ_LENGTH)
+            prices_seq = np.append(context['close'].values, curr_price)
+            
+            # Log Returns & Scale
+            log_rets = np.log(prices_seq[1:] / prices_seq[:-1])
+            if len(log_rets) < SEQ_LENGTH: continue # Safety check
+            
+            scaled = scaler.fit_transform(log_rets.reshape(-1, 1))
             
             with torch.no_grad():
+                tensor_seq = torch.from_numpy(scaled).float().unsqueeze(0).to(device)
                 logits = model(tensor_seq)
-                probs = torch.nn.functional.softmax(logits, dim=1)
                 _, pred_idx = torch.max(logits, 1)
-                
-            class_idx = pred_idx.item()
-            signal = {0: -1, 1: 0, 2: 1}[class_idx]
-            confidence = probs[0][class_idx].item()
-            
-            results.append({
-                'date': df.index[i],
-                'price': df['close'].iloc[i],
-                'signal': signal,
-                'confidence': confidence,
-                'logits': [round(float(x), 4) for x in logits.numpy()[0]]
-            })
-            
-        return results, None
-        
-    except Exception as e:
-        return None, f"Inference Loop Failed: {str(e)}"
+                position = {0: -1, 1: 0, 2: 1}[pred_idx.item()]
 
-# ==========================================
-# 3. SCIENTIFIC VISUALIZATION
-# ==========================================
-def create_plot(results):
-    dates = [r['date'] for r in results]
-    prices = [r['price'] for r in results]
-    signals = [r['signal'] for r in results]
-    conf = [r['confidence'] for r in results]
-    
-    plt.rcParams['font.family'] = 'serif'
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 9), sharex=True, gridspec_kw={'height_ratios': [3, 1]})
-    plt.subplots_adjust(hspace=0.08)
-    
-    # Price and Full History Signals
-    ax1.plot(dates, prices, color='black', linewidth=1, label='BTC Monthly Price')
-    
-    # Filter signals for plotting
-    buys = [(d, p) for d, p, s in zip(dates, prices, signals) if s == 1]
-    sells = [(d, p) for d, p, s in zip(dates, prices, signals) if s == -1]
-    
-    if buys:
-        ax1.scatter(*zip(*buys), marker='^', facecolors='none', edgecolors='green', s=80, linewidth=1.5, label='BUY Signal', zorder=5)
-    if sells:
-        ax1.scatter(*zip(*sells), marker='v', color='red', s=80, label='SELL Signal', zorder=5)
-    
-    ax1.set_yscale('log') # Log scale is essential for full BTC history
-    ax1.set_ylabel('USD Price (Log Scale)', fontweight='bold')
-    ax1.set_title(f'Full Historical Sequence Analysis: {SYMBOL} (Monthly)', fontsize=14, pad=20)
-    ax1.grid(True, which="both", linestyle='--', alpha=0.3)
-    ax1.legend(loc='upper left', frameon=True, edgecolor='black')
-    
-    # Confidence Score
-    ax2.fill_between(dates, conf, 0, color='gray', alpha=0.2, label='Confidence')
-    ax2.plot(dates, conf, color='black', linewidth=0.8)
-    ax2.set_ylabel('Probability', fontsize=10)
-    ax2.set_ylim(0, 1.1)
-    ax2.grid(True, linestyle='--', alpha=0.3)
-    
-    ax2.xaxis.set_major_formatter(DateFormatter('%Y-%m'))
-    fig.autofmt_xdate()
-    
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', bbox_inches='tight', dpi=150)
-    buf.seek(0)
-    img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-    plt.close(fig)
-    return img_base64
+            if i % 24 == 0 or i == len(df_hourly) - 1:
+                equity_curve.append({'date': curr_time, 'equity': capital, 'price': curr_price})
+
+        # 5. Stats
+        returns = np.array(returns)
+        sharpe = (np.mean(returns) / np.std(returns)) * np.sqrt(8760) if np.std(returns) > 0 else 0
+        
+        # 6. Plotting
+        dates = [d['date'] for d in equity_curve]
+        equity_vals = [d['equity'] for d in equity_curve]
+        price_norm = [d['price'] / equity_curve[0]['price'] for d in equity_curve]
+
+        plt.figure(figsize=(12, 6))
+        plt.plot(dates, equity_vals, color='#0ea5e9', linewidth=2, label='LSTM Strategy')
+        plt.plot(dates, price_norm, color='#94a3b8', linestyle='--', alpha=0.6, label='BTC Buy & Hold')
+        plt.title(f"Annual Strategy Performance: {SYMBOL}")
+        plt.legend()
+        plt.grid(alpha=0.2)
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+        plt.close()
+
+        cache.update({
+            "status": "complete",
+            "summary": {"sharpe": sharpe, "total_return": (capital - 1) * 100},
+            "plot_img": img_base64,
+            "timestamp": time.strftime('%Y-%m-%d %H:%M:%S')
+        })
+        print("Startup: Backtest complete. Cache populated.")
+
+    except Exception as e:
+        print(f"Startup Error: {e}")
+        cache.update({"status": "error", "error": str(e)})
 
 # ==========================================
 # 4. WEB SERVER
@@ -209,72 +183,54 @@ HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>LSTM Full History Dashboard</title>
+    <title>LSTM Lab - Startup Report</title>
+    <meta http-equiv="refresh" content="{{ '10' if status == 'processing' or status == 'initializing' else '3600' }}">
     <style>
-        body { font-family: "Times New Roman", serif; background: #eee; padding: 20px; }
-        .paper { max-width: 1200px; margin: 0 auto; background: #fff; padding: 40px; border: 1px solid #111; box-shadow: 15px 15px 0px rgba(0,0,0,0.1); }
-        .hdr { text-align: center; border-bottom: 3px double #000; margin-bottom: 30px; }
-        .meta-grid { display: grid; grid-template-columns: repeat(3, 1fr); border: 1px solid #000; margin-bottom: 25px; background: #f9f9f9; }
-        .meta-item { padding: 10px; border: 1px solid #eee; font-size: 0.9em; }
-        .chart-box { border: 1px solid #000; padding: 10px; margin-bottom: 30px; }
-        table { width: 100%; border-collapse: collapse; font-family: "Courier New", monospace; font-size: 12px; }
-        th, td { border: 1px solid #333; padding: 6px; text-align: center; }
-        th { background: #eee; }
-        .buy { background: #dcfce7; font-weight: bold; }
-        .sell { background: #fee2e2; font-weight: bold; }
-        .error { color: #b91c1c; border: 2px solid #b91c1c; padding: 20px; text-align: center; }
+        body { font-family: system-ui, -apple-system, sans-serif; background: #f8fafc; color: #1e293b; padding: 40px; }
+        .card { max-width: 1000px; margin: 0 auto; background: #fff; padding: 40px; border-radius: 12px; box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1); border: 1px solid #e2e8f0; }
+        .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 30px 0; }
+        .stat-box { background: #f1f5f9; padding: 20px; border-radius: 8px; text-align: center; }
+        .val { font-size: 32px; font-weight: 800; display: block; }
+        .label { font-size: 12px; text-transform: uppercase; color: #64748b; font-weight: 700; }
+        .loader { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 30px; height: 30px; animation: spin 2s linear infinite; display: inline-block; vertical-align: middle; margin-right: 10px; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .badge { background: #e0f2fe; color: #0369a1; padding: 4px 12px; border-radius: 9999px; font-size: 12px; font-weight: 600; }
     </style>
 </head>
 <body>
-    <div class="paper">
-        <div class="hdr">
-            <h1>ARCHIVAL MARKET INTELLIGENCE REPORT</h1>
-            <p>Comprehensive Historical Inference Engine • Monthly Resolution</p>
-        </div>
-
-        <div class="meta-grid">
-            <div class="meta-item"><strong>Instrument:</strong> {{ symbol }}</div>
-            <div class="meta-item"><strong>LSTM Config:</strong> {{ hidden }}H / {{ layers }}L</div>
-            <div class="meta-item"><strong>Window:</strong> {{ seq }} Months</div>
-            <div class="meta-item"><strong>Sample Count:</strong> {{ total_samples }}</div>
-            <div class="meta-item"><strong>Model File:</strong> {{ model }}</div>
-            <div class="meta-item"><strong>Report Date:</strong> {{ now }}</div>
-        </div>
-
-        {% if error %}
-            <div class="error">
-                CRITICAL INITIALIZATION ERROR: {{ error }}
+    <div class="card">
+        <h1>LSTM Archival Analysis</h1>
+        
+        {% if status == 'processing' or status == 'initializing' %}
+            <div style="padding: 100px 0; text-align: center;">
+                <div class="loader"></div>
+                <h2 style="display:inline-block;">Executing 1-Year Backtest...</h2>
+                <p style="color: #64748b;">The engine is running ~8,760 inferences on startup. This page will refresh automatically.</p>
+            </div>
+        {% elif status == 'error' %}
+            <div style="background: #fef2f2; color: #991b1b; padding: 20px; border-radius: 8px;">
+                <strong>Simulation Failed:</strong> {{ error }}
             </div>
         {% else %}
-            <div class="chart-box">
-                <img src="data:image/png;base64,{{ plot_img }}" style="width: 100%;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span class="badge">Last Computed: {{ timestamp }}</span>
+                <span style="font-size: 14px; color: #64748b;">{{ symbol }} / Hourly Resolution</span>
             </div>
 
-            <h3 style="border-bottom: 2px solid #000; padding-bottom: 5px;">Complete Inference Archive (Recent to Oldest)</h3>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Date</th>
-                        <th>Close (USD)</th>
-                        <th>Model Signal</th>
-                        <th>Confidence</th>
-                        <th>Raw Logits [S, H, B]</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for row in table_data %}
-                    <tr>
-                        <td>{{ row.date.strftime('%Y-%m') }}</td>
-                        <td>${{ "{:,.2f}".format(row.price) }}</td>
-                        <td class="{{ 'buy' if row.signal == 1 else 'sell' if row.signal == -1 else '' }}">
-                            {{ "BUY" if row.signal == 1 else "SELL" if row.signal == -1 else "HOLD" }}
-                        </td>
-                        <td>{{ "{:.2f}%".format(row.confidence * 100) }}</td>
-                        <td style="color: #666; font-size: 10px;">{{ row.logits }}</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
+            <div class="stat-grid">
+                <div class="stat-box">
+                    <span class="label">Annualized Sharpe Ratio</span>
+                    <span class="val">{{ "%.4f"|format(summary.sharpe) }}</span>
+                </div>
+                <div class="stat-box">
+                    <span class="label">Total Strategy Return</span>
+                    <span class="val" style="color: {{ '#16a34a' if summary.total_return > 0 else '#dc2626' }}">
+                        {{ "%.2f"|format(summary.total_return) }}%
+                    </span>
+                </div>
+            </div>
+
+            <img src="data:image/png;base64,{{ plot_img }}" style="width: 100%; border-radius: 8px; border: 1px solid #e2e8f0;">
         {% endif %}
     </div>
 </body>
@@ -283,29 +239,19 @@ HTML_TEMPLATE = """
 
 @app.route('/')
 def index():
-    results, error = get_analysis_data()
-    plot_img = None
-    table_data = []
-    
-    if results:
-        plot_img = create_plot(results)
-        # Display the full log, newest first
-        table_data = results[::-1]
-    
     return render_template_string(
         HTML_TEMPLATE,
-        symbol=SYMBOL,
-        model=MODEL_FILENAME, 
-        hidden=HIDDEN_DIM, 
-        layers=NUM_LAYERS, 
-        seq=SEQ_LENGTH,
-        total_samples=len(results) if results else 0,
-        now=time.strftime('%Y-%m-%d %H:%M:%S'),
-        error=error, 
-        plot_img=plot_img, 
-        table_data=table_data
+        status=cache["status"],
+        summary=cache["summary"],
+        plot_img=cache["plot_img"],
+        error=cache["error"],
+        timestamp=cache["timestamp"],
+        symbol=SYMBOL
     )
 
 if __name__ == "__main__":
+    # Start the backtest thread before launching the web server
+    threading.Thread(target=run_startup_backtest, daemon=True).start()
+    
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
