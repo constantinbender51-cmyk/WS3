@@ -10,7 +10,7 @@ PRICES = [100.0, 102.5, 101.2, 105.0, 107.3, 104.5, 103.0, 108.2,
           110.5, 109.0, 112.4, 115.8, 114.2, 113.5, 118.0]
 
 # Penalty for switching from one action to another (higher = more stability)
-SWITCHING_PENALTY_WEIGHT = 0.5 
+SWITCHING_PENALTY_WEIGHT = 1 
 
 # Actions available at each step
 ACTIONS = ['Long', 'Hold', 'Short']
