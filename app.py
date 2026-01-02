@@ -33,11 +33,18 @@ class LSTMClassifier(nn.Module):
         super().__init__()
         self.lstm = nn.LSTM(INPUT_DIM, HIDDEN_DIM, NUM_LAYERS, 
                             batch_first=True, dropout=DROPOUT)
+        # FIX: Added BatchNorm1d to match "lstm_regularized.pth" structure
+        self.bn = nn.BatchNorm1d(HIDDEN_DIM)
         self.fc = nn.Linear(HIDDEN_DIM, NUM_CLASSES)
         
     def forward(self, x):
         out, _ = self.lstm(x)
-        out = self.fc(out[:, -1, :])
+        # Take the output from the last time step
+        out = out[:, -1, :]
+        # Apply Batch Normalization
+        out = self.bn(out)
+        # Final Classification
+        out = self.fc(out)
         return out
 
 def get_action_name(idx):
