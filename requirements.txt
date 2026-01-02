@@ -1,12 +1,3 @@
-flask
-pandas
-matplotlib
-scikit-learn
-requests
-gunicorn
-yfinance
 numpy
-pandas-datareader
-torch
-Pillow
+gunicorn
 # Note: Python 3.6+ required for f-strings and other features used in app.py
