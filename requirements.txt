@@ -1,5 +1,6 @@
 flask
-pandas
+pandasmatplotlib
+scikit-learn
 requests
 gunicorn
 yfinance
