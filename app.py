@@ -17,7 +17,7 @@ WINDOW_SIZE = 10
 
 # Penalty for switching actions (Set to 25 as requested)
 # This strongly favors long-term positions over frequent trading.
-SWITCHING_PENALTY_WEIGHT = 25.0 
+SWITCHING_PENALTY_WEIGHT = 35
 
 # Actions available at each step
 ACTIONS = ['Long', 'Hold', 'Short']
