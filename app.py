@@ -1,83 +1,94 @@
 import itertools
 import numpy as np
+import time
 
-def solve_trading_sequence(prices, switching_penalty_weight=0.1):
+# ==========================================
+# CONFIGURATION PARAMETERS
+# ==========================================
+# 15 sample prices (p1 to p15)
+PRICES = [100.0, 102.5, 101.2, 105.0, 107.3, 104.5, 103.0, 108.2, 
+          110.5, 109.0, 112.4, 115.8, 114.2, 113.5, 118.0]
+
+# Penalty for switching from one action to another (higher = more stability)
+SWITCHING_PENALTY_WEIGHT = 0.5 
+
+# Actions available at each step
+ACTIONS = ['Long', 'Hold', 'Short']
+
+# ==========================================
+
+def solve_trading_problem():
     """
-    Finds the optimal sequence of Long (L), Hold (H), and Short (S) actions
-    to maximize (Mean Return / Std Dev) - (Switching Penalty).
+    Finds the optimal sequence of actions to maximize:
+    (Mean Return / Std Dev) - (Switching Penalty * Switches)
     """
-    actions = ['Long', 'Hold', 'Short']
-    n = len(prices)
+    n_prices = len(PRICES)
+    n_intervals = n_prices - 1
     
-    # Calculate period-over-period returns
-    # returns[i] is the gain from holding 'Long' between price[i] and price[i+1]
-    price_returns = np.diff(prices)
-    num_intervals = len(price_returns)
+    # Pre-calculate price changes
+    price_diffs = np.diff(PRICES)
     
     best_score = -float('inf')
     best_sequence = None
-    results_summary = {}
+    
+    print(f"Analyzing {3**n_intervals:,} possible sequences...")
+    start_time = time.time()
 
-    # Iterate through all 3^n possible action sequences
-    # Note: Action at index i determines the return from prices[i] to prices[i+1]
-    for sequence in itertools.product(actions, repeat=num_intervals):
-        current_returns = []
-        switches = 0
+    # Iterate through all 3^(n-1) action sequences
+    for sequence in itertools.product(ACTIONS, repeat=n_intervals):
+        # Map actions to return multipliers
+        # Long = 1, Hold = 0, Short = -1
+        multipliers = np.array([1 if a == 'Long' else (-1 if a == 'Short' else 0) for a in sequence])
         
-        for i in range(num_intervals):
-            action = sequence[i]
-            
-            # Define return multiplier based on action
-            if action == 'Long':
-                current_returns.append(price_returns[i])
-            elif action == 'Short':
-                current_returns.append(-price_returns[i])
-            else: # Hold
-                current_returns.append(0)
-            
-            # Count switches (penalty for changing strategy)
-            if i > 0 and sequence[i] != sequence[i-1]:
+        # Calculate resulting returns for this path
+        strategy_returns = price_diffs * multipliers
+        
+        # 1. Return/Risk Metric
+        total_return = np.sum(strategy_returns)
+        std_dev = np.std(strategy_returns)
+        
+        # Avoid division by zero
+        risk_adj_return = total_return / (std_dev + 1e-9)
+        
+        # 2. Switching Penalty
+        # Count how many times the action at t differs from t-1
+        switches = 0
+        for i in range(1, n_intervals):
+            if sequence[i] != sequence[i-1]:
                 switches += 1
         
-        # Calculate Metrics
-        total_return = sum(current_returns)
-        std_dev = np.std(current_returns) if len(current_returns) > 1 else 1.0
+        # Normalize switching penalty by number of possible switch points
+        penalty = (switches / (n_intervals - 1)) * SWITCHING_PENALTY_WEIGHT
         
-        # Avoid division by zero for standard deviation
-        risk_adjusted_return = total_return / (std_dev + 1e-9)
+        # Final Objective: Maximize Risk Adjusted Return minus Penalty
+        current_score = risk_adj_return - penalty
         
-        # Final Objective Function: Maximize (Return/Risk) - (Penalty * Switches)
-        # We normalize switches by the max possible switches (n-1)
-        normalized_switch_penalty = (switches / (num_intervals - 1)) if num_intervals > 1 else 0
-        score = risk_adjusted_return - (switching_penalty_weight * normalized_switch_penalty)
-        
-        if score > best_score:
-            best_score = score
+        if current_score > best_score:
+            best_score = current_score
             best_sequence = sequence
-            results_summary = {
-                "Score": score,
-                "Total Return": total_return,
-                "Std Dev": std_dev,
+            best_metrics = {
+                "Return": total_return,
+                "StdDev": std_dev,
                 "Switches": switches,
-                "Sequence": sequence
+                "Score": current_score
             }
 
-    return results_summary
+    end_time = time.time()
+    
+    # Display Results
+    print("\n" + "="*40)
+    print("OPTIMAL TRADING SEQUENCE FOUND")
+    print("="*40)
+    print(f"Computation Time: {end_time - start_time:.2f} seconds")
+    print(f"Final Score:      {best_metrics['Score']:.4f}")
+    print(f"Total Return:     {best_metrics['Return']:.2f}")
+    print(f"Volatility (Std): {best_metrics['StdDev']:.2f}")
+    print(f"Total Switches:   {best_metrics['Switches']}")
+    print("-" * 40)
+    
+    print("Step-by-Step Action Plan:")
+    for i, action in enumerate(best_sequence):
+        print(f"Interval {i+1} (p{i+1}->p{i+2}): {action}")
 
-# --- Execution ---
 if __name__ == "__main__":
-    # Example: 10 sample prices (p1 to p10)
-    sample_prices = [100, 102, 101, 105, 107, 104, 103, 108, 110, 109]
-    
-    # Set the penalty weight (higher = less switching)
-    penalty_weight = 0.5 
-    
-    result = solve_trading_sequence(sample_prices, switching_penalty_weight=penalty_weight)
-    
-    print("--- Optimal Trading Strategy ---")
-    print(f"Prices: {sample_prices}")
-    print(f"Optimal Sequence: {result['Sequence']}")
-    print(f"Total Return: {result['Total Return']:.2f}")
-    print(f"Volatility (Std Dev): {result['Std Dev']:.2f}")
-    print(f"Number of Switches: {result['Switches']}")
-    print(f"Final Combined Score: {result['Score']:.4f}")
+    solve_trading_problem()
