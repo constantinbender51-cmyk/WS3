@@ -14,7 +14,7 @@ PAIR = 'XBTUSD'        # Bitcoin/USD
 KRAKEN_INTERVAL = 10080 # 10080 min = 1 Week (Fetch Weekly to build Monthly)
 SEQ_LENGTH = 60        # 60 Months (5 Years)
 
-# Model Hyperparameters (Must match training exactly)
+# Model Hyperparameters
 INPUT_DIM = 1         
 HIDDEN_DIM = 128      
 NUM_LAYERS = 2        
@@ -45,9 +45,8 @@ def get_action_name(class_index):
 # 3. DATA PIPELINE
 # ==========================================
 def fetch_and_process_data():
-    print(f"1. Fetching Weekly data from Kraken for {PAIR}...")
+    print(f"1. Fetching Weekly data from Kraken for {PAIR}...", flush=True)
     url = "https://api.kraken.com/0/public/OHLC"
-    # Fetch weekly data. Kraken usually returns ~720 candles.
     params = {'pair': PAIR, 'interval': KRAKEN_INTERVAL}
     
     try:
@@ -55,53 +54,46 @@ def fetch_and_process_data():
         data = response.json()
         
         if data.get('error'):
-            print(f"Kraken Error: {data['error']}")
+            print(f"Kraken Error: {data['error']}", flush=True)
             return None, None
 
-        # Dynamic key extraction
         result_keys = list(data['result'].keys())
         target_key = [k for k in result_keys if k != 'last'][0]
         ohlc = data['result'][target_key]
         
-        # Create DataFrame
         df = pd.DataFrame(ohlc, columns=['time', 'open', 'high', 'low', 'close', 'vwap', 'vol', 'count'])
         df['close'] = pd.to_numeric(df['close'])
         df['dt'] = pd.to_datetime(df['time'], unit='s')
         df.set_index('dt', inplace=True)
         
-        print(f"   > Received {len(df)} weekly candles.")
+        print(f"   > Received {len(df)} weekly candles.", flush=True)
 
-        # --- RESAMPLING TO MONTHLY ---
-        print("2. Resampling Weekly -> Monthly...")
-        # 'ME' is Month End
+        print("2. Resampling Weekly -> Monthly...", flush=True)
         monthly_df = df['close'].resample('ME').last().to_frame() 
         
-        # --- CALCULATE LOG RETURNS ---
         monthly_df['log_ret'] = np.log(monthly_df['close'] / monthly_df['close'].shift(1))
         monthly_df.dropna(inplace=True)
         
-        print(f"   > Generated {len(monthly_df)} monthly return points.")
+        print(f"   > Generated {len(monthly_df)} monthly return points.", flush=True)
         
-        # --- NORMALIZATION ---
-        print("3. Normalizing (StandardScaler)...")
+        print("3. Normalizing (StandardScaler)...", flush=True)
         scaler = StandardScaler()
         data_val = monthly_df['log_ret'].values.reshape(-1, 1)
         scaled_data = scaler.fit_transform(data_val)
         
-        # Return the full dataset and the dataframe (for dates)
         return scaled_data, monthly_df
 
     except Exception as e:
-        print(f"Data Processing Error: {e}")
+        print(f"Data Processing Error: {e}", flush=True)
         return None, None
 
 # ==========================================
 # 4. MAIN EXECUTION
 # ==========================================
 if __name__ == "__main__":
-    print("-" * 50)
-    print(" MONTHLY BITCOIN PREDICTION (Last 12 Months Review)")
-    print("-" * 50)
+    print("-" * 65, flush=True)
+    print(" MONTHLY BITCOIN PREDICTION (Historical Timeline)", flush=True)
+    print("-" * 65, flush=True)
 
     # 1. Load Model
     device = torch.device('cpu')
@@ -110,9 +102,9 @@ if __name__ == "__main__":
     try:
         model.load_state_dict(torch.load(MODEL_FILENAME, map_location=device))
         model.eval()
-        print(f"Model weights loaded from {MODEL_FILENAME}")
+        print(f"Model weights loaded from {MODEL_FILENAME}", flush=True)
     except FileNotFoundError:
-        print(f"Error: {MODEL_FILENAME} not found.")
+        print(f"Error: {MODEL_FILENAME} not found.", flush=True)
         exit()
 
     # 2. Get Full Data
@@ -121,36 +113,21 @@ if __name__ == "__main__":
     if scaled_data is not None:
         total_len = len(scaled_data)
         
-        # We want the last 12 months.
-        # Ensure we have enough data to go back 12 months + 60 lookback
-        if total_len < SEQ_LENGTH + 12:
-            print(f"Warning: Not enough data for full 12-month history. Showing what is available.")
-            start_loop = SEQ_LENGTH
-        else:
-            start_loop = total_len - 12
+        # Start at 59 so we include the very first valid sequence (indices 0-59)
+        start_loop = SEQ_LENGTH - 1
 
-        print("\n" + "="*65)
-        print(f"{'DATE':<15} | {'ACTION':<10} | {'CONFIDENCE':<10} | {'RAW LOGITS'}")
-        print("="*65)
+        print("\n" + "="*80, flush=True)
+        print(f"{'DATE':<12} | {'ACTION':<6} | {'CONF':<8} | {'RAW LOGITS'}", flush=True)
+        print("="*80, flush=True)
 
-        # 3. Loop through the desired range
-        # range(start_loop, total_len + 1) because slice is exclusive on the right
-        # Wait, if we want the prediction FOR index i, we need data up to i.
-        # So we loop i from start_loop to total_len-1.
-        # Slice will be [i - SEQ_LENGTH + 1 : i + 1]
-        
+        # 3. Loop through EVERY valid month
         for i in range(start_loop, total_len):
-            # Create window: e.g., if i=100, we want 41..100 (60 items)
-            # Python slice is [start:end], excludes end. So [41 : 101]
             window_end = i + 1
             window_start = window_end - SEQ_LENGTH
             
             sequence = scaled_data[window_start:window_end]
-            
-            # Prepare Tensor
             tensor_seq = torch.from_numpy(sequence).float().unsqueeze(0)
             
-            # Inference
             with torch.no_grad():
                 logits = model(tensor_seq)
                 probs = torch.nn.functional.softmax(logits, dim=1)
@@ -158,11 +135,9 @@ if __name__ == "__main__":
                 action_code = pred_idx.item()
                 action = get_action_name(action_code)
 
-            # Formatting
             date_str = monthly_df.index[i].strftime('%Y-%m-%d')
             prob_val = probs[0][action_code].item() * 100
             
-            # Color/Text logic
             if action == 1:
                 act_str = "BUY"
             elif action == -1:
@@ -170,9 +145,10 @@ if __name__ == "__main__":
             else:
                 act_str = "HOLD"
 
-            print(f"{date_str:<15} | {act_str:<10} | {prob_val:>6.2f}%    | {logits.numpy()[0]}")
+            # CRITICAL: flush=True ensures line sends immediately
+            print(f"{date_str:<12} | {act_str:<6} | {prob_val:>6.2f}%  | {logits.numpy()[0]}", flush=True)
             
-            # 0.1s Delay
+            # CRITICAL: Sleep ensures log system preserves order
             time.sleep(0.1)
 
-        print("="*65)
+        print("="*80, flush=True)
