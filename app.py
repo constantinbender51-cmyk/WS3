@@ -1,85 +1,51 @@
 import os
 import io
-import sys
-import time
 import base64
+import time
 import threading
 import requests
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
-from sklearn.preprocessing import RobustScaler
-from sklearn.utils.class_weight import compute_class_weight
 from flask import Flask, render_template_string
+from sklearn.preprocessing import RobustScaler
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
 
-# Try importing gdown, handle if missing
-try:
-    import gdown
-except ImportError:
-    gdown = None
-
 # ==========================================
-# 1. CONFIGURATION (FROM CORRECT ORIGIN)
+# 1. CONFIGURATION & MODEL SPECS
 # ==========================================
-# System
-torch.set_num_threads(12)
-DEVICE = torch.device('cpu')
-
-# Data
-FILE_ID = '1zmPWQo5MAxgyDyvaFTpf_NiqN2o6lswa'
-DOWNLOAD_OUTPUT = 'market_data.csv'
-SEQ_LENGTH = 20
-TRAIN_SPLIT = 0.8
-
-# Model
-INPUT_DIM = 2          # Feature 1: Log Returns, Feature 2: Z-Scored Month
-HIDDEN_DIM = 256
-NUM_LAYERS = 3
-DROPOUT = 0.2
-NUM_CLASSES = 3
-
-# Training
-BATCH_SIZE = 4096
-EPOCHS = 50 # Reduced from 300 for demo speed (User can adjust)
-MAX_LR = 1e-2
-WEIGHT_DECAY = 1e-4
+# Updated based on 'gru_full_dataset.pth' training script
 MODEL_FILENAME = 'gru_full_dataset.pth'
+SYMBOL = 'BTCUSDT'       
+SEQ_LENGTH = 20          # Updated from 30
+INPUT_DIM = 2            # Updated from 1 (Feat 1: LogRet, Feat 2: Month)
+HIDDEN_DIM = 256         # Updated from 128
+NUM_LAYERS = 3           # Updated from 2
+DROPOUT = 0.2            # Updated from 0.4
+NUM_CLASSES = 3       
 
-# Global State for Web UI
+# Global storage for pre-calculated results
 cache = {
     "status": "initializing",
-    "epoch": 0,
-    "total_epochs": EPOCHS,
-    "train_loss": 0.0,
-    "val_acc": 0.0,
     "summary": None,
     "plot_img": None,
     "error": None,
-    "timestamp": None,
-    "logs": []
+    "timestamp": None
 }
 
-def log(msg):
-    ts = time.strftime('%H:%M:%S')
-    print(f"[{ts}] {msg}", flush=True)
-    cache["logs"].append(f"[{ts}] {msg}")
-    # Keep logs trimmed
-    if len(cache["logs"]) > 50:
-        cache["logs"].pop(0)
-
-# ==========================================
-# 2. MODEL DEFINITION (GRU)
-# ==========================================
 class GRUClassifier(nn.Module):
     def __init__(self):
         super().__init__()
-        self.gru = nn.GRU(INPUT_DIM, HIDDEN_DIM, NUM_LAYERS, 
-                          batch_first=True, dropout=DROPOUT)
+        self.gru = nn.GRU(
+            input_size=INPUT_DIM, 
+            hidden_size=HIDDEN_DIM, 
+            num_layers=NUM_LAYERS, 
+            batch_first=True, 
+            dropout=DROPOUT
+        )
         self.bn = nn.BatchNorm1d(HIDDEN_DIM)
         self.dropout = nn.Dropout(DROPOUT)
         self.fc = nn.Linear(HIDDEN_DIM, NUM_CLASSES)
@@ -87,7 +53,7 @@ class GRUClassifier(nn.Module):
     def forward(self, x):
         # Input shape: (Batch, Seq, Feature)
         out, _ = self.gru(x)
-        # GRU returns (output, hidden). We take the last time step
+        # Take the last time step
         out = out[:, -1, :] 
         out = self.bn(out)
         out = torch.relu(out)
@@ -96,200 +62,139 @@ class GRUClassifier(nn.Module):
         return out
 
 # ==========================================
-# 3. BACKGROUND TASK: DATA & TRAIN
+# 2. DATA UTILITIES
 # ==========================================
-def download_data():
-    if not os.path.exists(DOWNLOAD_OUTPUT):
-        log(f"Downloading data from ID: {FILE_ID}...")
-        try:
-            url = f'https://drive.google.com/uc?id={FILE_ID}'
-            if gdown:
-                gdown.download(url, DOWNLOAD_OUTPUT, quiet=False, fuzzy=True)
-            else:
-                # Fallback if gdown is not installed
-                log("gdown not found. Attempting raw requests download...")
-                resp = requests.get(url)
-                with open(DOWNLOAD_OUTPUT, 'wb') as f:
-                    f.write(resp.content)
-        except Exception as e:
-            raise RuntimeError(f"Download Error: {e}")
+def fetch_binance_data(symbol, interval, limit=1000, start_time=None):
+    url = "https://api.binance.com/api/v3/klines"
+    params = {'symbol': symbol, 'interval': interval, 'limit': limit}
+    if start_time: params['startTime'] = int(start_time)
+    resp = requests.get(url, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    df = pd.DataFrame(data, columns=['ot','o','h','l','close','v','ct','q','n','tb','tq','i'])
+    df['close'] = pd.to_numeric(df['close'])
+    df['dt'] = pd.to_datetime(df['ot'], unit='ms')
+    return df[['dt', 'close']]
 
-def run_pipeline():
+# ==========================================
+# 3. BACKTEST ENGINE (BACKGROUND TASK)
+# ==========================================
+def run_startup_backtest():
     global cache
     cache["status"] = "processing"
+    print(f"Startup: Beginning 1-Year Hourly Backtest for {SYMBOL} using GRU...")
     
     try:
-        # --- 1. Data Loading ---
-        download_data()
-        df = pd.read_csv(DOWNLOAD_OUTPUT)
-        df.columns = df.columns.str.strip().str.lower()
-        log(f"Data Loaded: {len(df)} rows.")
-
-        # Feature Engineering
-        if 'value' in df.columns: price_col = 'value'
-        elif 'close' in df.columns: price_col = 'close'
-        else: raise ValueError("No price column found")
-
+        # 1. Fetch 1 Year of Hourly Data
+        # We need enough history to fit the scaler reasonably well
+        all_hourly = []
+        start_ts = (time.time() - (365 * 24 * 3600)) * 1000
+        for _ in range(9): # Fetch chunks to get ~8760 rows
+            chunk = fetch_binance_data(SYMBOL, '1h', limit=1000, start_time=start_ts)
+            if chunk.empty: break
+            all_hourly.append(chunk)
+            start_ts = (chunk['dt'].iloc[-1].timestamp() * 1000) + 1
+        
+        df_hourly = pd.concat(all_hourly).drop_duplicates().sort_values('dt').reset_index(drop=True)
+        
+        # 2. Pre-calculate Features for the whole history (to fit scalers)
         # Log Returns
-        df['log_ret'] = np.log(df[price_col] / df[price_col].shift(1))
+        df_hourly['log_ret'] = np.log(df_hourly['close'] / df_hourly['close'].shift(1))
+        # Month
+        df_hourly['month'] = df_hourly['dt'].dt.month
         
-        # Month Z-Score
-        if 'month' not in df.columns:
-            if 'datetime' in df.columns:
-                df['month'] = pd.to_datetime(df['datetime']).dt.month
-            else:
-                df['month'] = 0
-        
-        month_mean = df['month'].mean()
-        month_std = df['month'].std() if df['month'].std() != 0 else 1.0
-        df['month_norm'] = (df['month'] - month_mean) / month_std
-        
-        # Labels
-        label_map = {-1: 0, 0: 1, 1: 2}
-        if 'signal' not in df.columns: raise ValueError("No signal column")
-        df['target_class'] = df['signal'].map(label_map)
-        
-        # Cleanup
-        df.dropna(subset=['log_ret', 'target_class', 'month_norm'], inplace=True)
-        df = df[~df.isin([np.nan, np.inf, -np.inf]).any(axis=1)]
-        
-        # Scaling
-        log_ret_vals = df['log_ret'].values.reshape(-1, 1)
-        scaler = RobustScaler()
-        log_ret_scaled = scaler.fit_transform(log_ret_vals)
-        month_scaled = df['month_norm'].values.reshape(-1, 1)
-        
-        # Stack Features (N, 2)
-        data_val = np.hstack([log_ret_scaled, month_scaled])
-        labels_val = df['target_class'].values.astype(int)
-        raw_prices = df[price_col].values # Keep for backtest simulation
-        
-        # Sequence Generation
-        from numpy.lib.stride_tricks import sliding_window_view
-        windows = sliding_window_view(data_val, window_shape=SEQ_LENGTH, axis=0)
-        X = windows.transpose(0, 2, 1) # (N, Seq, Feat)
-        y = labels_val[SEQ_LENGTH-1:]
-        
-        # Align prices for backtest
-        # The prediction at index i corresponds to the price movement AFTER index i (usually)
-        # or the signal generated at that time. We align prices to the end of the sequence.
-        prices_aligned = raw_prices[SEQ_LENGTH-1:]
-        
-        min_len = min(len(X), len(y))
-        X, y = X[:min_len], y[:min_len]
-        prices_aligned = prices_aligned[:min_len]
-        
-        # Split
-        split_idx = int(len(X) * TRAIN_SPLIT)
-        X_train = torch.tensor(X[:split_idx], dtype=torch.float32)
-        y_train = torch.tensor(y[:split_idx], dtype=torch.long)
-        X_test = torch.tensor(X[split_idx:], dtype=torch.float32)
-        y_test = torch.tensor(y[split_idx:], dtype=torch.long)
-        
-        # Weights
-        unique_classes = np.unique(y[:split_idx])
-        class_weights = compute_class_weight('balanced', classes=unique_classes, y=y[:split_idx])
-        weights_tensor = torch.zeros(NUM_CLASSES).to(DEVICE)
-        for i, cls in enumerate(unique_classes):
-            weights_tensor[cls] = class_weights[i]
+        # Drop initial NaN from shift
+        df_hourly = df_hourly.dropna().reset_index(drop=True)
 
-        # --- 2. Training ---
-        train_ds = TensorDataset(X_train, y_train)
-        test_ds = TensorDataset(X_test, y_test)
+        # 3. Fit Scalers (Global Fit based on history)
+        # The training script used RobustScaler on Returns and Z-Score on Month
+        scaler_ret = RobustScaler()
+        scaler_ret.fit(df_hourly['log_ret'].values.reshape(-1, 1))
         
-        loader_bs = min(BATCH_SIZE, len(train_ds))
-        train_loader = DataLoader(train_ds, batch_size=loader_bs, shuffle=True)
-        test_loader = DataLoader(test_ds, batch_size=loader_bs, shuffle=False)
-        
-        model = GRUClassifier().to(DEVICE)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=MAX_LR, weight_decay=WEIGHT_DECAY)
-        criterion = nn.CrossEntropyLoss(weight=weights_tensor)
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=MAX_LR, steps_per_epoch=len(train_loader), epochs=EPOCHS, pct_start=0.3
-        )
-        
-        log(f"Starting Training: {EPOCHS} Epochs")
-        best_acc = 0
-        
-        for epoch in range(EPOCHS):
-            model.train()
-            train_loss = 0
-            for bx, by in train_loader:
-                bx, by = bx.to(DEVICE), by.to(DEVICE)
-                optimizer.zero_grad()
-                out = model(bx)
-                loss = criterion(out, by)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                scheduler.step()
-                train_loss += loss.item()
-            
-            # Validation
-            model.eval()
-            val_correct = 0
-            with torch.no_grad():
-                for bx, by in test_loader:
-                    bx, by = bx.to(DEVICE), by.to(DEVICE)
-                    out = model(bx)
-                    val_correct += (out.argmax(1) == by).sum().item()
-            
-            val_acc = 100 * val_correct / len(test_ds)
-            avg_train_loss = train_loss / len(train_loader)
-            
-            # Update UI
-            cache["epoch"] = epoch + 1
-            cache["train_loss"] = avg_train_loss
-            cache["val_acc"] = val_acc
-            
-            if val_acc > best_acc:
-                best_acc = val_acc
-                torch.save(model.state_dict(), MODEL_FILENAME)
-                
-            if (epoch + 1) % 5 == 0:
-                log(f"Ep {epoch+1}: Loss {avg_train_loss:.4f} | Acc {val_acc:.2f}%")
+        month_mean = df_hourly['month'].mean()
+        month_std = df_hourly['month'].std()
+        if month_std == 0: month_std = 1.0
 
-        # --- 3. Backtest Simulation (on Test Set) ---
-        log("Running Backtest on Test Split...")
-        model.load_state_dict(torch.load(MODEL_FILENAME, map_location=DEVICE))
+        # 4. Model Loading
+        device = torch.device('cpu')
+        model = GRUClassifier().to(device)
+        
+        # Check for model file
+        if not os.path.exists(MODEL_FILENAME):
+            print(f"Warning: {MODEL_FILENAME} not found. Running with initialized weights (random) for demo.")
+        else:
+            try:
+                model.load_state_dict(torch.load(MODEL_FILENAME, map_location=device))
+                print(f"Loaded weights from {MODEL_FILENAME}")
+            except Exception as e:
+                 print(f"Error loading weights: {e}")
+
         model.eval()
-        
-        # Predict all test set
-        all_preds = []
-        with torch.no_grad():
-            # Process in chunks to avoid memory issues
-            for i in range(0, len(X_test), 1000):
-                batch = X_test[i:i+1000].to(DEVICE)
-                out = model(batch)
-                preds = out.argmax(1).cpu().numpy()
-                all_preds.extend(preds)
-        
-        all_preds = np.array(all_preds)
-        test_prices = prices_aligned[split_idx:]
-        
-        # Simple Logic: 0 -> Short, 1 -> Neutral, 2 -> Long
-        # Position mapping: 0 -> -1, 1 -> 0, 2 -> 1
-        positions = np.vectorize({0: -1, 1: 0, 2: 1}.get)(all_preds)
-        
-        # Calculate Returns
-        # Return at t is (Price_t - Price_t-1)/Price_t-1 * Position_t-1
-        # aligned prices are raw prices corresponding to the sequence end.
-        price_returns = np.diff(test_prices) / test_prices[:-1]
-        strategy_returns = positions[:-1] * price_returns
-        
-        # Cumulative
-        cum_strategy = (1 + strategy_returns).cumprod()
-        cum_bnh = (1 + price_returns).cumprod()
-        
-        # Metrics
-        total_ret = (cum_strategy[-1] - 1) * 100
-        sharpe = (np.mean(strategy_returns) / np.std(strategy_returns) * np.sqrt(252)) if np.std(strategy_returns) > 0 else 0
 
-        # Plot
-        plt.figure(figsize=(10, 5))
-        plt.plot(cum_strategy, label='GRU Strategy', color='#0ea5e9', linewidth=2)
-        plt.plot(cum_bnh, label='Buy & Hold', color='#94a3b8', linestyle='--', alpha=0.6)
-        plt.title(f"Out-of-Sample Performance (Acc: {best_acc:.2f}%)")
+        # 5. Simulation Loop
+        capital = 1.0
+        position = 0
+        returns = []
+        equity_curve = []
+        
+        # We start the loop after SEQ_LENGTH to ensure we have enough context
+        # We simulate "walking forward" through the data
+        start_index = SEQ_LENGTH
+        
+        for i in range(start_index, len(df_hourly)):
+            curr_row = df_hourly.iloc[i]
+            curr_time = curr_row['dt']
+            curr_price = curr_row['close']
+
+            # Calculate PnL from previous step
+            if i > start_index:
+                prev_price = df_hourly.iloc[i-1]['close']
+                h_ret = (curr_price - prev_price) / prev_price
+                period_pnl = position * h_ret
+                capital *= (1 + period_pnl)
+                returns.append(period_pnl)
+
+            # Prepare Input Sequence
+            # We need the LAST 20 rows of data up to this point
+            window = df_hourly.iloc[i-SEQ_LENGTH+1 : i+1].copy()
+            
+            # 1. Get raw features
+            raw_rets = window['log_ret'].values.reshape(-1, 1)
+            raw_months = window['month'].values.reshape(-1, 1)
+            
+            # 2. Scale features (using the pre-fitted stats to prevent lookahead bias)
+            scaled_rets = scaler_ret.transform(raw_rets)
+            scaled_months = (raw_months - month_mean) / month_std
+            
+            # 3. Stack [LogRet, Month] -> Shape (20, 2)
+            seq_data = np.hstack([scaled_rets, scaled_months])
+            
+            # Inference
+            with torch.no_grad():
+                tensor_seq = torch.from_numpy(seq_data).float().unsqueeze(0).to(device)
+                logits = model(tensor_seq)
+                _, pred_idx = torch.max(logits, 1)
+                # Map 0->Short, 1->Neutral, 2->Long
+                position = {0: -1, 1: 0, 2: 1}[pred_idx.item()]
+
+            # Record Equity Curve
+            if i % 24 == 0 or i == len(df_hourly) - 1:
+                equity_curve.append({'date': curr_time, 'equity': capital, 'price': curr_price})
+
+        # 6. Stats & Plotting
+        returns = np.array(returns)
+        sharpe = (np.mean(returns) / np.std(returns)) * np.sqrt(8760) if len(returns) > 0 and np.std(returns) > 0 else 0
+        
+        dates = [d['date'] for d in equity_curve]
+        equity_vals = [d['equity'] for d in equity_curve]
+        # Normalize BTC price to start at 1.0 for comparison
+        base_price = equity_curve[0]['price'] if equity_curve else 1.0
+        price_norm = [d['price'] / base_price for d in equity_curve]
+
+        plt.figure(figsize=(12, 6))
+        plt.plot(dates, equity_vals, color='#8b5cf6', linewidth=2, label='GRU Strategy')
+        plt.plot(dates, price_norm, color='#94a3b8', linestyle='--', alpha=0.6, label='BTC Buy & Hold')
+        plt.title(f"Annual Strategy Performance: {SYMBOL} (GRU)")
         plt.legend()
         plt.grid(alpha=0.2)
         
@@ -301,18 +206,17 @@ def run_pipeline():
 
         cache.update({
             "status": "complete",
-            "summary": {"sharpe": sharpe, "total_return": total_ret, "acc": best_acc},
+            "summary": {"sharpe": sharpe, "total_return": (capital - 1) * 100},
             "plot_img": img_base64,
             "timestamp": time.strftime('%Y-%m-%d %H:%M:%S')
         })
-        log("Pipeline Complete.")
+        print("Startup: Backtest complete. Cache populated.")
 
     except Exception as e:
-        log(f"Error: {e}")
-        cache["status"] = "error"
-        cache["error"] = str(e)
+        print(f"Startup Error: {e}")
         import traceback
         traceback.print_exc()
+        cache.update({"status": "error", "error": str(e)})
 
 # ==========================================
 # 4. WEB SERVER
@@ -323,82 +227,55 @@ HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>GRU Deployment Dashboard</title>
-    <meta http-equiv="refresh" content="{{ '3' if status == 'processing' or status == 'initializing' else '600' }}">
+    <title>GRU Lab - Startup Report</title>
+    <meta http-equiv="refresh" content="{{ '10' if status == 'processing' or status == 'initializing' else '3600' }}">
     <style>
-        body { font-family: 'Segoe UI', sans-serif; background: #111827; color: #f3f4f6; margin: 0; padding: 40px; }
-        .container { max-width: 900px; margin: 0 auto; }
-        .card { background: #1f2937; padding: 30px; border-radius: 16px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.5); border: 1px solid #374151; }
-        h1 { margin-top: 0; color: #60a5fa; font-size: 24px; }
-        .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin: 20px 0; }
-        .metric { background: #374151; padding: 15px; border-radius: 8px; text-align: center; }
-        .val { font-size: 24px; font-weight: bold; display: block; margin-top: 5px; }
-        .label { font-size: 12px; color: #9ca3af; text-transform: uppercase; letter-spacing: 1px; }
-        .log-box { background: #000; color: #10b981; font-family: monospace; padding: 15px; border-radius: 8px; height: 150px; overflow-y: auto; font-size: 12px; margin-top: 20px; border: 1px solid #374151; }
-        .status-badge { display: inline-block; padding: 4px 12px; border-radius: 99px; font-size: 12px; font-weight: bold; }
-        .processing { background: #f59e0b; color: #fff; }
-        .complete { background: #10b981; color: #fff; }
-        .error { background: #ef4444; color: #fff; }
-        img { width: 100%; border-radius: 8px; margin-top: 20px; border: 1px solid #374151; }
+        body { font-family: system-ui, -apple-system, sans-serif; background: #f8fafc; color: #1e293b; padding: 40px; }
+        .card { max-width: 1000px; margin: 0 auto; background: #fff; padding: 40px; border-radius: 12px; box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1); border: 1px solid #e2e8f0; }
+        .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 30px 0; }
+        .stat-box { background: #f1f5f9; padding: 20px; border-radius: 8px; text-align: center; }
+        .val { font-size: 32px; font-weight: 800; display: block; }
+        .label { font-size: 12px; text-transform: uppercase; color: #64748b; font-weight: 700; }
+        .loader { border: 4px solid #f3f3f3; border-top: 4px solid #8b5cf6; border-radius: 50%; width: 30px; height: 30px; animation: spin 2s linear infinite; display: inline-block; vertical-align: middle; margin-right: 10px; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .badge { background: #f3e8ff; color: #6b21a8; padding: 4px 12px; border-radius: 9999px; font-size: 12px; font-weight: 600; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="card">
-            <div style="display:flex; justify-content:space-between; align-items:center;">
-                <h1>GRU Market Classifier</h1>
-                <span class="status-badge {{ status }}">{{ status|upper }}</span>
+    <div class="card">
+        <h1>GRU Archival Analysis</h1>
+        
+        {% if status == 'processing' or status == 'initializing' %}
+            <div style="padding: 100px 0; text-align: center;">
+                <div class="loader"></div>
+                <h2 style="display:inline-block;">Executing 1-Year Backtest...</h2>
+                <p style="color: #64748b;">The engine is running ~8,760 inferences on startup using the GRU model (2-Feature). This page will refresh automatically.</p>
+            </div>
+        {% elif status == 'error' %}
+            <div style="background: #fef2f2; color: #991b1b; padding: 20px; border-radius: 8px;">
+                <strong>Simulation Failed:</strong> {{ error }}
+            </div>
+        {% else %}
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span class="badge">Last Computed: {{ timestamp }}</span>
+                <span style="font-size: 14px; color: #64748b;">{{ symbol }} / Hourly Resolution</span>
             </div>
 
-            {% if status == 'processing' or status == 'initializing' %}
-                <div class="metric" style="margin: 20px 0; background: #262626;">
-                    <span class="label">Training Progress</span>
-                    <span class="val">Epoch {{ epoch }} / {{ total_epochs }}</span>
-                    <div style="width: 100%; background: #4b5563; height: 4px; margin-top: 10px; border-radius: 2px;">
-                        <div style="width: {{ (epoch/total_epochs)*100 }}%; background: #60a5fa; height: 100%; border-radius: 2px; transition: width 0.5s;"></div>
-                    </div>
+            <div class="stat-grid">
+                <div class="stat-box">
+                    <span class="label">Annualized Sharpe Ratio</span>
+                    <span class="val">{{ "%.4f"|format(summary.sharpe) }}</span>
                 </div>
-                <div class="grid">
-                    <div class="metric">
-                        <span class="label">Current Loss</span>
-                        <span class="val">{{ "%.4f"|format(train_loss) }}</span>
-                    </div>
-                    <div class="metric">
-                        <span class="label">Val Accuracy</span>
-                        <span class="val">{{ "%.2f"|format(val_acc) }}%</span>
-                    </div>
+                <div class="stat-box">
+                    <span class="label">Total Strategy Return</span>
+                    <span class="val" style="color: {{ '#16a34a' if summary.total_return > 0 else '#dc2626' }}">
+                        {{ "%.2f"|format(summary.total_return) }}%
+                    </span>
                 </div>
-            {% elif status == 'complete' %}
-                <div class="grid">
-                    <div class="metric">
-                        <span class="label">Best Val Accuracy</span>
-                        <span class="val" style="color: #60a5fa;">{{ "%.2f"|format(summary.acc) }}%</span>
-                    </div>
-                    <div class="metric">
-                        <span class="label">Sharpe Ratio</span>
-                        <span class="val">{{ "%.3f"|format(summary.sharpe) }}</span>
-                    </div>
-                    <div class="metric">
-                        <span class="label">Strategy Return</span>
-                        <span class="val" style="color: {{ '#34d399' if summary.total_return > 0 else '#f87171' }}">
-                            {{ "%.2f"|format(summary.total_return) }}%
-                        </span>
-                    </div>
-                </div>
-                <img src="data:image/png;base64,{{ plot_img }}">
-            {% elif status == 'error' %}
-                <div style="color: #ef4444; margin: 20px 0;">
-                    <h3>Error Occurred</h3>
-                    <pre>{{ error }}</pre>
-                </div>
-            {% endif %}
-
-            <div class="log-box" id="logs">
-                {% for l in logs[-8:] %}
-                    <div>{{ l }}</div>
-                {% endfor %}
             </div>
-        </div>
+
+            <img src="data:image/png;base64,{{ plot_img }}" style="width: 100%; border-radius: 8px; border: 1px solid #e2e8f0;">
+        {% endif %}
     </div>
 </body>
 </html>
@@ -409,21 +286,16 @@ def index():
     return render_template_string(
         HTML_TEMPLATE,
         status=cache["status"],
-        epoch=cache["epoch"],
-        total_epochs=cache["total_epochs"],
-        train_loss=cache["train_loss"],
-        val_acc=cache["val_acc"],
         summary=cache["summary"],
         plot_img=cache["plot_img"],
         error=cache["error"],
-        logs=cache["logs"]
+        timestamp=cache["timestamp"],
+        symbol=SYMBOL
     )
 
 if __name__ == "__main__":
-    # Launch Background Pipeline
-    t = threading.Thread(target=run_pipeline, daemon=True)
-    t.start()
+    # Start the backtest thread before launching the web server
+    threading.Thread(target=run_startup_backtest, daemon=True).start()
     
-    # Run Server
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
