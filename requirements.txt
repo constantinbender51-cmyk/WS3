@@ -1,3 +1,8 @@
 numpy
 matplotlib
+pandas
+torch
+scikit-learn
+requests
+flask
 # Note: Python 3.6+ required for f-strings and other features used in app.py
