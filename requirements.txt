@@ -1,5 +1,6 @@
 flask
-pandasmatplotlib
+pandas
+matplotlib
 scikit-learn
 requests
 gunicorn
