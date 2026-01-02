@@ -3,6 +3,7 @@ import torch.nn as nn
 import numpy as np
 import pandas as pd
 import requests
+import time
 from sklearn.preprocessing import StandardScaler
 
 # ==========================================
@@ -46,9 +47,7 @@ def get_action_name(class_index):
 def fetch_and_process_data():
     print(f"1. Fetching Weekly data from Kraken for {PAIR}...")
     url = "https://api.kraken.com/0/public/OHLC"
-    # Fetch weekly data (Interval=10080). 
-    # Kraken usually returns ~720 candles (approx 14 years of weekly data), 
-    # which is plenty to build a 60-month history.
+    # Fetch weekly data. Kraken usually returns ~720 candles.
     params = {'pair': PAIR, 'interval': KRAKEN_INTERVAL}
     
     try:
@@ -59,7 +58,7 @@ def fetch_and_process_data():
             print(f"Kraken Error: {data['error']}")
             return None, None
 
-        # Dynamic key extraction (e.g., XXBTZUSD vs XBTUSD)
+        # Dynamic key extraction
         result_keys = list(data['result'].keys())
         target_key = [k for k in result_keys if k != 'last'][0]
         ohlc = data['result'][target_key]
@@ -74,45 +73,26 @@ def fetch_and_process_data():
 
         # --- RESAMPLING TO MONTHLY ---
         print("2. Resampling Weekly -> Monthly...")
-        # We take the 'last' close of every month to simulate Monthly candles
-        monthly_df = df['close'].resample('ME').last().to_frame() # 'ME' is Month End
+        # 'ME' is Month End
+        monthly_df = df['close'].resample('ME').last().to_frame() 
         
         # --- CALCULATE LOG RETURNS ---
-        # Same formula as training: ln(current / prev)
         monthly_df['log_ret'] = np.log(monthly_df['close'] / monthly_df['close'].shift(1))
         monthly_df.dropna(inplace=True)
         
         print(f"   > Generated {len(monthly_df)} monthly return points.")
         
         # --- NORMALIZATION ---
-        # CRITICAL: We fit the scaler on the ENTIRE available history 
-        # to best approximate the global mean/std the model expects.
         print("3. Normalizing (StandardScaler)...")
         scaler = StandardScaler()
         data_val = monthly_df['log_ret'].values.reshape(-1, 1)
         scaled_data = scaler.fit_transform(data_val)
         
-        # --- SEQUENCE CREATION ---
-        if len(scaled_data) < SEQ_LENGTH:
-            print(f"ERROR: Not enough monthly data. Need {SEQ_LENGTH}, got {len(scaled_data)}")
-            return None, None
-            
-        # Grab exactly the last 60 months
-        final_sequence = scaled_data[-SEQ_LENGTH:]
-        
-        # Convert to PyTorch Tensor: (1, 60, 1)
-        tensor_seq = torch.from_numpy(final_sequence).float().unsqueeze(0)
-        
-        # Get date range for display
-        start_date = monthly_df.index[-SEQ_LENGTH]
-        end_date = monthly_df.index[-1]
-        
-        return tensor_seq, (start_date, end_date)
+        # Return the full dataset and the dataframe (for dates)
+        return scaled_data, monthly_df
 
     except Exception as e:
         print(f"Data Processing Error: {e}")
-        import traceback
-        traceback.print_exc()
         return None, None
 
 # ==========================================
@@ -120,7 +100,7 @@ def fetch_and_process_data():
 # ==========================================
 if __name__ == "__main__":
     print("-" * 50)
-    print(" MONTHLY BITCOIN PREDICTION (Kraken -> Resample)")
+    print(" MONTHLY BITCOIN PREDICTION (Last 12 Months Review)")
     print("-" * 50)
 
     # 1. Load Model
@@ -128,40 +108,71 @@ if __name__ == "__main__":
     model = LSTMClassifier().to(device)
     
     try:
-        print(f"Loading weights from {MODEL_FILENAME}...")
         model.load_state_dict(torch.load(MODEL_FILENAME, map_location=device))
         model.eval()
+        print(f"Model weights loaded from {MODEL_FILENAME}")
     except FileNotFoundError:
         print(f"Error: {MODEL_FILENAME} not found.")
         exit()
 
-    # 2. Get Data
-    input_tensor, date_info = fetch_and_process_data()
+    # 2. Get Full Data
+    scaled_data, monthly_df = fetch_and_process_data()
     
-    if input_tensor is not None:
-        # 3. Inference
-        with torch.no_grad():
-            logits = model(input_tensor)
-            probs = torch.nn.functional.softmax(logits, dim=1)
-            _, pred_idx = torch.max(logits, 1)
-            action = get_action_name(pred_idx.item())
-
-        # 4. Output
-        print("\n" + "="*40)
-        print(" PREDICTION RESULTS")
-        print("="*40)
-        print(f"Timeframe:     Monthly (Resampled from Weekly)")
-        print(f"Range Used:    {date_info[0].date()} to {date_info[1].date()}")
-        print("-" * 40)
-        print(f"Raw Logits:    {logits.numpy()[0]}")
-        print(f"Probabilities: {probs.numpy()[0]}")
-        print("-" * 40)
-        print(f"MODEL DECISION: {action}")
-        print("="*40)
+    if scaled_data is not None:
+        total_len = len(scaled_data)
         
-        if action == 1:
-            print(">>> BUY (Long Term)")
-        elif action == -1:
-            print(">>> SELL (Long Term)")
+        # We want the last 12 months.
+        # Ensure we have enough data to go back 12 months + 60 lookback
+        if total_len < SEQ_LENGTH + 12:
+            print(f"Warning: Not enough data for full 12-month history. Showing what is available.")
+            start_loop = SEQ_LENGTH
         else:
-            print(">>> HOLD")
+            start_loop = total_len - 12
+
+        print("\n" + "="*65)
+        print(f"{'DATE':<15} | {'ACTION':<10} | {'CONFIDENCE':<10} | {'RAW LOGITS'}")
+        print("="*65)
+
+        # 3. Loop through the desired range
+        # range(start_loop, total_len + 1) because slice is exclusive on the right
+        # Wait, if we want the prediction FOR index i, we need data up to i.
+        # So we loop i from start_loop to total_len-1.
+        # Slice will be [i - SEQ_LENGTH + 1 : i + 1]
+        
+        for i in range(start_loop, total_len):
+            # Create window: e.g., if i=100, we want 41..100 (60 items)
+            # Python slice is [start:end], excludes end. So [41 : 101]
+            window_end = i + 1
+            window_start = window_end - SEQ_LENGTH
+            
+            sequence = scaled_data[window_start:window_end]
+            
+            # Prepare Tensor
+            tensor_seq = torch.from_numpy(sequence).float().unsqueeze(0)
+            
+            # Inference
+            with torch.no_grad():
+                logits = model(tensor_seq)
+                probs = torch.nn.functional.softmax(logits, dim=1)
+                _, pred_idx = torch.max(logits, 1)
+                action_code = pred_idx.item()
+                action = get_action_name(action_code)
+
+            # Formatting
+            date_str = monthly_df.index[i].strftime('%Y-%m-%d')
+            prob_val = probs[0][action_code].item() * 100
+            
+            # Color/Text logic
+            if action == 1:
+                act_str = "BUY"
+            elif action == -1:
+                act_str = "SELL"
+            else:
+                act_str = "HOLD"
+
+            print(f"{date_str:<15} | {act_str:<10} | {prob_val:>6.2f}%    | {logits.numpy()[0]}")
+            
+            # 0.1s Delay
+            time.sleep(0.1)
+
+        print("="*65)
