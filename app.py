@@ -46,7 +46,7 @@ if __name__ == "__main__":
     model = LSTMClassifier().to(device)
 
     # Load weights
-    model_path = 'model.pth'
+    model_path = 'lstm_32core.pth'
     try:
         model.load_state_dict(torch.load(model_path, map_location=device))
         model.eval() # Set to evaluation mode (turns off dropout)
