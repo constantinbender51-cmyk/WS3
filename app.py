@@ -9,7 +9,7 @@ from sklearn.preprocessing import StandardScaler
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-MODEL_FILENAME = 'lstm_32core.pth'
+MODEL_FILENAME = 'lstm_regularized.pth'
 PAIR = 'XBTUSD'        # Bitcoin/USD
 KRAKEN_INTERVAL = 10080 # 10080 min = 1 Week (Fetch Weekly to build Monthly)
 SEQ_LENGTH = 60        # 60 Months (5 Years)
@@ -18,7 +18,7 @@ SEQ_LENGTH = 60        # 60 Months (5 Years)
 INPUT_DIM = 1         
 HIDDEN_DIM = 128      
 NUM_LAYERS = 2        
-DROPOUT = 0.2     
+DROPOUT = 0.5
 NUM_CLASSES = 3       
 
 # ==========================================
