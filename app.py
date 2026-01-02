@@ -13,7 +13,7 @@ PAIR = 'BTCUSDT'
 
 # Size of the optimization window (number of prices)
 # 10 provides a good balance between depth and performance (3^9 combinations).
-WINDOW_SIZE = 10 
+WINDOW_SIZE = 12
 
 # Penalty for switching actions (Set to 25 as requested)
 # This strongly favors long-term positions over frequent trading.
