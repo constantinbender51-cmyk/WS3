@@ -15,8 +15,9 @@ MAX_PRICE = 200000
 NUM_BUCKETS = 20
 BUCKET_SIZE = (MAX_PRICE - MIN_PRICE) / NUM_BUCKETS
 BUCKET_CHARS = string.ascii_uppercase[:NUM_BUCKETS] # A-T
-WINDOW_SIZE = 4
+WINDOW_SIZE = 6    # Max history depth
 SIM_YEARS = 50
+MAX_EDITS = 2      # Depth of Norvig edit search
 
 # --- THE PROBABILISTIC ENGINE ---
 
@@ -24,11 +25,11 @@ class MarketCorrector:
     def __init__(self, prices):
         self.loc_stream, self.mom_stream = self.discretize(prices)
         
-        # The 'Dictionary' (Counts of corrected historical sequences)
+        # The 'Dictionary' (Counts of corrected historical sequences of varying lengths)
         self.loc_counts = collections.Counter()
         self.mom_counts = collections.Counter()
         
-        # Transitions (Next Step after a sequence)
+        # Transitions (What follows each sequence)
         self.loc_trans = collections.defaultdict(collections.Counter)
         self.mom_trans = collections.defaultdict(collections.Counter)
         
@@ -47,19 +48,22 @@ class MarketCorrector:
         return max(0, min(NUM_BUCKETS - 1, int((p - MIN_PRICE) / BUCKET_SIZE)))
 
     def train(self):
-        print("Training engine on historical corpus...")
+        print(f"Training engine on sequences (1 to {WINDOW_SIZE} steps)...")
         time.sleep(0.1)
-        for i in range(len(self.loc_stream) - WINDOW_SIZE):
-            l_w = tuple(self.loc_stream[i:i+WINDOW_SIZE])
-            m_w = tuple(self.mom_stream[i:i+WINDOW_SIZE])
-            
-            n_l = self.loc_stream[i+WINDOW_SIZE]
-            n_m = self.mom_stream[i+WINDOW_SIZE]
-            
-            self.loc_counts[l_w] += 1
-            self.mom_counts[m_w] += 1
-            self.loc_trans[l_w][n_l] += 1
-            self.mom_trans[m_w][n_m] += 1
+        
+        # Train on multiple n-gram lengths to support variable input sizes
+        for n in range(1, WINDOW_SIZE + 1):
+            for i in range(len(self.loc_stream) - n):
+                l_w = tuple(self.loc_stream[i:i+n])
+                m_w = tuple(self.mom_stream[i:i+n])
+                
+                n_l = self.loc_stream[i+n]
+                n_m = self.mom_stream[i+n]
+                
+                self.loc_counts[l_w] += 1
+                self.mom_counts[m_w] += 1
+                self.loc_trans[l_w][n_l] += 1
+                self.mom_trans[m_w][n_m] += 1
             
         self.total_l = sum(self.loc_counts.values())
         self.total_m = sum(self.mom_counts.values())
@@ -74,22 +78,27 @@ class MarketCorrector:
         inserts    = [L + (c,) + R for L, R in splits for c in alphabet]
         return set(deletes + transposes + replaces + inserts)
 
-    def edits2(self, word, alphabet):
-        return set(e2 for e1 in self.edits1(word, alphabet) for e2 in self.edits1(e1, alphabet))
-
     def candidates(self, word, counts, alphabet):
         """Finds 'Corrected' versions of the input pattern."""
-        # A pattern is corrected if it exists in history. 
-        # Order of preference: self, then edits1, then edits2.
-        return (set([word]) if word in counts else None) or \
-               set(e for e in self.edits1(word, alphabet) if e in counts) or \
-               set(e for e in self.edits2(word, alphabet) if e in counts) or \
-               set([word])
+        if word in counts:
+            return set([word])
+        
+        current_edits = set([word])
+        for _ in range(MAX_EDITS):
+            next_generation = set()
+            for w in current_edits:
+                next_generation.update(self.edits1(w, alphabet))
+            
+            known_edits = set(e for e in next_generation if e in counts)
+            if known_edits:
+                return known_edits
+            current_edits = next_generation
+            
+        return set([word])
 
     def solve(self, in_loc, in_mom):
-        """Calculates P(Next | Input) by summing across corrected candidates."""
         time.sleep(0.1)
-        print(f"Correcting sequence: {''.join(in_loc)} | {''.join(in_mom)}")
+        print(f"Correcting variable sequence: {''.join(in_loc)} | {''.join(in_mom)}")
         
         l_cand = self.candidates(tuple(in_loc), self.loc_counts, BUCKET_CHARS)
         m_cand = self.candidates(tuple(in_mom), self.mom_counts, ['U', 'D', 'F'])
@@ -102,9 +111,12 @@ class MarketCorrector:
             if 0 <= t_idx < NUM_BUCKETS:
                 t_loc = BUCKET_CHARS[t_idx]
                 
-                # P(move) = Sum [ P(Candidate) * P(move | Candidate) ]
-                p_abc = sum((self.loc_counts[c]/self.total_l) * (self.loc_trans[c][t_loc]/sum(self.loc_trans[c].values())) for c in l_cand if sum(self.loc_trans[c].values()) > 0)
-                p_udf = sum((self.mom_counts[c]/self.total_m) * (self.mom_trans[c][move]/sum(self.mom_trans[c].values())) for c in m_cand if sum(self.mom_trans[c].values()) > 0)
+                # Probability = P(Pattern) * P(NextStep | Pattern)
+                p_abc = sum((self.loc_counts[c]/self.total_l) * (self.loc_trans[c][t_loc]/sum(self.loc_trans[c].values())) 
+                            for c in l_cand if sum(self.loc_trans[c].values()) > 0)
+                
+                p_udf = sum((self.mom_counts[c]/self.total_m) * (self.mom_trans[c][move]/sum(self.mom_trans[c].values())) 
+                            for c in m_cand if sum(self.mom_trans[c].values()) > 0)
                 
                 metrics.append({
                     'target': t_loc, 'move': move,
@@ -113,14 +125,10 @@ class MarketCorrector:
                 })
 
         metrics.sort(key=lambda x: x['score'], reverse=True)
-        for m in metrics[:3]:
-            time.sleep(0.1)
-            print(f"  -> {m['target']}{m['move']}: {m['score']:.6f} (ABC: {m['p_abc']:.6f} + UDF: {m['p_udf']:.6f})")
-            
         return metrics
 
 # --- DATA GENERATION ---
-print("Simulating 50 years of data...")
+print(f"Simulating {SIM_YEARS} years of data...")
 prices = [100000]
 for _ in range(365 * SIM_YEARS):
     prices.append(max(MIN_PRICE, min(MAX_PRICE, prices[-1] + random.gauss(50, 2500))))
@@ -133,17 +141,20 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
         self.end_headers()
-        self.wfile.write(b"""
+        self.wfile.write(f"""
         <html><body style="font-family:sans-serif; max-width:600px; margin:40px auto; line-height:1.6">
             <h2>Market Spell Corrector</h2>
-            <p>Input a location sequence (A-T) and momentum (U/D/F). Length must match window (4).</p>
+            <p>Input a sequence of any length (up to {WINDOW_SIZE}).</p>
             <form method="POST">
-                Loc: <input name="l" value="KKKK" maxlength="4"><br>
-                Mom: <input name="m" value="FFFF" maxlength="4"><br><br>
+                Loc (A-T): <input name="l" value="KKK" style="text-transform:uppercase"><br>
+                Mom (U/D/F): <input name="m" value="FF" style="text-transform:uppercase"><br><br>
                 <button type="submit">Predict Completion</button>
             </form>
+            <div style="font-size:0.8em; color:#888; margin-top:20px;">
+                Alphabet: A-T (Price Buckets) | U=Up, D=Down, F=Flat
+            </div>
         </body></html>
-        """)
+        """.encode())
 
     def do_POST(self):
         length = int(self.headers['Content-Length'])
@@ -151,8 +162,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         l_in = list(data.get('l', [''])[0].upper())
         m_in = list(data.get('m', [''])[0].upper())
         
-        if len(l_in) != WINDOW_SIZE:
-            self.send_error(400, "Invalid Length")
+        if not l_in or not m_in:
+            self.send_error(400, "Empty Input")
             return
 
         results = engine.solve(l_in, m_in)
@@ -165,15 +176,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(f"""
         <html><body style="font-family:sans-serif; max-width:600px; margin:40px auto;">
             <h2>Analysis Results</h2>
-            <div style="background:#eee; padding:15px; border-radius:5px">
-                <b>Input:</b> {''.join(l_in)} | {''.join(m_in)}<br>
-                <b>Prediction:</b> {results[0]['target']}
+            <div style="background:#f4f4f4; padding:15px; border-radius:5px; border-left: 5px solid #007bff;">
+                <b>Input Sequence:</b> {''.join(l_in)} | {''.join(m_in)}<br>
+                <b>Most Likely Completion:</b> <span style="color:#007bff; font-weight:bold;">{results[0]['target']}</span>
             </div>
             <table border="1" style="width:100%; margin-top:20px; border-collapse:collapse" cellpadding="10">
-                <thead><tr style="background:#ddd"><th>Completion</th><th>Total Score</th><th>P(ABC)</th><th>P(UDF)</th></tr></thead>
+                <thead><tr style="background:#eee"><th>Next Step</th><th>Total Score</th><th>P(ABC)</th><th>P(UDF)</th></tr></thead>
                 <tbody>{rows}</tbody>
             </table>
-            <br><a href="/">Try another</a>
+            <br><a href="/" style="text-decoration:none; color:#007bff;">&larr; Try another pattern</a>
         </body></html>
         """.encode())
 
