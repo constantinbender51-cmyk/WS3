@@ -20,7 +20,7 @@ class MarketDataHandler:
         self.last_min = 0
         self.last_step = 0
 
-    def fetch_candles(self, symbol="BTC-USD", days=60):
+    def fetch_candles(self, symbol="SPY", days=60):
         """Fetches daily candles from Yahoo Finance."""
         print(f"Fetching {days} days of data for {symbol} via Yahoo Finance...")
         
@@ -191,7 +191,8 @@ class CompletionCorrector:
 
 if __name__ == "__main__":
     # Settings
-    SYMBOL = "BTC-USD" # Works for AAPL, TSLA, BTC-USD, EURUSD=X
+    # Good Options: 'SPY' (S&P 500), 'EURUSD=X' (Forex), 'NVDA' (Volatile Tech)
+    SYMBOL = "SPY" 
     DAYS = 60
     
     market = MarketDataHandler()
