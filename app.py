@@ -5,7 +5,6 @@ import numpy as np
 from collections import Counter
 
 # Override print for railway/console flushing
-# Note: Reduced sleep to 0.01s to speed up the backtest loop output
 _builtin_print = print
 def print(*args, **kwargs):
     # time.sleep(0.01) 
@@ -24,6 +23,7 @@ class MarketDataHandler:
         """Fetches a large dataset for statistical significance."""
         print(f"Fetching {period} of data for {symbol} via Yahoo Finance...")
         
+        # 'progress=False' suppresses the yahoo bar, keeping output clean
         df = yf.download(symbol, period=period, interval="1d", progress=False)
         
         if df.empty:
@@ -31,9 +31,19 @@ class MarketDataHandler:
             return []
             
         try:
-            prices = df['Close'].values.flatten().tolist()
-        except KeyError:
-            prices = df['Close'].tolist()
+            # Handle newer yfinance output structures
+            if 'Close' in df.columns:
+                # Check if it's a MultiIndex (common in new yf)
+                if isinstance(df.columns, pd.MultiIndex):
+                    prices = df['Close'][symbol].tolist()
+                else:
+                    prices = df['Close'].values.flatten().tolist()
+            else:
+                # Fallback
+                prices = df.iloc[:, 0].tolist() 
+        except Exception:
+            # Ultimate fallback for Series vs DataFrame
+            prices = df['Close'].tolist() if 'Close' in df else df.values.flatten().tolist()
             
         prices = [p for p in prices if not math.isnan(p)]
         print(f"Loaded {len(prices)} data points.")
@@ -42,11 +52,9 @@ class MarketDataHandler:
     def discretize_sequence(self, prices, num_bins=40):
         """
         Maps prices to categories.
-        Increased num_bins to 40 to capture finer movements over a 10y range.
         """
         if not prices or len(prices) < 2: return []
 
-        # Global min/max for stable state space (simplified for this demo)
         min_p = min(prices) * 0.95
         max_p = max(prices) * 1.05
         price_range = max_p - min_p
@@ -87,7 +95,7 @@ class ZScoreEngine:
         self.mom_map = {k: v for v, k in enumerate(['UP', 'DOWN', 'FLAT'])}
         self.mom_list = ['UP', 'DOWN', 'FLAT']
         
-        # Initialize with Uniform Probabilities (Will be overwritten by train())
+        # Initialize with Uniform Probabilities
         self.mom_trans = np.ones((3, 3)) / 3
         self.mom_start = np.ones(3) / 3
         self.cat_trans = np.ones((num_categories, num_categories)) / num_categories
@@ -98,41 +106,31 @@ class ZScoreEngine:
     def train(self, sequence):
         """
         LEARNS physics from the provided training sequence.
-        Builds transition matrices based on actual historical frequency.
         """
         print("Training model on historical data...")
         
-        # Reset counters with small epsilon for smoothing (laplace smoothing)
         mom_counts = np.ones((3, 3)) * 0.1
         cat_counts = np.ones((self.num_categories, self.num_categories)) * 0.1
         
         mom_start_counts = np.ones(3) * 0.1
         cat_start_counts = np.ones(self.num_categories) * 0.1
 
-        # Iterate through history
         for i in range(len(sequence) - 1):
             curr_mom, curr_cat = sequence[i]
             next_mom, next_cat = sequence[i+1]
             
-            # Indices
             curr_m_idx = self.mom_map[curr_mom]
             next_m_idx = self.mom_map[next_mom]
             curr_c_idx = curr_cat - 1
             next_c_idx = next_cat - 1
             
-            # Count Transitions
             mom_counts[curr_m_idx][next_m_idx] += 1
             cat_counts[curr_c_idx][next_c_idx] += 1
-            
-            # Count Starts (Marginals)
             mom_start_counts[curr_m_idx] += 1
             cat_start_counts[curr_c_idx] += 1
 
-        # Normalize to create Probability Matrices
-        # Axis 1 = sum across columns (for each row)
         self.mom_trans = mom_counts / mom_counts.sum(axis=1, keepdims=True)
         self.cat_trans = cat_counts / cat_counts.sum(axis=1, keepdims=True)
-        
         self.mom_start = mom_start_counts / mom_start_counts.sum()
         self.cat_start = cat_start_counts / cat_start_counts.sum()
         
@@ -140,7 +138,6 @@ class ZScoreEngine:
 
     def _get_log_prob(self, seq, trans, start):
         if not seq: return 0.0
-        # Guard against zero index issues
         first_idx = seq[0]
         if first_idx >= len(start): return -99.0
         
@@ -157,18 +154,14 @@ class ZScoreEngine:
     def calibrate(self):
         """Generates Z-Score baselines using the LEARNED probabilities."""
         print("Calibrating Z-Score baselines (Monte Carlo)...")
-        # Calibrate for relevant window sizes (e.g., 8 to 10)
-        # We need slightly longer than window to account for prediction appends
         for length in range(2, 15): 
             m_logs, c_logs = [], []
-            for _ in range(500): # 500 samples per length
-                # Sim Mom
+            for _ in range(500): 
                 s_m = [np.random.choice(3, p=self.mom_start)]
                 for _ in range(length-1): 
                     s_m.append(np.random.choice(3, p=self.mom_trans[s_m[-1]]))
                 m_logs.append(self._get_log_prob(s_m, self.mom_trans, self.mom_start))
                 
-                # Sim Cat
                 s_c = [np.random.choice(self.num_categories, p=self.cat_start)]
                 for _ in range(length-1): 
                     s_c.append(np.random.choice(self.num_categories, p=self.cat_trans[s_c[-1]]))
@@ -179,7 +172,7 @@ class ZScoreEngine:
 
     def get_z_score(self, sequence):
         length = len(sequence)
-        if length not in self.stats['mom']: return -10.0 # Penalty
+        if length not in self.stats['mom']: return -10.0 
         
         m_idxs = [self.mom_map[m] for m, c in sequence]
         c_idxs = [c-1 for m, c in sequence]
@@ -194,7 +187,7 @@ class ZScoreEngine:
 class CompletionCorrector:
     def __init__(self, engine):
         self.engine = engine
-        self.COST_INSERT = 1.2 # Lower cost to encourage predictions if data supports it
+        self.COST_INSERT = 1.2 
 
     def repair_physics(self, sequence):
         if not sequence: return []
@@ -209,11 +202,9 @@ class CompletionCorrector:
         return repaired
 
     def solve(self, sequence):
-        # Window size 8 is standard for this setup
         N = len(sequence)
         variants = [{'seq': sequence, 'op': 'HOLD', 'cost': 0}]
         
-        # Try appending ONE future item (Prediction)
         last_cat = sequence[-1][1]
         
         # Only try plausible moves (+/- 1 or same)
@@ -230,7 +221,6 @@ class CompletionCorrector:
                 'cost': self.COST_INSERT
             })
         
-        # Score
         results = []
         for v in variants:
             z = self.engine.get_z_score(v['seq'])
@@ -244,11 +234,13 @@ class CompletionCorrector:
 # ==============================================================================
 
 if __name__ == "__main__":
+    import pandas as pd # Ensure pandas is available for type check
+    
     # CONFIG
     SYMBOL = "SPY"
-    PERIOD = "10y"       # Requires ~2500 candles for significance
-    NUM_BINS = 40        # Finer granularity for 10y range
-    SPLIT_RATIO = 0.7    # 70% Train, 30% Test
+    PERIOD = "10y"       
+    NUM_BINS = 40        
+    SPLIT_RATIO = 0.7    
     
     # 1. FETCH
     market = MarketDataHandler()
@@ -278,44 +270,82 @@ if __name__ == "__main__":
     print(f"\nRunning Backtest on {len(test_seq)} points...")
     correct_predictions = 0
     total_predictions = 0
+    
+    captured_volatility = 0.0 # Sum of |Return| when Correct
+    missed_volatility = 0.0   # Sum of |Return| when Wrong
+    
     window_size = 8
     
-    # Iterate through test set with sliding window
-    # We only count it as a "Prediction" if the AI chooses 'PREDICT' over 'HOLD'
     for i in range(len(test_seq) - window_size - 1):
         window = test_seq[i : i+window_size]
-        actual_next = test_seq[i+window_size][1] # The real category that happened
         
+        # Get Real Price Data for returns calculation
+        # The window ends at `split_idx + i + window_size - 1`
+        # The "Next" (Target) price is at `split_idx + i + window_size`
+        curr_price_idx = split_idx + i + window_size - 1
+        next_price_idx = split_idx + i + window_size
+        
+        curr_price = raw_prices[curr_price_idx]
+        next_price = raw_prices[next_price_idx]
+        
+        actual_return_pct = (next_price - curr_price) / curr_price
+        actual_move_size = abs(actual_return_pct)
+        
+        # AI Decision
         result = ai.solve(window)
         
         if result['op'] == 'PREDICT':
             total_predictions += 1
+            
+            # Categories
+            last_known_cat = window[-1][1]
             predicted_cat = result['seq'][-1][1]
             
-            # Did it predict the correct category?
-            # We allow +/- 0 tolerance (strict) or +/- 1 (loose)
-            # Let's check strict directional accuracy (did it predict UP vs DOWN correctly?)
+            # Directions
+            pred_dir = np.sign(predicted_cat - last_known_cat) # +1, -1, or 0
+            actual_dir = np.sign(actual_return_pct)            # +1 or -1 (float)
             
-            last_known = window[-1][1]
-            pred_dir = np.sign(predicted_cat - last_known)
-            actual_dir = np.sign(actual_next - last_known)
+            # Treat 0 return (very rare) as Flat
+            if actual_return_pct == 0: actual_dir = 0
+            elif actual_return_pct > 0: actual_dir = 1
+            else: actual_dir = -1
             
-            if predicted_cat == actual_next:
+            # CHECK ACCURACY
+            if pred_dir == actual_dir:
                 correct_predictions += 1
+                captured_volatility += actual_move_size
+            else:
+                missed_volatility += actual_move_size
             
     print("\n" + "="*40)
-    print("BACKTEST RESULTS (Statistical Significance)")
+    print("BACKTEST RESULTS")
     print("="*40)
+    
     if total_predictions > 0:
-        acc = (correct_predictions / total_predictions) * 100
-        print(f"Algorithm triggered prediction {total_predictions} times.")
-        print(f"Exact Category Match: {acc:.2f}%")
-        print("Note: Random guessing on 40 bins is ~2.5%")
+        win_rate = (correct_predictions / total_predictions) * 100
+        
+        print(f"Total Predictions Triggered: {total_predictions}")
+        print(f"Directional Accuracy:        {win_rate:.2f}%")
+        
+        print("-" * 40)
+        print("VOLATILITY CAPTURE (The 'Interesting' Metric)")
+        print(f"Sum of |Return| (Correct):   {captured_volatility:.4f}")
+        print(f"Sum of |Return| (Wrong):     {missed_volatility:.4f}")
+        
+        if missed_volatility > 0:
+            ratio = captured_volatility / missed_volatility
+            print(f"Capture Ratio:               {ratio:.2f} (Target > 1.0)")
+        
+        print("-" * 40)
+        if ratio > 1.0:
+            print("CONCLUSION: Algorithm captures more volatility than it loses.")
+        else:
+            print("CONCLUSION: Algorithm is losing on volatility.")
+            
     else:
         print("Algorithm was too conservative (0 trades triggered).")
-        print("Try lowering COST_INSERT.")
 
-    # 6. LIVE PREDICTION (Current Day)
+    # 6. LIVE PREDICTION
     print("\n" + "="*40)
     print(f"LIVE FORECAST ({SYMBOL})")
     print("="*40)
@@ -329,7 +359,5 @@ if __name__ == "__main__":
         p_cat = final_result['seq'][-1][1]
         p_price = market.category_to_price(p_cat)
         print(f"AI PREDICTION:   Category {p_cat} (~${p_price:.2f})")
-        print(f"Logic:           Momentum Z-Score > Insert Cost")
     else:
-        print(f"AI DECISION:     HOLD / WAIT")
-        print(f"Logic:           No statistically significant pattern found.")
+        print(f"AI DECISION:     HOLD / WAIT")n
