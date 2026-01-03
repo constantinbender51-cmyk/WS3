@@ -2,6 +2,7 @@ import random
 import collections
 import string
 import time
+import os
 
 # --- CONFIGURATION ---
 MIN_PRICE = 0
@@ -11,6 +12,7 @@ BUCKET_SIZE = (MAX_PRICE - MIN_PRICE) / NUM_BUCKETS
 BUCKET_CHARS = string.ascii_uppercase[:NUM_BUCKETS] # A-T
 WINDOW_SIZE = 4
 SIMULATION_YEARS = 50
+PORT = int(os.environ.get('PORT', 8080))
 
 class StockPatternCompleter:
     def __init__(self, price_history, window_size=WINDOW_SIZE):
@@ -18,10 +20,11 @@ class StockPatternCompleter:
         self.window = window_size
         
         # 1. Ingest Data
-        # We need both streams to build our probability distributions
+        # Every step i has a Loc[i] and a Mom[i] (change from i-1 to i)
         self.loc_stream, self.mom_stream = self.discretize_data(self.prices)
         
         # 2. Train Memory Banks
+        # Both look for patterns of exactly WINDOW_SIZE
         self.loc_probs = collections.defaultdict(collections.Counter)
         self.mom_probs = collections.defaultdict(collections.Counter)
         self.train()
@@ -33,149 +36,119 @@ class StockPatternCompleter:
 
     def discretize_data(self, prices):
         """
-        Translates raw prices into the two fundamental languages.
+        Translates raw prices into two synced streams.
+        Step i contains Location at i and the Momentum that led to i.
         """
         locs = []
         moms = []
+        # We start from index 1 so every entry has a preceding price to determine momentum
         for i in range(1, len(prices)):
-            prev = self.get_bucket_index(prices[i-1])
-            curr = self.get_bucket_index(prices[i])
+            prev_idx = self.get_bucket_index(prices[i-1])
+            curr_idx = self.get_bucket_index(prices[i])
             
-            # Location (The "Word")
-            locs.append(BUCKET_CHARS[curr])
+            locs.append(BUCKET_CHARS[curr_idx])
             
-            # Momentum (The "Grammar")
-            if curr > prev: moms.append('U')
-            elif curr < prev: moms.append('D')
+            if curr_idx > prev_idx: moms.append('U')
+            elif curr_idx < prev_idx: moms.append('D')
             else: moms.append('F')
         return locs, moms
 
     def train(self):
-        print(f"Training on {len(self.loc_stream)} cycles...")
         time.sleep(0.1)
-        # Train Location Model: P(NextLocation | PreviousLocations)
+        print(f"Training on {len(self.loc_stream)} market steps...")
+        
+        # Both models train on the same window size
         for i in range(len(self.loc_stream) - self.window):
-            pattern = tuple(self.loc_stream[i : i + self.window])
-            next_val = self.loc_stream[i + self.window]
-            self.loc_probs[pattern][next_val] += 1
+            # Location pattern and the next location
+            loc_pattern = tuple(self.loc_stream[i : i + self.window])
+            next_loc = self.loc_stream[i + self.window]
+            self.loc_probs[loc_pattern][next_loc] += 1
 
-        # Train Momentum Model: P(NextMove | PreviousMoves)
-        for i in range(len(self.mom_stream) - self.window):
-            pattern = tuple(self.mom_stream[i : i + self.window])
-            next_val = self.mom_stream[i + self.window]
-            self.mom_probs[pattern][next_val] += 1
+            # Momentum pattern and the next momentum
+            mom_pattern = tuple(self.mom_stream[i : i + self.window])
+            next_mom = self.mom_stream[i + self.window]
+            self.mom_probs[mom_pattern][next_mom] += 1
 
     def get_probability(self, counter, target):
         total = sum(counter.values())
         if total == 0: return 0.0
         return counter[target] / total
 
-    def complete_pattern(self, incomplete_loc_pattern):
+    def complete_pattern(self, input_locs, input_moms):
         """
-        Takes an incomplete Location Pattern (e.g. ['K', 'K', 'L'])
-        And returns the most likely Completed Location Pattern.
+        Takes a synced pattern of locations and the momentums that reached them.
+        Returns the likely next location.
         """
-        # 1. Derive the Momentum Pattern from the Location Pattern
-        # (Translation Step: Location -> Momentum)
-        current_moms = []
-        for i in range(1, len(incomplete_loc_pattern)):
-            prev_char = incomplete_loc_pattern[i-1]
-            curr_char = incomplete_loc_pattern[i]
-            prev_idx = BUCKET_CHARS.index(prev_char)
-            curr_idx = BUCKET_CHARS.index(curr_char)
-            
-            if curr_idx > prev_idx: current_moms.append('U')
-            elif curr_idx < prev_idx: current_moms.append('D')
-            else: current_moms.append('F')
+        if len(input_locs) != self.window or len(input_moms) != self.window:
+            return "Error: Input must match window size"
 
-        # 2. Setup History Tuples
-        hist_loc = tuple(incomplete_loc_pattern)
-        hist_mom = tuple(current_moms) # Note: Momentum history is 1 shorter than Loc history
-
-        # We need the momentum window to match the training size
-        # If input is short, we use what we have.
+        hist_loc = tuple(input_locs)
+        hist_mom = tuple(input_moms)
         
         time.sleep(0.1)
-        print(f"\n[Input] Location Pattern: {incomplete_loc_pattern}")
-        time.sleep(0.1)
-        print(f"[Derived] Momentum Pattern: {current_moms}")
+        print(f"\n[Input Word] Loc: {''.join(input_locs)} | Mom: {''.join(input_moms)}")
 
-        # 3. Determine Candidates for the NEXT Location
-        last_char = incomplete_loc_pattern[-1]
+        last_char = input_locs[-1]
         last_idx = BUCKET_CHARS.index(last_char)
-        
         candidates = []
         
-        # Physics: We can only move Up, Down, or Flat from current location
+        # Possible next steps
         transitions = [('U', 1), ('D', -1), ('F', 0)]
         
         for move, idx_change in transitions:
             next_idx = last_idx + idx_change
-            
-            # Boundary Check
             if 0 <= next_idx < NUM_BUCKETS:
                 next_loc = BUCKET_CHARS[next_idx]
                 
-                # --- PROBABILITY CALCULATION ---
-                # We calculate the likelihood of this specific Next Location
+                # Probability from Location history (ABC part)
+                p_abc = self.get_probability(self.loc_probs[hist_loc], next_loc)
                 
-                # A. Location Probability (Specific History)
-                # "How often does K,K,L lead to M?"
-                # If pattern is new, this is 0.0
-                p_loc = self.get_probability(self.loc_probs[hist_loc], next_loc)
+                # Probability from Momentum history (UDF part)
+                p_udf = self.get_probability(self.mom_probs[hist_mom], move)
                 
-                # B. Momentum Probability (General History)
-                # "How often does F,U lead to U?"
-                # This provides the "Grammar" when the specific word is unknown.
-                p_mom = self.get_probability(self.mom_probs[hist_mom], move)
-                
-                total_score = p_loc + p_mom
+                # Combined dependent pattern completion probability
+                total_score = p_abc + p_udf
                 
                 candidates.append({
-                    'next_loc': next_loc,
-                    'move': move,
-                    'score': total_score,
-                    'debug': f"P_loc({p_loc:.2f}) + P_mom({p_mom:.2f})"
+                    'loc': next_loc, 'mom': move, 'score': total_score,
+                    'p_abc': p_abc, 'p_udf': p_udf
                 })
 
-        # 4. Pick Winner
         candidates.sort(key=lambda x: x['score'], reverse=True)
-        winner = candidates[0]
         
-        print(f"  Candidates:")
+        print("  Candidate Scores:")
         for c in candidates:
-             time.sleep(0.1)
-             print(f"    -> Extend to '{c['next_loc']}' ({c['move']}): Score {c['score']:.2f} [{c['debug']}]")
+            time.sleep(0.1)
+            print(f"    -> {c['loc']} (via {c['mom']}): {c['score']:.2f} [ABC: {c['p_abc']:.2f}, UDF: {c['p_udf']:.2f}]")
 
-        # 5. Return the Completed Location Pattern
-        completed_pattern = list(incomplete_loc_pattern)
-        completed_pattern.append(winner['next_loc'])
-        
+        winner = candidates[0]
         time.sleep(0.1)
-        print(f"[Result] Completed Location Pattern: {completed_pattern}")
-        return completed_pattern
-
-# --- SIMULATION ---
+        print(f"[Prediction] Next Location: {winner['loc']}")
+        return winner['loc']
 
 if __name__ == "__main__":
-    # Generate Data
-    print(f"--- GENERATING MARKET DATA ({SIMULATION_YEARS} Years) ---")
-    prices = [100000]
+    # 1. Setup Data
+    print(f"--- SIMULATING {SIMULATION_YEARS} YEARS OF MARKET DATA ---")
+    prices = [100000] # Start at 100k
     for _ in range(365 * SIMULATION_YEARS):
-        change = random.gauss(50, 2000)
+        change = random.gauss(50, 2500)
         prices.append(max(MIN_PRICE, min(MAX_PRICE, prices[-1] + change)))
 
+    # 2. Train Completer
     completer = StockPatternCompleter(prices)
 
-    # TEST 1: Common Pattern
-    # Input: K -> K -> K -> K (Consolidation in Middle)
-    print(f"\n--- TEST 1: Middle Consolidation ---")
-    completer.complete_pattern(['K', 'K', 'K', 'K'])
+    # 3. Demonstration
+    # Note: For the input word, we provide the Location AND the Momentum that reached it.
+    
+    print(f"\n--- TEST 1: Sideways in Zone K ---")
+    # Location is K, reached by Flat moves
+    completer.complete_pattern(['K', 'K', 'K', 'K'], ['F', 'F', 'F', 'F'])
 
-    # TEST 2: The "New Area" Test
-    # Input: A -> B -> C -> D (Strong Rally at Bottom)
-    # The Model likely has NEVER seen 'A,B,C,D'. P_loc will be 0.
-    # But it has seen 'U,U,U' many times. P_mom will be high for 'U'.
-    # Result should be extension to 'E'.
-    print(f"\n--- TEST 2: Rally in Rare Zone (Zone A->D) ---")
-    completer.complete_pattern(['A', 'B', 'C', 'D'])
+    print(f"\n--- TEST 2: Rally in Rare Zone (A to D) ---")
+    # Location moves A->B->C->D, reached by Up moves
+    # Even if ABC history is 0, UDF history will drive the result.
+    completer.complete_pattern(['A', 'B', 'C', 'D'], ['U', 'U', 'U', 'U'])
+
+    print(f"\n--- TEST 3: Volatile Reversal ---")
+    # Down Down Down reaching Zone J, but then Flat
+    completer.complete_pattern(['M', 'L', 'K', 'J'], ['D', 'D', 'D', 'F'])
