@@ -2,209 +2,174 @@ import random
 import collections
 import string
 
-# --- CONFIGURATION PARAMETERS ---
-
-# Linear Bucketing Settings
+# --- CONFIGURATION ---
 MIN_PRICE = 0
 MAX_PRICE = 200000
 NUM_BUCKETS = 20
 BUCKET_SIZE = (MAX_PRICE - MIN_PRICE) / NUM_BUCKETS
+BUCKET_CHARS = string.ascii_uppercase[:NUM_BUCKETS] # A-T
+WINDOW_SIZE = 4
+SIMULATION_YEARS = 50
 
-# Generate Bucket Alphabet (A-T)
-BUCKET_CHARS = string.ascii_uppercase[:NUM_BUCKETS]
-
-# Movement Alphabet
-MOVE_CHARS = ['U', 'D', 'F']
-
-# Pattern Recognition Settings
-WINDOW_SIZE = 4          # A "word" is 4 days of (Bucket+Move) tokens
-                         # Example: ['KF', 'KF', 'LU', 'LF']
-
-# Simulation Settings
-SIMULATION_YEARS = 50    # Increased years to help fill the larger state space
-START_PRICE = 100000     
-DAILY_VOLATILITY = 2000  
-DAILY_DRIFT = 50         
-
-# --- LOGIC ---
-
-class StockSpellChecker:
+class StockPatternCompleter:
     def __init__(self, price_history, window_size=WINDOW_SIZE):
         self.prices = price_history
-        self.window_size = window_size
+        self.window = window_size
         
-        # 1. Translate Prices to "Language" (List of Combined Tokens)
-        self.sequence = self.encode_prices(self.prices)
+        # 1. Ingest Data
+        # We need both streams to build our probability distributions
+        self.loc_stream, self.mom_stream = self.discretize_data(self.prices)
         
-        # 2. Train the "Dictionary"
-        self.pattern_counts = collections.Counter()
-        self.valid_tokens = set(self.sequence) # Remember which tokens actually exist
-        self.train_patterns()
+        # 2. Train Memory Banks
+        self.loc_probs = collections.defaultdict(collections.Counter)
+        self.mom_probs = collections.defaultdict(collections.Counter)
+        self.train()
 
     def get_bucket_index(self, price):
-        """Helper to find which absolute zone a price is in."""
         if price >= MAX_PRICE: return NUM_BUCKETS - 1
         if price <= MIN_PRICE: return 0
         return int((price - MIN_PRICE) / BUCKET_SIZE)
-        
-    def encode_prices(self, prices):
+
+    def discretize_data(self, prices):
         """
-        Converts price history to a list of tokens.
-        Token Format: "{BucketChar}{MoveChar}" (e.g., "KF")
+        Translates raw prices into the two fundamental languages.
         """
-        encoded_tokens = []
+        locs = []
+        moms = []
         for i in range(1, len(prices)):
-            prev_idx = self.get_bucket_index(prices[i-1])
-            curr_idx = self.get_bucket_index(prices[i])
+            prev = self.get_bucket_index(prices[i-1])
+            curr = self.get_bucket_index(prices[i])
             
-            # Determine Movement
-            if curr_idx > prev_idx:
-                move = 'U' # Crossed Up
-            elif curr_idx < prev_idx:
-                move = 'D' # Crossed Down
-            else:
-                move = 'F' # Flat (Same Bucket)
+            # Location (The "Word")
+            locs.append(BUCKET_CHARS[curr])
             
-            # Determine Bucket Char
-            bucket_char = BUCKET_CHARS[curr_idx]
-            
-            # Combine: "K" + "F" -> "KF"
-            token = f"{bucket_char}{move}"
-            encoded_tokens.append(token)
-            
-        return encoded_tokens
+            # Momentum (The "Grammar")
+            if curr > prev: moms.append('U')
+            elif curr < prev: moms.append('D')
+            else: moms.append('F')
+        return locs, moms
 
-    def train_patterns(self):
+    def train(self):
+        print(f"Training on {len(self.loc_stream)} cycles...")
+        # Train Location Model: P(NextLocation | PreviousLocations)
+        for i in range(len(self.loc_stream) - self.window):
+            pattern = tuple(self.loc_stream[i : i + self.window])
+            next_val = self.loc_stream[i + self.window]
+            self.loc_probs[pattern][next_val] += 1
+
+        # Train Momentum Model: P(NextMove | PreviousMoves)
+        for i in range(len(self.mom_stream) - self.window):
+            pattern = tuple(self.mom_stream[i : i + self.window])
+            next_val = self.mom_stream[i + self.window]
+            self.mom_probs[pattern][next_val] += 1
+
+    def get_probability(self, counter, target):
+        total = sum(counter.values())
+        if total == 0: return 0.0
+        return counter[target] / total
+
+    def complete_pattern(self, incomplete_loc_pattern):
         """
-        Learns all historical patterns of length `window_size`.
-        Keys are now Tuples of strings, e.g. ('KF', 'KF', 'LU', 'LF')
+        Takes an incomplete Location Pattern (e.g. ['K', 'K', 'L'])
+        And returns the most likely Completed Location Pattern.
         """
-        print(f"Training on {len(self.sequence)} days of data...")
-        print(f"Vocabulary: {len(self.valid_tokens)} unique states seen (out of {NUM_BUCKETS*3} possible).")
+        # 1. Derive the Momentum Pattern from the Location Pattern
+        # (Translation Step: Location -> Momentum)
+        current_moms = []
+        for i in range(1, len(incomplete_loc_pattern)):
+            prev_char = incomplete_loc_pattern[i-1]
+            curr_char = incomplete_loc_pattern[i]
+            prev_idx = BUCKET_CHARS.index(prev_char)
+            curr_idx = BUCKET_CHARS.index(curr_char)
+            
+            if curr_idx > prev_idx: current_moms.append('U')
+            elif curr_idx < prev_idx: current_moms.append('D')
+            else: current_moms.append('F')
+
+        # 2. Setup History Tuples
+        hist_loc = tuple(incomplete_loc_pattern)
+        hist_mom = tuple(current_moms) # Note: Momentum history is 1 shorter than Loc history
+
+        # We need the momentum window to match the training size
+        # If input is short, we use what we have.
         
-        self.transitions = collections.defaultdict(collections.Counter)
-        
-        for i in range(len(self.sequence) - self.window_size):
-            # Create a tuple for the pattern (hashable)
-            pattern = tuple(self.sequence[i : i + self.window_size])
-            next_move = self.sequence[i + self.window_size]
-            
-            self.transitions[pattern][next_move] += 1
-            self.pattern_counts[pattern] += 1
+        print(f"\n[Input] Location Pattern: {incomplete_loc_pattern}")
+        print(f"[Derived] Momentum Pattern: {current_moms}")
 
-    def predict_next(self, recent_pattern_list):
-        """
-        Finds the most likely next token.
-        input: list of tokens e.g. ['KF', 'KF', 'LU', 'LF']
-        """
-        # Convert list to tuple for dictionary lookup
-        pattern_tuple = tuple(recent_pattern_list)
-
-        if len(pattern_tuple) != self.window_size:
-            print(f"Error: Pattern length must be {self.window_size}")
-            return None
-
-        if pattern_tuple in self.transitions:
-            candidates = self.transitions[pattern_tuple]
-            total = sum(candidates.values())
-            
-            print(f"\nAnalysis for pattern {pattern_tuple}:")
-            print(f"  Historical occurrences: {self.pattern_counts[pattern_tuple]}")
-            
-            predictions = []
-            for token, count in candidates.most_common():
-                prob = count / total
-                predictions.append((token, prob))
-                
-                # Contextual description
-                b_char = token[0]
-                m_char = token[1]
-                desc = "Unknown"
-                if m_char == 'U': desc = "Up into"
-                elif m_char == 'D': desc = "Down into"
-                elif m_char == 'F': desc = "Staying in"
-                
-                print(f"  -> Next: {token} ({desc} Zone {b_char}): {prob*100:.1f}%")
-            
-            return predictions[0][0]
-        else:
-            return self.find_fuzzy_match(pattern_tuple)
-
-    def find_fuzzy_match(self, pattern_tuple):
-        """
-        Edits tokens to find a similar historical sequence.
-        """
-        print(f"\nPattern {pattern_tuple} never seen. Fuzzy matching...")
+        # 3. Determine Candidates for the NEXT Location
+        last_char = incomplete_loc_pattern[-1]
+        last_idx = BUCKET_CHARS.index(last_char)
         
         candidates = []
         
-        # 1-Edit Distance (Substitute 1 token in the sequence)
-        # We only substitute with 'valid_tokens' that we've actually seen in history
-        # to avoid searching 60 possibilities every time.
-        for i in range(len(pattern_tuple)):
-            for token in self.valid_tokens:
-                if token == pattern_tuple[i]: continue
-                
-                # Create modified tuple
-                edited_list = list(pattern_tuple)
-                edited_list[i] = token
-                edited_tuple = tuple(edited_list)
-                
-                if edited_tuple in self.transitions:
-                    weight = self.pattern_counts[edited_tuple]
-                    candidates.append((edited_tuple, weight))
+        # Physics: We can only move Up, Down, or Flat from current location
+        transitions = [('U', 1), ('D', -1), ('F', 0)]
         
-        if not candidates:
-            return "Unknown"
+        for move, idx_change in transitions:
+            next_idx = last_idx + idx_change
             
-        best_match = max(candidates, key=lambda x: x[1])[0]
-        print(f"  Closest historical match: {best_match}")
-        return self.predict_next(best_match)
+            # Boundary Check
+            if 0 <= next_idx < NUM_BUCKETS:
+                next_loc = BUCKET_CHARS[next_idx]
+                
+                # --- PROBABILITY CALCULATION ---
+                # We calculate the likelihood of this specific Next Location
+                
+                # A. Location Probability (Specific History)
+                # "How often does K,K,L lead to M?"
+                # If pattern is new, this is 0.0
+                p_loc = self.get_probability(self.loc_probs[hist_loc], next_loc)
+                
+                # B. Momentum Probability (General History)
+                # "How often does F,U lead to U?"
+                # This provides the "Grammar" when the specific word is unknown.
+                p_mom = self.get_probability(self.mom_probs[hist_mom], move)
+                
+                total_score = p_loc + p_mom
+                
+                candidates.append({
+                    'next_loc': next_loc,
+                    'move': move,
+                    'score': total_score,
+                    'debug': f"P_loc({p_loc:.2f}) + P_mom({p_mom:.2f})"
+                })
+
+        # 4. Pick Winner
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+        winner = candidates[0]
+        
+        print(f"  Candidates:")
+        for c in candidates:
+             print(f"    -> Extend to '{c['next_loc']}' ({c['move']}): Score {c['score']:.2f} [{c['debug']}]")
+
+        # 5. Return the Completed Location Pattern
+        completed_pattern = list(incomplete_loc_pattern)
+        completed_pattern.append(winner['next_loc'])
+        
+        print(f"[Result] Completed Location Pattern: {completed_pattern}")
+        return completed_pattern
 
 # --- SIMULATION ---
 
 if __name__ == "__main__":
-    print(f"--- PARAMETERS ---")
-    print(f"Buckets: {NUM_BUCKETS} (Size: ${BUCKET_SIZE:,.0f})")
-    print(f"Token Structure: [Bucket][Move] (e.g., 'KF' = Zone K, Flat)")
-    
-    # 1. Generate Fake Stock Data
-    print(f"\nGenerating {SIMULATION_YEARS} years of data...")
-    prices = [START_PRICE]
+    # Generate Data
+    print(f"--- GENERATING MARKET DATA ({SIMULATION_YEARS} Years) ---")
+    prices = [100000]
     for _ in range(365 * SIMULATION_YEARS):
-        change = random.gauss(DAILY_DRIFT, DAILY_VOLATILITY)
-        new_price = prices[-1] + change
-        # Keep inside bounds
-        if new_price < MIN_PRICE: new_price = MIN_PRICE + 100
-        if new_price > MAX_PRICE: new_price = MAX_PRICE - 100
-        prices.append(new_price)
+        change = random.gauss(50, 2000)
+        prices.append(max(MIN_PRICE, min(MAX_PRICE, prices[-1] + change)))
 
-    # 2. Initialize
-    model = StockSpellChecker(prices)
+    completer = StockPatternCompleter(prices)
 
-    # 3. Test Scenarios
-    
-    # Scenario 1: Middle of the pack, doing nothing.
-    # K is ~100k. F is Flat.
-    test_1 = ['KF', 'KF', 'KF', 'KF']
-    print(f"\n--- TEST 1: Consolidation in Zone K ({test_1}) ---")
-    model.predict_next(test_1)
+    # TEST 1: Common Pattern
+    # Input: K -> K -> K -> K (Consolidation in Middle)
+    print(f"\n--- TEST 1: Middle Consolidation ---")
+    completer.complete_pattern(['K', 'K', 'K', 'K'])
 
-    # Scenario 2: Moving Up the ladder.
-    # J(Up) -> K(Up) -> L(Up) -> M(Up)
-    # This implies a very strong trend crossing buckets rapidly.
-    test_2 = ['JU', 'KU', 'LU', 'MU']
-    print(f"\n--- TEST 2: Breakout Rally ({test_2}) ---")
-    model.predict_next(test_2)
-    
-    # Scenario 3: A Crash followed by a bounce (rare/complex)
-    # L(Down) -> K(Down) -> J(Flat) -> J(Up)
-    test_3 = ['LD', 'KD', 'JF', 'JU']
-    print(f"\n--- TEST 3: Dip and Bounce ({test_3}) ---")
-    model.predict_next(test_3)
-    
-    print("\n--- Bucket Legend (Partial) ---")
-    for i in range(0, NUM_BUCKETS, 5): 
-        char = BUCKET_CHARS[i]
-        start = MIN_PRICE + (i * BUCKET_SIZE)
-        print(f"Zone {char}: ${start:,.0f}+")
+    # TEST 2: The "New Area" Test
+    # Input: A -> B -> C -> D (Strong Rally at Bottom)
+    # The Model likely has NEVER seen 'A,B,C,D'. P_loc will be 0.
+    # But it has seen 'U,U,U' many times. P_mom will be high for 'U'.
+    # Result should be extension to 'E'.
+    print(f"\n--- TEST 2: Rally in Rare Zone (Zone A->D) ---")
+    completer.complete_pattern(['A', 'B', 'C', 'D'])
