@@ -20,7 +20,7 @@ class MarketDataHandler:
         self.last_min = 0
         self.last_step = 0
 
-    def fetch_candles(self, symbol="SPY", period="5y"): # Reduced period for speed
+    def fetch_candles(self, symbol="SPY", period="10y"):
         """Fetches dataset."""
         print(f"Fetching {period} of data for {symbol} via Yahoo Finance...")
         
@@ -30,27 +30,33 @@ class MarketDataHandler:
                 print("Error: No data found.")
                 return []
                 
-            # Handle different yfinance return formats (MultiIndex vs Standard)
+            # Robust data extraction for different yfinance versions
+            prices = []
             if 'Close' in df.columns:
                 if isinstance(df.columns, pd.MultiIndex):
-                    # For newer yfinance versions where columns are (Price, Ticker)
-                    prices = df['Close'][symbol].tolist()
+                    # MultiIndex case: ('Close', 'SPY')
+                    try:
+                        prices = df['Close'][symbol].dropna().tolist()
+                    except KeyError:
+                        prices = df['Close'].iloc[:, 0].dropna().tolist()
                 else:
-                    prices = df['Close'].values.flatten().tolist()
+                    # Standard case
+                    prices = df['Close'].dropna().tolist()
             else:
-                prices = df.iloc[:, 0].tolist()
+                # Fallback
+                prices = df.iloc[:, 0].dropna().tolist()
+                
         except Exception as e:
             print(f"Data fetch error: {e}")
             return []
             
-        prices = [p for p in prices if not math.isnan(p)]
         print(f"Loaded {len(prices)} data points.")
         return prices
 
     def discretize_sequence(self, prices, num_bins=40):
         if not prices or len(prices) < 2: return []
 
-        # Dynamic normalization based on the window provided
+        # Dynamic normalization
         min_p = min(prices) * 0.95
         max_p = max(prices) * 1.05
         price_range = max_p - min_p
@@ -79,10 +85,6 @@ class MarketDataHandler:
             
         return sequence
 
-    def sequence_to_prices(self, sequence):
-        """Converts the categorical sequence back to price levels."""
-        return [self.last_min + (cat * self.last_step) for _, cat in sequence]
-
 # ==============================================================================
 # 2. PROBABILISTIC ENGINE (The "Grammar" Checker)
 # ==============================================================================
@@ -104,7 +106,7 @@ class ZScoreEngine:
     def train(self, sequence):
         print("Training Markov chains on historical physics...")
         
-        # Reset counts with Laplace smoothing (start at 0.1)
+        # Reset counts with Laplace smoothing
         mom_counts = np.ones((3, 3)) * 0.1
         cat_counts = np.ones((self.num_categories, self.num_categories)) * 0.1
         mom_start_counts = np.ones(3) * 0.1
@@ -117,7 +119,6 @@ class ZScoreEngine:
             curr_m_idx = self.mom_map[curr_mom]
             next_m_idx = self.mom_map[next_mom]
             
-            # categories are 1-based, so subtract 1 for index
             curr_c_idx = curr_cat - 1
             next_c_idx = next_cat - 1
             
@@ -140,7 +141,7 @@ class ZScoreEngine:
         if not seq: return 0.0
         
         first_idx = seq[0]
-        if first_idx >= len(start) or first_idx < 0: return -50.0 # Penalty for out of bounds
+        if first_idx >= len(start) or first_idx < 0: return -50.0 
         
         log_prob = math.log(start[first_idx] + 1e-9)
         
@@ -149,7 +150,7 @@ class ZScoreEngine:
             next_val = seq[i+1]
             
             if curr >= len(trans) or next_val >= len(trans) or curr < 0 or next_val < 0:
-                log_prob += -50.0 # Heavy penalty for invalid transitions
+                log_prob += -50.0 
             else:
                 prob = trans[curr][next_val]
                 log_prob += math.log(prob + 1e-9)
@@ -157,12 +158,8 @@ class ZScoreEngine:
         return log_prob
 
     def calibrate(self):
-        """
-        Runs Monte Carlo simulations to determine what a 'normal' probability
-        looks like for sequences of different lengths.
-        """
+        """Calibrates 'Normal' probability for lengths 2 to 30."""
         print("Calibrating Z-Score baselines...")
-        # We calibrate for lengths 2 to 30
         for length in range(2, 31): 
             m_logs, c_logs = [], []
             for _ in range(100): 
@@ -183,9 +180,8 @@ class ZScoreEngine:
 
     def get_z_score(self, sequence):
         length = len(sequence)
-        # Fallback for uncalibrated lengths (extrapolate)
-        if length not in self.stats['mom']: 
-            return -2.0 # Assume slightly improbable if too long/short
+        # Handle lengths outside calibration by clamping
+        calib_len = max(2, min(length, 30))
         
         m_idxs = [self.mom_map[m] for m, c in sequence]
         c_idxs = [c-1 for m, c in sequence]
@@ -193,8 +189,8 @@ class ZScoreEngine:
         lp_m = self._get_log_prob(m_idxs, self.mom_trans, self.mom_start)
         lp_c = self._get_log_prob(c_idxs, self.cat_trans, self.cat_start)
         
-        mu = self.stats['mom'][length]['mu'] + self.stats['cat'][length]['mu']
-        std = math.sqrt(self.stats['mom'][length]['var'] + self.stats['cat'][length]['var'])
+        mu = self.stats['mom'][calib_len]['mu'] + self.stats['cat'][calib_len]['mu']
+        std = math.sqrt(self.stats['mom'][calib_len]['var'] + self.stats['cat'][calib_len]['var'])
         
         if std == 0: return 0
         return (lp_m + lp_c - mu) / std
@@ -206,25 +202,25 @@ class ZScoreEngine:
 class SequenceEditor:
     def __init__(self, engine, edit_penalty=0.4):
         self.engine = engine
-        self.edit_penalty = edit_penalty # Cost per edit (Standard Deviations)
+        self.edit_penalty = edit_penalty 
 
     def repair_momentum(self, sequence):
         """Ensures the (UP/DOWN/FLAT) labels match the actual category numbers."""
         if not sequence: return []
-        repaired = [sequence[0]] # Keep start momentum as is usually
+        repaired = [sequence[0]] 
         for i in range(1, len(sequence)):
             prev_mom, prev_cat = repaired[-1]
             curr_mom, curr_cat = sequence[i]
             
             if curr_cat > prev_cat: mom = 'UP'
             elif curr_cat < prev_cat: mom = 'DOWN'
-            else: mom = 'FLAT' # or keep prev_mom if desired
+            else: mom = 'FLAT'
             
             repaired.append((mom, curr_cat))
         return repaired
 
     def mutate(self, sequence):
-        """Randomly alters the sequence."""
+        """Randomly alters the sequence (Edit, Insert, Delete)."""
         seq = copy.deepcopy(sequence)
         if len(seq) < 2: return seq
         
@@ -234,87 +230,58 @@ class SequenceEditor:
         # 1. NUDGE VALUE (Modify) - 60% chance
         if op < 0.6:
             _, cat = seq[idx]
-            # +/- 1 or 2 steps
-            change = random.choice([-1, 1, -1, 1, -2, 2])
+            change = random.choice([-1, 1, -2, 2])
             new_cat = max(1, min(self.engine.num_categories, cat + change))
             seq[idx] = (seq[idx][0], new_cat)
             
         # 2. INSERT/EXTEND (Add) - 20% chance
         elif op < 0.8:
-            # If idx is end, it's a prediction/extension
-            # If idx is middle, it's an interpolation
             _, cat = seq[idx]
-            seq.insert(idx + 1, ('FLAT', cat)) # Dupe value, physics will fix momentum
+            # Insert a duplicate of the current value next to it
+            seq.insert(idx + 1, ('FLAT', cat)) 
             
         # 3. DELETE (Remove) - 20% chance
         else:
-            if len(seq) > 2: # Don't delete if too short
+            if len(seq) > 2: 
                 del seq[idx]
 
         return self.repair_momentum(seq)
 
     def solve(self, input_sequence, iterations=300):
         """
-        Hill Climbing Search.
-        Input: Noisy/Gibberish sequence.
-        Output: High probability sequence close to input.
+        Stochastic Hill Climbing to 'Spell Check' the sequence.
         """
         current_seq = self.repair_momentum(input_sequence)
-        current_edits = 0
         
-        # Calculate initial score
-        # Score = Z_Score - (Edit_Count * Penalty)
-        # We assume initial input has 0 edits.
+        # Initial Score
         current_z = self.engine.get_z_score(current_seq)
-        current_score = current_z
         
         best_seq = current_seq
-        best_score = current_score
+        best_score = current_z
         
-        # We track edits relative to the original input length to avoid 
-        # infinite growth or shrinking loops just for score hacking.
-        original_len = len(input_sequence)
-
         for i in range(iterations):
-            # Generate a mutation of the CURRENT best (local search)
+            # Try a mutation
             candidate_seq = self.mutate(current_seq)
-            
-            # Heuristic for Edit Distance (approximate)
-            # We penalize length deviation and values that differ from original indices
-            # Ideally this is Levenshtein, but for this simpler version:
-            # We just apply a flat penalty for every mutation accepted.
-            
             cand_z = self.engine.get_z_score(candidate_seq)
             
-            # Simple cooling schedule or fixed penalty
-            # We want to maximize Z-Score, but pay for edits.
-            # Since we are mutating 'current_seq', we are effectively walking away from input.
-            # We need to decide if the new step is worth it.
-            
-            # Compare candidate to CURRENT
-            # If Z-score improves significantly, take the step.
-            
+            # Improvement calculation
             z_diff = cand_z - current_z
             
-            # Acceptance threshold: 
-            # We need the Z-score to improve by at least 'edit_penalty' to justify a change.
+            # Acceptance Threshold (Must improve score by margin to justify edit)
             if z_diff > self.edit_penalty:
                 current_seq = candidate_seq
                 current_z = cand_z
-                current_score = cand_z # We reset score tracking to the new baseline
                 
-                # Keep track of absolute best found
                 if current_z > best_score:
                     best_seq = candidate_seq
                     best_score = current_z
             
-            # Random Restart (Simulated Annealing-lite)
-            # Occasionally revert to best found to prevent getting stuck in a bad local max
+            # Random Restart prevents getting stuck in local maxima
             if i % 50 == 0:
                 current_seq = best_seq
                 current_z = best_score
 
-        return best_seq, best_score
+        return best_seq
 
 # ==============================================================================
 # 4. RUNNER
@@ -322,9 +289,8 @@ class SequenceEditor:
 
 if __name__ == "__main__":
     
-    # SETUP
-    SYMBOL = "BTC-USD" # Crypto is noisier, good for testing correction
-    PERIOD = "2y"
+    SYMBOL = "SPY" 
+    PERIOD = "5y"
     NUM_BINS = 50
     
     # 1. Load Data
@@ -334,7 +300,7 @@ if __name__ == "__main__":
 
     full_seq = market.discretize_sequence(raw_prices, num_bins=NUM_BINS)
     
-    # 2. Train Engine (Learn "Spelling" Rules of the Market)
+    # 2. Train Engine 
     split = int(len(full_seq) * 0.8)
     train_data = full_seq[:split]
     test_data = full_seq[split:]
@@ -344,38 +310,48 @@ if __name__ == "__main__":
     engine.calibrate()
     
     # 3. The Corrector
-    # Lower penalty = more creativity/editing. Higher penalty = strict adherence to input.
+    # edit_penalty: Cost of making a change. 
+    # High = Strict (changes must be VERY good). Low = Creative (changes can be minor).
     corrector = SequenceEditor(engine, edit_penalty=0.15) 
     
     print("\n" + "="*60)
-    print(f"RUNNING CORRECTION DEMO (Input Length: 10)")
+    print(f"MARKET SPELL CHECKER DEMO ({SYMBOL})")
     print("="*60)
     
-    # Take random slices of the test data and try to "correct" them
-    for i in range(0, len(test_data) - 10, 20):
-        # We take a real slice, maybe add some artificial noise?
+    # Test on a few random slices
+    for i in range(0, len(test_data) - 10, 50):
+        # Grab a real slice
         input_slice = test_data[i : i+10]
         
-        # Let's add artificial noise to see if it fixes it
+        # --- Inject Artificial "Typos" (Noise) ---
         noisy_slice = copy.deepcopy(input_slice)
-        # Introduce a massive spike in the middle (Gibberish)
-        noisy_slice[5] = ('UP', min(NUM_BINS, noisy_slice[5][1] + 15)) 
+        
+        # Typo 1: Add a massive unrealistic spike in the middle
+        mid_idx = 5
+        noisy_slice[mid_idx] = ('UP', min(NUM_BINS, noisy_slice[mid_idx][1] + 10))
         noisy_slice = corrector.repair_momentum(noisy_slice)
 
         # Run Correction
-        corrected_slice, score = corrector.solve(noisy_slice, iterations=400)
+        corrected_slice = corrector.solve(noisy_slice, iterations=500)
         
-        # Format output
+        # --- Output ---
         input_vals = [x[1] for x in noisy_slice]
         output_vals = [x[1] for x in corrected_slice]
         
-        print(f"INPUT (Noisy):     {input_vals}")
-        print(f"OUTPUT (Corrected):{output_vals}")
+        print(f"INPUT (With Typo): {input_vals}")
+        print(f"OUTPUT (Edited):   {output_vals}")
         
-        # Check diff
-        if len(output_vals) > len(input_vals):
-            print(f"--> Extended by {len(output_vals)-len(input_vals)} steps")
-        elif len(output_vals) < len(input_vals):
-            print(f"--> Shortened by {len(input_vals)-len(output_vals)} steps")
+        if len(output_vals) != len(input_vals):
+             print(f"--> Length Changed: {len(input_vals)} -> {len(output_vals)}")
+
+        # Check if the spike was removed/smoothed
+        original_val = input_slice[mid_idx][1]
+        typo_val = input_vals[mid_idx]
+        try:
+            # Note: Index might shift if deletions occurred, simplified check
+            corrected_val = output_vals[mid_idx] 
+            print(f"--> Value at Index 5: Real={original_val}, Typo={typo_val}, Fixed={corrected_val}")
+        except IndexError:
+            print("--> Index 5 was deleted by editor.")
             
         print("-" * 60)
