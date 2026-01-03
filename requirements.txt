@@ -1,6 +1,2 @@
-tensorflow
+yfinance
 numpy
-requests
-matplotlib
-python-dotenv
-# Note: Python 3.6+ required for f-strings and other features used in app.py
