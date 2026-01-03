@@ -1,6 +1,13 @@
 import numpy as np
 import math
 import itertools
+import time
+
+# Override print to ensure correct order of railway output
+_builtin_print = print
+def print(*args, **kwargs):
+    time.sleep(0.1)
+    _builtin_print(*args, **kwargs)
 
 # ==============================================================================
 # 1. CONFIGURATION: The "Cost of Truth"
