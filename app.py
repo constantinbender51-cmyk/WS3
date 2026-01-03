@@ -16,31 +16,29 @@ NUM_BUCKETS = 20
 BUCKET_SIZE = (MAX_PRICE - MIN_PRICE) / NUM_BUCKETS
 BUCKET_CHARS = string.ascii_uppercase[:NUM_BUCKETS] # A-T
 MAX_EDITS = 2
-DATA_POINTS = 500
+DATA_POINTS = 600
 TRAIN_SPLIT = 0.5
-WINDOW_SIZE = 3  # Optimized window size based on performance observations
+WORD_LENGTH = 4 # All "valid" market words are 4 tokens long
 
 # --- DATA GENERATION ---
 def generate_mock_data(n=DATA_POINTS):
     prices = [100000]
     for _ in range(n - 1):
-        # Weighted random walk to create semi-predictable patterns
-        change = random.gauss(150, 4000)
+        # Create patterns that repeat to give the "Dictionary" structure
+        change = random.gauss(100, 3500)
         new_price = max(MIN_PRICE + 5000, min(MAX_PRICE - 5000, prices[-1] + change))
         prices.append(new_price)
     return prices
 
-# --- PROBABILISTIC ENGINE ---
-class MarketCorrector:
-    def __init__(self, training_prices, window_size=WINDOW_SIZE):
-        self.window = window_size
+# --- THE NORVIG ENGINE ---
+class MarketSpellCorrector:
+    def __init__(self, training_prices):
         self.loc_stream, self.mom_stream = self.discretize(training_prices)
-        self.loc_counts = collections.defaultdict(collections.Counter)
-        self.mom_counts = collections.defaultdict(collections.Counter)
-        self.loc_trans = collections.defaultdict(collections.Counter)
-        self.mom_trans = collections.defaultdict(collections.Counter)
-        self.vocab_loc = set()
-        self.vocab_mom = set()
+        
+        # Dictionary of "Valid" 4-token words
+        self.loc_dict = collections.Counter()
+        self.mom_dict = collections.Counter()
+        
         self.train()
 
     def get_idx(self, p):
@@ -56,96 +54,108 @@ class MarketCorrector:
         return locs, moms
 
     def train(self):
+        print(f"Building Dictionary of {WORD_LENGTH}-token words...")
         time.sleep(0.1)
-        print(f"Training Dictionary on {len(self.loc_stream)} steps (Window Size: {self.window})...")
-        n = self.window
-        for i in range(len(self.loc_stream) - n):
-            l_w = tuple(self.loc_stream[i : i + n])
-            m_w = tuple(self.mom_stream[i : i + n])
-            n_l, n_m = self.loc_stream[i + n], self.mom_stream[i + n]
-            
-            self.loc_counts[l_w][n_l] += 1
-            self.mom_counts[m_w][n_m] += 1
-            self.loc_trans[l_w][n_l] += 1
-            self.mom_trans[m_w][n_m] += 1
-            self.vocab_loc.add(l_w)
-            self.vocab_mom.add(m_w)
-            
-        self.total_l = sum(sum(c.values()) for c in self.loc_counts.values())
-        self.total_m = sum(sum(c.values()) for c in self.mom_counts.values())
+        # We only store words of exactly WORD_LENGTH
+        for i in range(len(self.loc_stream) - WORD_LENGTH + 1):
+            l_word = tuple(self.loc_stream[i : i + WORD_LENGTH])
+            m_word = tuple(self.mom_stream[i : i + WORD_LENGTH])
+            self.loc_dict[l_word] += 1
+            self.mom_dict[m_word] += 1
+
+    def P(self, word, dictionary): 
+        """Probability of a word based on dictionary frequency."""
+        return dictionary[word] / sum(dictionary.values())
 
     def edits1(self, word, alphabet):
-        splits = [(word[:i], word[i:]) for i in range(len(word) + 1)]
-        replaces = [L + (c,) + R[1:] for L, R in splits if R for c in alphabet]
-        return set(replaces)
+        """Standard Norvig edits: Deletes, Transposes, Replaces, Inserts."""
+        splits     = [(word[:i], word[i:]) for i in range(len(word) + 1)]
+        deletes    = [L + R[1:] for L, R in splits if R]
+        transposes = [L + (R[1], R[0]) + R[2:] for L, R in splits if len(R)>1]
+        replaces   = [L + (c,) + R[1:] for L, R in splits if R for c in alphabet]
+        inserts    = [L + (c,) + R for L, R in splits for c in alphabet]
+        return set(deletes + transposes + replaces + inserts)
 
-    def candidates(self, word, vocab, alphabet):
-        if word in vocab: return {word}
-        curr = {word}
-        for _ in range(MAX_EDITS):
-            nxt = set()
-            for w in curr: nxt.update(self.edits1(w, alphabet))
-            known = {e for e in nxt if e in vocab}
-            if known: return known
-            curr = nxt
-        return {word}
+    def known(self, words, dictionary): 
+        """Return the subset of words that actually exist in our market dictionary."""
+        return set(w for w in words if w in dictionary)
 
-    def solve(self, in_loc, in_mom):
-        l_cand = self.candidates(tuple(in_loc), self.vocab_loc, BUCKET_CHARS)
-        m_cand = self.candidates(tuple(in_mom), self.vocab_mom, ['U', 'D', 'F'])
-        last_idx = BUCKET_CHARS.index(in_loc[-1])
-        results = []
-        for move, shift in [('U', 1), ('D', -1), ('F', 0)]:
-            t_idx = max(0, min(NUM_BUCKETS - 1, last_idx + shift))
-            t_loc = BUCKET_CHARS[t_idx]
-            
-            p_abc = sum((sum(self.loc_counts[c].values())/self.total_l) * (self.loc_trans[c][t_loc]/sum(self.loc_trans[c].values())) 
-                        for c in l_cand if sum(self.loc_trans[c].values()) > 0)
-            p_udf = sum((sum(self.mom_counts[c].values())/self.total_m) * (self.mom_trans[c][move]/sum(self.mom_trans[c].values())) 
-                        for c in m_cand if sum(self.mom_trans[c].values()) > 0)
-            
-            results.append({'target': t_loc, 'move': move, 'score': p_abc + p_udf})
+    def candidates(self, word, dictionary, alphabet):
+        """
+        Norvig's logic: 
+        1. If it's a known word, use it.
+        2. Otherwise, look for known words at edit distance 1.
+        3. Otherwise, look for known words at edit distance 2.
+        4. Otherwise, return the word itself (even if unknown).
+        """
+        return (self.known([word], dictionary) or 
+                self.known(self.edits1(word, alphabet), dictionary) or 
+                self.known([e2 for e1 in self.edits1(word, alphabet) for e2 in self.edits1(e1, alphabet)], dictionary) or 
+                [word])
+
+    def correct(self, in_loc, in_mom):
+        """
+        Corrects/Completes the input pattern to the most likely 4-token word.
+        """
+        # Find candidate corrections for both streams
+        c_locs = self.candidates(tuple(in_loc), self.loc_dict, BUCKET_CHARS)
+        c_moms = self.candidates(tuple(in_mom), self.mom_dict, ['U', 'D', 'F'])
         
-        results.sort(key=lambda x: x['score'], reverse=True)
-        return results[0]
+        # Among candidates, which one has the highest probability P(word)?
+        # We sum ABC and UDF probabilities to find the most likely 'True' state
+        
+        # Scoring all possible 4-token combinations that could match these candidates
+        best_word = None
+        max_score = -1
+
+        # To keep it efficient, we only check combinations of our best candidates
+        for loc_w in c_locs:
+            for mom_w in c_moms:
+                # Basic Score: Freq(Loc_Word) + Freq(Mom_Word)
+                score = self.loc_dict[loc_w] + self.mom_dict[mom_w]
+                if score > max_score:
+                    max_score = score
+                    best_word = (loc_w, mom_w)
+        
+        return best_word # Returns (Location_Word, Momentum_Word)
 
 # --- SERVER ---
 prices = generate_mock_data()
 split_pt = int(len(prices) * TRAIN_SPLIT)
 train_prices = prices[:split_pt]
 test_prices = prices[split_pt:]
-engine = MarketCorrector(train_prices)
+engine = MarketSpellCorrector(train_prices)
 
-# HTML Template as a standard string to avoid brace issues with f-strings
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Optimized Market Spell Corrector</title>
+    <title>Market Pattern Spell Corrector</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        body { font-family: sans-serif; background: #121212; color: #e0e0e0; margin: 20px; }
-        .container { max-width: 1100px; margin: auto; background: #1e1e1e; padding: 20px; border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
-        h1 { color: #00e676; border-bottom: 1px solid #333; padding-bottom: 10px; }
-        canvas { background: #1a1a1a; border-radius: 4px; margin-top: 20px; }
-        .controls { display: flex; gap: 20px; margin-bottom: 20px; flex-wrap: wrap; }
-        .stat-card { background: #2a2a2a; padding: 15px; border-radius: 6px; flex: 1; min-width: 150px; border-left: 4px solid #00e676; }
-        .legend { font-size: 0.8em; color: #888; margin-top: 10px; }
+        body { font-family: sans-serif; background: #0f172a; color: #f8fafc; margin: 20px; }
+        .container { max-width: 1100px; margin: auto; background: #1e293b; padding: 25px; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+        h1 { color: #38bdf8; border-bottom: 1px solid #334155; padding-bottom: 15px; margin-top: 0; }
+        .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 25px; }
+        .stat-card { background: #334155; padding: 15px; border-radius: 8px; border-top: 3px solid #38bdf8; }
+        canvas { background: #0f172a; border-radius: 8px; padding: 10px; }
+        .legend { font-size: 0.85em; color: #94a3b8; margin-top: 15px; line-height: 1.5; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Market Spell Corrector: Optimized Window ({{WINDOW_SIZE}})</h1>
-        <div class="controls">
-            <div class="stat-card"><b>Status:</b> Online</div>
-            <div class="stat-card"><b>Active Window:</b> {{WINDOW_SIZE}} Steps</div>
-            <div class="stat-card"><b>Alphabet:</b> A-T (Buckets)</div>
-            <div class="stat-card"><b>Logic:</b> ABC + UDF Sum</div>
+        <h1>Market Spell Corrector (Norvig Edition)</h1>
+        <div class="stat-grid">
+            <div class="stat-card"><b>Word Definition:</b> {{WORD_LENGTH}} Tokens</div>
+            <div class="stat-card"><b>Input:</b> Sliding 3-step window</div>
+            <div class="stat-card"><b>Correction:</b> Max Edit Distance 2</div>
+            <div class="stat-card"><b>Alphabet:</b> A-T (Buckets) + UDF</div>
         </div>
         <canvas id="marketChart" width="800" height="400"></canvas>
         <div class="legend">
-            * Performance analysis focused on window size {{WINDOW_SIZE}}. White line represents actual price buckets; 
-            Green line represents predicted completion.
+            <b>White Line:</b> Actual Market Buckets.<br>
+            <b>Cyan Dotted:</b> The "Corrected" Completion. We feed the model 3 tokens (a "misspelled" 4-letter word); 
+            it finds the most likely 4-letter completion from the historical dictionary.
         </div>
     </div>
     <script>
@@ -160,18 +170,19 @@ HTML_TEMPLATE = """
                     label: 'Actual Market',
                     data: data.actual.map(bucketToVal),
                     borderColor: '#ffffff',
-                    borderWidth: 3,
+                    borderWidth: 2.5,
                     pointRadius: 0,
                     fill: false,
                     tension: 0.1
                 },
                 {
-                    label: `Window {{WINDOW_SIZE}} Prediction`,
+                    label: 'Spell-Corrected Completion',
                     data: data.prediction.map(b => b ? bucketToVal(b) : null),
-                    borderColor: '#00e676',
-                    borderDash: [5, 5],
+                    borderColor: '#38bdf8',
+                    borderDash: [4, 4],
                     borderWidth: 2,
-                    pointRadius: 2,
+                    pointRadius: 3,
+                    pointBackgroundColor: '#38bdf8',
                     fill: false
                 }
             ];
@@ -182,10 +193,21 @@ HTML_TEMPLATE = """
                 options: {
                     responsive: true,
                     scales: {
-                        y: { title: { display: true, text: 'Price Bucket Index (A-T)' }, min: 0, max: 20, grid: { color: '#333' } },
-                        x: { title: { display: true, text: 'Time Step (Test Set)' }, grid: { display: false } }
+                        y: { 
+                            title: { display: true, text: 'Price Bucket Index (A-T)', color: '#94a3b8' }, 
+                            min: 0, max: 20, 
+                            grid: { color: '#334155' },
+                            ticks: { color: '#94a3b8' }
+                        },
+                        x: { 
+                            title: { display: true, text: 'Time Step (Test Set)', color: '#94a3b8' }, 
+                            grid: { display: false },
+                            ticks: { color: '#94a3b8' }
+                        }
                     },
-                    plugins: { legend: { position: 'bottom' } }
+                    plugins: { 
+                        legend: { labels: { color: '#f8fafc' } } 
+                    }
                 }
             });
         }
@@ -198,18 +220,24 @@ HTML_TEMPLATE = """
 class Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/data':
+            # Run the Spell Corrector across the test set
             test_locs, test_moms = engine.discretize(test_prices)
-            preds = [None] * WINDOW_SIZE
-            for i in range(len(test_locs) - WINDOW_SIZE):
-                l_in, m_in = test_locs[i : i + WINDOW_SIZE], test_moms[i : i + WINDOW_SIZE]
-                res = engine.solve(l_in, m_in)
-                preds.append(res['target'])
             
-            payload = {
-                'actual': test_locs,
-                'prediction': preds,
-                'window': WINDOW_SIZE
-            }
+            # We provide a 3-token input (a 'forgotten' letter typo)
+            # The model completes it to the most likely 4-token word.
+            preds = [None] * (WORD_LENGTH - 1)
+            for i in range(len(test_locs) - (WORD_LENGTH - 1)):
+                # This is our 'Misspelled' 3-letter word
+                in_l = test_locs[i : i + (WORD_LENGTH - 1)]
+                in_m = test_moms[i : i + (WORD_LENGTH - 1)]
+                
+                # Correct it to the best 4-letter word
+                corrected_l, corrected_m = engine.correct(in_l, in_m)
+                
+                # The prediction is the 4th letter of the corrected word
+                preds.append(corrected_l[-1])
+            
+            payload = {'actual': test_locs, 'prediction': preds}
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
@@ -219,13 +247,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
         self.end_headers()
-        # Using string replacement instead of f-string to avoid brace conflict
-        content = HTML_TEMPLATE.replace("{{WINDOW_SIZE}}", str(WINDOW_SIZE))
+        content = HTML_TEMPLATE.replace("{{WORD_LENGTH}}", str(WORD_LENGTH))
         self.wfile.write(content.encode())
 
 if __name__ == "__main__":
     socketserver.TCPServer.allow_reuse_address = True
     with socketserver.TCPServer(("", PORT), Handler) as httpd:
         time.sleep(0.1)
-        print(f"Server optimized for Window Size {WINDOW_SIZE} live on port {PORT}.")
+        print(f"Norvig Market Spell Corrector live on port {PORT}...")
         httpd.serve_forever()
