@@ -360,4 +360,4 @@ if __name__ == "__main__":
         p_price = market.category_to_price(p_cat)
         print(f"AI PREDICTION:   Category {p_cat} (~${p_price:.2f})")
     else:
-        print(f"AI DECISION:     HOLD / WAIT")n
+        print(f"AI DECISION:     HOLD / WAIT")
