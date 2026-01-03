@@ -1,6 +1,7 @@
 import random
 import collections
 import string
+import time
 
 # --- CONFIGURATION ---
 MIN_PRICE = 0
@@ -51,6 +52,7 @@ class StockPatternCompleter:
 
     def train(self):
         print(f"Training on {len(self.loc_stream)} cycles...")
+        time.sleep(0.1)
         # Train Location Model: P(NextLocation | PreviousLocations)
         for i in range(len(self.loc_stream) - self.window):
             pattern = tuple(self.loc_stream[i : i + self.window])
@@ -93,7 +95,9 @@ class StockPatternCompleter:
         # We need the momentum window to match the training size
         # If input is short, we use what we have.
         
+        time.sleep(0.1)
         print(f"\n[Input] Location Pattern: {incomplete_loc_pattern}")
+        time.sleep(0.1)
         print(f"[Derived] Momentum Pattern: {current_moms}")
 
         # 3. Determine Candidates for the NEXT Location
@@ -140,12 +144,14 @@ class StockPatternCompleter:
         
         print(f"  Candidates:")
         for c in candidates:
+             time.sleep(0.1)
              print(f"    -> Extend to '{c['next_loc']}' ({c['move']}): Score {c['score']:.2f} [{c['debug']}]")
 
         # 5. Return the Completed Location Pattern
         completed_pattern = list(incomplete_loc_pattern)
         completed_pattern.append(winner['next_loc'])
         
+        time.sleep(0.1)
         print(f"[Result] Completed Location Pattern: {completed_pattern}")
         return completed_pattern
 
