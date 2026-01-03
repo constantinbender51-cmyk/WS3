@@ -3,127 +3,185 @@ import tensorflow as tf
 import requests
 import os
 import numpy as np
+import string
 
 # --- Configuration ---
 MODEL_URL = "https://github.com/constantinbender51-cmyk/Models/raw/refs/heads/main/spell_corrector.keras"
 MODEL_PATH = "spell_corrector.keras"
+LATENT_DIM = 256 # Must match training script
 
 st.set_page_config(page_title="Spell Corrector", page_icon="✨")
+
+# --- Vocabulary Setup (Must match training script exactly) ---
+characters = sorted(list(string.ascii_lowercase))
+
+# Encoder Mappings
+input_token_index = {char: i+1 for i, char in enumerate(characters)}
+reverse_input_char_index = {i: char for char, i in input_token_index.items()}
+
+# Decoder Mappings (Train script: \t=1, \n=2, chars=3+)
+target_token_index = {'\t': 1, '\n': 2}
+for i, char in enumerate(characters):
+    target_token_index[char] = i + 3
+reverse_target_char_index = {i: char for char, i in target_token_index.items()}
 
 # --- Helper Functions ---
 
 def download_model(url, save_path):
-    """Downloads the model file if it doesn't exist."""
     if not os.path.exists(save_path):
-        with st.spinner(f"Downloading model from {url}..."):
+        with st.spinner(f"Downloading model..."):
             try:
                 response = requests.get(url, stream=True)
                 response.raise_for_status()
                 with open(save_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
-                st.success("Model downloaded successfully!")
+                st.success("Model downloaded!")
             except Exception as e:
-                st.error(f"Error downloading model: {e}")
+                st.error(f"Download failed: {e}")
                 st.stop()
-    return True
 
 @st.cache_resource
-def load_keras_model(path):
-    """Loads the Keras model into memory."""
+def load_inference_models(path):
+    """
+    Loads the training model and reconstructs the separate 
+    Encoder and Decoder models needed for inference.
+    """
     try:
-        # Note: If your model uses custom layers, pass them in the custom_objects dict
-        # e.g., load_model(path, custom_objects={'CustomLayer': CustomLayer})
-        model = tf.keras.models.load_model(path)
-        return model
+        # 1. Load the full training model
+        train_model = tf.keras.models.load_model(path)
+        
+        # 2. Extract Layers by Name or Type
+        # We assume the layer naming from the training script holds
+        try:
+            encoder_gru = train_model.get_layer('encoder_gru')
+            encoder_state_concat = train_model.get_layer('encoder_state_concat')
+            decoder_gru = train_model.get_layer('decoder_gru')
+            attention_layer = train_model.get_layer('attention_layer')
+            output_dense = train_model.get_layer('output_dense')
+            
+            # Embeddings are usually auto-named 'embedding' and 'embedding_1'
+            # We filter layers to find them to be safe
+            embeddings = [l for l in train_model.layers if isinstance(l, tf.keras.layers.Embedding)]
+            encoder_embedding_layer = embeddings[0] # First one defined in script
+            decoder_embedding_layer = embeddings[1] # Second one defined in script
+            
+        except ValueError as e:
+            st.error(f"Layer extraction failed. Did you change layer names? Error: {e}")
+            return None, None
+
+        # 3. Reconstruct Encoder Model
+        # Input -> Embedding -> Bi-GRU -> [Outputs, Fwd_h, Bwd_h] -> Concat -> [Outputs, Combined_h]
+        enc_inputs = tf.keras.Input(shape=(None,), name='inf_enc_in')
+        enc_emb = encoder_embedding_layer(enc_inputs)
+        enc_out, state_h_fwd, state_h_bwd = encoder_gru(enc_emb)
+        state_h = encoder_state_concat([state_h_fwd, state_h_bwd])
+        
+        encoder_model = tf.keras.Model(enc_inputs, [enc_out, state_h])
+
+        # 4. Reconstruct Decoder Model
+        # We need to manually feed states and encoder outputs for Attention
+        dec_inputs = tf.keras.Input(shape=(None,), name='inf_dec_in')
+        dec_state_in = tf.keras.Input(shape=(LATENT_DIM * 2,), name='inf_dec_state_in')
+        enc_output_in = tf.keras.Input(shape=(None, LATENT_DIM * 2), name='inf_enc_out_in')
+
+        dec_emb = decoder_embedding_layer(dec_inputs)
+        dec_out, dec_state_out = decoder_gru(dec_emb, initial_state=dec_state_in)
+        
+        # Attention: connects Decoder Out (query) + Encoder Out (value)
+        context_vector = attention_layer([dec_out, enc_output_in])
+        
+        # Concat + Dense
+        dec_concat = tf.keras.layers.Concatenate(axis=-1)([dec_out, context_vector])
+        dec_final = output_dense(dec_concat)
+        
+        decoder_model = tf.keras.Model(
+            [dec_inputs, dec_state_in, enc_output_in],
+            [dec_final, dec_state_out]
+        )
+
+        return encoder_model, decoder_model
+
     except Exception as e:
-        st.error(f"Error loading model: {e}")
-        return None
+        st.error(f"Error rebuilding models: {e}")
+        return None, None
 
-def preprocess_text(text):
-    """
-    PRE-PROCESSING PLACEHOLDER
-    
-    IMPORTANT: A raw .keras file usually requires specific tokenization 
-    (converting text to numbers) that matches how it was trained.
-    
-    Since the tokenizer wasn't provided in the link, you must implement 
-    the specific logic here (e.g., loading a pickle tokenizer, character mapping, etc.).
-    """
-    # Example logic (You likely need to replace this with your actual Tokenizer):
-    # tokenizer = pickle.load(open('tokenizer.pkl', 'rb'))
-    # sequence = tokenizer.texts_to_sequences([text])
-    # padded = pad_sequences(sequence, maxlen=...)
-    # return padded
-    
-    st.warning("⚠️ Tokenizer logic missing. Using dummy conversion (Text -> Bytes). Check `preprocess_text` in code.")
-    return text 
+def decode_sequence(input_text, encoder_model, decoder_model):
+    # 1. Preprocess Input
+    input_text = input_text.lower()
+    # Map chars to integers
+    input_seq = np.zeros((1, len(input_text)), dtype="float32")
+    for t, char in enumerate(input_text):
+        if char in input_token_index:
+            input_seq[0, t] = input_token_index[char]
+            
+    # 2. Encode
+    enc_outs, states_value = encoder_model.predict(input_seq, verbose=0)
 
-def decode_output(prediction):
-    """
-    POST-PROCESSING PLACEHOLDER
+    # 3. Decode Loop
+    target_seq = np.zeros((1, 1))
+    target_seq[0, 0] = target_token_index['\t'] # Start token
+
+    stop_condition = False
+    decoded_sentence = ""
+    max_len = 50 # Safety limit
     
-    Convert the model's numeric output back to text.
-    """
-    # Example logic:
-    # predicted_ids = np.argmax(prediction, axis=-1)
-    # return tokenizer.sequences_to_texts(predicted_ids)[0]
-    
-    return str(prediction)
+    while not stop_condition:
+        # Predict next char
+        output_tokens, h = decoder_model.predict(
+            [target_seq, states_value, enc_outs], 
+            verbose=0
+        )
+
+        # Sample best token
+        sampled_token_index = np.argmax(output_tokens[0, -1, :])
+        
+        if sampled_token_index in reverse_target_char_index:
+            sampled_char = reverse_target_char_index[sampled_token_index]
+        else:
+            sampled_char = ''
+            
+        # Exit conditions
+        if sampled_char == '\n' or len(decoded_sentence) > max_len:
+            stop_condition = True
+        else:
+            decoded_sentence += sampled_char
+
+        # Update loop vars
+        target_seq = np.zeros((1, 1))
+        target_seq[0, 0] = sampled_token_index
+        states_value = h
+
+    return decoded_sentence
 
 # --- Main UI ---
 
-st.title("✨ AI Spell Corrector")
-st.markdown("This app loads a custom Keras model to correct spelling errors.")
+st.title("✨ Seq2Seq Spell Corrector")
+st.markdown("Enter a misspelled word (e.g., 'compputer') to correct it using the Attention model.")
 
-# 1. Download Model
 download_model(MODEL_URL, MODEL_PATH)
+enc_model, dec_model = load_inference_models(MODEL_PATH)
 
-# 2. Load Model
-model = load_keras_model(MODEL_PATH)
-
-if model:
-    # 3. Input UI
-    input_text = st.text_area("Enter text to correct:", placeholder="Type heere...")
-
-    if st.button("Correct Spelling"):
-        if input_text:
-            # 4. Inference
-            try:
-                # A. Preprocess
-                processed_input = preprocess_text(input_text)
+if enc_model and dec_model:
+    # Form
+    with st.form("correction_form"):
+        text_input = st.text_input("Misspelled Word:", value="intellgence")
+        submitted = st.form_submit_button("Correct")
+        
+        if submitted:
+            if not text_input:
+                st.warning("Please type a word.")
+            else:
+                with st.spinner("Correcting..."):
+                    result = decode_sequence(text_input, enc_model, dec_model)
                 
-                # B. Predict (logic depends heavily on model input shape)
-                # If the model expects a string directly (rare), use:
-                # prediction = model.predict([input_text])
-                
-                # If the model expects tensors (common), ensure processed_input is correct format
-                # For now, we wrap it in a try-catch because we don't know the model's signature
-                st.info("Running prediction...")
-                
-                # NOTE: This line will fail if preprocess_text doesn't return the exact tensor shape 
-                # the model expects. 
-                prediction = model.predict([processed_input]) 
-
-                # C. Decode
-                result = decode_output(prediction)
-
-                # 5. Output UI
-                st.subheader("Correction:")
+                st.subheader("Result:")
                 st.success(result)
                 
-            except Exception as e:
-                st.error(f"Prediction Error: {e}")
-                st.markdown("""
-                **Debugging Tip:** Keras models require specific input shapes (e.g., shape=(1, 50)). 
-                You need to update the `preprocess_text` function in `app.py` to convert your 
-                string input into the exact tensor format your model was trained on.
-                """)
-        else:
-            st.warning("Please enter some text first.")
-else:
-    st.error("Could not load the model.")
+    st.markdown("---")
+    st.markdown("### Debug Info")
+    st.text(f"Vocab Size: {len(input_token_index)} chars")
+    st.text(f"Model Latent Dim: {LATENT_DIM}")
 
-# --- Footer ---
-st.markdown("---")
-st.caption("Deployed via Railway")
+else:
+    st.error("Failed to initialize inference models.")
