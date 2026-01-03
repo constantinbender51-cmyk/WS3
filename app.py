@@ -116,11 +116,89 @@ train_prices = prices[:split_pt]
 test_prices = prices[split_pt:]
 engine = MarketCorrector(train_prices)
 
+# HTML Template as a standard string to avoid brace issues with f-strings
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Optimized Market Spell Corrector</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: sans-serif; background: #121212; color: #e0e0e0; margin: 20px; }
+        .container { max-width: 1100px; margin: auto; background: #1e1e1e; padding: 20px; border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+        h1 { color: #00e676; border-bottom: 1px solid #333; padding-bottom: 10px; }
+        canvas { background: #1a1a1a; border-radius: 4px; margin-top: 20px; }
+        .controls { display: flex; gap: 20px; margin-bottom: 20px; flex-wrap: wrap; }
+        .stat-card { background: #2a2a2a; padding: 15px; border-radius: 6px; flex: 1; min-width: 150px; border-left: 4px solid #00e676; }
+        .legend { font-size: 0.8em; color: #888; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Market Spell Corrector: Optimized Window ({{WINDOW_SIZE}})</h1>
+        <div class="controls">
+            <div class="stat-card"><b>Status:</b> Online</div>
+            <div class="stat-card"><b>Active Window:</b> {{WINDOW_SIZE}} Steps</div>
+            <div class="stat-card"><b>Alphabet:</b> A-T (Buckets)</div>
+            <div class="stat-card"><b>Logic:</b> ABC + UDF Sum</div>
+        </div>
+        <canvas id="marketChart" width="800" height="400"></canvas>
+        <div class="legend">
+            * Performance analysis focused on window size {{WINDOW_SIZE}}. White line represents actual price buckets; 
+            Green line represents predicted completion.
+        </div>
+    </div>
+    <script>
+        const bucketToVal = b => "ABCDEFGHIJKLMNOPQRST".indexOf(b);
+        async function loadChart() {
+            const resp = await fetch('/data');
+            const data = await resp.json();
+            const labels = data.actual.map((_, i) => i);
+            
+            const datasets = [
+                {
+                    label: 'Actual Market',
+                    data: data.actual.map(bucketToVal),
+                    borderColor: '#ffffff',
+                    borderWidth: 3,
+                    pointRadius: 0,
+                    fill: false,
+                    tension: 0.1
+                },
+                {
+                    label: `Window {{WINDOW_SIZE}} Prediction`,
+                    data: data.prediction.map(b => b ? bucketToVal(b) : null),
+                    borderColor: '#00e676',
+                    borderDash: [5, 5],
+                    borderWidth: 2,
+                    pointRadius: 2,
+                    fill: false
+                }
+            ];
+
+            new Chart(document.getElementById('marketChart'), {
+                type: 'line',
+                data: { labels, datasets },
+                options: {
+                    responsive: true,
+                    scales: {
+                        y: { title: { display: true, text: 'Price Bucket Index (A-T)' }, min: 0, max: 20, grid: { color: '#333' } },
+                        x: { title: { display: true, text: 'Time Step (Test Set)' }, grid: { display: false } }
+                    },
+                    plugins: { legend: { position: 'bottom' } }
+                }
+            });
+        }
+        loadChart();
+    </script>
+</body>
+</html>
+"""
+
 class Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/data':
             test_locs, test_moms = engine.discretize(test_prices)
-            # Only predict for the optimized WINDOW_SIZE
             preds = [None] * WINDOW_SIZE
             for i in range(len(test_locs) - WINDOW_SIZE):
                 l_in, m_in = test_locs[i : i + WINDOW_SIZE], test_moms[i : i + WINDOW_SIZE]
@@ -141,83 +219,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
         self.end_headers()
-        self.wfile.write(f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Optimized Market Spell Corrector</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        body {{ font-family: sans-serif; background: #121212; color: #e0e0e0; margin: 20px; }}
-        .container {{ max-width: 1100px; margin: auto; background: #1e1e1e; padding: 20px; border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }}
-        h1 {{ color: #00e676; border-bottom: 1px solid #333; padding-bottom: 10px; }}
-        canvas {{ background: #1a1a1a; border-radius: 4px; margin-top: 20px; }}
-        .controls {{ display: flex; gap: 20px; margin-bottom: 20px; flex-wrap: wrap; }}
-        .stat-card {{ background: #2a2a2a; padding: 15px; border-radius: 6px; flex: 1; min-width: 150px; border-left: 4px solid #00e676; }}
-        .legend {{ font-size: 0.8em; color: #888; margin-top: 10px; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Market Spell Corrector: Optimized Window ({WINDOW_SIZE})</h1>
-        <div class="controls">
-            <div class="stat-card"><b>Status:</b> Online</div>
-            <div class="stat-card"><b>Active Window:</b> {WINDOW_SIZE} Steps</div>
-            <div class="stat-card"><b>Alphabet:</b> A-T (Buckets)</div>
-            <div class="stat-card"><b>Logic:</b> ABC + UDF Sum</div>
-        </div>
-        <canvas id="marketChart" width="800" height="400"></canvas>
-        <div class="legend">
-            * Performance analysis focused on window size {WINDOW_SIZE}. White line represents actual price buckets; 
-            Green line represents predicted completion.
-        </div>
-    </div>
-    <script>
-        const bucketToVal = b => "ABCDEFGHIJKLMNOPQRST".indexOf(b);
-        async function loadChart() {
-            const resp = await fetch('/data');
-            const data = await resp.json();
-            const labels = data.actual.map((_, i) => i);
-            
-            const datasets = [
-                {{
-                    label: 'Actual Market',
-                    data: data.actual.map(bucketToVal),
-                    borderColor: '#ffffff',
-                    borderWidth: 3,
-                    pointRadius: 0,
-                    fill: false,
-                    tension: 0.1
-                }},
-                {{
-                    label: `Window 3 Prediction`,
-                    data: data.prediction.map(b => b ? bucketToVal(b) : null),
-                    borderColor: '#00e676',
-                    borderDash: [5, 5],
-                    borderWidth: 2,
-                    pointRadius: 2,
-                    fill: false
-                }}
-            ];
-
-            new Chart(document.getElementById('marketChart'), {{
-                type: 'line',
-                data: {{ labels, datasets }},
-                options: {{
-                    responsive: true,
-                    scales: {{
-                        y: {{ title: {{ display: true, text: 'Price Bucket Index (A-T)' }}, min: 0, max: 20, grid: {{ color: '#333' }} }},
-                        x: {{ title: {{ display: true, text: 'Time Step (Test Set)' }}, grid: {{ display: false }} }}
-                    }},
-                    plugins: {{ legend: {{ position: 'bottom' }} }}
-                }}
-            }});
-        }
-        loadChart();
-    </script>
-</body>
-</html>
-        """.encode())
+        # Using string replacement instead of f-string to avoid brace conflict
+        content = HTML_TEMPLATE.replace("{{WINDOW_SIZE}}", str(WINDOW_SIZE))
+        self.wfile.write(content.encode())
 
 if __name__ == "__main__":
     socketserver.TCPServer.allow_reuse_address = True
