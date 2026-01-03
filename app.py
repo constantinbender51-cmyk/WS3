@@ -1,53 +1,51 @@
-import requests
+import yfinance as yf
 import time
-import os
 import math
 import numpy as np
 
+# Override print for railway/console flushing
+_builtin_print = print
+def print(*args, **kwargs):
+    time.sleep(0.1)
+    _builtin_print(*args, **kwargs)
+
 # ==============================================================================
-# 1. API & DATA HANDLING
+# 1. DATA HANDLER (Yahoo Finance Version - No Key Needed)
 # ==============================================================================
 
 class MarketDataHandler:
-    def __init__(self, api_key):
-        self.api_key = api_key
-        self.base_url = "https://finnhub.io/api/v1"
-        
+    def __init__(self):
         # We need to remember how we converted $ to Categories
         # so we can convert the AI's answer back to $
         self.last_min = 0
         self.last_step = 0
 
-    def fetch_candles(self, symbol="AAPL", days=60):
-        """Fetches daily candles from Finnhub."""
-        if not self.api_key:
-            raise ValueError("Missing FINN_KEY environment variable.")
-
-        end_t = int(time.time())
-        start_t = end_t - (86400 * days) # 60 days ago
+    def fetch_candles(self, symbol="BTC-USD", days=60):
+        """Fetches daily candles from Yahoo Finance."""
+        print(f"Fetching {days} days of data for {symbol} via Yahoo Finance...")
         
-        url = f"{self.base_url}/stock/candle"
-        params = {
-            'symbol': symbol,
-            'resolution': 'D',
-            'from': start_t,
-            'to': end_t,
-            'token': self.api_key
-        }
+        # yfinance handles the API work
+        df = yf.download(symbol, period=f"{days}d", interval="1d", progress=False)
         
-        print(f"Fetching {symbol} data from Finnhub...")
-        r = requests.get(url, params=params)
-        data = r.json()
-        
-        if data.get('s') != 'ok':
-            print("API Error:", data)
+        if df.empty:
+            print("Error: No data found. Check symbol.")
             return []
             
-        return data['c'] # Return list of Close prices
+        # Get the 'Close' column as a list
+        # Handle cases where yfinance returns multi-index columns
+        try:
+            prices = df['Close'].values.flatten().tolist()
+        except KeyError:
+            # Fallback for different yfinance versions
+            prices = df['Close'].tolist()
+            
+        # Filter out NaNs if any
+        prices = [p for p in prices if not math.isnan(p)]
+        return prices
 
     def discretize_sequence(self, prices, num_bins=20):
         """
-        Converts real prices [150.5, 151.2...] into Categories [10, 11...]
+        Converts raw dollar prices [150.5, 151.2...] into Categories [10, 11...]
         and Momentums [UP, UP...]
         """
         if not prices or len(prices) < 2: return []
@@ -78,7 +76,7 @@ class MarketDataHandler:
             else:
                 if cat > prev_cat: mom = 'UP'
                 elif cat < prev_cat: mom = 'DOWN'
-                else: mom = 'FLAT' # Or use price-level micro momentum
+                else: mom = 'FLAT' 
             
             prev_cat = cat
             sequence.append((mom, cat))
@@ -90,20 +88,22 @@ class MarketDataHandler:
         return self.last_min + (category * self.last_step)
 
 # ==============================================================================
-# 2. THE AI ENGINE (Re-used)
+# 2. THE AI ENGINE (Z-Score & Completion)
 # ==============================================================================
 
 class ZScoreEngine:
     def __init__(self):
         self.mom_map = {k: v for v, k in enumerate(['UP', 'DOWN', 'FLAT'])}
+        # Trends are sticky
         self.mom_trans = np.array([[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.3, 0.3, 0.4]])
         self.mom_start = np.array([0.4, 0.4, 0.2])
+        # Prices move incrementally
         self.cat_trans = np.zeros((20, 20))
         for i in range(20):
-            self.cat_trans[i] = [0.0001]*20 # Teleport prob
-            self.cat_trans[i][i] = 0.5      # Stay
-            if i > 0: self.cat_trans[i][i-1] = 0.25 # Down 1
-            if i < 19: self.cat_trans[i][i+1] = 0.25 # Up 1
+            self.cat_trans[i] = [0.0001]*20 
+            self.cat_trans[i][i] = 0.5      
+            if i > 0: self.cat_trans[i][i-1] = 0.25 
+            if i < 19: self.cat_trans[i][i+1] = 0.25 
             self.cat_trans[i] /= self.cat_trans[i].sum()
         self.cat_start = np.ones(20) / 20
         self.stats = {'mom': {}, 'cat': {}}
@@ -116,8 +116,8 @@ class ZScoreEngine:
         return p
 
     def calibrate(self):
-        # Silent calibration
-        for length in range(2, 20): # Extended range for longer real sequences
+        # Calibrate for length 2 to 20
+        for length in range(2, 21): 
             m_logs, c_logs = [], []
             for _ in range(200):
                 s_m = [np.random.choice(3, p=self.mom_start)]
@@ -143,8 +143,7 @@ class ZScoreEngine:
 class CompletionCorrector:
     def __init__(self, engine):
         self.engine = engine
-        self.COST_SWAP = 2.0
-        self.COST_INSERT = 1.6 # Aggressive insertion for prediction
+        self.COST_INSERT = 1.6 # Cost to assume a prediction
 
     def repair_physics(self, sequence):
         if not sequence: return []
@@ -159,8 +158,7 @@ class CompletionCorrector:
         return repaired
 
     def solve(self, sequence):
-        # Limit analysis to the last 8 candles to keep Z-Score relevant
-        # (Looking at 60 days of Z-Score dilutes the signal)
+        # Analyze last 8 candles
         analysis_window = sequence[-8:] 
         prefix = sequence[:-8]
         
@@ -183,8 +181,6 @@ class CompletionCorrector:
             results.append({**v, 'net': z - v['cost']})
             
         results.sort(key=lambda x: x['net'], reverse=True)
-        
-        # Re-attach prefix for full context
         winner = results[0]
         winner['full_seq'] = prefix + winner['seq']
         return winner
@@ -194,54 +190,46 @@ class CompletionCorrector:
 # ==============================================================================
 
 if __name__ == "__main__":
-    # 1. SETUP
-    api_key = os.getenv("FINN_KEY")
-    if not api_key:
-        print("ERROR: Please set FINN_KEY in your .env file")
-        exit()
-        
-    symbol = "AAPL" # Change to 'BINANCE:BTCUSDT' for crypto if Finnhub supports your plan
+    # Settings
+    SYMBOL = "BTC-USD" # Works for AAPL, TSLA, BTC-USD, EURUSD=X
+    DAYS = 60
     
-    market = MarketDataHandler(api_key)
+    market = MarketDataHandler()
     engine = ZScoreEngine()
     engine.calibrate()
     ai = CompletionCorrector(engine)
 
-    # 2. FETCH REAL DATA
-    raw_prices = market.fetch_candles(symbol, days=60)
+    # 1. Fetch
+    raw_prices = market.fetch_candles(SYMBOL, days=DAYS)
     if not raw_prices:
         exit()
         
-    # 3. DISCRETIZE
-    # Convert $200 -> Category 15
+    # 2. Discretize
     seq = market.discretize_sequence(raw_prices, num_bins=20)
     
-    # 4. RUN AI ANALYSIS
-    print(f"\nAnalyzing last 8 candles of {symbol}...")
-    print(f"Current Price: ${raw_prices[-1]}")
-    print(f"Current Cat:   {seq[-1][1]}")
+    # 3. Analyze
+    print(f"\nAnalyzing {SYMBOL} (Price: ${raw_prices[-1]:.2f})...")
     
     result = ai.solve(seq)
     
-    # 5. DECODE RESULT
+    # 4. Result
     print("\n" + "="*40)
     print(f"AI DECISION: {result['op']}")
     print("="*40)
     
     if result['op'] == 'PREDICT':
-        # The last item in the sequence is the prediction
         pred_cat = result['seq'][-1][1]
         pred_price = market.category_to_price(pred_cat)
         
-        print(f"SIGNAL:     BUY/SELL MOMENTUM")
-        print(f"Prediction: Price moves to Category {pred_cat}")
+        print(f"SIGNAL:     MOMENTUM TRADE DETECTED")
+        print(f"Prediction: Sequence implies move to Cat {pred_cat}")
         print(f"Target:     ${pred_price:.2f}")
         print(f"Confidence: {result['net']:.2f}")
         
     elif result['op'] == 'GAP_FILL':
-        print("SIGNAL:     HOLD (Data Irregularity)")
-        print("Reason:     The model found a gap in past data, implying volatility/noise.")
+        print("SIGNAL:     HOLD (Noise)")
+        print("Reason:     Internal gap fill detected. Market is choppy.")
         
     else:
-        print("SIGNAL:     HOLD (No clear edge)")
-        print("Reason:     Current trend is statistically normal.")
+        print("SIGNAL:     HOLD")
+        print("Reason:     Current price action is statistically normal.")
