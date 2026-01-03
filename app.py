@@ -46,6 +46,10 @@ class MarketSpellCorrector:
         self.loc_dict = collections.Counter()
         self.mom_dict = collections.Counter()
         
+        # Totals per length for normalization
+        self.loc_len_counts = collections.Counter()
+        self.mom_len_counts = collections.Counter()
+        
         self.train()
 
     def get_idx(self, p):
@@ -64,7 +68,6 @@ class MarketSpellCorrector:
         print(f"Learning multi-length pattern probabilities (1 to {MAX_PATTERN_LENGTH})...")
         time.sleep(0.1)
         # We learn "words" of every length from 1 to MAX_PATTERN_LENGTH
-        # This allows the model to recognize 'ABC' as a word even if it's inside 'ABCDE'
         for length in range(1, MAX_PATTERN_LENGTH + 1):
             for i in range(len(self.loc_stream) - length + 1):
                 l_word = tuple(self.loc_stream[i : i + length])
@@ -72,13 +75,24 @@ class MarketSpellCorrector:
                 self.loc_dict[l_word] += 1
                 self.mom_dict[m_word] += 1
         
-        self.total_loc_count = sum(self.loc_dict.values())
-        self.total_mom_count = sum(self.mom_dict.values())
+        # Populate length-specific totals for normalization
+        # This allows us to say "This is a very common Length-5 pattern" 
+        # vs "This is a common Length-1 pattern" without the Length-1 winning by raw volume.
+        for word, count in self.loc_dict.items():
+            self.loc_len_counts[len(word)] += count
+            
+        for word, count in self.mom_dict.items():
+            self.mom_len_counts[len(word)] += count
 
-    def P(self, word, dictionary, total): 
-        """Normalized probability of a pattern appearing in the continuous stream."""
+    def P(self, word, dictionary, len_counts): 
+        """
+        Normalized probability of a pattern appearing relative to other patterns 
+        OF THE SAME LENGTH. This removes the bias towards very short patterns.
+        """
         if not word in dictionary: return 0
-        return dictionary[word] / total
+        n = len(word)
+        if n not in len_counts or len_counts[n] == 0: return 0
+        return dictionary[word] / len_counts[n]
 
     def edits1(self, word, alphabet):
         """Standard Norvig edits. These naturally change the length of the word."""
@@ -95,8 +109,6 @@ class MarketSpellCorrector:
     def get_all_candidates(self, word, dictionary, alphabet):
         """
         Collects all possible corrections within MAX_EDITS.
-        Unlike standard Norvig which stops at the first tier, we collect all
-        to allow a shorter, much more probable word to beat a longer typo.
         """
         candidates = self.known([word], dictionary)
         
@@ -114,15 +126,16 @@ class MarketSpellCorrector:
     def correct(self, in_loc, in_mom):
         """
         Corrects the input pattern to the highest probability pattern in history,
-        allowing for length changes.
+        using length-normalized probability.
         """
         # Find all historical chunks that are "near" the input
         c_locs = self.get_all_candidates(tuple(in_loc), self.loc_dict, BUCKET_CHARS)
         c_moms = self.get_all_candidates(tuple(in_mom), self.mom_dict, ['U', 'D', 'F'])
         
-        # Select the best based on Joint Probability
-        best_loc = max(c_locs, key=lambda w: self.P(w, self.loc_dict, self.total_loc_count))
-        best_mom = max(c_moms, key=lambda w: self.P(w, self.mom_dict, self.total_mom_count))
+        # Select the best based on Length-Normalized Probability
+        # We pass the length counts (self.loc_len_counts) instead of a global sum
+        best_loc = max(c_locs, key=lambda w: self.P(w, self.loc_dict, self.loc_len_counts))
+        best_mom = max(c_moms, key=lambda w: self.P(w, self.mom_dict, self.mom_len_counts))
         
         return best_loc, best_mom
 
@@ -154,14 +167,15 @@ HTML_TEMPLATE = """
         <h1>Market Sequence Spell Corrector</h1>
         <div class="stat-grid">
             <div class="stat-card"><b>Dictionary Depth:</b> Chunks 1-{{MAX_LEN}}</div>
-            <div class="stat-card"><b>Logic:</b> Global Probability Search</div>
+            <div class="stat-card"><b>Logic:</b> Length-Normalized Prob.</div>
             <div class="stat-card"><b>Edit Distance:</b> Max {{MAX_EDITS}}</div>
         </div>
         <canvas id="marketChart" width="800" height="400"></canvas>
         <div class="info">
             <b>Theory:</b> The market is a continuous stream of tokens. We identify the most probable "words" (ABC/UDF chunks) 
-            regardless of length. If a provided sequence is unlikely, the model corrects it to the nearest high-frequency historical pattern. 
-            A long sequence like <i>ABCABCDAA</i> can be corrected to <i>ABC</i> if the shorter version is significantly more probable.
+            regardless of length. <br><br>
+            <b>Normalization Update:</b> We now compare candidates against others of the <i>same length</i>. 
+            This prevents short, high-frequency noise (Length 1) from always overpowering rarer, but highly distinct, long-form patterns (Length 6).
         </div>
     </div>
     <script>
