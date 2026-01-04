@@ -1,311 +1,193 @@
-
 import random
 import time
+import os
+import json
+import base64
+import requests
 from collections import defaultdict
 from typing import List, Tuple
+import matplotlib.pyplot as plt
+from io import BytesIO
 
 # ============================================================================
-# PARAMETERS
+# PARAMETERS & ENV CONFIG
 # ============================================================================
-N_PRICES = 20000
+GITHUB_REPO = "constantinbender51-cmyk/Models"
+# Railway provides the PAT via environment variables
+GITHUB_PAT = os.environ.get('PAT', '')
+
+N_PRICES = 5000  # Reduced for faster deployment execution
 MIN_PRICE = 100
 MAX_PRICE = 600
 N_CATEGORIES = 100
 TRAIN_SPLIT = 0.7
-CATEGORY_STEP = 1  # Change this to 2, 3, etc. to increase variant space
-PRINT_DELAY = 0.1
+CATEGORY_STEP = 1
 STARTING_EQUITY = 10000
-CATEGORY_TO_DOLLAR = 10  # Scaling factor for category movements to dollars
+CATEGORY_TO_DOLLAR = 10
+
+# ============================================================================
+# PREDICTION LOGIC
 # ============================================================================
 
-
-def custom_print(text: str, delay: float = PRINT_DELAY):
-    """Print with delay"""
-    print(text)
-    time.sleep(delay)
-
 def generate_prices(n: int, min_price: float, max_price: float) -> List[float]:
-    """Generate mock prices"""
-    return [random.uniform(min_price, max_price) for _ in range(n)]
+    prices = []
+    curr = (min_price + max_price) / 2
+    for _ in range(n):
+        curr += random.uniform(-5, 5)
+        curr = max(min_price, min(max_price, curr))
+        prices.append(curr)
+    return prices
 
 def categorize_price(price: float, min_price: float, max_price: float, n_categories: int) -> int:
-    """Categorize price into buckets"""
     step = (max_price - min_price) / n_categories
-    if price < min_price:
-        return 0
-    elif price > max_price:
-        return n_categories + int((price - max_price) / step)
-    else:
-        return int((price - min_price) / step)
+    return int(max(0, min(n_categories - 1, (price - min_price) / step)))
 
-def compute_category_sequence_probabilities(categories: List[int]) -> dict:
-    """Compute probability of each 3-sequential category sequence"""
-    sequence_counts = defaultdict(int)
-    total_sequences = 0
+def compute_probs(categories: List[int]):
+    cat_counts = defaultdict(int)
+    dir_counts = defaultdict(int)
     
+    # Category sequences
     for i in range(len(categories) - 2):
         seq = tuple(categories[i:i+3])
-        sequence_counts[seq] += 1
-        total_sequences += 1
+        cat_counts[seq] += 1
     
-    probabilities = {seq: count / total_sequences for seq, count in sequence_counts.items()}
-    return probabilities
+    # Directional sequences
+    dirs = [categories[i+1] - categories[i] for i in range(len(categories) - 1)]
+    for i in range(len(dirs) - 2):
+        seq = tuple(dirs[i:i+3])
+        dir_counts[seq] += 1
+        
+    c_total = sum(cat_counts.values())
+    d_total = sum(dir_counts.values())
+    
+    cat_probs = {k: v/c_total for k, v in cat_counts.items()}
+    dir_probs = {k: v/d_total for k, v in dir_counts.items()}
+    return cat_probs, dir_probs
 
-def compute_directional_probabilities(categories: List[int]) -> dict:
-    """Compute probability of directional sequences based on category differences"""
-    directions = [categories[i+1] - categories[i] for i in range(len(categories) - 1)]
-    
-    dir_sequence_counts = defaultdict(int)
-    total_sequences = 0
-    
-    for i in range(len(directions) - 2):
-        seq = tuple(directions[i:i+3])
-        dir_sequence_counts[seq] += 1
-        total_sequences += 1
-    
-    probabilities = {seq: count / total_sequences for seq, count in dir_sequence_counts.items()}
-    return probabilities
-
-def generate_category_variants(last_two_cats: List[int], n_steps: int) -> List[List[int]]:
-    """Generate all category sequences n steps away from last two categories
-    
-    For n_steps=1: 5,4 -> 4,4  5,4  6,4  5,3  5,4  5,5
-    For n_steps=2: 5,4 -> 3,4  4,4  5,4  6,4  7,4  5,2  5,3  5,4  5,5  5,6
-    """
-    c1, c2 = last_two_cats
-    
-    # Edit first two categories - generate all combinations within n_steps
-    variants_step1 = []
-    for delta1 in range(-n_steps, n_steps + 1):
-        for delta2 in range(-n_steps, n_steps + 1):
-            variants_step1.append([c1 + delta1, c2 + delta2])
-    
-    # Append third category with n_steps variations
-    variants_step2 = []
-    for var in variants_step1:
-        for delta3 in range(-n_steps, n_steps + 1):
-            variants_step2.append(var + [c2 + delta3])
-    
-    return variants_step2
-
-def generate_directional_variants(cat_diffs: Tuple[int, int], n_steps: int) -> List[List[int]]:
-    """Generate directional variants based on category differences
-    
-    For n_steps=1: directions (1,2) -> (0,2) (1,2) (2,2) (1,1) (1,2) (1,3)
-    For n_steps=2: directions (1,2) -> (-1,2) (0,2) (1,2) (2,2) (3,2) (1,0) (1,1) (1,2) (1,3) (1,4)
-    """
-    d1, d2 = cat_diffs
-    
-    # Edit directional values
-    variants_step1 = []
-    for delta1 in range(-n_steps, n_steps + 1):
-        for delta2 in range(-n_steps, n_steps + 1):
-            variants_step1.append([d1 + delta1, d2 + delta2])
-    
-    # Append third direction
-    variants_step2 = []
-    for var in variants_step1:
-        for delta3 in range(-n_steps, n_steps + 1):
-            variants_step2.append(var + [d2 + delta3])
-    
-    return variants_step2
-
-def predict_next_category(
-    last_two_cats: List[int],
-    cat_probs: dict,
-    dir_probs: dict,
-    n_steps: int
-) -> Tuple[int, str]:
-    """Predict next category and action"""
-    
-    # Generate category variants
-    cat_variants = generate_category_variants(last_two_cats, n_steps)
-    
-    # Convert to directional (category differences)
-    directional = [last_two_cats[1] - last_two_cats[0]]
-    
-    # For directional variants, we need the difference pattern
-    # We'll compute this for each category variant
+def predict_next(last_two: List[int], cat_probs: dict, dir_probs: dict, step: int):
+    c1, c2 = last_two
     best_prob = -1
-    best_prediction = None
+    best_pred = c2
     
-    # Evaluate each variant
-    for cat_var in cat_variants:
-        # Get category sequence probability
-        cat_seq = tuple(cat_var)
-        cat_prob = cat_probs.get(cat_seq, 0)
-        
-        # Get directional sequence (differences between categories)
-        dir_seq = tuple([cat_var[i+1] - cat_var[i] for i in range(len(cat_var) - 1)])
-        dir_prob = dir_probs.get(dir_seq, 0)
-        
-        # Combined probability
-        combined_prob = cat_prob + dir_prob
-        
-        if combined_prob > best_prob:
-            best_prob = combined_prob
-            best_prediction = cat_var[2]
+    for d1 in range(-step, step + 1):
+        for d2 in range(-step, step + 1):
+            for d3 in range(-step, step + 1):
+                v = [c1 + d1, c2 + d2, c2 + d3]
+                cp = cat_probs.get(tuple(v), 0)
+                dp = dir_probs.get((v[1]-v[0], v[2]-v[1]), 0)
+                if (cp + dp) > best_prob:
+                    best_prob = cp + dp
+                    best_pred = v[2]
     
-    # Determine action
-    current_cat = last_two_cats[1]
-    if best_prediction is None:
-        best_prediction = current_cat
-    
-    if best_prediction > current_cat:
-        action = "buy"
-    elif best_prediction < current_cat:
-        action = "sell"
-    else:
-        action = "hold"
-    
-    return best_prediction, action
+    action = "hold"
+    if best_pred > c2: action = "buy"
+    elif best_pred < c2: action = "sell"
+    return best_pred, action
 
-def evaluate_predictions(
-    actual_cats: List[int],
-    predictions: List[Tuple[int, str]],
-    starting_equity: float,
-    cat_to_dollar: float
-) -> Tuple[float, float, float]:
-    """Evaluate accuracy, equity, and Sharpe ratio"""
-    correct = 0
-    equity = starting_equity
-    returns = []
-    position = 0  # 0: no position, 1: long, -1: short
-    entry_cat = 0
+# ============================================================================
+# GITHUB UPLOAD LOGIC
+# ============================================================================
+
+def upload_to_github(filename: str, content_bytes: bytes, message: str):
+    """Uploads a file to GitHub repository using REST API"""
+    if not GITHUB_PAT:
+        print("Error: GITHUB_PAT not found in environment.")
+        return
+
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/visuals/{filename}"
     
-    for i in range(len(predictions)):
-        pred_cat, action = predictions[i]
-        actual = actual_cats[i]
+    # Check if file exists to get SHA for update
+    headers = {"Authorization": f"token {GITHUB_PAT}"}
+    resp = requests.get(url, headers=headers)
+    sha = resp.json().get('sha') if resp.status_code == 200 else None
+    
+    payload = {
+        "message": message,
+        "content": base64.b64encode(content_bytes).decode('utf-8')
+    }
+    if sha:
+        payload["sha"] = sha
         
-        # Check direction accuracy
-        if i > 0:
-            actual_direction = actual - actual_cats[i-1]
-            pred_direction = pred_cat - actual_cats[i-1]
-            if (actual_direction > 0 and pred_direction > 0) or \
-               (actual_direction < 0 and pred_direction < 0) or \
-               (actual_direction == 0 and pred_direction == 0):
-                correct += 1
-        
-        # Simulate trading (using category movements as proxy for price movements)
-        if action == "buy" and position == 0:
-            position = 1
-            entry_cat = actual
-        elif action == "sell" and position == 1:
-            pnl = (actual - entry_cat) * cat_to_dollar
-            equity += pnl
-            returns.append(pnl / 1000 if pnl != 0 else 0)
-            position = 0
-        elif action == "sell" and position == 0:
-            position = -1
-            entry_cat = actual
-        elif action == "buy" and position == -1:
-            pnl = (entry_cat - actual) * cat_to_dollar
-            equity += pnl
-            returns.append(pnl / 1000 if pnl != 0 else 0)
-            position = 0
-    
-    # Close any open position
-    if position != 0 and len(actual_cats) > 0:
-        final_cat = actual_cats[-1]
-        if position == 1:
-            pnl = (final_cat - entry_cat) * cat_to_dollar
-            equity += pnl
-            returns.append(pnl / 1000 if pnl != 0 else 0)
-        else:
-            pnl = (entry_cat - final_cat) * cat_to_dollar
-            equity += pnl
-            returns.append(pnl / 1000 if pnl != 0 else 0)
-    
-    accuracy = correct / max(len(predictions) - 1, 1)
-    
-    # Sharpe ratio
-    if len(returns) > 0:
-        avg_return = sum(returns) / len(returns)
-        variance = sum((r - avg_return) ** 2 for r in returns) / len(returns)
-        std_return = variance ** 0.5
-        sharpe = avg_return / std_return if std_return > 0 else 0
+    put_resp = requests.put(url, headers=headers, json=payload)
+    if put_resp.status_code in [200, 201]:
+        print(f"Successfully uploaded {filename} to GitHub.")
     else:
-        sharpe = 0
-    
-    return accuracy, equity, sharpe
+        print(f"Failed to upload {filename}: {put_resp.text}")
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
 
 def main():
-    custom_print("=" * 60)
-    custom_print("Category-Based Price Prediction Algorithm")
-    custom_print("=" * 60)
-    
-    # Calculate and display variant space size
-    n_edits = (2 * CATEGORY_STEP + 1) ** 2  # Editing first two categories
-    n_appends = (2 * CATEGORY_STEP + 1)  # Appending third category
-    total_variants = n_edits * n_appends
-    custom_print(f"\nStep size: {CATEGORY_STEP}")
-    custom_print(f"Variant space size: {total_variants} variants per prediction")
-    
-    custom_print(f"\nGenerating {N_PRICES} mock prices...")
+    print("Starting Prediction Engine...")
     prices = generate_prices(N_PRICES, MIN_PRICE, MAX_PRICE)
-    
-    custom_print("Converting prices to categories...")
     categories = [categorize_price(p, MIN_PRICE, MAX_PRICE, N_CATEGORIES) for p in prices]
     
-    # Split data
-    split_idx = int(N_PRICES * TRAIN_SPLIT)
-    train_cats = categories[:split_idx]
-    test_cats = categories[split_idx:]
+    split = int(N_PRICES * TRAIN_SPLIT)
+    train_cats = categories[:split]
+    test_cats = categories[split:]
     
-    custom_print(f"Train set: {len(train_cats)} categories")
-    custom_print(f"Test set: {len(test_cats)} categories")
-    custom_print(f"Category range: {min(train_cats)} to {max(train_cats)}")
+    cat_probs, dir_probs = compute_probs(train_cats)
     
-    # Compute probabilities on training set
-    custom_print("\nComputing category sequence probabilities...")
-    cat_probs = compute_category_sequence_probabilities(train_cats)
-    custom_print(f"Found {len(cat_probs)} unique category sequences")
+    equity = STARTING_EQUITY
+    history = []
+    position = 0
+    entry_cat = 0
     
-    custom_print("\nComputing directional sequence probabilities...")
-    dir_probs = compute_directional_probabilities(train_cats)
-    custom_print(f"Found {len(dir_probs)} unique directional sequences")
-    
-    # Make predictions
-    custom_print("\nGenerating predictions...")
-    predictions = []
-    
+    print("Generating predictions and simulating trades...")
     for i in range(2, len(test_cats)):
         last_two = test_cats[i-2:i]
-        pred_cat, action = predict_next_category(
-            last_two, cat_probs, dir_probs, CATEGORY_STEP
-        )
-        predictions.append((pred_cat, action))
+        pred_cat, action = predict_next(last_two, cat_probs, dir_probs, CATEGORY_STEP)
+        actual = test_cats[i]
         
-        if i % 500 == 0:
-            custom_print(f"  Processed {i}/{len(test_cats)} test samples...")
+        # Simple Trade Simulation
+        if action == "buy" and position == 0:
+            position, entry_cat = 1, actual
+        elif action == "sell" and position == 1:
+            equity += (actual - entry_cat) * CATEGORY_TO_DOLLAR
+            position = 0
+        elif action == "sell" and position == 0:
+            position, entry_cat = -1, actual
+        elif action == "buy" and position == -1:
+            equity += (entry_cat - actual) * CATEGORY_TO_DOLLAR
+            position = 0
+            
+        history.append({
+            'equity': equity,
+            'actual': actual,
+            'pred': pred_cat
+        })
+
+    # --- Generate Plots ---
+    print("Generating Visualizations...")
     
-    custom_print(f"\nGenerated {len(predictions)} predictions")
+    # Plot 1: Equity Curve
+    plt.figure(figsize=(10, 5))
+    plt.plot([h['equity'] for h in history], color='#10b981', linewidth=2)
+    plt.title("Equity Curve (Category-Based Trading)")
+    plt.xlabel("Predictions")
+    plt.ylabel("Equity ($)")
+    plt.grid(True, alpha=0.3)
     
-    # Evaluate
-    custom_print("\nEvaluating predictions...")
-    actual_test = test_cats[2:]
-    accuracy, equity, sharpe = evaluate_predictions(actual_test, predictions, STARTING_EQUITY, CATEGORY_TO_DOLLAR)
+    buf = BytesIO()
+    plt.savefig(buf, format='png', dpi=150)
+    upload_to_github("equity_curve.png", buf.getvalue(), "Update equity curve plot")
+    plt.close()
+
+    # Plot 2: Actual vs Predicted (Last 50)
+    plt.figure(figsize=(10, 5))
+    subset = history[-50:]
+    plt.bar(range(50), [h['actual'] for h in subset], alpha=0.5, label='Actual Category', color='#3b82f6')
+    plt.step(range(50), [h['pred'] for h in subset], where='mid', label='Predicted', color='#f59e0b', linewidth=2)
+    plt.title("Actual vs Predicted Categories (Last 50 Samples)")
+    plt.legend()
     
-    custom_print("\n" + "=" * 60)
-    custom_print("RESULTS")
-    custom_print("=" * 60)
-    custom_print(f"Direction Accuracy: {accuracy:.2%}")
-    custom_print(f"Final Equity: ${equity:,.2f}")
-    custom_print(f"Sharpe Ratio: {sharpe:.4f}")
-    
-    # Show sample predictions
-    custom_print("\n" + "=" * 60)
-    custom_print("Sample Predictions (first 10):")
-    custom_print("=" * 60)
-    for i in range(min(10, len(predictions))):
-        actual = actual_test[i]
-        pred_cat, action = predictions[i]
-        prev_cat = test_cats[i+1]
-        custom_print(f"Day {i+3}: Category {prev_cat} -> Predicted={pred_cat}, Actual={actual}, Action={action.upper()}")
-    
-    custom_print("\n" + "=" * 60)
-    custom_print("Execution Complete")
-    custom_print("=" * 60)
+    buf = BytesIO()
+    plt.savefig(buf, format='png', dpi=150)
+    upload_to_github("prediction_accuracy.png", buf.getvalue(), "Update prediction accuracy plot")
+    plt.close()
+
+    print("Execution complete. Check your GitHub repository for the 'visuals' folder.")
 
 if __name__ == "__main__":
     main()
