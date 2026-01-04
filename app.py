@@ -199,54 +199,46 @@ class SequenceTrader:
         return candidates
 
     def derive_direction_sequence(self, cat_sequence):
-        """
-        Derives the implied Direction sequence from a Category sequence.
-        Dirs[0] is always 0 (Flat).
-        Dirs[i] = Cat[i] - Cat[i-1]
-        """
         if not cat_sequence:
             return tuple()
-        
         dirs = [0] * len(cat_sequence)
         for i in range(1, len(cat_sequence)):
             dirs[i] = cat_sequence[i] - cat_sequence[i-1]
-            
         return tuple(dirs)
 
     def get_best_joint_variation(self, input_c, cat_model, dir_model, cat_alphabet):
         """
         1. Generate edits on CATEGORIES.
-        2. Derive DIRECTIONS from the edited category sequence.
+        2. Derive DIRECTIONS.
         3. Score = P(cat) + P(dir).
+        Apply Boost only to extensions that predict a move.
         """
-        # Generate variations of the Category Sequence
         cat_variations = self.generate_edits(input_c, cat_alphabet)
-        
         best_var = None
         best_joint_prob = -1.0
         input_len = len(input_c)
+        current_cat = input_c[-1] if input_len > 0 else None
         
         for var in cat_variations:
-            # 1. Get Category Probability
             seq_c = var['seq']
             prob_c = cat_model.get_probability(seq_c)
-            
-            # 2. Derive Implied Direction Sequence & Get Probability
             seq_d = self.derive_direction_sequence(seq_c)
             prob_d = dir_model.get_probability(seq_d)
             
-            # 3. Apply Prediction Boost
-            # If the edit is an "Insert at End", multiply probability
+            # --- Selective Prediction Boost ---
             multiplier = 1.0
-            if var['type'] == 'insert' and var['meta'][0] == input_len:
-                multiplier = CONFIG["PREDICTION_BOOST"]
+            is_extension = (var['type'] == 'insert' and var['meta'][0] == input_len)
+            
+            if is_extension:
+                predicted_cat = var['meta'][1]
+                # Only boost if the predicted cat represents a MOVE away from current cat
+                if predicted_cat != current_cat:
+                    multiplier = CONFIG["PREDICTION_BOOST"]
                 
             joint_prob = (prob_c + prob_d) * multiplier
             
-            # 4. Track Best
             if joint_prob > best_joint_prob:
                 best_joint_prob = joint_prob
-                # Store derived direction seq in meta for reference
                 var['derived_dir_seq'] = seq_d
                 var['prob_c'] = prob_c
                 var['prob_d'] = prob_d
@@ -255,38 +247,22 @@ class SequenceTrader:
         return best_var, best_joint_prob
 
     def _analyze_window(self, window_prices):
-        """Helper to get raw prediction data using Joint Optimization."""
         cat_seq, dir_seq = self.discretize_single_window(window_prices)
         input_len = self.max_seq_len - 1
         if len(cat_seq) < input_len: return None
-        
         input_c = tuple(cat_seq[-input_len:])
-        # input_d is strictly derived from input_c, but good to have for consistency check
-        
-        # Alphabet: Valid Training Categories
         alph_c = list(range(self.n_categories))
-        
-        # JOINT OPTIMIZATION
         best_var, joint_prob = self.get_best_joint_variation(input_c, self.cat_model, self.dir_model, alph_c)
-        
-        return {
-            "input_c": input_c,
-            "best_var": best_var,
-            "joint_prob": joint_prob
-        }
+        return {"input_c": input_c, "best_var": best_var, "joint_prob": joint_prob}
 
     def predict(self, window_prices):
         data = self._analyze_window(window_prices)
         if not data: return 0
-        
         best_var = data["best_var"]
         joint_prob = data["joint_prob"]
         input_c = data["input_c"]
-        
-        # Detect Extensions
         is_ext = (best_var['type'] == 'insert' and best_var['meta'][0] == len(input_c))
         
-        # --- Filtered Debug Print ---
         if is_ext and self.debug_count < self.debug_limit:
             predicted_cat = best_var['meta'][1]
             msg = f">>> PREDICTION EVENT {self.debug_count + 1} <<<\n"
@@ -295,59 +271,33 @@ class SequenceTrader:
             msg += f"  Joint Score: {joint_prob:.4f} (P_c: {best_var['prob_c']:.2f} + P_d: {best_var['prob_d']:.2f})\n"
             slow_print(msg)
             self.debug_count += 1
-        # -------------------------------
 
         if is_ext:
             pred_cat = best_var['meta'][1]
             curr_cat = input_c[-1]
-            
             if pred_cat > curr_cat:
                 if joint_prob > self.signal_threshold: return 1
             elif pred_cat < curr_cat:
                 if joint_prob > self.signal_threshold: return -1
-                
         return 0
 
     def print_random_test_samples(self, prices, count=5):
         n = len(prices)
         split_idx = int(n * 0.5)
         test_range = range(split_idx, n - 1)
-        if len(test_range) < count:
-            print("Not enough test data.")
-            return
-
+        if len(test_range) < count: return
         random_indices = random.sample(test_range, count)
         random_indices.sort()
-        
-        print("\n" + "="*60)
-        print(f"RANDOM SAMPLES FROM TESTING SET (JOINT OPTIMIZATION)")
-        print("="*60)
-        
+        print("\n" + "="*60 + "\nRANDOM SAMPLES FROM TESTING SET (JOINT OPTIMIZATION)\n" + "="*60)
         for idx in random_indices:
             window_start = idx - self.max_seq_len
             if window_start < 0: continue
-            
             window = prices[window_start : idx + 1]
             data = self._analyze_window(window)
             if not data: continue
-            
             var = data['best_var']
-            
-            out_str = "None"
-            if var['type'] == 'insert' and var['meta'][0] == len(data['input_c']):
-                out_str = f"Append {var['meta'][1]}"
-            else:
-                out_str = f"{var['type']}"
-                
-            slow_print(f"Sample Index: {idx}")
-            slow_print(f"  Input Cat Sequence:  {data['input_c']}")
-            slow_print(f"  Result Cat Sequence: {var['seq']}")
-            slow_print(f"  Result Dir Sequence: {var['derived_dir_seq']}")
-            slow_print(f"  Operation:           {out_str}")
-            slow_print(f"  Joint Score:         {data['joint_prob']:.4f}")
-            slow_print("-" * 60)
-            
-        print("="*60 + "\n")
+            out_str = f"Append {var['meta'][1]}" if (var['type'] == 'insert' and var['meta'][0] == len(data['input_c'])) else f"{var['type']}"
+            slow_print(f"Sample Index: {idx}\n  Input Cat:  {data['input_c']}\n  Result Cat: {var['seq']}\n  Result Dir: {var['derived_dir_seq']}\n  Operation:  {out_str}\n  Joint Score: {data['joint_prob']:.4f}\n" + "-"*60)
 
     def calculate_sharpe(self):
         eq_series = pd.Series(self.equity)
@@ -357,198 +307,75 @@ class SequenceTrader:
         return (returns.mean() / returns.std()) * np.sqrt(252)
 
     def run_backtest(self, prices):
-        n = len(prices)
-        split_idx = int(n * 0.5)
-        train_data = prices[:split_idx]
-        
+        n = len(prices); split_idx = int(n * 0.5); train_data = prices[:split_idx]
         self.fit(train_data)
-        
-        position = 0
-        entry_price = 0
-        test_indices = range(split_idx, n-1)
-        
+        position = 0; entry_price = 0; test_indices = range(split_idx, n-1)
         for t in test_indices:
-            window_start = t - self.max_seq_len
-            window = prices[window_start : t + 1]
-            sig = self.predict(window)
-            curr_p = prices[t]
-            
+            window_start = t - self.max_seq_len; window = prices[window_start : t + 1]
+            sig = self.predict(window); curr_p = prices[t]
             if position != 0:
-                pnl = (curr_p - entry_price) * position
-                self.equity.append(self.equity[-1] + pnl)
+                self.equity.append(self.equity[-1] + (curr_p - entry_price) * position)
                 position = 0
-            else:
-                self.equity.append(self.equity[-1])
-            
-            if sig != 0:
-                position = sig
-                entry_price = curr_p
+            else: self.equity.append(self.equity[-1])
+            if sig != 0: position = sig; entry_price = curr_p
         return self.equity
 
 # ==========================================
 # 4. Grid Search
 # ==========================================
 def perform_grid_search(train_data):
-    print("="*40)
-    print("STARTING GRID SEARCH")
-    print("="*40)
-    
-    # Ranges
-    r_len = range(2, 11)        # 2 to 10
-    r_depth = range(1, 5)       # 1 to 4
-    r_cats = range(10, 101, 10) # 10 to 100
-    r_boost = np.linspace(1, 5, 10) # 1 to 5 in 10 steps
-    
-    best_sharpe = -999.0
-    best_params = {}
-    
-    total_iterations = len(r_len) * len(r_depth) * len(r_cats) * len(r_boost)
-    count = 0
-    
+    print("="*40 + "\nSTARTING GRID SEARCH\n" + "="*40)
+    r_len = range(2, 11); r_depth = range(1, 5); r_cats = range(10, 101, 10); r_boost = np.linspace(1, 5, 10)
+    best_sharpe = -999.0; best_params = {}
+    total_iterations = len(r_len) * len(r_depth) * len(r_cats) * len(r_boost); count = 0
     for length, depth, cats, boost in itertools.product(r_len, r_depth, r_cats, r_boost):
-        count += 1
-        
-        # Update config dynamically for the current iteration
-        CONFIG["PREDICTION_BOOST"] = boost
-        
-        trader = SequenceTrader(
-            max_seq_len=length,
-            edit_depth=depth,
-            n_categories=cats,
-            signal_threshold=CONFIG["SIGNAL_THRESHOLD"],
-            debug_limit=0 
-        )
-        
-        trader.run_backtest(train_data)
-        sharpe = trader.calculate_sharpe()
-        
+        count += 1; CONFIG["PREDICTION_BOOST"] = boost
+        trader = SequenceTrader(length, depth, cats, CONFIG["SIGNAL_THRESHOLD"], 0)
+        trader.run_backtest(train_data); sharpe = trader.calculate_sharpe()
         if sharpe > best_sharpe:
-            best_sharpe = sharpe
-            best_params = {
-                "MAX_SEQ_LEN": length,
-                "EDIT_DEPTH": depth,
-                "N_CATEGORIES": cats,
-                "PREDICTION_BOOST": boost
-            }
+            best_sharpe = sharpe; best_params = {"MAX_SEQ_LEN": length, "EDIT_DEPTH": depth, "N_CATEGORIES": cats, "PREDICTION_BOOST": boost}
             print(f"[{count}/{total_iterations}] New Best: {best_params} -> Sharpe: {sharpe:.4f}")
-        else:
-            if count % 100 == 0:
-                print(f"[{count}/{total_iterations}] Current: L={length}, D={depth}, C={cats}, B={boost:.1f} -> Sharpe: {sharpe:.4f}")
-                
-    print("\n" + "="*40)
-    print(f"GRID SEARCH COMPLETE. Best Params: {best_params} (Sharpe: {best_sharpe:.4f})")
-    print("="*40 + "\n")
-    
+        elif count % 200 == 0: print(f"[{count}/{total_iterations}] Current: L={length}, D={depth}, C={cats}, B={boost:.1f} -> Sharpe: {sharpe:.4f}")
     return best_params
 
 # ==========================================
 # 5. GitHub Upload Logic
 # ==========================================
 def upload_plot_to_github(filename, repo, token, branch="main"):
-    print(f"Preparing to upload {filename} to {repo}...")
     try:
-        with open(filename, "rb") as image_file:
-            encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-    except FileNotFoundError:
-        print(f"File {filename} not found, skipping upload.")
-        return
-
-    url = f"https://api.github.com/repos/{repo}/contents/{filename}"
-    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
-    
-    check_response = requests.get(url, headers=headers)
-    sha = None
-    if check_response.status_code == 200:
-        sha = check_response.json().get("sha")
-        print(f"{filename} exists, overwriting...")
-
-    data = {"message": f"Update plot: {filename}", "content": encoded_string, "branch": branch}
+        with open(filename, "rb") as f: encoded = base64.b64encode(f.read()).decode("utf-8")
+    except: return
+    url = f"https://api.github.com/repos/{repo}/contents/{filename}"; headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    resp = requests.get(url, headers=headers); sha = resp.json().get("sha") if resp.status_code == 200 else None
+    data = {"message": f"Update plot: {filename}", "content": encoded, "branch": branch}
     if sha: data["sha"] = sha
-
-    response = requests.put(url, headers=headers, data=json.dumps(data))
-    if response.status_code in [200, 201]: print(f"Successfully uploaded {filename} to GitHub.")
-    else: print(f"Failed to upload {filename}. Status: {response.status_code}")
+    requests.put(url, headers=headers, data=json.dumps(data))
 
 # ==========================================
 # 6. Main Execution
 # ==========================================
 def main():
     load_env()
-    
-    # 1. Fetch Data
     try:
-        df = fetch_price_data(
-            ticker=CONFIG["TICKER"], 
-            start=CONFIG["START_DATE"], 
-            end=CONFIG["END_DATE"]
-        )
+        df = fetch_price_data(CONFIG["TICKER"], CONFIG["START_DATE"], CONFIG["END_DATE"])
         prices = df['price'].values
-    except Exception as e:
-        print(f"Failed to load data: {e}")
-        return
-
-    print(f"Loaded {len(prices)} data points.")
-    
-    # 2. Grid Search
+    except Exception as e: print(e); return
     if CONFIG["ENABLE_GRID_SEARCH"]:
-        train_len = int(len(prices) * 0.5)
-        training_data_subset = prices[:train_len]
-        
-        best_params = perform_grid_search(training_data_subset)
+        best_params = perform_grid_search(prices[:int(len(prices)*0.5)])
         CONFIG.update(best_params)
-    
-    # 3. Final Backtest
-    print("Running Final Backtest with Optimized Parameters...")
-    trader = SequenceTrader(
-        max_seq_len=CONFIG["MAX_SEQ_LEN"],
-        edit_depth=CONFIG["EDIT_DEPTH"],
-        n_categories=CONFIG["N_CATEGORIES"],
-        signal_threshold=CONFIG["SIGNAL_THRESHOLD"],
-        debug_limit=CONFIG["DEBUG_PRINTS"]
-    )
+    trader = SequenceTrader(CONFIG["MAX_SEQ_LEN"], CONFIG["EDIT_DEPTH"], CONFIG["N_CATEGORIES"], CONFIG["SIGNAL_THRESHOLD"], CONFIG["DEBUG_PRINTS"])
     equity = trader.run_backtest(prices)
-    
-    # 3b. Sample 5 Random Dates
     trader.print_random_test_samples(prices, count=5)
-
     sharpe = trader.calculate_sharpe()
-    print("-" * 30)
-    print(f"Final Equity: ${equity[-1]:.2f}")
-    print(f"Sharpe Ratio: {sharpe:.4f}")
-    print("-" * 30)
-
-    # 4. Plots
-    plt.figure(figsize=(10, 6))
-    plt.plot(equity, label='Strategy Equity')
-    plt.title(f'Sequence Trader Results (Sharpe: {sharpe:.2f})')
-    plt.xlabel('Trades')
-    plt.ylabel('Equity ($)')
-    plt.legend(); plt.grid(True)
-    plt.savefig(CONFIG["PLOT_FILENAME_EQUITY"], dpi=CONFIG["PLOT_DPI"]) 
-    print(f"Equity plot saved as {CONFIG['PLOT_FILENAME_EQUITY']}")
-    plt.close()
-
-    plt.figure(figsize=(12, 8))
-    plt.plot(prices, label='Price', color='black', linewidth=1)
-    if trader.bin_edges is not None:
-        for i, edge in enumerate(trader.bin_edges):
-            plt.axhline(y=edge, color='red', linestyle='--', alpha=0.3, linewidth=0.5)
-    split_idx = int(len(prices) * 0.5)
-    plt.axvline(x=split_idx, color='blue', linestyle='-', linewidth=2, label='Train/Test Split')
-    plt.title(f'Price History vs {CONFIG["N_CATEGORIES"]} Equal-Width Bins')
-    plt.xlabel('Bars (Days)'); plt.ylabel('Price'); plt.legend()
-    plt.savefig(CONFIG["PLOT_FILENAME_PRICE"], dpi=CONFIG["PLOT_DPI"])
-    print(f"Price plot saved as {CONFIG['PLOT_FILENAME_PRICE']}")
-    plt.close()
-
-    # 5. Upload
-    pat = os.environ.get("PAT")
-    repo = CONFIG["GITHUB_REPO"]
+    print(f"Final Equity: ${equity[-1]:.2f}\nSharpe Ratio: {sharpe:.4f}")
+    plt.figure(figsize=(10, 6)); plt.plot(equity); plt.title(f'Equity (Sharpe: {sharpe:.2f})'); plt.savefig(CONFIG["PLOT_FILENAME_EQUITY"], dpi=CONFIG["PLOT_DPI"]); plt.close()
+    plt.figure(figsize=(12, 8)); plt.plot(prices); plt.axvline(x=int(len(prices)*0.5), color='blue')
+    if trader.bin_edges:
+        for edge in trader.bin_edges: plt.axhline(y=edge, color='red', alpha=0.3, linewidth=0.5)
+    plt.savefig(CONFIG["PLOT_FILENAME_PRICE"], dpi=CONFIG["PLOT_DPI"]); plt.close()
+    pat = os.environ.get("PAT"); repo = CONFIG["GITHUB_REPO"]
     if pat:
         upload_plot_to_github(CONFIG["PLOT_FILENAME_EQUITY"], repo, pat, CONFIG["GITHUB_BRANCH"])
         upload_plot_to_github(CONFIG["PLOT_FILENAME_PRICE"], repo, pat, CONFIG["GITHUB_BRANCH"])
-    else:
-        print("Warning: 'PAT' not found. Skipping upload.")
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
