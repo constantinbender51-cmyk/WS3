@@ -6,6 +6,7 @@ import os
 import requests
 import base64
 import json
+import yfinance as yf
 
 # ==========================================
 # 0. Helper: Load .env manually
@@ -21,18 +22,52 @@ def load_env():
                     os.environ[key] = value.strip()
 
 # ==========================================
-# 1. Data Generation
+# 1. Data Fetching (Real Data)
 # ==========================================
-def generate_price_data(n=2000, seed=42):
-    np.random.seed(seed)
-    t = np.linspace(0, 100, n)
-    trend = t * 0.1 
-    cycle = 5 * np.sin(t) + 3 * np.sin(t * 3)
-    noise = np.random.normal(0, 1, n)
-    random_walk = np.cumsum(np.random.normal(0, 0.5, n))
-    price = 100 + trend + cycle + noise + random_walk
-    price = np.maximum(price, 10.0) 
-    return pd.DataFrame({'price': price})
+def fetch_price_data(ticker="SPY", start="2020-01-01", end="2025-01-01"):
+    """
+    Fetches daily price data from Yahoo Finance.
+    """
+    print(f"Downloading data for {ticker} from {start} to {end}...")
+    df = yf.download(ticker, start=start, end=end, progress=False)
+    
+    if df.empty:
+        raise ValueError(f"No data found for {ticker}. Check ticker symbol or date range.")
+
+    # Handle yfinance versions that return MultiIndex columns
+    # or different column structures
+    price_series = None
+    
+    # Check for MultiIndex columns (e.g., ('Adj Close', 'SPY'))
+    if isinstance(df.columns, pd.MultiIndex):
+        try:
+            # Try to get Adj Close first (accounts for dividends/splits)
+            price_series = df.xs('Adj Close', axis=1, level=0)
+        except KeyError:
+            try:
+                price_series = df.xs('Close', axis=1, level=0)
+            except KeyError:
+                pass
+        
+        # If we got a DataFrame (e.g. multiple tickers), take the first column
+        if isinstance(price_series, pd.DataFrame):
+            price_series = price_series.iloc[:, 0]
+            
+    else:
+        # Standard flat columns
+        if 'Adj Close' in df.columns:
+            price_series = df['Adj Close']
+        elif 'Close' in df.columns:
+            price_series = df['Close']
+
+    if price_series is None:
+         raise ValueError("Could not locate 'Close' or 'Adj Close' price data in response.")
+
+    # Return as DataFrame with 'price' column, drop NaNs
+    clean_df = pd.DataFrame({'price': price_series.values})
+    clean_df.dropna(inplace=True)
+    
+    return clean_df
 
 # ==========================================
 # 2. Sequence Model
@@ -80,12 +115,17 @@ class SequenceTrader:
         
     def fit(self, train_prices):
         print(f"Training on {len(train_prices)} bars...")
+        # Learn bins
         _, self.bin_edges = pd.qcut(train_prices, self.n_categories, retbins=True, duplicates='drop')
+        
+        # Discretize
         train_cats = pd.cut(train_prices, bins=self.bin_edges, labels=False, include_lowest=True)
         train_cats = np.nan_to_num(train_cats, nan=0).astype(int)
+        
         train_dirs = [0] * len(train_cats)
         for i in range(1, len(train_cats)):
             train_dirs[i] = train_cats[i] - train_cats[i-1]
+            
         self.unique_dirs = set(train_dirs)
         self.cat_model.train(list(train_cats))
         self.dir_model.train(train_dirs)
@@ -166,10 +206,10 @@ class SequenceTrader:
         n = len(prices)
         split_idx = int(n * 0.5)
         train_data = prices[:split_idx]
-        test_data = prices[split_idx:] # Not strictly used, just for logging
+        test_data = prices[split_idx:]
         
         self.fit(train_data)
-        print(f"Testing on {len(test_data)} bars (Bars {split_idx} to {n})...")
+        print(f"Testing on {len(test_data)} bars...")
         
         position = 0
         entry_price = 0
@@ -180,12 +220,15 @@ class SequenceTrader:
             window = prices[window_start : t + 1]
             sig = self.predict(window)
             curr_p = prices[t]
+            
+            # PnL Calculation
             if position != 0:
                 pnl = (curr_p - entry_price) * position
                 self.equity.append(self.equity[-1] + pnl)
                 position = 0
             else:
                 self.equity.append(self.equity[-1])
+            
             if sig != 0:
                 position = sig
                 entry_price = curr_p
@@ -206,7 +249,6 @@ def upload_plot_to_github(filename, repo, token, branch="main"):
         "Accept": "application/vnd.github.v3+json"
     }
     
-    # Check if file exists to get SHA (needed for update/overwrite)
     check_response = requests.get(url, headers=headers)
     sha = None
     if check_response.status_code == 200:
@@ -236,9 +278,16 @@ def main():
     # 0. Load Environment Variables
     load_env()
     
-    # 1. Generate Data
-    df = generate_price_data(n=2000)
-    prices = df['price'].values
+    # 1. Fetch Real Data
+    # You can change ticker and dates here
+    try:
+        df = fetch_price_data("SPY", start="2020-01-01", end="2025-01-01")
+        prices = df['price'].values
+    except Exception as e:
+        print(f"Failed to load data: {e}")
+        return
+
+    print(f"Loaded {len(prices)} data points.")
     
     # 2. Run Backtest
     trader = SequenceTrader(max_seq_len=4, edit_depth=1, n_categories=20)
@@ -265,7 +314,6 @@ def main():
     plt.grid(True)
     
     plot_filename = "equity_curve.png"
-    # Low resolution: 50 DPI
     plt.savefig(plot_filename, dpi=50) 
     print(f"Plot saved locally as {plot_filename} (Low Res)")
     
