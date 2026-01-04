@@ -5,14 +5,14 @@ import numpy as np
 import pandas as pd
 from collections import Counter
 
-# Override print to slow down output for readability
+# Override print to slow down output for readability (0.1s)
 _builtin_print = print
 def print(*args, **kwargs):
-    time.sleep(0.5)
+    time.sleep(0.1)
     _builtin_print(*args, **kwargs)
 
 # ==============================================================================
-# 1. DATA HANDLER
+# 1. DATA HANDLER (Preserved)
 # ==============================================================================
 
 class MarketDataHandler:
@@ -66,97 +66,174 @@ class MarketDataHandler:
         return sequence
 
 # ==============================================================================
-# 2. PURE MARKOV ENGINE (No Evolutionary Logic)
+# 2. FREQUENCY ENGINE (Exact Counting)
 # ==============================================================================
 
-class MarkovEngine:
+class FrequencyEngine:
     def __init__(self, num_categories=40):
         self.num_categories = num_categories
-        self.mom_map = {k: v for v, k in enumerate(['UP', 'DOWN', 'FLAT'])}
-        self.mom_trans = np.zeros((3, 3))
-        self.cat_trans = np.zeros((num_categories, num_categories))
-        
-        # We need smoothing to prevent log(0)
-        self.epsilon = 1e-9
+        self.history = []
 
     def train(self, sequence):
-        print("Training Markov Probabilities...")
-        mom_counts = np.ones((3, 3)) 
-        cat_counts = np.ones((self.num_categories, self.num_categories)) 
-        
-        for i in range(len(sequence) - 1):
-            curr_mom, curr_cat = sequence[i]
-            next_mom, next_cat = sequence[i+1]
-            
-            m1, m2 = self.mom_map[curr_mom], self.mom_map[next_mom]
-            c1, c2 = curr_cat - 1, next_cat - 1
-            
-            mom_counts[m1][m2] += 1
-            cat_counts[c1][c2] += 1
+        """Stores the historical sequence for pattern matching."""
+        print("Training Frequency Engine (Storing History)...")
+        self.history = sequence
 
-        # Normalize
-        self.mom_trans = mom_counts / mom_counts.sum(axis=1, keepdims=True)
-        self.cat_trans = cat_counts / cat_counts.sum(axis=1, keepdims=True)
-
-    def calculate_log_prob(self, seq):
-        """Calculates log probability of a specific sequence occurring."""
-        if not seq or len(seq) < 2: return -999.0
-        
-        m_idxs = [self.mom_map[m] for m, c in seq]
-        c_idxs = [c-1 for m, c in seq]
-        
-        log_prob = 0.0
-        for i in range(len(seq) - 1):
-            p_m = self.mom_trans[m_idxs[i]][m_idxs[i+1]]
-            p_c = self.cat_trans[c_idxs[i]][c_idxs[i+1]]
-            log_prob += math.log(p_m + self.epsilon)
-            log_prob += math.log(p_c + self.epsilon)
-            
-        return log_prob
-
-    def predict_next(self, input_seq):
+    def get_score(self, sub_seq):
         """
-        Given an input sequence, try all 3 possible next moves (UP, DOWN, FLAT).
-        Return the one with the highest total log probability.
+        Calculates Probability = Count / Total_Possible_Of_Length.
         """
-        last_val = input_seq[-1][1]
-        candidates = []
+        if not self.history or not sub_seq: return 0, 0.0
         
-        # 1. Try UP
-        if last_val < self.num_categories:
-            next_seq = input_seq + [('UP', last_val + 1)]
-            score = self.calculate_log_prob(next_seq)
-            candidates.append({
-                'action': 'BUY', 
-                'score': score, 
-                'next_cat': last_val + 1
-            })
-            
-        # 2. Try DOWN
-        if last_val > 1:
-            next_seq = input_seq + [('DOWN', last_val - 1)]
-            score = self.calculate_log_prob(next_seq)
-            candidates.append({
-                'action': 'SELL', 
-                'score': score, 
-                'next_cat': last_val - 1
-            })
-            
-        # 3. Try FLAT
-        next_seq = input_seq + [('FLAT', last_val)]
-        score = self.calculate_log_prob(next_seq)
-        candidates.append({
-            'action': 'FLAT', 
-            'score': score, 
-            'next_cat': last_val
-        })
+        len_sub = len(sub_seq)
+        len_hist = len(self.history)
         
-        # Sort by score (Highest Log Prob is best)
-        candidates.sort(key=lambda x: x['score'], reverse=True)
-        return candidates[0]
+        if len_sub > len_hist: return 0, 0.0
+        
+        # Exact Sequence Matching
+        count = 0
+        # We scan the history
+        for i in range(len_hist - len_sub + 1):
+            if self.history[i : i + len_sub] == sub_seq:
+                count += 1
+        
+        # Total possible sequences of this specific length
+        total_possible = len_hist - len_sub + 1
+        
+        prob = count / total_possible if total_possible > 0 else 0.0
+        return count, prob
 
 # ==============================================================================
-# 3. BACKTESTER UTILS
+# 3. MUTATION SOLVER (The Evolutionary Core)
+# ==============================================================================
+
+class MutationSolver:
+    def __init__(self, engine, num_bins):
+        self.engine = engine
+        self.num_bins = num_bins
+
+    def _repair_physics(self, seq):
+        """
+        Re-calculates Momentum tags to match Price Categories.
+        Essential after swapping/inserting to ensure sequence is valid for lookup.
+        """
+        if not seq: return []
+        repaired = []
+        for i in range(len(seq)):
+            cat = seq[i][1]
+            if i == 0:
+                # Keep original start momentum if possible, else FLAT
+                mom = seq[i][0]
+            else:
+                prev_cat = repaired[-1][1]
+                if cat > prev_cat: mom = 'UP'
+                elif cat < prev_cat: mom = 'DOWN'
+                else: mom = 'FLAT'
+            repaired.append((mom, cat))
+        return repaired
+
+    def generate_variants(self, input_seq):
+        """Generates all mutations: Swap, Del, Mod, Insert, Sub, Ext."""
+        pool = []
+        L = len(input_seq)
+        
+        # 1. Original
+        pool.append({'seq': input_seq, 'type': 'orig'})
+
+        # 2. Extensions (Forecasts) - Try UP/DOWN/FLAT
+        last_cat = input_seq[-1][1]
+        options = [last_cat]
+        if last_cat < self.num_bins: options.append(last_cat + 1)
+        if last_cat > 1: options.append(last_cat - 1)
+        
+        for opt in options:
+            # We append 'FLAT' as placeholder, _repair_physics fixes it later
+            ext_seq = input_seq + [('FLAT', opt)]
+            pool.append({'seq': ext_seq, 'type': 'ext'})
+
+        # 3. Sub-sequences (Shortening)
+        # We take slices from the END (most recent data must be preserved usually)
+        # But per user instruction "cde wins over Ababcde", we try all substrings
+        for start in range(L):
+            for end in range(start + 2, L + 1): # Min length 2
+                if start == 0 and end == L: continue # Skip original (already added)
+                sub = input_seq[start:end]
+                pool.append({'seq': sub, 'type': 'sub'})
+
+        # 4. Modifications (Noise adjust)
+        for i in range(L):
+            curr_mom, curr_cat = input_seq[i]
+            # +1
+            if curr_cat < self.num_bins:
+                m_seq = input_seq[:]
+                m_seq[i] = (curr_mom, curr_cat + 1)
+                pool.append({'seq': m_seq, 'type': 'mod'})
+            # -1
+            if curr_cat > 1:
+                m_seq = input_seq[:]
+                m_seq[i] = (curr_mom, curr_cat - 1)
+                pool.append({'seq': m_seq, 'type': 'mod'})
+
+        # 5. Swaps (Temporal dislocation)
+        for i in range(L - 1):
+            s_seq = input_seq[:]
+            s_seq[i], s_seq[i+1] = s_seq[i+1], s_seq[i]
+            pool.append({'seq': s_seq, 'type': 'swap'})
+
+        # 6. Deletions (Remove outlier)
+        if L > 2:
+            for i in range(L):
+                d_seq = input_seq[:i] + input_seq[i+1:]
+                pool.append({'seq': d_seq, 'type': 'del'})
+        
+        # 7. Insertions (Interpolation)
+        # Insert average of neighbors
+        if L < 10: # Limit complexity
+            for i in range(L - 1):
+                c1 = input_seq[i][1]
+                c2 = input_seq[i+1][1]
+                avg = int((c1 + c2) / 2)
+                i_seq = input_seq[:i+1] + [('FLAT', avg)] + input_seq[i+1:]
+                pool.append({'seq': i_seq, 'type': 'ins'})
+
+        return pool
+
+    def solve(self, input_seq):
+        variants = self.generate_variants(input_seq)
+        scored = []
+        seen_hashes = set()
+
+        for v in variants:
+            # 1. Repair Physics
+            fixed_seq = self._repair_physics(v['seq'])
+            
+            # 2. Deduplicate
+            s_hash = str(fixed_seq)
+            if s_hash in seen_hashes: continue
+            seen_hashes.add(s_hash)
+            
+            # 3. Score (Frequency / Total_Possible)
+            count, prob = self.engine.get_score(fixed_seq)
+            
+            # 4. Filter impossible sequences
+            if count > 0:
+                scored.append({
+                    'seq': fixed_seq,
+                    'count': count,
+                    'prob': prob,
+                    'type': v['type']
+                })
+        
+        # Sort by Probability (Desc)
+        scored.sort(key=lambda x: x['prob'], reverse=True)
+        
+        if not scored:
+            return {'seq': input_seq, 'prob': 0.0, 'type': 'none', 'count': 0}
+            
+        return scored[0]
+
+# ==============================================================================
+# 4. BACKTESTER UTILS (Preserved)
 # ==============================================================================
 
 class Backtester:
@@ -187,7 +264,7 @@ class Backtester:
         return (mean / std) * math.sqrt(252) if std > 0 else 0.0
 
 # ==============================================================================
-# 4. MAIN COMPARISON RUNNER
+# 5. MAIN COMPARISON RUNNER
 # ==============================================================================
 
 if __name__ == "__main__":
@@ -206,22 +283,19 @@ if __name__ == "__main__":
     split_idx = int(len(full_seq) * 0.7)
     train_seq = full_seq[:split_idx]
     
-    engine = MarkovEngine(num_categories=NUM_BINS)
+    engine = FrequencyEngine(num_categories=NUM_BINS)
     engine.train(train_seq)
+    
+    solver = MutationSolver(engine, NUM_BINS)
     
     # Initialize Backtesters
     backtesters = {L: Backtester(f"Len-{L}") for L in LENGTHS_TO_TEST}
     
-    print(f"\nComparing Fixed Markov Windows: {LENGTHS_TO_TEST} on {SYMBOL}")
+    print(f"\nComparing Evolutionary Frequency (Mutations): {LENGTHS_TO_TEST} on {SYMBOL}")
     print(f"Training Data: {split_idx} candles | Test Data: {len(full_seq) - split_idx} candles")
     print("\n" + "="*100)
 
-    # We iterate through the test set.
-    # We must ensure we have enough history for the max length
-    max_L = max(LENGTHS_TO_TEST)
-    
     for i in range(split_idx, len(full_seq) - 1):
-        # We need next price for PnL
         curr_price = raw_prices[i]
         next_price = raw_prices[i+1]
         pct_change = (next_price - curr_price) / curr_price
@@ -234,24 +308,41 @@ if __name__ == "__main__":
         
         # Run each length
         for L in LENGTHS_TO_TEST:
-            if i < L: 
-                continue
+            if i < L: continue
                 
             input_window = full_seq[i - L + 1 : i + 1]
             input_cats = [x[1] for x in input_window]
             
-            # Predict
-            prediction = engine.predict_next(input_window)
-            action = prediction['action']
-            next_cat = prediction['next_cat']
+            # SOLVE (Generate Mutations -> Compare Probs -> Pick Winner)
+            winner = solver.solve(input_window)
+            best_seq = winner['seq']
             
-            output_cats = input_cats + [next_cat]
+            # DECISION LOGIC
+            # We only trade if the winner EXTENDS beyond the current timeframe
+            action = "FLAT"
+            
+            # Length check: Did it forecast?
+            if len(best_seq) > len(input_window):
+                # Check the first new value (index = len(input))
+                pred_cat = best_seq[len(input_window)][1]
+                curr_cat = input_window[-1][1]
+                
+                if pred_cat > curr_cat: action = "BUY"
+                elif pred_cat < curr_cat: action = "SELL"
             
             # Backtest
             backtesters[L].step(action, pct_change)
             
-            # Formatting (Convert lists to strings for nice display)
-            print(f"  L={L}: {str(input_cats):<35} -> {str(output_cats):<40} | {action}")
+            # Formatting
+            output_cats = [x[1] for x in best_seq]
+            
+            # Truncate strings if too long
+            in_s = str(input_cats)
+            out_s = str(output_cats)
+            if len(out_s) > 30: out_s = out_s[:27] + "..."
+            
+            stats = f"[Type={winner['type']}, P={winner['prob']:.3f}]"
+            print(f"  L={L}: {in_s:<20} -> {out_s:<30} | {action:<4} {stats}")
             
         print("-" * 100)
 
