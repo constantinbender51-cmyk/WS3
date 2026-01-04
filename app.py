@@ -25,12 +25,12 @@ CONFIG = {
     "MAX_SEQ_LEN": 4,        
     "EDIT_DEPTH": 1,         
     "N_CATEGORIES": 20,      
-    "SIGNAL_THRESHOLD": 0,
-    "PREDICTION_BOOST": 3, # Multiplier for "Insert at End" probabilities
+    "SIGNAL_THRESHOLD": 2.5,
+    "PREDICTION_BOOST": 1.5, # Multiplier for "Insert at End" probabilities
     
     # Debugging & Output
     "DEBUG_PRINTS": 0,       
-    "PRINT_DELAY": 1,     
+    "PRINT_DELAY": 0.1,     
     
     # Grid Search
     "ENABLE_GRID_SEARCH": True,
@@ -393,7 +393,7 @@ def perform_grid_search(train_data):
     print("="*40)
     
     # Ranges
-    r_len = range(2, 11)        # 2 to 10
+    r_len = range(2, 6)         # 2 to 5 (Restricted as requested)
     r_depth = range(1, 5)       # 1 to 4
     r_cats = range(10, 101, 10) # 10 to 100
     
