@@ -365,7 +365,7 @@ class EvolutionarySolver:
 
 if __name__ == "__main__":
     # Settings
-    SYMBOL = "BTC-USD"  # Volatile assets show this effect better
+    SYMBOL = "SPY"  # Standard equity ETF
     PERIOD = "2y"
     NUM_BINS = 50
     WINDOW_SIZE = 10    # Input size
