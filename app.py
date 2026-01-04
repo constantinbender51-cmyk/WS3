@@ -1,381 +1,293 @@
-import numpy as np
-import pandas as pd
-from collections import defaultdict
-import matplotlib.pyplot as plt
-import os
-import requests
-import base64
-import json
-import yfinance as yf
-import time
-import math
-import itertools
+
 import random
+import time
+from collections import defaultdict
+from typing import List, Tuple
 
-# ==========================================
-# 0. Configuration & Parameters
-# ==========================================
-CONFIG = {
-    # Data Fetching
-    "TICKER": "SPY",
-    "START_DATE": "2020-01-01",
-    "END_DATE": "2025-01-01",
-    
-    # Strategy / Model Parameters (Defaults, overwritten by Grid Search)
-    "MAX_SEQ_LEN": 4,        
-    "EDIT_DEPTH": 1,         
-    "N_CATEGORIES": 20,      
-    "SIGNAL_THRESHOLD": 2.5,
-    "PREDICTION_BOOST": 1.5, # Multiplier for "Insert at End" probabilities
-    
-    # Debugging & Output
-    "DEBUG_PRINTS": 0,       
-    "PRINT_DELAY": 0.1,     
-    
-    # Grid Search
-    "ENABLE_GRID_SEARCH": True,
-    
-    # Plotting
-    "PLOT_FILENAME_EQUITY": "equity_curve.png",
-    "PLOT_FILENAME_PRICE": "price_categories.png",
-    "PLOT_DPI": 100,         
-    
-    # GitHub Upload
-    "GITHUB_REPO": "constantinbender51-cmyk/Models",
-    "GITHUB_BRANCH": "main"
-}
-
-# ==========================================
-# 0.1 Helper: Load .env manually
-# ==========================================
-def load_env():
-    if os.path.exists('.env'):
-        with open('.env') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    key, value = line.split('=', 1)
-                    os.environ[key] = value.strip()
-
-# ==========================================
-# 0.2 Helper: Slow Print
-# ==========================================
-def slow_print(text, delay=CONFIG["PRINT_DELAY"]):
+def custom_print(text: str, delay: float = 0.1):
+    """Print with delay"""
     print(text)
     time.sleep(delay)
 
-# ==========================================
-# 1. Data Fetching (Real Data)
-# ==========================================
-def fetch_price_data(ticker, start, end):
-    print(f"Downloading data for {ticker} from {start} to {end}...")
-    df = yf.download(ticker, start=start, end=end, progress=False)
-    
-    if df.empty:
-        raise ValueError(f"No data found for {ticker}.")
+def generate_prices(n: int, min_price: float = 100, max_price: float = 600) -> List[float]:
+    """Generate mock prices"""
+    return [random.uniform(min_price, max_price) for _ in range(n)]
 
-    price_series = None
-    if isinstance(df.columns, pd.MultiIndex):
-        try:
-            price_series = df.xs('Adj Close', axis=1, level=0)
-        except KeyError:
-            try:
-                price_series = df.xs('Close', axis=1, level=0)
-            except KeyError:
-                pass
-        if isinstance(price_series, pd.DataFrame):
-            price_series = price_series.iloc[:, 0]
-    else:
-        if 'Adj Close' in df.columns:
-            price_series = df['Adj Close']
-        elif 'Close' in df.columns:
-            price_series = df['Close']
-
-    if price_series is None:
-         raise ValueError("Could not locate price data.")
-
-    clean_df = pd.DataFrame({'price': price_series.values})
-    clean_df.dropna(inplace=True)
-    return clean_df
-
-# ==========================================
-# 2. Sequence Model
-# ==========================================
-class SequenceModel:
-    def __init__(self, max_len=5):
-        self.max_len = max_len
-        self.counts = defaultdict(int)
-        self.total_counts_by_len = defaultdict(int)
-        self.unique_patterns_by_len = defaultdict(set)
-
-    def train(self, sequence):
-        n = len(sequence)
-        for length in range(1, self.max_len + 1):
-            for i in range(n - length + 1):
-                sub = tuple(sequence[i : i + length])
-                self.counts[sub] += 1
-                self.total_counts_by_len[length] += 1
-                self.unique_patterns_by_len[length].add(sub)
-
-    def get_probability(self, sequence_tuple):
-        length = len(sequence_tuple)
-        if length == 0 or length > self.max_len: return 0.0
-        count = self.counts.get(sequence_tuple, 0)
-        
-        num_unique = len(self.unique_patterns_by_len[length])
-        if num_unique == 0: return 0.0
-        total_occurrences = self.total_counts_by_len[length]
-        avg_occurrence = total_occurrences / num_unique
-        if avg_occurrence == 0: return 0.0
-        return count / avg_occurrence
-
-# ==========================================
-# 3. Trader Class
-# ==========================================
-class SequenceTrader:
-    def __init__(self, max_seq_len, edit_depth, n_categories, signal_threshold, debug_limit):
-        self.max_seq_len = max_seq_len
-        self.edit_depth = edit_depth
-        self.n_categories = n_categories
-        self.signal_threshold = signal_threshold
-        self.debug_limit = debug_limit
-        
-        self.cat_model = SequenceModel(max_seq_len)
-        self.dir_model = SequenceModel(max_seq_len)
-        
-        self.train_min = None
-        self.train_max = None
-        self.bin_width = None
-        self.bin_edges = None 
-        
-        self.unique_dirs = set()
-        self.equity = [1000.0]
-        self.debug_count = 0
-        
-    def fit(self, train_prices):
-        self.train_min = np.min(train_prices)
-        self.train_max = np.max(train_prices)
-        price_range = self.train_max - self.train_min
-        if price_range == 0: price_range = 1.0
-        
-        self.bin_width = price_range / self.n_categories
-        self.bin_edges = [self.train_min + i * self.bin_width for i in range(self.n_categories + 1)]
-        
-        train_cats_raw = np.floor((train_prices - self.train_min) / self.bin_width).astype(int)
-        train_cats = np.clip(train_cats_raw, 0, self.n_categories - 1)
-        
-        train_dirs = [0] * len(train_cats)
-        for i in range(1, len(train_cats)):
-            train_dirs[i] = train_cats[i] - train_cats[i-1]
-            
-        self.unique_dirs = set(train_dirs)
-        self.cat_model.train(list(train_cats))
-        self.dir_model.train(train_dirs)
-
-    def discretize_single_window(self, prices):
-        raw_cats = np.floor((prices - self.train_min) / self.bin_width).astype(int)
-        cats = list(raw_cats)
-        dirs = [0] * len(cats)
-        for i in range(1, len(cats)):
-            dirs[i] = cats[i] - cats[i-1]
-        return cats, dirs
-
-    def generate_edits(self, seq, alphabet):
-        candidates = [{'seq': seq, 'type': 'original', 'meta': None}]
-        if self.edit_depth < 1: return candidates
-        seq_len = len(seq)
-        for i in range(seq_len + 1):
-            for token in alphabet:
-                new_seq = seq[:i] + (token,) + seq[i:]
-                candidates.append({'seq': new_seq, 'type': 'insert', 'meta': (i, token)})
-        for i in range(seq_len):
-            new_seq = seq[:i] + seq[i+1:]
-            candidates.append({'seq': new_seq, 'type': 'remove', 'meta': i})
-        for i in range(seq_len):
-            for token in alphabet:
-                if token != seq[i]:
-                    new_seq = seq[:i] + (token,) + seq[i+1:]
-                    candidates.append({'seq': new_seq, 'type': 'swap', 'meta': (i, token)})
-        return candidates
-
-    def derive_direction_sequence(self, cat_sequence):
-        if not cat_sequence:
-            return tuple()
-        dirs = [0] * len(cat_sequence)
-        for i in range(1, len(cat_sequence)):
-            dirs[i] = cat_sequence[i] - cat_sequence[i-1]
-        return tuple(dirs)
-
-    def get_best_joint_variation(self, input_c, cat_model, dir_model, cat_alphabet):
-        """
-        1. Generate edits on CATEGORIES.
-        2. Derive DIRECTIONS.
-        3. Score = P(cat) + P(dir).
-        Apply Boost only to extensions that predict a move.
-        """
-        cat_variations = self.generate_edits(input_c, cat_alphabet)
-        best_var = None
-        best_joint_prob = -1.0
-        input_len = len(input_c)
-        current_cat = input_c[-1] if input_len > 0 else None
-        
-        for var in cat_variations:
-            seq_c = var['seq']
-            prob_c = cat_model.get_probability(seq_c)
-            seq_d = self.derive_direction_sequence(seq_c)
-            prob_d = dir_model.get_probability(seq_d)
-            
-            # --- Selective Prediction Boost ---
-            multiplier = 1.0
-            is_extension = (var['type'] == 'insert' and var['meta'][0] == input_len)
-            
-            if is_extension:
-                predicted_cat = var['meta'][1]
-                # Only boost if the predicted cat represents a MOVE away from current cat
-                if predicted_cat != current_cat:
-                    multiplier = CONFIG["PREDICTION_BOOST"]
-                
-            joint_prob = (prob_c + prob_d) * multiplier
-            
-            if joint_prob > best_joint_prob:
-                best_joint_prob = joint_prob
-                var['derived_dir_seq'] = seq_d
-                var['prob_c'] = prob_c
-                var['prob_d'] = prob_d
-                best_var = var
-                
-        return best_var, best_joint_prob
-
-    def _analyze_window(self, window_prices):
-        cat_seq, dir_seq = self.discretize_single_window(window_prices)
-        input_len = self.max_seq_len - 1
-        if len(cat_seq) < input_len: return None
-        input_c = tuple(cat_seq[-input_len:])
-        alph_c = list(range(self.n_categories))
-        best_var, joint_prob = self.get_best_joint_variation(input_c, self.cat_model, self.dir_model, alph_c)
-        return {"input_c": input_c, "best_var": best_var, "joint_prob": joint_prob}
-
-    def predict(self, window_prices):
-        data = self._analyze_window(window_prices)
-        if not data: return 0
-        best_var = data["best_var"]
-        joint_prob = data["joint_prob"]
-        input_c = data["input_c"]
-        is_ext = (best_var['type'] == 'insert' and best_var['meta'][0] == len(input_c))
-        
-        if is_ext and self.debug_count < self.debug_limit:
-            predicted_cat = best_var['meta'][1]
-            msg = f">>> PREDICTION EVENT {self.debug_count + 1} <<<\n"
-            msg += f"  Input: {input_c}\n"
-            msg += f"  Predict Append: {predicted_cat}\n"
-            msg += f"  Joint Score: {joint_prob:.4f} (P_c: {best_var['prob_c']:.2f} + P_d: {best_var['prob_d']:.2f})\n"
-            slow_print(msg)
-            self.debug_count += 1
-
-        if is_ext:
-            pred_cat = best_var['meta'][1]
-            curr_cat = input_c[-1]
-            if pred_cat > curr_cat:
-                if joint_prob > self.signal_threshold: return 1
-            elif pred_cat < curr_cat:
-                if joint_prob > self.signal_threshold: return -1
+def categorize_price(price: float, min_price: float, max_price: float, n_categories: int) -> int:
+    """Categorize price into buckets"""
+    step = (max_price - min_price) / n_categories
+    if price < min_price:
         return 0
+    elif price > max_price:
+        return n_categories + int((price - max_price) / step)
+    else:
+        return int((price - min_price) / step)
 
-    def print_random_test_samples(self, prices, count=5):
-        n = len(prices)
-        split_idx = int(n * 0.5)
-        test_range = range(split_idx, n - 1)
-        if len(test_range) < count: return
-        random_indices = random.sample(test_range, count)
-        random_indices.sort()
-        print("\n" + "="*60 + "\nRANDOM SAMPLES FROM TESTING SET (JOINT OPTIMIZATION)\n" + "="*60)
-        for idx in random_indices:
-            window_start = idx - self.max_seq_len
-            if window_start < 0: continue
-            window = prices[window_start : idx + 1]
-            data = self._analyze_window(window)
-            if not data: continue
-            var = data['best_var']
-            out_str = f"Append {var['meta'][1]}" if (var['type'] == 'insert' and var['meta'][0] == len(data['input_c'])) else f"{var['type']}"
-            slow_print(f"Sample Index: {idx}\n  Input Cat:  {data['input_c']}\n  Result Cat: {var['seq']}\n  Result Dir: {var['derived_dir_seq']}\n  Operation:  {out_str}\n  Joint Score: {data['joint_prob']:.4f}\n" + "-"*60)
+def compute_sequence_probabilities(prices: List[float], min_price: float, max_price: float, n_categories: int) -> dict:
+    """Compute probability of each 3-sequential price category sequence"""
+    categorized = [categorize_price(p, min_price, max_price, n_categories) for p in prices]
+    sequence_counts = defaultdict(int)
+    total_sequences = 0
+    
+    for i in range(len(categorized) - 2):
+        seq = tuple(categorized[i:i+3])
+        sequence_counts[seq] += 1
+        total_sequences += 1
+    
+    probabilities = {seq: count / total_sequences for seq, count in sequence_counts.items()}
+    return probabilities
 
-    def calculate_sharpe(self):
-        eq_series = pd.Series(self.equity)
-        if len(eq_series) < 2: return 0.0
-        returns = eq_series.pct_change().dropna()
-        if len(returns) < 2 or returns.std() == 0: return 0.0
-        return (returns.mean() / returns.std()) * np.sqrt(252)
+def compute_directional_probabilities(prices: List[float]) -> dict:
+    """Compute probability of directional sequences"""
+    directions = [prices[i+1] - prices[i] for i in range(len(prices) - 1)]
+    
+    dir_sequence_counts = defaultdict(int)
+    total_sequences = 0
+    
+    for i in range(len(directions) - 2):
+        seq = tuple(directions[i:i+3])
+        dir_sequence_counts[seq] += 1
+        total_sequences += 1
+    
+    probabilities = {seq: count / total_sequences for seq, count in dir_sequence_counts.items()}
+    return probabilities
 
-    def run_backtest(self, prices):
-        n = len(prices); split_idx = int(n * 0.5); train_data = prices[:split_idx]
-        self.fit(train_data)
-        position = 0; entry_price = 0; test_indices = range(split_idx, n-1)
-        for t in test_indices:
-            window_start = t - self.max_seq_len; window = prices[window_start : t + 1]
-            sig = self.predict(window); curr_p = prices[t]
-            if position != 0:
-                self.equity.append(self.equity[-1] + (curr_p - entry_price) * position)
-                position = 0
-            else: self.equity.append(self.equity[-1])
-            if sig != 0: position = sig; entry_price = curr_p
-        return self.equity
+def generate_variants(last_two_prices: List[float], step: float = 1.0) -> List[List[float]]:
+    """Generate all sequences 1 step away from last two prices"""
+    p1, p2 = last_two_prices
+    
+    # Edit first price
+    variants_step1 = [
+        [p1 - step, p2],
+        [p1 + step, p2],
+        [p1, p2 - step],
+        [p1, p2 + step]
+    ]
+    
+    # Append third price with 1 step variations
+    variants_step2 = []
+    for var in variants_step1:
+        variants_step2.extend([
+            var + [p2 - step],
+            var + [p2],
+            var + [p2 + step]
+        ])
+    
+    return variants_step2
 
-# ==========================================
-# 4. Grid Search
-# ==========================================
-def perform_grid_search(train_data):
-    print("="*40 + "\nSTARTING GRID SEARCH\n" + "="*40)
-    r_len = range(2, 11); r_depth = range(1, 5); r_cats = range(10, 101, 10); r_boost = np.linspace(1, 5, 10)
-    best_sharpe = -999.0; best_params = {}
-    total_iterations = len(r_len) * len(r_depth) * len(r_cats) * len(r_boost); count = 0
-    for length, depth, cats, boost in itertools.product(r_len, r_depth, r_cats, r_boost):
-        count += 1; CONFIG["PREDICTION_BOOST"] = boost
-        trader = SequenceTrader(length, depth, cats, CONFIG["SIGNAL_THRESHOLD"], 0)
-        trader.run_backtest(train_data); sharpe = trader.calculate_sharpe()
-        if sharpe > best_sharpe:
-            best_sharpe = sharpe; best_params = {"MAX_SEQ_LEN": length, "EDIT_DEPTH": depth, "N_CATEGORIES": cats, "PREDICTION_BOOST": boost}
-            print(f"[{count}/{total_iterations}] New Best: {best_params} -> Sharpe: {sharpe:.4f}")
-        elif count % 200 == 0: print(f"[{count}/{total_iterations}] Current: L={length}, D={depth}, C={cats}, B={boost:.1f} -> Sharpe: {sharpe:.4f}")
-    return best_params
+def generate_directional_variants(price_diff: Tuple[float, float], step: float = 1.0) -> List[List[float]]:
+    """Generate directional variants"""
+    d1, d2 = price_diff
+    
+    # Edit directional values
+    variants_step1 = [
+        [d1 - step, d2],
+        [d1 + step, d2],
+        [d1, d2 - step],
+        [d1, d2 + step]
+    ]
+    
+    # Append third direction
+    variants_step2 = []
+    for var in variants_step1:
+        variants_step2.extend([
+            var + [d2 - step],
+            var + [d2],
+            var + [d2 + step]
+        ])
+    
+    return variants_step2
 
-# ==========================================
-# 5. GitHub Upload Logic
-# ==========================================
-def upload_plot_to_github(filename, repo, token, branch="main"):
-    try:
-        with open(filename, "rb") as f: encoded = base64.b64encode(f.read()).decode("utf-8")
-    except: return
-    url = f"https://api.github.com/repos/{repo}/contents/{filename}"; headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
-    resp = requests.get(url, headers=headers); sha = resp.json().get("sha") if resp.status_code == 200 else None
-    data = {"message": f"Update plot: {filename}", "content": encoded, "branch": branch}
-    if sha: data["sha"] = sha
-    requests.put(url, headers=headers, data=json.dumps(data))
+def predict_next_price(
+    last_two_prices: List[float],
+    price_probs: dict,
+    dir_probs: dict,
+    min_price: float,
+    max_price: float,
+    n_categories: int,
+    step: float = 1.0
+) -> Tuple[float, str]:
+    """Predict next price and action"""
+    
+    # Generate price variants
+    price_variants = generate_variants(last_two_prices, step)
+    
+    # Convert to directional
+    p_prev = last_two_prices[0]
+    directional = [last_two_prices[0] - p_prev, last_two_prices[1] - last_two_prices[0]]
+    dir_variants = generate_directional_variants(tuple(directional), step)
+    
+    best_prob = -1
+    best_prediction = None
+    
+    # Evaluate each variant
+    for i, p_var in enumerate(price_variants):
+        # Categorize price sequence
+        cat_seq = tuple(categorize_price(p, min_price, max_price, n_categories) for p in p_var)
+        price_prob = price_probs.get(cat_seq, 0)
+        
+        # Get directional sequence
+        dir_seq = tuple(dir_variants[i])
+        dir_prob = dir_probs.get(dir_seq, 0)
+        
+        # Combined probability
+        combined_prob = price_prob + dir_prob
+        
+        if combined_prob > best_prob:
+            best_prob = combined_prob
+            best_prediction = p_var[2]
+    
+    # Determine action
+    current_price = last_two_prices[1]
+    if best_prediction is None:
+        best_prediction = current_price
+    
+    if best_prediction > current_price:
+        action = "buy"
+    elif best_prediction < current_price:
+        action = "sell"
+    else:
+        action = "hold"
+    
+    return best_prediction, action
 
-# ==========================================
-# 6. Main Execution
-# ==========================================
+def evaluate_predictions(actual_prices: List[float], predictions: List[Tuple[float, str]]) -> Tuple[float, float, float]:
+    """Evaluate accuracy, equity, and Sharpe ratio"""
+    correct = 0
+    equity = 10000  # Starting equity
+    returns = []
+    position = 0  # 0: no position, 1: long, -1: short
+    entry_price = 0
+    
+    for i in range(len(predictions)):
+        pred_price, action = predictions[i]
+        actual = actual_prices[i]
+        
+        # Check direction accuracy
+        if i > 0:
+            actual_direction = actual - actual_prices[i-1]
+            pred_direction = pred_price - actual_prices[i-1]
+            if (actual_direction > 0 and pred_direction > 0) or \
+               (actual_direction < 0 and pred_direction < 0) or \
+               (actual_direction == 0 and pred_direction == 0):
+                correct += 1
+        
+        # Simulate trading
+        if action == "buy" and position == 0:
+            position = 1
+            entry_price = actual
+        elif action == "sell" and position == 1:
+            pnl = actual - entry_price
+            equity += pnl
+            returns.append(pnl / entry_price)
+            position = 0
+        elif action == "sell" and position == 0:
+            position = -1
+            entry_price = actual
+        elif action == "buy" and position == -1:
+            pnl = entry_price - actual
+            equity += pnl
+            returns.append(pnl / entry_price)
+            position = 0
+    
+    # Close any open position
+    if position != 0 and len(actual_prices) > 0:
+        final_price = actual_prices[-1]
+        if position == 1:
+            pnl = final_price - entry_price
+            equity += pnl
+            returns.append(pnl / entry_price)
+        else:
+            pnl = entry_price - final_price
+            equity += pnl
+            returns.append(pnl / entry_price)
+    
+    accuracy = correct / max(len(predictions) - 1, 1)
+    
+    # Sharpe ratio
+    if len(returns) > 0:
+        avg_return = sum(returns) / len(returns)
+        std_return = (sum((r - avg_return) ** 2 for r in returns) / len(returns)) ** 0.5
+        sharpe = avg_return / std_return if std_return > 0 else 0
+    else:
+        sharpe = 0
+    
+    return accuracy, equity, sharpe
+
 def main():
-    load_env()
-    try:
-        df = fetch_price_data(CONFIG["TICKER"], CONFIG["START_DATE"], CONFIG["END_DATE"])
-        prices = df['price'].values
-    except Exception as e: print(e); return
-    if CONFIG["ENABLE_GRID_SEARCH"]:
-        best_params = perform_grid_search(prices[:int(len(prices)*0.5)])
-        CONFIG.update(best_params)
-    trader = SequenceTrader(CONFIG["MAX_SEQ_LEN"], CONFIG["EDIT_DEPTH"], CONFIG["N_CATEGORIES"], CONFIG["SIGNAL_THRESHOLD"], CONFIG["DEBUG_PRINTS"])
-    equity = trader.run_backtest(prices)
-    trader.print_random_test_samples(prices, count=5)
-    sharpe = trader.calculate_sharpe()
-    print(f"Final Equity: ${equity[-1]:.2f}\nSharpe Ratio: {sharpe:.4f}")
-    plt.figure(figsize=(10, 6)); plt.plot(equity); plt.title(f'Equity (Sharpe: {sharpe:.2f})'); plt.savefig(CONFIG["PLOT_FILENAME_EQUITY"], dpi=CONFIG["PLOT_DPI"]); plt.close()
-    plt.figure(figsize=(12, 8)); plt.plot(prices); plt.axvline(x=int(len(prices)*0.5), color='blue')
-    if trader.bin_edges:
-        for edge in trader.bin_edges: plt.axhline(y=edge, color='red', alpha=0.3, linewidth=0.5)
-    plt.savefig(CONFIG["PLOT_FILENAME_PRICE"], dpi=CONFIG["PLOT_DPI"]); plt.close()
-    pat = os.environ.get("PAT"); repo = CONFIG["GITHUB_REPO"]
-    if pat:
-        upload_plot_to_github(CONFIG["PLOT_FILENAME_EQUITY"], repo, pat, CONFIG["GITHUB_BRANCH"])
-        upload_plot_to_github(CONFIG["PLOT_FILENAME_PRICE"], repo, pat, CONFIG["GITHUB_BRANCH"])
+    custom_print("=" * 60)
+    custom_print("Price Prediction Algorithm")
+    custom_print("=" * 60)
+    
+    # Parameters
+    n_prices = 20000
+    min_price = 100
+    max_price = 600
+    n_categories = 100
+    train_split = 0.7
+    step = 5.0
+    
+    custom_print(f"\nGenerating {n_prices} mock prices...")
+    prices = generate_prices(n_prices, min_price, max_price)
+    
+    # Split data
+    split_idx = int(n_prices * train_split)
+    train_prices = prices[:split_idx]
+    test_prices = prices[split_idx:]
+    
+    custom_print(f"Train set: {len(train_prices)} prices")
+    custom_print(f"Test set: {len(test_prices)} prices")
+    
+    # Compute probabilities on training set
+    custom_print("\nComputing price sequence probabilities...")
+    price_probs = compute_sequence_probabilities(train_prices, min_price, max_price, n_categories)
+    custom_print(f"Found {len(price_probs)} unique price sequences")
+    
+    custom_print("\nComputing directional sequence probabilities...")
+    dir_probs = compute_directional_probabilities(train_prices)
+    custom_print(f"Found {len(dir_probs)} unique directional sequences")
+    
+    # Make predictions
+    custom_print("\nGenerating predictions...")
+    predictions = []
+    
+    for i in range(2, len(test_prices)):
+        last_two = test_prices[i-2:i]
+        pred_price, action = predict_next_price(
+            last_two, price_probs, dir_probs, 
+            min_price, max_price, n_categories, step
+        )
+        predictions.append((pred_price, action))
+        
+        if i % 500 == 0:
+            custom_print(f"  Processed {i}/{len(test_prices)} test samples...")
+    
+    custom_print(f"\nGenerated {len(predictions)} predictions")
+    
+    # Evaluate
+    custom_print("\nEvaluating predictions...")
+    actual_test = test_prices[2:]
+    accuracy, equity, sharpe = evaluate_predictions(actual_test, predictions)
+    
+    custom_print("\n" + "=" * 60)
+    custom_print("RESULTS")
+    custom_print("=" * 60)
+    custom_print(f"Direction Accuracy: {accuracy:.2%}")
+    custom_print(f"Final Equity: ${equity:,.2f}")
+    custom_print(f"Sharpe Ratio: {sharpe:.4f}")
+    
+    # Show sample predictions
+    custom_print("\n" + "=" * 60)
+    custom_print("Sample Predictions (first 10):")
+    custom_print("=" * 60)
+    for i in range(min(10, len(predictions))):
+        actual = actual_test[i]
+        pred_price, action = predictions[i]
+        custom_print(f"Day {i+3}: Predicted={pred_price:.2f}, Actual={actual:.2f}, Action={action.upper()}")
+    
+    custom_print("\n" + "=" * 60)
+    custom_print("Execution Complete")
+    custom_print("=" * 60)
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()
