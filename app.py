@@ -119,18 +119,30 @@ class MarkovEngine:
         if last_val < self.num_categories:
             next_seq = input_seq + [('UP', last_val + 1)]
             score = self.calculate_log_prob(next_seq)
-            candidates.append({'action': 'BUY', 'score': score})
+            candidates.append({
+                'action': 'BUY', 
+                'score': score, 
+                'next_cat': last_val + 1
+            })
             
         # 2. Try DOWN
         if last_val > 1:
             next_seq = input_seq + [('DOWN', last_val - 1)]
             score = self.calculate_log_prob(next_seq)
-            candidates.append({'action': 'SELL', 'score': score})
+            candidates.append({
+                'action': 'SELL', 
+                'score': score, 
+                'next_cat': last_val - 1
+            })
             
         # 3. Try FLAT
         next_seq = input_seq + [('FLAT', last_val)]
         score = self.calculate_log_prob(next_seq)
-        candidates.append({'action': 'FLAT', 'score': score})
+        candidates.append({
+            'action': 'FLAT', 
+            'score': score, 
+            'next_cat': last_val
+        })
         
         # Sort by score (Highest Log Prob is best)
         candidates.sort(key=lambda x: x['score'], reverse=True)
@@ -196,11 +208,9 @@ if __name__ == "__main__":
     print(f"\nComparing Fixed Markov Windows: {LENGTHS_TO_TEST} on {SYMBOL}")
     print(f"Training Data: {split_idx} candles | Test Data: {len(full_seq) - split_idx} candles")
     print("\n" + "="*100)
-    print(f"{'IDX':<5} | {'ACTUAL':<8} | {'L=4 ACTION':<12} | {'L=5 ACTION':<12} | {'L=6 ACTION':<12} | {'L=7 ACTION':<12}")
-    print("-" * 100)
 
     # We iterate through the test set.
-    # We must ensure we have enough history for the max length (7)
+    # We must ensure we have enough history for the max length
     max_L = max(LENGTHS_TO_TEST)
     
     for i in range(split_idx, len(full_seq) - 1):
@@ -213,30 +223,30 @@ if __name__ == "__main__":
         if pct_change > 0.001: actual_move = "UP"
         elif pct_change < -0.001: actual_move = "DOWN"
 
-        row_str = f"{i:<5} | {actual_move:<8}"
+        print(f"IDX: {i:<5} | Actual: {actual_move:<5} ({pct_change*100:+.2f}%)")
         
         # Run each length
         for L in LENGTHS_TO_TEST:
-            # We need the PAST L candles ending at 'i'
-            # slice: [i - L + 1 : i + 1] includes index i
             if i < L: 
-                row_str += f" | {'N/A':<12}"
                 continue
                 
             input_window = full_seq[i - L + 1 : i + 1]
+            input_cats = [x[1] for x in input_window]
             
             # Predict
             prediction = engine.predict_next(input_window)
             action = prediction['action']
+            next_cat = prediction['next_cat']
+            
+            output_cats = input_cats + [next_cat]
             
             # Backtest
             backtesters[L].step(action, pct_change)
             
-            # Formatting
-            res_str = f"{action}"
-            row_str += f" | {res_str:<12}"
+            # Formatting (Convert lists to strings for nice display)
+            print(f"  L={L}: {str(input_cats):<35} -> {str(output_cats):<40} | {action}")
             
-        print(row_str)
+        print("-" * 100)
 
     # ==========================================================================
     # FINAL RESULTS
