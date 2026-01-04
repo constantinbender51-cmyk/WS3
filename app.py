@@ -22,7 +22,7 @@ CONFIG = {
     "MAX_SEQ_LEN": 4,        # Length of sequence to analyze (m)
     "EDIT_DEPTH": 1,         # Number of edits allowed
     "N_CATEGORIES": 20,      # Number of quantile bins
-    "SIGNAL_THRESHOLD": 2.5, # Combined probability score required to trade
+    "SIGNAL_THRESHOLD": 1, # Combined probability score required to trade
     
     # Debugging & Output
     "DEBUG_PRINTS": 10,      # Number of predictions to print
@@ -142,8 +142,10 @@ class SequenceTrader:
         
     def fit(self, train_prices):
         print(f"Training on {len(train_prices)} bars...")
-        _, self.bin_edges = pd.qcut(train_prices, self.n_categories, retbins=True, duplicates='drop')
+        # Learn bins: Use pd.cut for Equal-Width bins (uniform size) instead of Quantiles
+        _, self.bin_edges = pd.cut(train_prices, self.n_categories, retbins=True)
         
+        # Discretize
         train_cats = pd.cut(train_prices, bins=self.bin_edges, labels=False, include_lowest=True)
         train_cats = np.nan_to_num(train_cats, nan=0).astype(int)
         
@@ -370,7 +372,7 @@ def main():
     plt.figure(figsize=(12, 8))
     plt.plot(prices, label='Price', color='black', linewidth=1)
     
-    # Draw horizontal lines for bin edges (Quantiles)
+    # Draw horizontal lines for bin edges
     if trader.bin_edges is not None:
         for i, edge in enumerate(trader.bin_edges):
             # Skip extreme edges if they are effectively inf or equal to min/max
@@ -380,7 +382,7 @@ def main():
     split_idx = int(len(prices) * 0.5)
     plt.axvline(x=split_idx, color='blue', linestyle='-', linewidth=2, label='Train/Test Split')
     
-    plt.title(f'Price History vs {CONFIG["N_CATEGORIES"]} Training Quantiles')
+    plt.title(f'Price History vs {CONFIG["N_CATEGORIES"]} Equal-Width Bins')
     plt.xlabel('Bars (Days)')
     plt.ylabel('Price')
     plt.legend()
