@@ -26,7 +26,7 @@ CONFIG = {
     "EDIT_DEPTH": 1,         
     "N_CATEGORIES": 20,      
     "SIGNAL_THRESHOLD": 2.5,
-    "PREDICTION_BOOST": 1.5, # Multiplier for "Insert at End" probabilities
+    "PREDICTION_BOOST": 2, # Multiplier for "Insert at End" probabilities
     
     # Debugging & Output
     "DEBUG_PRINTS": 0,       
