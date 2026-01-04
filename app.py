@@ -236,8 +236,7 @@ class SequenceTrader:
             prob_d = dir_model.get_probability(seq_d)
             
             # 3. Apply Prediction Boost
-            # If the edit is an "Insert at End", multiply BOTH probabilities
-            # (or the sum, mathematically equivalent regarding ranking if > 0)
+            # If the edit is an "Insert at End", multiply probability
             multiplier = 1.0
             if var['type'] == 'insert' and var['meta'][0] == input_len:
                 multiplier = CONFIG["PREDICTION_BOOST"]
@@ -395,18 +394,22 @@ def perform_grid_search(train_data):
     print("="*40)
     
     # Ranges
-    r_len = range(2, 6)         # 2 to 5
+    r_len = range(2, 11)        # 2 to 10
     r_depth = range(1, 5)       # 1 to 4
     r_cats = range(10, 101, 10) # 10 to 100
+    r_boost = np.linspace(1, 5, 10) # 1 to 5 in 10 steps
     
     best_sharpe = -999.0
     best_params = {}
     
-    total_iterations = len(r_len) * len(r_depth) * len(r_cats)
+    total_iterations = len(r_len) * len(r_depth) * len(r_cats) * len(r_boost)
     count = 0
     
-    for length, depth, cats in itertools.product(r_len, r_depth, r_cats):
+    for length, depth, cats, boost in itertools.product(r_len, r_depth, r_cats, r_boost):
         count += 1
+        
+        # Update config dynamically for the current iteration
+        CONFIG["PREDICTION_BOOST"] = boost
         
         trader = SequenceTrader(
             max_seq_len=length,
@@ -424,12 +427,13 @@ def perform_grid_search(train_data):
             best_params = {
                 "MAX_SEQ_LEN": length,
                 "EDIT_DEPTH": depth,
-                "N_CATEGORIES": cats
+                "N_CATEGORIES": cats,
+                "PREDICTION_BOOST": boost
             }
             print(f"[{count}/{total_iterations}] New Best: {best_params} -> Sharpe: {sharpe:.4f}")
         else:
             if count % 100 == 0:
-                print(f"[{count}/{total_iterations}] Current: L={length}, D={depth}, C={cats} -> Sharpe: {sharpe:.4f}")
+                print(f"[{count}/{total_iterations}] Current: L={length}, D={depth}, C={cats}, B={boost:.1f} -> Sharpe: {sharpe:.4f}")
                 
     print("\n" + "="*40)
     print(f"GRID SEARCH COMPLETE. Best Params: {best_params} (Sharpe: {best_sharpe:.4f})")
