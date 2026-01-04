@@ -25,10 +25,11 @@ CONFIG = {
     "MAX_SEQ_LEN": 4,        
     "EDIT_DEPTH": 1,         
     "N_CATEGORIES": 20,      
-    "SIGNAL_THRESHOLD": 2.5, 
+    "SIGNAL_THRESHOLD": 2.5,
+    "PREDICTION_BOOST": 1.5, # Multiplier for "Insert at End" probabilities
     
     # Debugging & Output
-    "DEBUG_PRINTS": 0,       # Set to 0 to keep console clean for the 5 random samples
+    "DEBUG_PRINTS": 0,       
     "PRINT_DELAY": 0.1,     
     
     # Grid Search
@@ -201,11 +202,22 @@ class SequenceTrader:
         variations = self.generate_edits(input_seq, alphabet)
         best_var = None
         best_prob = -1.0
+        
+        input_len = len(input_seq)
+        
         for var in variations:
             prob = model.get_probability(var['seq'])
+            
+            # --- Apply Prediction Boost ---
+            # If the edit is an "Insert at End", multiply probability
+            if var['type'] == 'insert' and var['meta'][0] == input_len:
+                prob *= CONFIG["PREDICTION_BOOST"]
+            # ------------------------------
+            
             if prob > best_prob:
                 best_prob = prob
                 best_var = var
+                
         return best_var, best_prob
 
     def _analyze_window(self, window_prices):
