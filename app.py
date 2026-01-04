@@ -1,20 +1,29 @@
-import random
+import urllib.request
+import json
 import time
 import sys
-import json
-import urllib.request
+import random
 from collections import Counter, defaultdict
 from datetime import datetime
 
-def delayed_print(text, delay=0.1):
-    """Prints text with a specific delay to simulate a real-time feed."""
+# --- Configuration ---
+ASSETS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", 
+    "ADAUSDT", "DOGEUSDT", "TRXUSDT", "AVAXUSDT", "LINKUSDT"
+]
+BUCKET_DIVISORS = list(range(10, 110, 10)) # [10, 20, ..., 100]
+SEQ_LENGTHS = [3, 4, 5, 6]
+START_DATE = "2021-01-01" # Using 2021 to ensure faster processing while keeping enough data
+
+def delayed_print(text, delay=0.0):
     print(text)
     sys.stdout.flush()
-    time.sleep(delay)
+    if delay > 0:
+        time.sleep(delay)
 
-def get_binance_data(symbol="ETHUSDT", interval="1h", start_str="2018-01-01"):
-    """Fetches historical kline data from Binance public API."""
-    delayed_print(f"--- Fetching {symbol} {interval} data from Binance ---")
+def get_binance_data(symbol, interval="1h", start_str=START_DATE):
+    """Fetches historical kline data from Binance."""
+    delayed_print(f"[{symbol}] Fetching data...", delay=0.1)
     
     start_ts = int(datetime.strptime(start_str, "%Y-%m-%d").timestamp() * 1000)
     end_ts = int(time.time() * 1000)
@@ -34,182 +43,136 @@ def get_binance_data(symbol="ETHUSDT", interval="1h", start_str="2018-01-01"):
                 all_prices.extend(batch_prices)
                 current_start = data[-1][6] + 1
                 
-                date_str = datetime.fromtimestamp(current_start / 1000).strftime('%Y-%m')
-                sys.stdout.write(f"\rCollected {len(all_prices)} candles. Currently at {date_str}...")
-                sys.stdout.flush()
-                time.sleep(0.05) 
+                # Tiny sleep to avoid aggressive rate limiting
+                time.sleep(0.05)
         except Exception as e:
-            delayed_print(f"\nError fetching data: {e}")
-            break
+            delayed_print(f"Error fetching {symbol}: {e}")
+            return []
             
-    delayed_print(f"\nTotal data points fetched: {len(all_prices)}")
     return all_prices
 
-def get_percentile(price):
-    """Converts price to percentile buckets of 100."""
+def get_percentile(price, divisor):
+    """Converts price to bucket based on dynamic divisor."""
     if price >= 0:
-        return (int(price) // 100) + 1
+        return (int(price) // divisor) + 1
     else:
-        return (int(price + 1) // 100) - 1
+        return (int(price + 1) // divisor) - 1
 
-def run_analysis():
-    # 1. Get Real Data
-    prices = get_binance_data()
-    if len(prices) < 100:
-        delayed_print("Not enough data to run analysis.")
-        return
-
-    percentiles = [get_percentile(p) for p in prices]
+def evaluate_absolute_model(prices, divisor, seq_len):
+    """
+    Runs the Absolute Model analysis for a specific configuration.
+    Returns: (Directional Accuracy %, Valid Case Count)
+    """
+    # 1. Convert to buckets
+    buckets = [get_percentile(p, divisor) for p in prices]
     
-    split_idx = int(len(percentiles) * 0.7)
-    train_perc = percentiles[:split_idx]
-    test_perc = percentiles[split_idx:]
+    # 2. Split Data
+    split_idx = int(len(buckets) * 0.7)
+    train_data = buckets[:split_idx]
+    test_data = buckets[split_idx:]
     
-    all_train_values = list(set(train_perc))
-    all_train_changes = list(set(train_perc[j] - train_perc[j-1] for j in range(1, len(train_perc))))
-    
-    # 2. Training
+    # 3. Train
     abs_map = defaultdict(Counter)
-    der_map = defaultdict(Counter)
-
-    delayed_print("Training models on historical patterns...")
-    for i in range(split_idx - 5):
-        a_seq = tuple(percentiles[i:i+5])
-        a_succ = percentiles[i+5]
-        abs_map[a_seq][a_succ] += 1
-        
-        if i > 0:
-            d_seq = tuple(percentiles[j] - percentiles[j-1] for j in range(i, i+5))
-            d_succ = percentiles[i+5] - percentiles[i+4]
-            der_map[d_seq][d_succ] += 1
+    # Fallback list for random choice if needed (though we only care about valid signals here)
+    train_values = list(set(train_data))
     
-    delayed_print("Training complete.")
-
-    # 3. Testing with "Actionable" Filter
-    # "Standard" metrics (counting everything)
-    std_correct = {"abs": 0, "der": 0, "comb": 0, "rand": 0, "coin": 0}
+    for i in range(len(train_data) - seq_len):
+        seq = tuple(train_data[i : i+seq_len])
+        successor = train_data[i+seq_len]
+        abs_map[seq][successor] += 1
+        
+    # 4. Test (Directional Accuracy Only)
+    dir_correct = 0
+    dir_total = 0
     
-    # "Actionable" metrics (Prediction != Last Val, AND Exact Match)
-    act_correct = {"abs": 0, "der": 0, "comb": 0, "rand": 0, "coin": 0}
-    act_total   = {"abs": 0, "der": 0, "comb": 0, "rand": 0, "coin": 0}
-
-    # "Directional" metrics (Prediction != Last Val, AND Actual != Last Val)
-    # This excludes cases where market was flat, as requested.
-    dir_correct = {"abs": 0, "der": 0, "comb": 0, "rand": 0, "coin": 0}
-    dir_total   = {"abs": 0, "der": 0, "comb": 0, "rand": 0, "coin": 0}
+    # Pre-calculate prices to avoid index lookups in loop
+    # We need the original prices corresponding to the test buckets to determine actual direction
+    # This is an approximation since we dropped the exact price mapping, 
+    # but for "bucket direction" we can use the bucket values themselves.
     
-    total_samples = len(test_perc) - 5
-    delayed_print(f"Running analysis on {total_samples} test sequences...")
-
-    for i in range(total_samples):
-        curr_idx = split_idx + i
+    for i in range(len(test_data) - seq_len):
+        seq = tuple(test_data[i : i+seq_len])
+        last_val = seq[-1]
+        actual_val = test_data[i+seq_len]
         
-        a_seq = tuple(percentiles[curr_idx : curr_idx+5])
-        d_seq = tuple(percentiles[j] - percentiles[j-1] for j in range(curr_idx, curr_idx+5))
-        
-        last_val = a_seq[-1]
-        actual_val = percentiles[curr_idx+5]
-        
-        # Helper to process prediction stats
-        def process_pred(model_name, prediction):
-            # 1. Standard Accuracy
-            if prediction == actual_val:
-                std_correct[model_name] += 1
+        # Prediction
+        if seq in abs_map:
+            prediction = abs_map[seq].most_common(1)[0][0]
             
-            # Prediction Difference vs Actual Difference
+            # Prediction Difference
             pred_diff = prediction - last_val
             actual_diff = actual_val - last_val
-
-            # Only process if the model PREDICTS a move
-            if pred_diff != 0:
-                act_total[model_name] += 1
-                
-                # 2. Actionable Precision (Exact bucket match)
-                if prediction == actual_val:
-                    act_correct[model_name] += 1
-                
-                # 3. Conditional Directional Accuracy
-                # Only counts if the market ACTUALLY MOVED (Exclude flat outcomes)
-                if actual_diff != 0:
-                    dir_total[model_name] += 1
-                    
-                    # Correct if signs match
-                    if (pred_diff > 0 and actual_diff > 0) or (pred_diff < 0 and actual_diff < 0):
-                        dir_correct[model_name] += 1
-
-        # --- Benchmark 1: Global Random ---
-        rand_pred = random.choice(all_train_values)
-        process_pred("rand", rand_pred)
-
-        # --- Benchmark 2: 3-Sided Coin Flip (Local Random) ---
-        coin_move = random.choice([-1, 0, 1])
-        coin_pred = last_val + coin_move
-        process_pred("coin", coin_pred)
-
-        # --- Model 1: Absolute Only ---
-        if a_seq in abs_map:
-            pred_abs = abs_map[a_seq].most_common(1)[0][0]
-        else:
-            pred_abs = random.choice(all_train_values)
-        process_pred("abs", pred_abs)
-
-        # --- Model 2: Derivative Only ---
-        if d_seq in der_map:
-            pred_change = der_map[d_seq].most_common(1)[0][0]
-        else:
-            pred_change = random.choice(all_train_changes)
-        process_pred("der", last_val + pred_change)
-
-        # --- Model 3: Combined Consensus ---
-        abs_candidates = abs_map.get(a_seq, Counter())
-        der_candidates = der_map.get(d_seq, Counter())
-        
-        possible_next_vals = set(abs_candidates.keys())
-        for change in der_candidates.keys():
-            possible_next_vals.add(last_val + change)
             
-        if not possible_next_vals:
-            pred_comb = random.choice(all_train_values)
-        else:
-            best_val = None
-            max_combined_score = -1
-            for val in possible_next_vals:
-                implied_change = val - last_val
-                score = abs_candidates[val] + der_candidates[implied_change]
-                if score > max_combined_score:
-                    max_combined_score = score
-                    best_val = val
-            pred_comb = best_val
+            # Check Actionable Signal (Prediction is not Flat)
+            if pred_diff != 0:
+                # Check Volatility (Market is not Flat)
+                if actual_diff != 0:
+                    dir_total += 1
+                    # Check Direction Match
+                    if (pred_diff > 0 and actual_diff > 0) or (pred_diff < 0 and actual_diff < 0):
+                        dir_correct += 1
+                        
+    accuracy = (dir_correct / dir_total * 100) if dir_total > 0 else 0.0
+    return accuracy, dir_total
 
-        process_pred("comb", pred_comb)
-
-    # 4. Reporting
-    def calc_perc(correct, total):
-        return (correct / total * 100) if total > 0 else 0
-
-    delayed_print("\n--- STANDARD ACCURACY (Includes Inertia) ---")
-    delayed_print(f"Global Random: {calc_perc(std_correct['rand'], total_samples):.2f}%")
-    delayed_print(f"3-Sided Coin:  {calc_perc(std_correct['coin'], total_samples):.2f}%")
-    delayed_print(f"Absolute:      {calc_perc(std_correct['abs'], total_samples):.2f}%")
-    delayed_print(f"Derivative:    {calc_perc(std_correct['der'], total_samples):.2f}%")
-    delayed_print(f"Combined:      {calc_perc(std_correct['comb'], total_samples):.2f}%")
-
-    delayed_print("\n--- MOVEMENT PRECISION (Exact Bucket Match) ---")
-    delayed_print(f"Global Random: {calc_perc(act_correct['rand'], act_total['rand']):.2f}%  (Attempts: {act_total['rand']})")
-    delayed_print(f"3-Sided Coin:  {calc_perc(act_correct['coin'], act_total['coin']):.2f}%  (Attempts: {act_total['coin']})")
-    delayed_print(f"Absolute:      {calc_perc(act_correct['abs'], act_total['abs']):.2f}%  (Attempts: {act_total['abs']})")
-    delayed_print(f"Derivative:    {calc_perc(act_correct['der'], act_total['der']):.2f}%  (Attempts: {act_total['der']})")
-    delayed_print(f"Combined:      {calc_perc(act_correct['comb'], act_total['comb']):.2f}%  (Attempts: {act_total['comb']})")
-
-    delayed_print("\n--- CONDITIONAL DIRECTIONAL ACCURACY ---")
-    delayed_print("Measures: If model predicted move AND market moved, was direction correct?")
-    delayed_print("Formula: Correct Direction / (Total Direction Predictions - Flat Market Outcomes)")
+def run_grid_search():
+    delayed_print("--- STARTING CRYPTO GRID SEARCH ---")
+    delayed_print(f"Assets: {len(ASSETS)}")
+    delayed_print(f"Configs per Asset: {len(BUCKET_DIVISORS) * len(SEQ_LENGTHS)}")
+    delayed_print("-----------------------------------")
     
-    delayed_print(f"Global Random: {calc_perc(dir_correct['rand'], dir_total['rand']):.2f}%  (Valid Cases: {dir_total['rand']})")
-    delayed_print(f"3-Sided Coin:  {calc_perc(dir_correct['coin'], dir_total['coin']):.2f}%  (Valid Cases: {dir_total['coin']})")
-    delayed_print(f"Absolute:      {calc_perc(dir_correct['abs'], dir_total['abs']):.2f}%  (Valid Cases: {dir_total['abs']})")
-    delayed_print(f"Derivative:    {calc_perc(dir_correct['der'], dir_total['der']):.2f}%  (Valid Cases: {dir_total['der']})")
-    delayed_print(f"Combined:      {calc_perc(dir_correct['comb'], dir_total['comb']):.2f}%  (Valid Cases: {dir_total['comb']})")
+    results = [] # List of tuples: (Asset, Divisor, Length, Accuracy, Count)
+    
+    for asset in ASSETS:
+        prices = get_binance_data(asset)
+        if not prices:
+            continue
+            
+        delayed_print(f"[{asset}] Testing configurations...")
+        
+        for div in BUCKET_DIVISORS:
+            for length in SEQ_LENGTHS:
+                acc, count = evaluate_absolute_model(prices, div, length)
+                
+                # Filter out statistically insignificant results (e.g., less than 10 signals)
+                if count >= 30: 
+                    results.append({
+                        "Asset": asset,
+                        "Divisor": div,
+                        "Length": length,
+                        "Accuracy": acc,
+                        "Signals": count
+                    })
+    
+    # Sort by Accuracy Descending
+    results.sort(key=lambda x: x["Accuracy"], reverse=True)
+    
+    delayed_print("\n\n--- TOP 20 CONFIGURATIONS (Ranked by Directional Accuracy) ---")
+    delayed_print(f"{'RANK':<5} {'ASSET':<10} {'DIVISOR':<10} {'LENGTH':<8} {'ACCURACY':<10} {'SIGNALS':<10}")
+    delayed_print("-" * 60)
+    
+    for i, res in enumerate(results[:20]):
+        delayed_print(f"{i+1:<5} {res['Asset']:<10} {res['Divisor']:<10} {res['Length']:<8} {res['Accuracy']:.2f}%    {res['Signals']:<10}")
+
+    # Also find the best generic settings (Average across all assets)
+    delayed_print("\n--- BEST GENERIC SETTINGS (Avg Accuracy across assets) ---")
+    
+    config_scores = defaultdict(list)
+    for res in results:
+        key = (res['Divisor'], res['Length'])
+        config_scores[key].append(res['Accuracy'])
+        
+    avg_results = []
+    for (div, length), scores in config_scores.items():
+        if len(scores) > 3: # Only consider configs that worked for multiple assets
+            avg_acc = sum(scores) / len(scores)
+            avg_results.append((div, length, avg_acc, len(scores)))
+            
+    avg_results.sort(key=lambda x: x[2], reverse=True)
+    
+    delayed_print(f"{'DIVISOR':<10} {'LENGTH':<8} {'AVG ACC':<10} {'ASSETS COVERED'}")
+    for i, (div, length, acc, count) in enumerate(avg_results[:5]):
+        delayed_print(f"{div:<10} {length:<8} {acc:.2f}%     {count}")
 
 if __name__ == "__main__":
-    run_analysis()
+    run_grid_search()
