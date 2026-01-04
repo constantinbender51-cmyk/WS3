@@ -13,13 +13,10 @@ def get_percentile(price):
     """
     Converts price to percentile buckets of 100.
     Logic: 0-99 -> 1, 100-199 -> 2, etc.
-    Handles overflow: 10099 -> 101
-    Handles underflow: -99 -> -1, -100 -> -2
     """
     if price >= 0:
         return (int(price) // 100) + 1
     else:
-        # For negative prices: -1 to -100 is bucket -1
         return (int(price + 1) // 100) - 1
 
 def run_analysis():
@@ -28,21 +25,23 @@ def run_analysis():
     # 1. Create 10,000 mock prices
     prices = [5000]
     for _ in range(9999):
+        # Using a slightly volatile random walk
         change = random.randint(-150, 150)
         prices.append(prices[-1] + change)
     
     # 2. Convert to percentiles
     percentiles = [get_percentile(p) for p in prices]
     
-    # Split data 70/30
+    # Split data 70/30 (7000 train, 3000 test)
     split_idx = int(len(percentiles) * 0.7)
     train_data = percentiles[:split_idx]
     test_data = percentiles[split_idx:]
     
-    # Unique values for random benchmarks
     unique_train_percentiles = list(set(train_data))
+    num_test_sequences = len(test_data) - 5
     
-    delayed_print(f"Data generated. Train size: {len(train_data)}, Test size: {len(test_data)}")
+    delayed_print(f"Data generated. Train size: {len(train_data)}")
+    delayed_print(f"Test size: {len(test_data)} (Contains {num_test_sequences} sequences of 5)")
 
     # 3 & 4. Sequence counting (Percentiles)
     seq_counts = defaultdict(Counter)
@@ -53,34 +52,7 @@ def run_analysis():
     
     delayed_print("Sequence mapping for percentiles completed.")
 
-    # 5, 6, 7. Predict and Compute Accuracy (Percentiles + Random Benchmark)
-    correct_preds = 0
-    random_correct_preds = 0
-    total_preds = 0
-    
-    for i in range(len(test_data) - 5):
-        sequence = tuple(test_data[i:i+5])
-        actual = test_data[i+5]
-        
-        # Random Benchmark: Predict any random percentile that existed in training
-        random_prediction = random.choice(unique_train_percentiles)
-        if random_prediction == actual:
-            random_correct_preds += 1
-
-        if sequence in seq_counts:
-            # Predict the successor with the most counts
-            prediction = seq_counts[sequence].most_common(1)[0][0]
-            if prediction == actual:
-                correct_preds += 1
-            total_preds += 1
-            
-    perc_accuracy = (correct_preds / total_preds * 100) if total_preds > 0 else 0
-    rand_perc_accuracy = (random_correct_preds / (len(test_data) - 5) * 100)
-    
-    delayed_print(f"Percentile Prediction Accuracy: {perc_accuracy:.2f}%")
-    delayed_print(f"Random Percentile Benchmark: {rand_perc_accuracy:.2f}%")
-
-    # 8. Derivative dataset
+    # 8. Derivative dataset (Assume first derivative is 0)
     derivatives = [0]
     for i in range(1, len(percentiles)):
         derivatives.append(percentiles[i] - percentiles[i-1])
@@ -89,8 +61,6 @@ def run_analysis():
     test_deriv = derivatives[split_idx:]
     unique_train_deriv = list(set(train_deriv))
     
-    delayed_print("Derivative dataset created.")
-
     # 9. Sequence counting (Derivatives)
     deriv_seq_counts = defaultdict(Counter)
     for i in range(len(train_deriv) - 5):
@@ -100,38 +70,74 @@ def run_analysis():
         
     delayed_print("Sequence mapping for derivatives completed.")
 
-    # 10 & 11. Predict and Compute Accuracy (Derivatives + Random Benchmark)
-    d_correct_preds = 0
-    d_random_correct_preds = 0
-    d_total_preds = 0
+    # Prediction Loops
+    p_correct = 0
+    d_correct = 0
+    r_correct = 0
+    c_correct = 0
     
-    for i in range(len(test_deriv) - 5):
-        sequence = tuple(test_deriv[i:i+5])
-        actual = test_deriv[i+5]
+    for i in range(num_test_sequences):
+        # Actual values
+        seq_p = tuple(test_data[i:i+5])
+        act_p = test_data[i+5]
         
-        # Random Benchmark for Derivatives
-        d_random_prediction = random.choice(unique_train_deriv)
-        if d_random_prediction == actual:
-            d_random_correct_preds += 1
+        seq_d = tuple(test_deriv[i:i+5])
+        act_d = test_deriv[i+5]
+        
+        last_p = seq_p[-1]
 
-        if sequence in deriv_seq_counts:
-            prediction = deriv_seq_counts[sequence].most_common(1)[0][0]
-            if prediction == actual:
-                d_correct_preds += 1
-            d_total_preds += 1
+        # 1. Random Benchmark
+        if random.choice(unique_train_percentiles) == act_p:
+            r_correct += 1
+
+        # 2. Percentile Prediction
+        if seq_p in seq_counts:
+            if seq_counts[seq_p].most_common(1)[0][0] == act_p:
+                p_correct += 1
+        
+        # 3. Derivative Prediction
+        if seq_d in deriv_seq_counts:
+            if deriv_seq_counts[seq_d].most_common(1)[0][0] == act_d:
+                d_correct += 1
+        
+        # 4. Combined Prediction
+        # We combine counts by translating derivative outcomes into percentile outcomes
+        combined_votes = Counter()
+        
+        # Add absolute counts
+        if seq_p in seq_counts:
+            for val, count in seq_counts[seq_p].items():
+                combined_votes[val] += count
+        
+        # Add derivative counts (mapped to percentiles)
+        if seq_d in deriv_seq_counts:
+            for d_val, count in deriv_seq_counts[seq_d].items():
+                translated_p = last_p + d_val
+                combined_votes[translated_p] += count
+        
+        if combined_votes:
+            best_combined = combined_votes.most_common(1)[0][0]
+            if best_combined == act_p:
+                c_correct += 1
             
-    deriv_accuracy = (d_correct_preds / d_total_preds * 100) if d_total_preds > 0 else 0
-    rand_deriv_accuracy = (d_random_correct_preds / (len(test_deriv) - 5) * 100)
+    # Calculate Accuracies
+    acc_p = (p_correct / num_test_sequences) * 100
+    acc_d = (d_correct / num_test_sequences) * 100
+    acc_r = (r_correct / num_test_sequences) * 100
+    acc_c = (c_correct / num_test_sequences) * 100
     
     # 12. Final Results
     delayed_print("\n--- FINAL RESULTS ---")
-    delayed_print(f"Absolute Percentile Accuracy: {perc_accuracy:.2f}% (Bench: {rand_perc_accuracy:.2f}%)")
-    delayed_print(f"Derivative (Return) Accuracy: {deriv_accuracy:.2f}% (Bench: {rand_deriv_accuracy:.2f}%)")
+    delayed_print(f"Total Test Sequences: {num_test_sequences}")
+    delayed_print(f"Random Benchmark Accuracy: {acc_r:.2f}%")
+    delayed_print(f"Percentile Model Accuracy: {acc_p:.2f}%")
+    delayed_print(f"Derivative Model Accuracy: {acc_d:.2f}%")
+    delayed_print(f"Combined Model Accuracy:   {acc_c:.2f}%")
     
-    if deriv_accuracy > perc_accuracy:
-        delayed_print("Comparison: Derivative model is more predictable than the Absolute model.")
+    if acc_c > max(acc_p, acc_d):
+        delayed_print("Observation: The combined model improved prediction accuracy.")
     else:
-        delayed_print("Comparison: Absolute model is more predictable than the Derivative model.")
+        delayed_print("Observation: Combining models did not significantly outperform individual models.")
 
 if __name__ == "__main__":
     run_analysis()
