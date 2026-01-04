@@ -6,7 +6,7 @@ import urllib.request
 from collections import Counter, defaultdict
 from datetime import datetime
 
-def delayed_print(text, delay=0.5):
+def delayed_print(text, delay=0.1):
     """Prints text with a specific delay to simulate a real-time feed."""
     print(text)
     sys.stdout.flush()
@@ -89,10 +89,13 @@ def run_analysis():
     # "Standard" metrics (counting everything)
     std_correct = {"abs": 0, "der": 0, "comb": 0, "rand": 0, "coin": 0}
     
-    # "Actionable" metrics (only counting when PREDICTION != LAST_VAL)
-    # This measures: When the model predicts a move, is it right?
+    # "Actionable" metrics (Prediction != Last Val, AND Exact Match)
     act_correct = {"abs": 0, "der": 0, "comb": 0, "rand": 0, "coin": 0}
     act_total   = {"abs": 0, "der": 0, "comb": 0, "rand": 0, "coin": 0}
+
+    # "Directional" metrics (Prediction != Last Val, AND Sign Match)
+    dir_correct = {"abs": 0, "der": 0, "comb": 0, "rand": 0, "coin": 0}
+    dir_total   = {"abs": 0, "der": 0, "comb": 0, "rand": 0, "coin": 0}
     
     total_samples = len(test_perc) - 5
     delayed_print(f"Running analysis on {total_samples} test sequences...")
@@ -112,11 +115,23 @@ def run_analysis():
             if prediction == actual_val:
                 std_correct[model_name] += 1
             
-            # 2. Actionable Accuracy (Did we predict a move?)
-            if prediction != last_val:
+            # Prediction Difference vs Actual Difference
+            pred_diff = prediction - last_val
+            actual_diff = actual_val - last_val
+
+            # Only process "Actionable/Directional" if the model PREDICTS a move
+            if pred_diff != 0:
                 act_total[model_name] += 1
+                dir_total[model_name] += 1
+                
+                # 2. Actionable Precision (Exact bucket match)
                 if prediction == actual_val:
                     act_correct[model_name] += 1
+                
+                # 3. Directional Accuracy (Sign match)
+                # Correct if both > 0 OR both < 0
+                if (pred_diff > 0 and actual_diff > 0) or (pred_diff < 0 and actual_diff < 0):
+                    dir_correct[model_name] += 1
 
         # --- Benchmark 1: Global Random ---
         rand_pred = random.choice(all_train_values)
@@ -176,18 +191,20 @@ def run_analysis():
     delayed_print(f"Derivative:    {calc_perc(std_correct['der'], total_samples):.2f}%")
     delayed_print(f"Combined:      {calc_perc(std_correct['comb'], total_samples):.2f}%")
 
-    delayed_print("\n--- MOVEMENT PRECISION (Only when Move Predicted) ---")
-    delayed_print("Precision = Correct Direction / Total Direction Guesses")
-    
+    delayed_print("\n--- MOVEMENT PRECISION (Exact Bucket Match) ---")
     delayed_print(f"Global Random: {calc_perc(act_correct['rand'], act_total['rand']):.2f}%  (Attempts: {act_total['rand']})")
     delayed_print(f"3-Sided Coin:  {calc_perc(act_correct['coin'], act_total['coin']):.2f}%  (Attempts: {act_total['coin']})")
     delayed_print(f"Absolute:      {calc_perc(act_correct['abs'], act_total['abs']):.2f}%  (Attempts: {act_total['abs']})")
     delayed_print(f"Derivative:    {calc_perc(act_correct['der'], act_total['der']):.2f}%  (Attempts: {act_total['der']})")
     delayed_print(f"Combined:      {calc_perc(act_correct['comb'], act_total['comb']):.2f}%  (Attempts: {act_total['comb']})")
-    
-    delayed_print("\nAnalysis:")
-    delayed_print("3-Sided Coin is a tough local benchmark. If Absolute/Derivative beats it,")
-    delayed_print("it means the model is finding direction better than a 33/33/33 guess.")
+
+    delayed_print("\n--- DIRECTIONAL ACCURACY (Up/Down Correctness) ---")
+    delayed_print("Accuracy = Correct Direction / Total Direction Predictions")
+    delayed_print(f"Global Random: {calc_perc(dir_correct['rand'], dir_total['rand']):.2f}%")
+    delayed_print(f"3-Sided Coin:  {calc_perc(dir_correct['coin'], dir_total['coin']):.2f}%")
+    delayed_print(f"Absolute:      {calc_perc(dir_correct['abs'], dir_total['abs']):.2f}%")
+    delayed_print(f"Derivative:    {calc_perc(dir_correct['der'], dir_total['der']):.2f}%")
+    delayed_print(f"Combined:      {calc_perc(dir_correct['comb'], dir_total['comb']):.2f}%")
 
 if __name__ == "__main__":
     run_analysis()
