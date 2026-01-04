@@ -9,12 +9,7 @@ from datetime import datetime
 # --- CONFIGURATION ---
 SYMBOL = "ETHUSDT"
 INTERVAL = "1h"
-START_DATE = "2020-01-01" # Shortened slightly for faster grid search, adjust as needed
-
-def delayed_print(text, delay=0.0):
-    """Prints text. Delay removed for grid search speed, but kept signature."""
-    print(text)
-    sys.stdout.flush()
+START_DATE = "2020-01-01" 
 
 def get_binance_data(symbol=SYMBOL, interval=INTERVAL, start_str=START_DATE):
     """Fetches historical kline data from Binance public API."""
@@ -25,8 +20,6 @@ def get_binance_data(symbol=SYMBOL, interval=INTERVAL, start_str=START_DATE):
     
     all_prices = []
     current_start = start_ts
-    
-    # Simple loading bar vars
     total_time = end_ts - start_ts
     
     while current_start < end_ts:
@@ -41,7 +34,6 @@ def get_binance_data(symbol=SYMBOL, interval=INTERVAL, start_str=START_DATE):
                 all_prices.extend(batch_prices)
                 current_start = data[-1][6] + 1
                 
-                # Progress indicator
                 progress = (current_start - start_ts) / total_time
                 sys.stdout.write(f"\rDownload Progress: [{int(progress*20)*'#'}{(20-int(progress*20))*'-'}] {len(all_prices)} candles")
                 sys.stdout.flush()
@@ -63,7 +55,7 @@ def get_bucket(price, bucket_size):
 def evaluate_parameters(prices, bucket_size, seq_len):
     """
     Runs the analysis for specific parameters.
-    Returns the Directional Accuracy of the 'Combined' model.
+    Returns the BEST Directional Accuracy among (Abs, Der, Comb).
     """
     
     # 1. Preprocess Data based on Bucket Size
@@ -73,40 +65,63 @@ def evaluate_parameters(prices, bucket_size, seq_len):
     train_buckets = buckets[:split_idx]
     test_buckets = buckets[split_idx:]
     
+    # Need sets for fallback random choices if pattern unseen
+    all_train_values = list(set(train_buckets))
+    all_train_changes = list(set(train_buckets[j] - train_buckets[j-1] for j in range(1, len(train_buckets))))
+
     # 2. Training
     abs_map = defaultdict(Counter)
     der_map = defaultdict(Counter)
     
-    # Train on history
     for i in range(len(train_buckets) - seq_len):
         # Absolute Pattern
         a_seq = tuple(train_buckets[i : i + seq_len])
         a_succ = train_buckets[i + seq_len]
         abs_map[a_seq][a_succ] += 1
         
-        # Derivative Pattern (requires at least 1 previous point relative to start of seq)
+        # Derivative Pattern
         if i > 0:
             d_seq = tuple(train_buckets[j] - train_buckets[j-1] for j in range(i, i + seq_len))
             d_succ = train_buckets[i + seq_len] - train_buckets[i + seq_len - 1]
             der_map[d_seq][d_succ] += 1
 
-    # 3. Testing (Focusing on Combined Model Directional Accuracy)
-    dir_correct = 0
-    dir_total = 0 # Valid cases where market actually moved
+    # 3. Testing
+    # Stats: [correct_count, valid_total_count]
+    stats = {
+        "Absolute": [0, 0],
+        "Derivative": [0, 0],
+        "Combined": [0, 0]
+    }
     
     total_samples = len(test_buckets) - seq_len
     
     for i in range(total_samples):
         curr_idx = split_idx + i
         
-        # Build sequences from test data
+        # Current Sequences
         a_seq = tuple(buckets[curr_idx : curr_idx + seq_len])
         d_seq = tuple(buckets[j] - buckets[j-1] for j in range(curr_idx, curr_idx + seq_len))
         
         last_val = a_seq[-1]
         actual_val = buckets[curr_idx + seq_len]
-        
-        # --- Combined Consensus Logic ---
+        actual_diff = actual_val - last_val
+
+        # --- Predictions ---
+
+        # 1. Absolute Model
+        if a_seq in abs_map:
+            pred_abs = abs_map[a_seq].most_common(1)[0][0]
+        else:
+            pred_abs = random.choice(all_train_values)
+
+        # 2. Derivative Model
+        if d_seq in der_map:
+            pred_change = der_map[d_seq].most_common(1)[0][0]
+        else:
+            pred_change = random.choice(all_train_changes)
+        pred_der = last_val + pred_change
+
+        # 3. Combined Model
         abs_candidates = abs_map.get(a_seq, Counter())
         der_candidates = der_map.get(d_seq, Counter())
         
@@ -114,80 +129,96 @@ def evaluate_parameters(prices, bucket_size, seq_len):
         for change in der_candidates.keys():
             possible_next_vals.add(last_val + change)
             
-        pred_comb = last_val # Default to no move
-        
-        if possible_next_vals:
+        if not possible_next_vals:
+            pred_comb = random.choice(all_train_values)
+        else:
             best_val = None
             max_combined_score = -1
             for val in possible_next_vals:
                 implied_change = val - last_val
-                # Simple weighting: 1:1
                 score = abs_candidates[val] + der_candidates[implied_change]
                 if score > max_combined_score:
                     max_combined_score = score
                     best_val = val
             pred_comb = best_val
 
-        # --- Calculate Directional Accuracy ---
-        pred_diff = pred_comb - last_val
-        actual_diff = actual_val - last_val
-        
-        # Only count if Model predicted a move AND Market actually moved
-        if pred_diff != 0 and actual_diff != 0:
-            dir_total += 1
-            if (pred_diff > 0 and actual_diff > 0) or (pred_diff < 0 and actual_diff < 0):
-                dir_correct += 1
-                
-    if dir_total == 0:
-        return 0.0, 0
+        # --- Evaluate Direction for all 3 ---
+        # Helper to update stats
+        def update_stat(name, prediction):
+            pred_diff = prediction - last_val
+            # Condition: Model predicts move AND Market actually moves
+            if pred_diff != 0 and actual_diff != 0:
+                stats[name][1] += 1 # Total Valid
+                if (pred_diff > 0 and actual_diff > 0) or (pred_diff < 0 and actual_diff < 0):
+                    stats[name][0] += 1 # Correct
+
+        update_stat("Absolute", pred_abs)
+        update_stat("Derivative", pred_der)
+        update_stat("Combined", pred_comb)
+
+    # 4. Find Winner
+    best_acc = -1
+    best_model = "None"
+    best_trades = 0
+
+    for name, (correct, total) in stats.items():
+        if total > 0:
+            acc = (correct / total) * 100
+            if acc > best_acc:
+                best_acc = acc
+                best_model = name
+                best_trades = total
     
-    return (dir_correct / dir_total * 100), dir_total
+    if best_acc == -1: return 0.0, "None", 0
+
+    return best_acc, best_model, best_trades
 
 def run_grid_search():
-    # 1. Fetch Data Once
+    # 1. Fetch Data
     prices = get_binance_data()
     if len(prices) < 500:
         print("Not enough data.")
         return
 
     # 2. Define Grid
-    bucket_sizes = list(range(100, 9, -10)) # 100, 90, ... 10
+    bucket_sizes = list(range(100, 9, -10)) # 100, 90 ... 10
     seq_lengths = [3, 4, 5, 6]
     
     results = []
     
     print(f"\n--- Starting Grid Search ({len(bucket_sizes) * len(seq_lengths)} combinations) ---")
-    print(f"{'Bucket':<8} | {'SeqLen':<8} | {'Dir Acc %':<10} | {'Valid Trades':<12}")
-    print("-" * 45)
+    print(f"{'Bucket':<8} | {'SeqLen':<8} | {'Best Model':<12} | {'Dir Acc %':<10} | {'Trades':<8}")
+    print("-" * 60)
 
     start_time = time.time()
 
     for b_size in bucket_sizes:
         for s_len in seq_lengths:
-            accuracy, sample_size = evaluate_parameters(prices, b_size, s_len)
+            accuracy, model_name, trades = evaluate_parameters(prices, b_size, s_len)
             
-            # Filter out insignificant sample sizes (optional, prevents 100% acc on 1 trade)
-            if sample_size > 50: 
+            # Filter for statistical significance (e.g., >50 valid trades)
+            if trades > 50: 
                 results.append({
                     "bucket": b_size,
                     "seq_len": s_len,
+                    "model": model_name,
                     "accuracy": accuracy,
-                    "trades": sample_size
+                    "trades": trades
                 })
-                print(f"{b_size:<8} | {s_len:<8} | {accuracy:<10.2f} | {sample_size:<12}")
+                print(f"{b_size:<8} | {s_len:<8} | {model_name:<12} | {accuracy:<10.2f} | {trades:<8}")
             else:
-                 print(f"{b_size:<8} | {s_len:<8} | {'Low Data':<10} | {sample_size:<12}")
+                 print(f"{b_size:<8} | {s_len:<8} | {'Too Few Data':<12} | {'N/A':<10} | {trades:<8}")
 
     # 3. Sort and Display Best
-    print("\n" + "="*30)
-    print(" TOP 5 CONFIGURATIONS ")
-    print("="*30)
+    print("\n" + "="*40)
+    print(" TOP 10 CONFIGURATIONS (By Directional Acc) ")
+    print("="*40)
     
     # Sort by Accuracy Descending
     results.sort(key=lambda x: x['accuracy'], reverse=True)
     
-    for rank, res in enumerate(results[:5], 1):
-        print(f"#{rank}: Bucket {res['bucket']}, Len {res['seq_len']} -> {res['accuracy']:.2f}% ({res['trades']} trades)")
+    for rank, res in enumerate(results[:10], 1):
+        print(f"#{rank}: Bucket {res['bucket']}, Len {res['seq_len']} -> {res['model']} Model: {res['accuracy']:.2f}% ({res['trades']} trades)")
 
     print(f"\nGrid search completed in {time.time() - start_time:.2f} seconds.")
 
