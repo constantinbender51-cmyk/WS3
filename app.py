@@ -15,7 +15,7 @@ BUCKET_DIVISORS = list(range(10, 110, 10)) # [10, 20, ..., 100]
 SEQ_LENGTHS = [3, 4, 5, 6]
 START_DATE = "2021-01-01" # Using 2021 to ensure faster processing while keeping enough data
 
-def delayed_print(text, delay=0.0):
+def delayed_print(text, delay=0.1):
     print(text)
     sys.stdout.flush()
     if delay > 0:
