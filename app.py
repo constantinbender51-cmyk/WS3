@@ -30,7 +30,7 @@ CONFIG = {
     
     # Debugging & Output
     "DEBUG_PRINTS": 0,       
-    "PRINT_DELAY": 0.1,     
+    "PRINT_DELAY": 0.2,     
     
     # Grid Search
     "ENABLE_GRID_SEARCH": True,
