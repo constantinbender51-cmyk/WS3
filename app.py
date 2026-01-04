@@ -6,7 +6,7 @@ import urllib.request
 from collections import Counter, defaultdict
 from datetime import datetime
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION --- hi 
 SYMBOL = "ETHUSDT"
 INTERVAL = "1h"
 START_DATE = "2020-01-01" 
