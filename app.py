@@ -59,7 +59,7 @@ class MarketDataHandler:
         return sequence
 
 # ==============================================================================
-# 2. PROBABILISTIC ENGINE (Likelihood Based)
+# 2. PROBABILISTIC ENGINE (Variance-Normalized Z-Score)
 # ==============================================================================
 
 class MarkovEngine:
@@ -67,71 +67,104 @@ class MarkovEngine:
         self.num_categories = num_categories
         self.mom_map = {k: v for v, k in enumerate(['UP', 'DOWN', 'FLAT'])}
         
-        # Probabilities
         self.mom_trans = np.zeros((3, 3))
-        self.cat_trans = np.zeros((num_categories, num_categories))
-        
-        # We need start probs to handle the very first item's existence probability
         self.mom_start = np.zeros(3)
+        self.cat_trans = np.zeros((num_categories, num_categories))
         self.cat_start = np.zeros(num_categories)
+        self.stats = {} 
 
     def train(self, sequence):
         print("Training Markov Probabilities...")
-        mom_counts = np.ones((3, 3)) # Laplace smoothing (start at 1)
+        mom_counts = np.ones((3, 3)) 
         cat_counts = np.ones((self.num_categories, self.num_categories)) 
         
         for i in range(len(sequence) - 1):
             curr_mom, curr_cat = sequence[i]
             next_mom, next_cat = sequence[i+1]
-            
             m1, m2 = self.mom_map[curr_mom], self.mom_map[next_mom]
             c1, c2 = curr_cat - 1, next_cat - 1
-            
             mom_counts[m1][m2] += 1
             cat_counts[c1][c2] += 1
-            
             self.mom_start[m1] += 1
             self.cat_start[c1] += 1
 
-        # Normalize to probabilities (Sum of row = 1.0)
         self.mom_trans = mom_counts / mom_counts.sum(axis=1, keepdims=True)
         self.cat_trans = cat_counts / cat_counts.sum(axis=1, keepdims=True)
         self.mom_start = self.mom_start / self.mom_start.sum()
         self.cat_start = self.cat_start / self.cat_start.sum()
-        
-    def get_average_log_likelihood(self, seq):
-        """
-        Calculates the Average Log Likelihood per Transition.
-        This metric is independent of length.
-        """
+
+    def _get_raw_log_prob(self, seq):
+        """Calculates Total Log Probability (Joint Likelihood)."""
         if not seq: return -999.0
-        L = len(seq)
-        if L < 2: return -999.0 # Need at least 2 points for a transition
-        
         m_idxs = [self.mom_map[m] for m, c in seq]
         c_idxs = [c-1 for m, c in seq]
         
-        total_log_prob = 0.0
-        
-        # 1. Starting Probability (How likely is the start state?)
-        # We include this so "rare" starting points are penalized slightly
-        total_log_prob += math.log(self.mom_start[m_idxs[0]] + 1e-9)
-        total_log_prob += math.log(self.cat_start[c_idxs[0]] + 1e-9)
-        
-        # 2. Transition Probabilities
-        count = 1 # We counted the start
-        
-        for i in range(L - 1):
-            p_m = self.mom_trans[m_idxs[i]][m_idxs[i+1]]
-            p_c = self.cat_trans[c_idxs[i]][c_idxs[i+1]]
+        log_prob = 0.0
+        # Start Prob
+        log_prob += math.log(self.mom_start[m_idxs[0]] + 1e-9)
+        log_prob += math.log(self.cat_start[c_idxs[0]] + 1e-9)
+        # Transition Probs
+        for i in range(len(seq) - 1):
+            log_prob += math.log(self.mom_trans[m_idxs[i]][m_idxs[i+1]] + 1e-9)
+            log_prob += math.log(self.cat_trans[c_idxs[i]][c_idxs[i+1]] + 1e-9)
+        return log_prob
+
+    def calibrate(self, max_len=20, samples=2000):
+        """
+        Monte Carlo simulation to find the Mean and StdDev of log-probabilities
+        for RANDOM walks of each length.
+        """
+        print(f"Calibrating baseline statistics (Max Len: {max_len})...")
+        for length in range(1, max_len + 1):
+            logs = []
+            for _ in range(samples):
+                m = np.random.choice(3, p=self.mom_start)
+                c = np.random.choice(self.num_categories, p=self.cat_start)
+                m_hist, c_hist = [m], [c]
+                for _ in range(length - 1):
+                    m = np.random.choice(3, p=self.mom_trans[m])
+                    c = np.random.choice(self.num_categories, p=self.cat_trans[c])
+                    m_hist.append(m)
+                    c_hist.append(c)
+                
+                lp = math.log(self.mom_start[m_hist[0]] + 1e-9) + math.log(self.cat_start[c_hist[0]] + 1e-9)
+                for i in range(length - 1):
+                    lp += math.log(self.mom_trans[m_hist[i]][m_hist[i+1]] + 1e-9)
+                    lp += math.log(self.cat_trans[c_hist[i]][c_hist[i+1]] + 1e-9)
+                logs.append(lp)
             
-            total_log_prob += math.log(p_m + 1e-9)
-            total_log_prob += math.log(p_c + 1e-9)
-            count += 1
-            
-        # Return Average Log Likelihood
-        # Higher (closer to 0) is better.
-        return total_log_prob / count
+            self.stats[length] = {'mu': np.mean(logs), 'std': np.std(logs)}
+
+    def get_normalized_z_score(self, sequence):
+        """
+        Returns Z-Score divided by Sqrt(N).
+        This normalizes the "Accumulated Advantage" of length.
+        """
+        if not sequence: return 99.0
+        L = len(sequence)
+        if L not in self.stats: return 50.0 
+        
+        raw_lp = self._get_raw_log_prob(sequence)
+        mu = self.stats[L]['mu']
+        std = self.stats[L]['std']
+        
+        if std == 0: return 0
+        
+        # Standard Z: (X - Mu) / Std
+        # We invert it because low prob = high negative log. 
+        # We want High Prob = Low Score (Minimization)
+        # Actually, let's stick to Maximization for Z logic first:
+        # High prob = Less negative log = Higher value > Mean.
+        # So (raw_lp - mu) is positive for good sequences.
+        z = (raw_lp - mu) / std
+        
+        # CRITICAL FIX: Normalize by Square Root of Length
+        # This penalizes the linear accumulation of "winning" steps.
+        z_norm = z / math.sqrt(L)
+        
+        # Return negative so we can MINIMIZE it in the solver (Lowest is best)
+        # We want the HIGHEST z_norm to be the winner.
+        return -z_norm
 
 # ==============================================================================
 # 3. EVOLUTIONARY SOLVER
@@ -208,7 +241,7 @@ class EvolutionarySolver:
                         final_pool.append({'seq': new_tip, 'type': item['type'] + '+ext'})
                 current_tips = new_tips
 
-        # Evaluate based on Average Likelihood
+        # Evaluate based on Normalized Z-Score
         scored = []
         unique_hashes = set()
         
@@ -218,8 +251,8 @@ class EvolutionarySolver:
             if s_hash in unique_hashes: continue
             unique_hashes.add(s_hash)
             
-            # Score is Average Log Likelihood (Max is best, e.g. -0.5 is better than -2.0)
-            score = self.engine.get_average_log_likelihood(fixed_seq)
+            # Returns Negative Normalized Z (Lower is better)
+            score = self.engine.get_normalized_z_score(fixed_seq)
             
             scored.append({
                 'seq': fixed_seq, 
@@ -227,8 +260,8 @@ class EvolutionarySolver:
                 'type': cand['type']
             })
 
-        # Sort Descending (Highest Average Probability first)
-        scored.sort(key=lambda x: x['score'], reverse=True)
+        # Sort Ascending (Lowest negative score = Highest Positive Z)
+        scored.sort(key=lambda x: x['score'])
         return scored[0]
 
 # ==============================================================================
@@ -293,12 +326,15 @@ if __name__ == "__main__":
     engine = MarkovEngine(num_categories=NUM_BINS)
     engine.train(train_seq)
     
+    # Must calibrate for Normalized Z-Score to work!
+    engine.calibrate(max_len=WINDOW_SIZE + HORIZON + 5)
+    
     # Init Solver
     solver = EvolutionarySolver(engine, NUM_BINS)
     backtester = Backtester()
     
-    print(f"\nRunning Evolutionary Likelihood Solver...")
-    print(f"{'IDX':<5} | {'WINNER LEN':<10} | {'ACTION':<10} | {'AVG LOG-LIK':<12} | {'EQUITY':<12}")
+    print(f"\nRunning Variance-Normalized Z-Score Solver...")
+    print(f"{'IDX':<5} | {'WINNER LEN':<10} | {'ACTION':<10} | {'NORM Z':<12} | {'EQUITY':<12}")
     print("-" * 65)
     
     actions_count = Counter()
@@ -336,7 +372,9 @@ if __name__ == "__main__":
         if i % 25 == 0:
             len_delta = len(best_seq) - len(input_window)
             len_fmt = f"{len(best_seq)} ({len_delta:+})"
-            print(f"{i:<5} | {len_fmt:<10} | {action:<10} | {winner['score']:.4f}       | {backtester.equity[-1]:,.0f}")
+            # Winner score is negative Z, so we print -score to see positive Z
+            z_val = -winner['score']
+            print(f"{i:<5} | {len_fmt:<10} | {action:<10} | {z_val:.4f}       | {backtester.equity[-1]:,.0f}")
 
     stats = backtester.get_stats()
     
