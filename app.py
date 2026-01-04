@@ -26,7 +26,7 @@ CONFIG = {
     "EDIT_DEPTH": 1,         
     "N_CATEGORIES": 20,      
     "SIGNAL_THRESHOLD": 2.5,
-    "PREDICTION_BOOST": 5, # Multiplier for "Insert at End" probabilities
+    "PREDICTION_BOOST": 1.5, # Multiplier for "Insert at End" probabilities
     
     # Debugging & Output
     "DEBUG_PRINTS": 0,       
@@ -198,119 +198,131 @@ class SequenceTrader:
                     candidates.append({'seq': new_seq, 'type': 'swap', 'meta': (i, token)})
         return candidates
 
-    def get_best_variation(self, input_seq, model, alphabet):
-        variations = self.generate_edits(input_seq, alphabet)
+    def derive_direction_sequence(self, cat_sequence):
+        """
+        Derives the implied Direction sequence from a Category sequence.
+        Dirs[0] is always 0 (Flat).
+        Dirs[i] = Cat[i] - Cat[i-1]
+        """
+        if not cat_sequence:
+            return tuple()
+        
+        dirs = [0] * len(cat_sequence)
+        for i in range(1, len(cat_sequence)):
+            dirs[i] = cat_sequence[i] - cat_sequence[i-1]
+            
+        return tuple(dirs)
+
+    def get_best_joint_variation(self, input_c, cat_model, dir_model, cat_alphabet):
+        """
+        1. Generate edits on CATEGORIES.
+        2. Derive DIRECTIONS from the edited category sequence.
+        3. Score = P(cat) + P(dir).
+        """
+        # Generate variations of the Category Sequence
+        cat_variations = self.generate_edits(input_c, cat_alphabet)
+        
         best_var = None
-        best_prob = -1.0
+        best_joint_prob = -1.0
+        input_len = len(input_c)
         
-        input_len = len(input_seq)
-        
-        for var in variations:
-            prob = model.get_probability(var['seq'])
+        for var in cat_variations:
+            # 1. Get Category Probability
+            seq_c = var['seq']
+            prob_c = cat_model.get_probability(seq_c)
             
-            # --- Apply Prediction Boost ---
-            # If the edit is an "Insert at End", multiply probability
+            # 2. Derive Implied Direction Sequence & Get Probability
+            seq_d = self.derive_direction_sequence(seq_c)
+            prob_d = dir_model.get_probability(seq_d)
+            
+            # 3. Apply Prediction Boost
+            # If the edit is an "Insert at End", multiply BOTH probabilities
+            # (or the sum, mathematically equivalent regarding ranking if > 0)
+            multiplier = 1.0
             if var['type'] == 'insert' and var['meta'][0] == input_len:
-                prob *= CONFIG["PREDICTION_BOOST"]
-            # ------------------------------
+                multiplier = CONFIG["PREDICTION_BOOST"]
+                
+            joint_prob = (prob_c + prob_d) * multiplier
             
-            if prob > best_prob:
-                best_prob = prob
+            # 4. Track Best
+            if joint_prob > best_joint_prob:
+                best_joint_prob = joint_prob
+                # Store derived direction seq in meta for reference
+                var['derived_dir_seq'] = seq_d
+                var['prob_c'] = prob_c
+                var['prob_d'] = prob_d
                 best_var = var
                 
-        return best_var, best_prob
+        return best_var, best_joint_prob
 
     def _analyze_window(self, window_prices):
-        """Helper to get raw prediction data without executing trades."""
+        """Helper to get raw prediction data using Joint Optimization."""
         cat_seq, dir_seq = self.discretize_single_window(window_prices)
         input_len = self.max_seq_len - 1
         if len(cat_seq) < input_len: return None
         
         input_c = tuple(cat_seq[-input_len:])
-        input_d = tuple(dir_seq[-input_len:])
+        # input_d is strictly derived from input_c, but good to have for consistency check
         
+        # Alphabet: Valid Training Categories
         alph_c = list(range(self.n_categories))
-        alph_d = list(self.unique_dirs)
         
-        best_c, prob_c = self.get_best_variation(input_c, self.cat_model, alph_c)
-        best_d, prob_d = self.get_best_variation(input_d, self.dir_model, alph_d)
+        # JOINT OPTIMIZATION
+        best_var, joint_prob = self.get_best_joint_variation(input_c, self.cat_model, self.dir_model, alph_c)
         
         return {
             "input_c": input_c,
-            "input_d": input_d,
-            "best_c": best_c,
-            "prob_c": prob_c,
-            "best_d": best_d,
-            "prob_d": prob_d
+            "best_var": best_var,
+            "joint_prob": joint_prob
         }
 
     def predict(self, window_prices):
         data = self._analyze_window(window_prices)
         if not data: return 0
         
-        best_c = data["best_c"]
-        prob_c = data["prob_c"]
-        best_d = data["best_d"]
-        prob_d = data["prob_d"]
+        best_var = data["best_var"]
+        joint_prob = data["joint_prob"]
         input_c = data["input_c"]
-        input_d = data["input_d"]
         
         # Detect Extensions
-        c_is_ext = (best_c['type'] == 'insert' and best_c['meta'][0] == len(input_c))
-        d_is_ext = (best_d['type'] == 'insert' and best_d['meta'][0] == len(input_d))
+        is_ext = (best_var['type'] == 'insert' and best_var['meta'][0] == len(input_c))
         
         # --- Filtered Debug Print ---
-        if (c_is_ext or d_is_ext) and self.debug_count < self.debug_limit:
+        if is_ext and self.debug_count < self.debug_limit:
+            predicted_cat = best_var['meta'][1]
             msg = f">>> PREDICTION EVENT {self.debug_count + 1} <<<\n"
-            if c_is_ext:
-                msg += f"  [Category] Predict: Append {best_c['meta'][1]} (Prob: {prob_c:.4f})\n"
-            else:
-                msg += f"  [Category] No Extension (Type: {best_c['type']})\n"
-                
-            if d_is_ext:
-                msg += f"  [Directn]  Predict: Append {best_d['meta'][1]} (Prob: {prob_d:.4f})\n"
-            else:
-                msg += f"  [Directn]  No Extension (Type: {best_d['type']})\n"
-            
+            msg += f"  Input: {input_c}\n"
+            msg += f"  Predict Append: {predicted_cat}\n"
+            msg += f"  Joint Score: {joint_prob:.4f} (P_c: {best_var['prob_c']:.2f} + P_d: {best_var['prob_d']:.2f})\n"
             slow_print(msg)
             self.debug_count += 1
         # -------------------------------
 
-        signal_score = 0
-        combined_prob = prob_c + prob_d
-        
-        if c_is_ext:
-            pred_cat = best_c['meta'][1]
+        if is_ext:
+            pred_cat = best_var['meta'][1]
             curr_cat = input_c[-1]
-            if pred_cat > curr_cat: signal_score += combined_prob
-            elif pred_cat < curr_cat: signal_score -= combined_prob
             
-        if d_is_ext:
-            pred_dir = best_d['meta'][1]
-            if pred_dir > 0: signal_score += combined_prob
-            elif pred_dir < 0: signal_score -= combined_prob
-        
-        if signal_score > self.signal_threshold: return 1
-        if signal_score < -self.signal_threshold: return -1
+            if pred_cat > curr_cat:
+                if joint_prob > self.signal_threshold: return 1
+            elif pred_cat < curr_cat:
+                if joint_prob > self.signal_threshold: return -1
+                
         return 0
 
     def print_random_test_samples(self, prices, count=5):
-        """Prints Input/Output pairs for N random dates in the test set."""
         n = len(prices)
         split_idx = int(n * 0.5)
-        
-        # Range of valid indices for testing
         test_range = range(split_idx, n - 1)
         if len(test_range) < count:
-            print("Not enough test data to sample.")
+            print("Not enough test data.")
             return
 
         random_indices = random.sample(test_range, count)
-        random_indices.sort() # sort for readability
+        random_indices.sort()
         
-        print("\n" + "="*50)
-        print(f"RANDOM SAMPLES FROM TESTING SET (FINAL PARAMETERS)")
-        print("="*50)
+        print("\n" + "="*60)
+        print(f"RANDOM SAMPLES FROM TESTING SET (JOINT OPTIMIZATION)")
+        print("="*60)
         
         for idx in random_indices:
             window_start = idx - self.max_seq_len
@@ -318,35 +330,25 @@ class SequenceTrader:
             
             window = prices[window_start : idx + 1]
             data = self._analyze_window(window)
-            
             if not data: continue
             
-            best_c = data['best_c']
-            best_d = data['best_d']
+            var = data['best_var']
             
-            # Format Output Strings
-            out_c = "None"
-            if best_c['type'] == 'insert' and best_c['meta'][0] == len(data['input_c']):
-                out_c = f"Append {best_c['meta'][1]} (Prob: {data['prob_c']:.2f})"
+            out_str = "None"
+            if var['type'] == 'insert' and var['meta'][0] == len(data['input_c']):
+                out_str = f"Append {var['meta'][1]}"
             else:
-                out_c = f"{best_c['type']} (Prob: {data['prob_c']:.2f})"
-
-            out_d = "None"
-            if best_d['type'] == 'insert' and best_d['meta'][0] == len(data['input_d']):
-                out_d = f"Append {best_d['meta'][1]} (Prob: {data['prob_d']:.2f})"
-            else:
-                out_d = f"{best_d['type']} (Prob: {data['prob_d']:.2f})"
-            
+                out_str = f"{var['type']}"
+                
             slow_print(f"Sample Index: {idx}")
             slow_print(f"  Input Cat Sequence:  {data['input_c']}")
-            slow_print(f"  Result Cat Sequence: {best_c['seq']}")
-            slow_print(f"  Output Cat Signal:   {out_c}")
-            slow_print(f"  Input Dir Sequence:  {data['input_d']}")
-            slow_print(f"  Result Dir Sequence: {best_d['seq']}")
-            slow_print(f"  Output Dir Signal:   {out_d}")
-            slow_print("-" * 50)
+            slow_print(f"  Result Cat Sequence: {var['seq']}")
+            slow_print(f"  Result Dir Sequence: {var['derived_dir_seq']}")
+            slow_print(f"  Operation:           {out_str}")
+            slow_print(f"  Joint Score:         {data['joint_prob']:.4f}")
+            slow_print("-" * 60)
             
-        print("="*50 + "\n")
+        print("="*60 + "\n")
 
     def calculate_sharpe(self):
         eq_series = pd.Series(self.equity)
@@ -393,7 +395,7 @@ def perform_grid_search(train_data):
     print("="*40)
     
     # Ranges
-    r_len = range(2, 6)         # 2 to 5 (Restricted as requested)
+    r_len = range(2, 6)         # 2 to 5
     r_depth = range(1, 5)       # 1 to 4
     r_cats = range(10, 101, 10) # 10 to 100
     
