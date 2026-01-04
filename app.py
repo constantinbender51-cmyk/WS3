@@ -31,9 +31,6 @@ def run_analysis():
     test_perc = percentiles[split_idx:]
     
     # 2. Training: Build Global Frequency Maps
-    # abs_map: seq(5) -> Counter(successor)
-    # der_map: seq(5) -> Counter(successor_change) 
-    # Note: We use length 5 for both to match your requirement.
     abs_map = defaultdict(Counter)
     der_map = defaultdict(Counter)
 
@@ -44,7 +41,6 @@ def run_analysis():
         abs_map[a_seq][a_succ] += 1
         
         # Derivative sequence of 5 (using true history) and its successor
-        # To get a deriv seq of 5 ending at i+4, we need indices (i-1 to i+4)
         if i > 0:
             d_seq = tuple(percentiles[j] - percentiles[j-1] for j in range(i, i+5))
             d_succ = percentiles[i+5] - percentiles[i+4]
@@ -56,6 +52,12 @@ def run_analysis():
     correct_abs = 0
     correct_der = 0
     correct_comb = 0
+    
+    # Tracking counts where predictions were actually possible
+    total_abs_possible = 0
+    total_der_possible = 0
+    total_comb_possible = 0
+    
     total_samples = len(test_perc) - 5
     
     for i in range(total_samples):
@@ -71,49 +73,59 @@ def run_analysis():
         
         # --- Model 1: Absolute Only (Baseline) ---
         if a_seq in abs_map:
-            if abs_map[a_seq].most_common(1)[0][0] == actual_val:
-                correct_abs += 1
+            results = abs_map[a_seq].most_common(1)
+            if results: # Safety check for empty Counter
+                total_abs_possible += 1
+                if results[0][0] == actual_val:
+                    correct_abs += 1
 
         # --- Model 2: Derivative Only (Baseline) ---
         if d_seq in der_map:
-            pred_change = der_map[d_seq].most_common(1)[0][0]
-            if last_val + pred_change == actual_val:
-                correct_der += 1
+            results = der_map[d_seq].most_common(1)
+            if results:
+                total_der_possible += 1
+                pred_change = results[0][0]
+                if last_val + pred_change == actual_val:
+                    correct_der += 1
 
         # --- Model 3: Combined Consensus Model ---
-        # 1. Get all candidate successors from the absolute map
-        candidates = abs_map[a_seq] # Counter of {val: count}
+        candidates = abs_map.get(a_seq)
         
         if candidates:
             best_val = None
             max_combined_score = -1
             
             for val, abs_count in candidates.items():
-                # What change does this prediction imply?
                 implied_change = val - last_val
                 
-                # How many times has the derivative expert seen this change after this d_seq?
+                # Check how often this change occurred in the derivative expert's history
                 der_count = der_map[d_seq][implied_change]
                 
-                # Combined Score: Sum of counts
+                # Scoring: Absolute freq + Derivative freq
                 combined_score = abs_count + der_count
                 
                 if combined_score > max_combined_score:
                     max_combined_score = combined_score
                     best_val = val
             
-            if best_val == actual_val:
-                correct_comb += 1
+            if best_val is not None:
+                total_comb_possible += 1
+                if best_val == actual_val:
+                    correct_comb += 1
 
     # 4. Reporting
     delayed_print("\n--- FINAL RESULTS ---")
-    delayed_print(f"Absolute Model Accuracy:   {correct_abs/total_samples*100:.2f}%")
-    delayed_print(f"Derivative Model Accuracy: {correct_der/total_samples*100:.2f}%")
-    delayed_print(f"Combined Consensus Acc:    {correct_comb/total_samples*100:.2f}%")
     
-    delayed_print("\nLogic Explanation:")
-    delayed_print("The Combined model checks absolute candidates and weights them")
-    delayed_print("by how often the resulting momentum change has occurred in history.")
+    def calc_acc(correct, possible):
+        return (correct / possible * 100) if possible > 0 else 0
+
+    delayed_print(f"Absolute Model Accuracy:   {calc_acc(correct_abs, total_abs_possible):.2f}% (Coverage: {total_abs_possible}/{total_samples})")
+    delayed_print(f"Derivative Model Accuracy: {calc_acc(correct_der, total_der_possible):.2f}% (Coverage: {total_der_possible}/{total_samples})")
+    delayed_print(f"Combined Consensus Acc:    {calc_acc(correct_comb, total_comb_possible):.2f}% (Coverage: {total_comb_possible}/{total_samples})")
+    
+    delayed_print("\nAnalysis Summary:")
+    delayed_print("The combined model weights absolute candidates by their historical momentum frequency.")
+    delayed_print("The IndexError was fixed by ensuring 'most_common' is not called on unknown sequences.")
 
 if __name__ == "__main__":
     run_analysis()
