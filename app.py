@@ -1,8 +1,15 @@
 import yfinance as yf
 import math
+import time
 import numpy as np
 import pandas as pd
 from collections import Counter
+
+# Override print to slow down output for readability
+_builtin_print = print
+def print(*args, **kwargs):
+    time.sleep(0.5)
+    _builtin_print(*args, **kwargs)
 
 # ==============================================================================
 # 1. DATA HANDLER
