@@ -6,7 +6,7 @@ import urllib.request
 from collections import Counter, defaultdict
 from datetime import datetime
 
-def delayed_print(text, delay=0.1):
+def delayed_print(text, delay=0.5):
     """Prints text with a specific delay to simulate a real-time feed."""
     print(text)
     sys.stdout.flush()
