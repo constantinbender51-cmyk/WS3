@@ -20,19 +20,22 @@ CONFIG = {
     
     # Strategy / Model Parameters
     "MAX_SEQ_LEN": 4,        # Length of sequence to analyze (m)
-    "EDIT_DEPTH": 1,         # Number of edits allowed (insert/remove/swap)
-    "N_CATEGORIES": 20,      # Number of quantile bins for discretization
-    "SIGNAL_THRESHOLD": 0, # Combined probability score required to trigger a trade
+    "EDIT_DEPTH": 1,         # Number of edits allowed
+    "N_CATEGORIES": 20,      # Number of quantile bins
+    "SIGNAL_THRESHOLD": 2.5, # Combined probability score required to trade
     
     # Debugging & Output
-    "DEBUG_PRINTS": 10,      # Number of predictions to print to console
-    "PRINT_DELAY": 0.1,      # Delay in seconds for the slow print function
+    "DEBUG_PRINTS": 10,      # Number of predictions to print
+    "PRINT_DELAY": 0.1,      # Delay for slow print
+    
+    # Plotting
+    "PLOT_FILENAME_EQUITY": "equity_curve.png",
+    "PLOT_FILENAME_PRICE": "price_categories.png",
+    "PLOT_DPI": 100,         # Slightly higher DPI for readability of lines
     
     # GitHub Upload
     "GITHUB_REPO": "constantinbender51-cmyk/Models",
-    "GITHUB_BRANCH": "main",
-    "PLOT_FILENAME": "equity_curve.png",
-    "PLOT_DPI": 50
+    "GITHUB_BRANCH": "main"
 }
 
 # ==========================================
@@ -59,19 +62,13 @@ def slow_print(text, delay=CONFIG["PRINT_DELAY"]):
 # 1. Data Fetching (Real Data)
 # ==========================================
 def fetch_price_data(ticker, start, end):
-    """
-    Fetches daily price data from Yahoo Finance.
-    """
     print(f"Downloading data for {ticker} from {start} to {end}...")
     df = yf.download(ticker, start=start, end=end, progress=False)
     
     if df.empty:
-        raise ValueError(f"No data found for {ticker}. Check ticker symbol or date range.")
+        raise ValueError(f"No data found for {ticker}.")
 
-    # Handle yfinance versions that return MultiIndex columns
     price_series = None
-    
-    # Check for MultiIndex columns (e.g., ('Adj Close', 'SPY'))
     if isinstance(df.columns, pd.MultiIndex):
         try:
             price_series = df.xs('Adj Close', axis=1, level=0)
@@ -80,23 +77,19 @@ def fetch_price_data(ticker, start, end):
                 price_series = df.xs('Close', axis=1, level=0)
             except KeyError:
                 pass
-        
         if isinstance(price_series, pd.DataFrame):
             price_series = price_series.iloc[:, 0]
-            
     else:
-        # Standard flat columns
         if 'Adj Close' in df.columns:
             price_series = df['Adj Close']
         elif 'Close' in df.columns:
             price_series = df['Close']
 
     if price_series is None:
-         raise ValueError("Could not locate 'Close' or 'Adj Close' price data in response.")
+         raise ValueError("Could not locate price data.")
 
     clean_df = pd.DataFrame({'price': price_series.values})
     clean_df.dropna(inplace=True)
-    
     return clean_df
 
 # ==========================================
@@ -149,10 +142,8 @@ class SequenceTrader:
         
     def fit(self, train_prices):
         print(f"Training on {len(train_prices)} bars...")
-        # Learn bins
         _, self.bin_edges = pd.qcut(train_prices, self.n_categories, retbins=True, duplicates='drop')
         
-        # Discretize
         train_cats = pd.cut(train_prices, bins=self.bin_edges, labels=False, include_lowest=True)
         train_cats = np.nan_to_num(train_cats, nan=0).astype(int)
         
@@ -245,7 +236,6 @@ class SequenceTrader:
             if pred_dir > 0: signal_score += combined_prob
             elif pred_dir < 0: signal_score -= combined_prob
         
-        # Use configurable threshold
         if signal_score > self.signal_threshold: return 1
         if signal_score < -self.signal_threshold: return -1
         return 0
@@ -269,7 +259,6 @@ class SequenceTrader:
             sig = self.predict(window)
             curr_p = prices[t]
             
-            # PnL Calculation
             if position != 0:
                 pnl = (curr_p - entry_price) * position
                 self.equity.append(self.equity[-1] + pnl)
@@ -288,8 +277,12 @@ class SequenceTrader:
 def upload_plot_to_github(filename, repo, token, branch="main"):
     print(f"Preparing to upload {filename} to {repo}...")
     
-    with open(filename, "rb") as image_file:
-        encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
+    try:
+        with open(filename, "rb") as image_file:
+            encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
+    except FileNotFoundError:
+        print(f"File {filename} not found, skipping upload.")
+        return
 
     url = f"https://api.github.com/repos/{repo}/contents/{filename}"
     headers = {
@@ -301,10 +294,10 @@ def upload_plot_to_github(filename, repo, token, branch="main"):
     sha = None
     if check_response.status_code == 200:
         sha = check_response.json().get("sha")
-        print("File exists, overwriting...")
+        print(f"{filename} exists, overwriting...")
 
     data = {
-        "message": f"Update equity plot: {filename}",
+        "message": f"Update plot: {filename}",
         "content": encoded_string,
         "branch": branch
     }
@@ -314,19 +307,18 @@ def upload_plot_to_github(filename, repo, token, branch="main"):
     response = requests.put(url, headers=headers, data=json.dumps(data))
     
     if response.status_code in [200, 201]:
-        print("Successfully uploaded to GitHub.")
+        print(f"Successfully uploaded {filename} to GitHub.")
     else:
-        print(f"Failed to upload. Status: {response.status_code}")
+        print(f"Failed to upload {filename}. Status: {response.status_code}")
         print(response.text)
 
 # ==========================================
 # 5. Main Execution
 # ==========================================
 def main():
-    # 0. Load Environment Variables
     load_env()
     
-    # 1. Fetch Real Data
+    # 1. Fetch Data
     try:
         df = fetch_price_data(
             ticker=CONFIG["TICKER"], 
@@ -361,7 +353,7 @@ def main():
     print(f"Sharpe Ratio: {sharpe:.4f}")
     print("-" * 30)
 
-    # 4. Create Low-Res Plot
+    # 4. Generate Plot 1: Equity Curve
     plt.figure(figsize=(10, 6))
     plt.plot(equity, label='Strategy Equity')
     plt.title(f'Sequence Trader Results (Sharpe: {sharpe:.2f})')
@@ -370,21 +362,43 @@ def main():
     plt.legend()
     plt.grid(True)
     
-    plot_filename = CONFIG["PLOT_FILENAME"]
-    plt.savefig(plot_filename, dpi=CONFIG["PLOT_DPI"]) 
-    print(f"Plot saved locally as {plot_filename} (Low Res)")
+    plt.savefig(CONFIG["PLOT_FILENAME_EQUITY"], dpi=CONFIG["PLOT_DPI"]) 
+    print(f"Equity plot saved as {CONFIG['PLOT_FILENAME_EQUITY']}")
+    plt.close() # Close figure to free memory
+
+    # 5. Generate Plot 2: Price with Categories
+    plt.figure(figsize=(12, 8))
+    plt.plot(prices, label='Price', color='black', linewidth=1)
     
-    # 5. Upload to GitHub
+    # Draw horizontal lines for bin edges (Quantiles)
+    if trader.bin_edges is not None:
+        for i, edge in enumerate(trader.bin_edges):
+            # Skip extreme edges if they are effectively inf or equal to min/max
+            plt.axhline(y=edge, color='red', linestyle='--', alpha=0.3, linewidth=0.5)
+    
+    # Vertical line for Train/Test Split
+    split_idx = int(len(prices) * 0.5)
+    plt.axvline(x=split_idx, color='blue', linestyle='-', linewidth=2, label='Train/Test Split')
+    
+    plt.title(f'Price History vs {CONFIG["N_CATEGORIES"]} Training Quantiles')
+    plt.xlabel('Bars (Days)')
+    plt.ylabel('Price')
+    plt.legend()
+    # No grid for clearer view of bins
+    
+    plt.savefig(CONFIG["PLOT_FILENAME_PRICE"], dpi=CONFIG["PLOT_DPI"])
+    print(f"Price plot saved as {CONFIG['PLOT_FILENAME_PRICE']}")
+    plt.close()
+
+    # 6. Upload to GitHub
     pat = os.environ.get("PAT")
     repo = CONFIG["GITHUB_REPO"]
     
     if pat:
-        try:
-            upload_plot_to_github(plot_filename, repo, pat, CONFIG["GITHUB_BRANCH"])
-        except Exception as e:
-            print(f"Error during upload: {e}")
+        upload_plot_to_github(CONFIG["PLOT_FILENAME_EQUITY"], repo, pat, CONFIG["GITHUB_BRANCH"])
+        upload_plot_to_github(CONFIG["PLOT_FILENAME_PRICE"], repo, pat, CONFIG["GITHUB_BRANCH"])
     else:
-        print("Warning: 'PAT' not found in environment variables or .env file. Skipping upload.")
+        print("Warning: 'PAT' not found. Skipping upload.")
 
 if __name__ == "__main__":
     main()
