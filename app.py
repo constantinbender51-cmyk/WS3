@@ -20,10 +20,10 @@ GITHUB_PAT = os.environ.get('PAT', '')
 SYMBOL = "ETHUSDT"
 INTERVAL = "1h"
 START_YEAR = 2018
-N_CATEGORIES = 100
+N_CATEGORIES = 1000
 TRAIN_SPLIT = 0.8
 SEQUENCE_LENGTH = 4  # Using last 3 hours to predict the 4th
-CATEGORY_STEP = 1    # Range of "neighboring" sequences to check
+CATEGORY_STEP = 2   # Range of "neighboring" sequences to check
 STARTING_EQUITY = 10000
 
 # Penalty for predicting the same category as the current one.
