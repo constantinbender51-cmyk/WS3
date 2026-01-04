@@ -87,12 +87,12 @@ def run_analysis():
 
     # 3. Testing with "Actionable" Filter
     # "Standard" metrics (counting everything)
-    std_correct = {"abs": 0, "der": 0, "comb": 0, "rand": 0}
+    std_correct = {"abs": 0, "der": 0, "comb": 0, "rand": 0, "coin": 0}
     
     # "Actionable" metrics (only counting when PREDICTION != LAST_VAL)
     # This measures: When the model predicts a move, is it right?
-    act_correct = {"abs": 0, "der": 0, "comb": 0, "rand": 0}
-    act_total   = {"abs": 0, "der": 0, "comb": 0, "rand": 0}
+    act_correct = {"abs": 0, "der": 0, "comb": 0, "rand": 0, "coin": 0}
+    act_total   = {"abs": 0, "der": 0, "comb": 0, "rand": 0, "coin": 0}
     
     total_samples = len(test_perc) - 5
     delayed_print(f"Running analysis on {total_samples} test sequences...")
@@ -118,9 +118,15 @@ def run_analysis():
                 if prediction == actual_val:
                     act_correct[model_name] += 1
 
-        # --- Random Benchmark ---
+        # --- Benchmark 1: Global Random ---
         rand_pred = random.choice(all_train_values)
         process_pred("rand", rand_pred)
+
+        # --- Benchmark 2: 3-Sided Coin Flip (Local Random) ---
+        # Randomly choose -1 (Down), 0 (Same), or +1 (Up)
+        coin_move = random.choice([-1, 0, 1])
+        coin_pred = last_val + coin_move
+        process_pred("coin", coin_pred)
 
         # --- Model 1: Absolute Only ---
         if a_seq in abs_map:
@@ -164,22 +170,24 @@ def run_analysis():
         return (correct / total * 100) if total > 0 else 0
 
     delayed_print("\n--- STANDARD ACCURACY (Includes Inertia) ---")
-    delayed_print(f"Random:      {calc_perc(std_correct['rand'], total_samples):.2f}%")
-    delayed_print(f"Absolute:    {calc_perc(std_correct['abs'], total_samples):.2f}%")
-    delayed_print(f"Derivative:  {calc_perc(std_correct['der'], total_samples):.2f}%")
-    delayed_print(f"Combined:    {calc_perc(std_correct['comb'], total_samples):.2f}%")
+    delayed_print(f"Global Random: {calc_perc(std_correct['rand'], total_samples):.2f}%")
+    delayed_print(f"3-Sided Coin:  {calc_perc(std_correct['coin'], total_samples):.2f}%")
+    delayed_print(f"Absolute:      {calc_perc(std_correct['abs'], total_samples):.2f}%")
+    delayed_print(f"Derivative:    {calc_perc(std_correct['der'], total_samples):.2f}%")
+    delayed_print(f"Combined:      {calc_perc(std_correct['comb'], total_samples):.2f}%")
 
     delayed_print("\n--- MOVEMENT PRECISION (Only when Move Predicted) ---")
-    delayed_print("Precision = Correct Move Predictions / Total Move Predictions")
+    delayed_print("Precision = Correct Direction / Total Direction Guesses")
     
-    delayed_print(f"Random:      {calc_perc(act_correct['rand'], act_total['rand']):.2f}%  (Attempts: {act_total['rand']})")
-    delayed_print(f"Absolute:    {calc_perc(act_correct['abs'], act_total['abs']):.2f}%  (Attempts: {act_total['abs']})")
-    delayed_print(f"Derivative:  {calc_perc(act_correct['der'], act_total['der']):.2f}%  (Attempts: {act_total['der']})")
-    delayed_print(f"Combined:    {calc_perc(act_correct['comb'], act_total['comb']):.2f}%  (Attempts: {act_total['comb']})")
+    delayed_print(f"Global Random: {calc_perc(act_correct['rand'], act_total['rand']):.2f}%  (Attempts: {act_total['rand']})")
+    delayed_print(f"3-Sided Coin:  {calc_perc(act_correct['coin'], act_total['coin']):.2f}%  (Attempts: {act_total['coin']})")
+    delayed_print(f"Absolute:      {calc_perc(act_correct['abs'], act_total['abs']):.2f}%  (Attempts: {act_total['abs']})")
+    delayed_print(f"Derivative:    {calc_perc(act_correct['der'], act_total['der']):.2f}%  (Attempts: {act_total['der']})")
+    delayed_print(f"Combined:      {calc_perc(act_correct['comb'], act_total['comb']):.2f}%  (Attempts: {act_total['comb']})")
     
     delayed_print("\nAnalysis:")
-    delayed_print("Standard Accuracy is inflated by predicting 'No Change'.")
-    delayed_print("Movement Precision reveals if the model actually knows WHEN the price will jump.")
+    delayed_print("3-Sided Coin is a tough local benchmark. If Absolute/Derivative beats it,")
+    delayed_print("it means the model is finding direction better than a 33/33/33 guess.")
 
 if __name__ == "__main__":
     run_analysis()
