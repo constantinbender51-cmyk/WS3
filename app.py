@@ -10,6 +10,7 @@ import yfinance as yf
 import time
 import math
 import itertools
+import random
 
 # ==========================================
 # 0. Configuration & Parameters
@@ -20,15 +21,15 @@ CONFIG = {
     "START_DATE": "2020-01-01",
     "END_DATE": "2025-01-01",
     
-    # Strategy / Model Parameters (Defaults, will be overwritten by Grid Search)
+    # Strategy / Model Parameters (Defaults, overwritten by Grid Search)
     "MAX_SEQ_LEN": 4,        
     "EDIT_DEPTH": 1,         
     "N_CATEGORIES": 20,      
     "SIGNAL_THRESHOLD": 2.5, 
     
     # Debugging & Output
-    "DEBUG_PRINTS": 1000000, 
-    "PRINT_DELAY": 0.05,     
+    "DEBUG_PRINTS": 0,       # Set to 0 to keep console clean for the 5 random samples
+    "PRINT_DELAY": 0.1,     
     
     # Grid Search
     "ENABLE_GRID_SEARCH": True,
@@ -47,7 +48,6 @@ CONFIG = {
 # 0.1 Helper: Load .env manually
 # ==========================================
 def load_env():
-    """Loads environment variables from .env file if present."""
     if os.path.exists('.env'):
         with open('.env') as f:
             for line in f:
@@ -152,7 +152,6 @@ class SequenceTrader:
         self.debug_count = 0
         
     def fit(self, train_prices):
-        # Determine Min/Max and Bin Width
         self.train_min = np.min(train_prices)
         self.train_max = np.max(train_prices)
         price_range = self.train_max - self.train_min
@@ -161,7 +160,6 @@ class SequenceTrader:
         self.bin_width = price_range / self.n_categories
         self.bin_edges = [self.train_min + i * self.bin_width for i in range(self.n_categories + 1)]
         
-        # Discretize Training Data
         train_cats_raw = np.floor((train_prices - self.train_min) / self.bin_width).astype(int)
         train_cats = np.clip(train_cats_raw, 0, self.n_categories - 1)
         
@@ -210,10 +208,12 @@ class SequenceTrader:
                 best_var = var
         return best_var, best_prob
 
-    def predict(self, window_prices):
+    def _analyze_window(self, window_prices):
+        """Helper to get raw prediction data without executing trades."""
         cat_seq, dir_seq = self.discretize_single_window(window_prices)
         input_len = self.max_seq_len - 1
-        if len(cat_seq) < input_len: return 0
+        if len(cat_seq) < input_len: return None
+        
         input_c = tuple(cat_seq[-input_len:])
         input_d = tuple(dir_seq[-input_len:])
         
@@ -222,6 +222,26 @@ class SequenceTrader:
         
         best_c, prob_c = self.get_best_variation(input_c, self.cat_model, alph_c)
         best_d, prob_d = self.get_best_variation(input_d, self.dir_model, alph_d)
+        
+        return {
+            "input_c": input_c,
+            "input_d": input_d,
+            "best_c": best_c,
+            "prob_c": prob_c,
+            "best_d": best_d,
+            "prob_d": prob_d
+        }
+
+    def predict(self, window_prices):
+        data = self._analyze_window(window_prices)
+        if not data: return 0
+        
+        best_c = data["best_c"]
+        prob_c = data["prob_c"]
+        best_d = data["best_d"]
+        prob_d = data["prob_d"]
+        input_c = data["input_c"]
+        input_d = data["input_d"]
         
         # Detect Extensions
         c_is_ext = (best_c['type'] == 'insert' and best_c['meta'][0] == len(input_c))
@@ -262,6 +282,58 @@ class SequenceTrader:
         if signal_score < -self.signal_threshold: return -1
         return 0
 
+    def print_random_test_samples(self, prices, count=5):
+        """Prints Input/Output pairs for N random dates in the test set."""
+        n = len(prices)
+        split_idx = int(n * 0.5)
+        
+        # Range of valid indices for testing
+        test_range = range(split_idx, n - 1)
+        if len(test_range) < count:
+            print("Not enough test data to sample.")
+            return
+
+        random_indices = random.sample(test_range, count)
+        random_indices.sort() # sort for readability
+        
+        print("\n" + "="*50)
+        print(f"RANDOM SAMPLES FROM TESTING SET (FINAL PARAMETERS)")
+        print("="*50)
+        
+        for idx in random_indices:
+            window_start = idx - self.max_seq_len
+            if window_start < 0: continue
+            
+            window = prices[window_start : idx + 1]
+            data = self._analyze_window(window)
+            
+            if not data: continue
+            
+            best_c = data['best_c']
+            best_d = data['best_d']
+            
+            # Format Output Strings
+            out_c = "None"
+            if best_c['type'] == 'insert' and best_c['meta'][0] == len(data['input_c']):
+                out_c = f"Append {best_c['meta'][1]} (Prob: {data['prob_c']:.2f})"
+            else:
+                out_c = f"{best_c['type']} (Prob: {data['prob_c']:.2f})"
+
+            out_d = "None"
+            if best_d['type'] == 'insert' and best_d['meta'][0] == len(data['input_d']):
+                out_d = f"Append {best_d['meta'][1]} (Prob: {data['prob_d']:.2f})"
+            else:
+                out_d = f"{best_d['type']} (Prob: {data['prob_d']:.2f})"
+            
+            slow_print(f"Sample Index: {idx}")
+            slow_print(f"  Input Cat Sequence: {data['input_c']}")
+            slow_print(f"  Output Cat Signal:  {out_c}")
+            slow_print(f"  Input Dir Sequence: {data['input_d']}")
+            slow_print(f"  Output Dir Signal:  {out_d}")
+            slow_print("-" * 50)
+            
+        print("="*50 + "\n")
+
     def calculate_sharpe(self):
         eq_series = pd.Series(self.equity)
         if len(eq_series) < 2: return 0.0
@@ -273,7 +345,6 @@ class SequenceTrader:
         n = len(prices)
         split_idx = int(n * 0.5)
         train_data = prices[:split_idx]
-        test_data = prices[split_idx:]
         
         self.fit(train_data)
         
@@ -303,9 +374,6 @@ class SequenceTrader:
 # 4. Grid Search
 # ==========================================
 def perform_grid_search(train_data):
-    """
-    Optimizes params on the Training Data (which is further split 50/50 inside run_backtest).
-    """
     print("="*40)
     print("STARTING GRID SEARCH")
     print("="*40)
@@ -313,7 +381,7 @@ def perform_grid_search(train_data):
     # Ranges
     r_len = range(2, 11)        # 2 to 10
     r_depth = range(1, 5)       # 1 to 4
-    r_cats = range(10, 101, 10) # 10 to 100 in steps of 10
+    r_cats = range(10, 101, 10) # 10 to 100
     
     best_sharpe = -999.0
     best_params = {}
@@ -324,7 +392,6 @@ def perform_grid_search(train_data):
     for length, depth, cats in itertools.product(r_len, r_depth, r_cats):
         count += 1
         
-        # Initialize trader with debug=0 to be silent
         trader = SequenceTrader(
             max_seq_len=length,
             edit_depth=depth,
@@ -333,9 +400,6 @@ def perform_grid_search(train_data):
             debug_limit=0 
         )
         
-        # We pass the 'train_data' (which is the first 50% of the full dataset).
-        # run_backtest will split THIS data into 50% train (quarter 1) and 50% val (quarter 2).
-        # This provides a valid OOS metric for parameter selection.
         trader.run_backtest(train_data)
         sharpe = trader.calculate_sharpe()
         
@@ -348,8 +412,7 @@ def perform_grid_search(train_data):
             }
             print(f"[{count}/{total_iterations}] New Best: {best_params} -> Sharpe: {sharpe:.4f}")
         else:
-            # Optional: Print progress every N steps
-            if count % 20 == 0:
+            if count % 100 == 0:
                 print(f"[{count}/{total_iterations}] Current: L={length}, D={depth}, C={cats} -> Sharpe: {sharpe:.4f}")
                 
     print("\n" + "="*40)
@@ -408,16 +471,13 @@ def main():
     
     # 2. Grid Search
     if CONFIG["ENABLE_GRID_SEARCH"]:
-        # Isolate the training portion (first 50%)
         train_len = int(len(prices) * 0.5)
         training_data_subset = prices[:train_len]
         
         best_params = perform_grid_search(training_data_subset)
-        
-        # Apply Best Params
         CONFIG.update(best_params)
     
-    # 3. Final Backtest (on full data, testing on 2nd half)
+    # 3. Final Backtest
     print("Running Final Backtest with Optimized Parameters...")
     trader = SequenceTrader(
         max_seq_len=CONFIG["MAX_SEQ_LEN"],
@@ -427,8 +487,11 @@ def main():
         debug_limit=CONFIG["DEBUG_PRINTS"]
     )
     equity = trader.run_backtest(prices)
+    
+    # 3b. Sample 5 Random Dates
+    trader.print_random_test_samples(prices, count=5)
+
     sharpe = trader.calculate_sharpe()
-        
     print("-" * 30)
     print(f"Final Equity: ${equity[-1]:.2f}")
     print(f"Sharpe Ratio: {sharpe:.4f}")
