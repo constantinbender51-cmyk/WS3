@@ -93,7 +93,8 @@ def run_analysis():
     act_correct = {"abs": 0, "der": 0, "comb": 0, "rand": 0, "coin": 0}
     act_total   = {"abs": 0, "der": 0, "comb": 0, "rand": 0, "coin": 0}
 
-    # "Directional" metrics (Prediction != Last Val, AND Sign Match)
+    # "Directional" metrics (Prediction != Last Val, AND Actual != Last Val)
+    # This excludes cases where market was flat, as requested.
     dir_correct = {"abs": 0, "der": 0, "comb": 0, "rand": 0, "coin": 0}
     dir_total   = {"abs": 0, "der": 0, "comb": 0, "rand": 0, "coin": 0}
     
@@ -119,26 +120,28 @@ def run_analysis():
             pred_diff = prediction - last_val
             actual_diff = actual_val - last_val
 
-            # Only process "Actionable/Directional" if the model PREDICTS a move
+            # Only process if the model PREDICTS a move
             if pred_diff != 0:
                 act_total[model_name] += 1
-                dir_total[model_name] += 1
                 
                 # 2. Actionable Precision (Exact bucket match)
                 if prediction == actual_val:
                     act_correct[model_name] += 1
                 
-                # 3. Directional Accuracy (Sign match)
-                # Correct if both > 0 OR both < 0
-                if (pred_diff > 0 and actual_diff > 0) or (pred_diff < 0 and actual_diff < 0):
-                    dir_correct[model_name] += 1
+                # 3. Conditional Directional Accuracy
+                # Only counts if the market ACTUALLY MOVED (Exclude flat outcomes)
+                if actual_diff != 0:
+                    dir_total[model_name] += 1
+                    
+                    # Correct if signs match
+                    if (pred_diff > 0 and actual_diff > 0) or (pred_diff < 0 and actual_diff < 0):
+                        dir_correct[model_name] += 1
 
         # --- Benchmark 1: Global Random ---
         rand_pred = random.choice(all_train_values)
         process_pred("rand", rand_pred)
 
         # --- Benchmark 2: 3-Sided Coin Flip (Local Random) ---
-        # Randomly choose -1 (Down), 0 (Same), or +1 (Up)
         coin_move = random.choice([-1, 0, 1])
         coin_pred = last_val + coin_move
         process_pred("coin", coin_pred)
@@ -198,13 +201,15 @@ def run_analysis():
     delayed_print(f"Derivative:    {calc_perc(act_correct['der'], act_total['der']):.2f}%  (Attempts: {act_total['der']})")
     delayed_print(f"Combined:      {calc_perc(act_correct['comb'], act_total['comb']):.2f}%  (Attempts: {act_total['comb']})")
 
-    delayed_print("\n--- DIRECTIONAL ACCURACY (Up/Down Correctness) ---")
-    delayed_print("Accuracy = Correct Direction / Total Direction Predictions")
-    delayed_print(f"Global Random: {calc_perc(dir_correct['rand'], dir_total['rand']):.2f}%")
-    delayed_print(f"3-Sided Coin:  {calc_perc(dir_correct['coin'], dir_total['coin']):.2f}%")
-    delayed_print(f"Absolute:      {calc_perc(dir_correct['abs'], dir_total['abs']):.2f}%")
-    delayed_print(f"Derivative:    {calc_perc(dir_correct['der'], dir_total['der']):.2f}%")
-    delayed_print(f"Combined:      {calc_perc(dir_correct['comb'], dir_total['comb']):.2f}%")
+    delayed_print("\n--- CONDITIONAL DIRECTIONAL ACCURACY ---")
+    delayed_print("Measures: If model predicted move AND market moved, was direction correct?")
+    delayed_print("Formula: Correct Direction / (Total Direction Predictions - Flat Market Outcomes)")
+    
+    delayed_print(f"Global Random: {calc_perc(dir_correct['rand'], dir_total['rand']):.2f}%  (Valid Cases: {dir_total['rand']})")
+    delayed_print(f"3-Sided Coin:  {calc_perc(dir_correct['coin'], dir_total['coin']):.2f}%  (Valid Cases: {dir_total['coin']})")
+    delayed_print(f"Absolute:      {calc_perc(dir_correct['abs'], dir_total['abs']):.2f}%  (Valid Cases: {dir_total['abs']})")
+    delayed_print(f"Derivative:    {calc_perc(dir_correct['der'], dir_total['der']):.2f}%  (Valid Cases: {dir_total['der']})")
+    delayed_print(f"Combined:      {calc_perc(dir_correct['comb'], dir_total['comb']):.2f}%  (Valid Cases: {dir_total['comb']})")
 
 if __name__ == "__main__":
     run_analysis()
