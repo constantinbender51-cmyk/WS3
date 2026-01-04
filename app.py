@@ -7,6 +7,7 @@ import requests
 import base64
 import json
 import yfinance as yf
+import time
 
 # ==========================================
 # 0. Helper: Load .env manually
@@ -20,6 +21,13 @@ def load_env():
                 if line and not line.startswith('#') and '=' in line:
                     key, value = line.split('=', 1)
                     os.environ[key] = value.strip()
+
+# ==========================================
+# 0.1 Helper: Slow Print
+# ==========================================
+def slow_print(text, delay=0.1):
+    print(text)
+    time.sleep(delay)
 
 # ==========================================
 # 1. Data Fetching (Real Data)
@@ -112,6 +120,7 @@ class SequenceTrader:
         self.bin_edges = None
         self.unique_dirs = set()
         self.equity = [1000.0]
+        self.debug_count = 0
         
     def fit(self, train_prices):
         print(f"Training on {len(train_prices)} bars...")
@@ -182,6 +191,19 @@ class SequenceTrader:
         best_c, prob_c = self.get_best_variation(input_c, self.cat_model, alph_c)
         best_d, prob_d = self.get_best_variation(input_d, self.dir_model, alph_d)
         
+        # --- Debug Print (First 10) ---
+        if self.debug_count < 10:
+            msg = (f"--- Prediction {self.debug_count + 1} ---\n"
+                   f"Input Cats: {input_c}\n"
+                   f"  -> Best Var: {best_c['seq']}\n"
+                   f"  -> Type: {best_c['type']}, Prob: {prob_c:.4f}\n"
+                   f"Input Dirs: {input_d}\n"
+                   f"  -> Best Var: {best_d['seq']}\n"
+                   f"  -> Type: {best_d['type']}, Prob: {prob_d:.4f}")
+            slow_print(msg)
+            self.debug_count += 1
+        # -------------------------------
+
         signal_score = 0
         c_is_ext = (best_c['type'] == 'insert' and best_c['meta'][0] == len(input_c))
         d_is_ext = (best_d['type'] == 'insert' and best_d['meta'][0] == len(input_d))
