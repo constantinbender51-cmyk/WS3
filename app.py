@@ -8,6 +8,7 @@ import base64
 import json
 import yfinance as yf
 import time
+import math
 
 # ==========================================
 # 0. Configuration & Parameters
@@ -21,8 +22,8 @@ CONFIG = {
     # Strategy / Model Parameters
     "MAX_SEQ_LEN": 4,        # Length of sequence to analyze (m)
     "EDIT_DEPTH": 1,         # Number of edits allowed
-    "N_CATEGORIES": 20,      # Number of quantile bins
-    "SIGNAL_THRESHOLD": 1, # Combined probability score required to trade
+    "N_CATEGORIES": 20,      # Number of equal-width bins
+    "SIGNAL_THRESHOLD": 2.5, # Combined probability score required to trade
     
     # Debugging & Output
     "DEBUG_PRINTS": 10,      # Number of predictions to print
@@ -115,6 +116,10 @@ class SequenceModel:
         length = len(sequence_tuple)
         if length == 0 or length > self.max_len: return 0.0
         count = self.counts.get(sequence_tuple, 0)
+        
+        # If the sequence was never seen (e.g., contains out-of-bounds categories),
+        # count will be 0, and we return 0.0. This handles the user requirement.
+        
         num_unique = len(self.unique_patterns_by_len[length])
         if num_unique == 0: return 0.0
         total_occurrences = self.total_counts_by_len[length]
@@ -135,19 +140,40 @@ class SequenceTrader:
         
         self.cat_model = SequenceModel(max_seq_len)
         self.dir_model = SequenceModel(max_seq_len)
-        self.bin_edges = None
+        
+        # Discretization state
+        self.train_min = None
+        self.train_max = None
+        self.bin_width = None
+        self.bin_edges = None # Kept for plotting
+        
         self.unique_dirs = set()
         self.equity = [1000.0]
         self.debug_count = 0
         
     def fit(self, train_prices):
         print(f"Training on {len(train_prices)} bars...")
-        # Learn bins: Use pd.cut for Equal-Width bins (uniform size) instead of Quantiles
-        _, self.bin_edges = pd.cut(train_prices, self.n_categories, retbins=True)
         
-        # Discretize
-        train_cats = pd.cut(train_prices, bins=self.bin_edges, labels=False, include_lowest=True)
-        train_cats = np.nan_to_num(train_cats, nan=0).astype(int)
+        # 1. Determine Min/Max and Bin Width
+        self.train_min = np.min(train_prices)
+        self.train_max = np.max(train_prices)
+        price_range = self.train_max - self.train_min
+        
+        # Avoid division by zero
+        if price_range == 0: price_range = 1.0
+        
+        self.bin_width = price_range / self.n_categories
+        
+        # Store edges for plotting later
+        self.bin_edges = [self.train_min + i * self.bin_width for i in range(self.n_categories + 1)]
+        
+        # 2. Discretize Training Data
+        # We use the mathematical formula: floor((price - min) / width)
+        # We clamp strictly to 0..N-1 for training to match standard indices
+        train_cats_raw = np.floor((train_prices - self.train_min) / self.bin_width).astype(int)
+        
+        # Handle the exact max case (it falls in bin N, needs to be N-1)
+        train_cats = np.clip(train_cats_raw, 0, self.n_categories - 1)
         
         train_dirs = [0] * len(train_cats)
         for i in range(1, len(train_cats)):
@@ -159,14 +185,29 @@ class SequenceTrader:
         print("Training Complete.")
 
     def discretize_single_window(self, prices):
-        cats = pd.cut(prices, bins=self.bin_edges, labels=False, include_lowest=True)
-        max_cat = len(self.bin_edges) - 2 
-        cats = np.nan_to_num(cats, nan=0)
-        cats = np.clip(cats, 0, max_cat).astype(int)
+        """
+        Calculates 'Virtual' bins based on training width.
+        Does NOT clamp. Allows bins < 0 and > N.
+        """
+        # Math formula: floor((price - train_min) / bin_width)
+        # Note: We do not clip here. 
+        # Prices > train_max will get bin index >= n_categories.
+        # Prices < train_min will get bin index < 0.
+        
+        raw_cats = np.floor((prices - self.train_min) / self.bin_width).astype(int)
+        
+        # Special handling: if we want to be consistent with Training where exact Max = N-1,
+        # we generally leave it raw for testing.
+        # E.g. If P = Max + epsilon, bin is N. That's a valid "virtual" bin.
+        
+        cats = list(raw_cats)
+        
+        # Directions are difference of virtual bins
         dirs = [0] * len(cats)
         for i in range(1, len(cats)):
             dirs[i] = cats[i] - cats[i-1]
-        return list(cats), dirs
+            
+        return cats, dirs
 
     def generate_edits(self, seq, alphabet):
         candidates = [{'seq': seq, 'type': 'original', 'meta': None}]
@@ -203,7 +244,11 @@ class SequenceTrader:
         if len(cat_seq) < input_len: return 0
         input_c = tuple(cat_seq[-input_len:])
         input_d = tuple(dir_seq[-input_len:])
-        alph_c = list(range(len(self.bin_edges)-1))
+        
+        # Alphabet for edits:
+        # Categories: Only 0 to N-1 (Known Training Categories)
+        alph_c = list(range(self.n_categories))
+        # Directions: Known Training Directions
         alph_d = list(self.unique_dirs)
         
         best_c, prob_c = self.get_best_variation(input_c, self.cat_model, alph_c)
@@ -212,10 +257,10 @@ class SequenceTrader:
         # --- Debug Print ---
         if self.debug_count < self.debug_limit:
             msg = (f"--- Prediction {self.debug_count + 1} ---\n"
-                   f"Input Cats: {input_c}\n"
+                   f"Input Cats: {input_c} (Prob: {self.cat_model.get_probability(input_c):.4f})\n"
                    f"  -> Best Var: {best_c['seq']}\n"
                    f"  -> Type: {best_c['type']}, Prob: {prob_c:.4f}\n"
-                   f"Input Dirs: {input_d}\n"
+                   f"Input Dirs: {input_d} (Prob: {self.dir_model.get_probability(input_d):.4f})\n"
                    f"  -> Best Var: {best_d['seq']}\n"
                    f"  -> Type: {best_d['type']}, Prob: {prob_d:.4f}")
             slow_print(msg)
