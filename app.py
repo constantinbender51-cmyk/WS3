@@ -16,14 +16,12 @@ def get_binance_data(symbol="ETHUSDT", interval="1h", start_str="2018-01-01"):
     """Fetches historical kline data from Binance public API."""
     delayed_print(f"--- Fetching {symbol} {interval} data from Binance ---")
     
-    # Convert start date to milliseconds
     start_ts = int(datetime.strptime(start_str, "%Y-%m-%d").timestamp() * 1000)
     end_ts = int(time.time() * 1000)
     
     all_prices = []
     current_start = start_ts
     
-    # Binance limit is 1000 per request
     while current_start < end_ts:
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&startTime={current_start}&limit=1000"
         try:
@@ -32,20 +30,14 @@ def get_binance_data(symbol="ETHUSDT", interval="1h", start_str="2018-01-01"):
                 if not data:
                     break
                 
-                # Close price is at index 4
                 batch_prices = [float(candle[4]) for candle in data]
                 all_prices.extend(batch_prices)
-                
-                # Update start time to the open time of the next candle
                 current_start = data[-1][6] + 1
                 
-                # Simple progress log
                 date_str = datetime.fromtimestamp(current_start / 1000).strftime('%Y-%m')
                 sys.stdout.write(f"\rCollected {len(all_prices)} candles. Currently at {date_str}...")
                 sys.stdout.flush()
-                
-                # Small sleep to avoid rate limiting
-                time.sleep(0.1)
+                time.sleep(0.05) 
         except Exception as e:
             delayed_print(f"\nError fetching data: {e}")
             break
@@ -54,7 +46,7 @@ def get_binance_data(symbol="ETHUSDT", interval="1h", start_str="2018-01-01"):
     return all_prices
 
 def get_percentile(price):
-    """Converts price to percentile buckets of 100 (e.g., 2450 -> 25)."""
+    """Converts price to percentile buckets of 100."""
     if price >= 0:
         return (int(price) // 100) + 1
     else:
@@ -73,11 +65,10 @@ def run_analysis():
     train_perc = percentiles[:split_idx]
     test_perc = percentiles[split_idx:]
     
-    # Unique values from training for benchmarks and fallbacks
     all_train_values = list(set(train_perc))
     all_train_changes = list(set(train_perc[j] - train_perc[j-1] for j in range(1, len(train_perc))))
     
-    # 2. Training: Build Global Frequency Maps
+    # 2. Training
     abs_map = defaultdict(Counter)
     der_map = defaultdict(Counter)
 
@@ -94,11 +85,14 @@ def run_analysis():
     
     delayed_print("Training complete.")
 
-    # 3. Testing
-    correct_abs = 0
-    correct_der = 0
-    correct_comb = 0
-    correct_rand = 0 
+    # 3. Testing with "Actionable" Filter
+    # "Standard" metrics (counting everything)
+    std_correct = {"abs": 0, "der": 0, "comb": 0, "rand": 0}
+    
+    # "Actionable" metrics (only counting when PREDICTION != LAST_VAL)
+    # This measures: When the model predicts a move, is it right?
+    act_correct = {"abs": 0, "der": 0, "comb": 0, "rand": 0}
+    act_total   = {"abs": 0, "der": 0, "comb": 0, "rand": 0}
     
     total_samples = len(test_perc) - 5
     delayed_print(f"Running analysis on {total_samples} test sequences...")
@@ -112,29 +106,37 @@ def run_analysis():
         last_val = a_seq[-1]
         actual_val = percentiles[curr_idx+5]
         
+        # Helper to process prediction stats
+        def process_pred(model_name, prediction):
+            # 1. Standard Accuracy
+            if prediction == actual_val:
+                std_correct[model_name] += 1
+            
+            # 2. Actionable Accuracy (Did we predict a move?)
+            if prediction != last_val:
+                act_total[model_name] += 1
+                if prediction == actual_val:
+                    act_correct[model_name] += 1
+
         # --- Random Benchmark ---
-        if random.choice(all_train_values) == actual_val:
-            correct_rand += 1
+        rand_pred = random.choice(all_train_values)
+        process_pred("rand", rand_pred)
 
         # --- Model 1: Absolute Only ---
         if a_seq in abs_map:
             pred_abs = abs_map[a_seq].most_common(1)[0][0]
         else:
             pred_abs = random.choice(all_train_values)
-            
-        if pred_abs == actual_val:
-            correct_abs += 1
+        process_pred("abs", pred_abs)
 
         # --- Model 2: Derivative Only ---
         if d_seq in der_map:
             pred_change = der_map[d_seq].most_common(1)[0][0]
         else:
             pred_change = random.choice(all_train_changes)
-            
-        if last_val + pred_change == actual_val:
-            correct_der += 1
+        process_pred("der", last_val + pred_change)
 
-        # --- Model 3: Combined Consensus Model ---
+        # --- Model 3: Combined Consensus ---
         abs_candidates = abs_map.get(a_seq, Counter())
         der_candidates = der_map.get(d_seq, Counter())
         
@@ -143,7 +145,7 @@ def run_analysis():
             possible_next_vals.add(last_val + change)
             
         if not possible_next_vals:
-            best_val = random.choice(all_train_values)
+            pred_comb = random.choice(all_train_values)
         else:
             best_val = None
             max_combined_score = -1
@@ -153,20 +155,31 @@ def run_analysis():
                 if score > max_combined_score:
                     max_combined_score = score
                     best_val = val
-        
-        if best_val == actual_val:
-            correct_comb += 1
+            pred_comb = best_val
+
+        process_pred("comb", pred_comb)
 
     # 4. Reporting
-    delayed_print("\n--- FINAL RESULTS (ETH/USDT Hourly) ---")
-    delayed_print(f"Random Benchmark:          {correct_rand/total_samples*100:.2f}%")
-    delayed_print(f"Absolute Model Accuracy:   {correct_abs/total_samples*100:.2f}%")
-    delayed_print(f"Derivative Model Accuracy: {correct_der/total_samples*100:.2f}%")
-    delayed_print(f"Combined Consensus Acc:    {correct_comb/total_samples*100:.2f}%")
+    def calc_perc(correct, total):
+        return (correct / total * 100) if total > 0 else 0
+
+    delayed_print("\n--- STANDARD ACCURACY (Includes Inertia) ---")
+    delayed_print(f"Random:      {calc_perc(std_correct['rand'], total_samples):.2f}%")
+    delayed_print(f"Absolute:    {calc_perc(std_correct['abs'], total_samples):.2f}%")
+    delayed_print(f"Derivative:  {calc_perc(std_correct['der'], total_samples):.2f}%")
+    delayed_print(f"Combined:    {calc_perc(std_correct['comb'], total_samples):.2f}%")
+
+    delayed_print("\n--- MOVEMENT PRECISION (Only when Move Predicted) ---")
+    delayed_print("Precision = Correct Move Predictions / Total Move Predictions")
     
-    delayed_print("\nSummary:")
-    delayed_print("Real-world crypto data is significantly noisier than a pure random walk.")
-    delayed_print("The Combined Consensus model attempts to filter noise by finding overlap between price level and trend.")
+    delayed_print(f"Random:      {calc_perc(act_correct['rand'], act_total['rand']):.2f}%  (Attempts: {act_total['rand']})")
+    delayed_print(f"Absolute:    {calc_perc(act_correct['abs'], act_total['abs']):.2f}%  (Attempts: {act_total['abs']})")
+    delayed_print(f"Derivative:  {calc_perc(act_correct['der'], act_total['der']):.2f}%  (Attempts: {act_total['der']})")
+    delayed_print(f"Combined:    {calc_perc(act_correct['comb'], act_total['comb']):.2f}%  (Attempts: {act_total['comb']})")
+    
+    delayed_print("\nAnalysis:")
+    delayed_print("Standard Accuracy is inflated by predicting 'No Change'.")
+    delayed_print("Movement Precision reveals if the model actually knows WHEN the price will jump.")
 
 if __name__ == "__main__":
     run_analysis()
