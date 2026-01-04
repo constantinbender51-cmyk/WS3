@@ -25,7 +25,7 @@ CONFIG = {
     "MAX_SEQ_LEN": 4,        
     "EDIT_DEPTH": 1,         
     "N_CATEGORIES": 20,      
-    "SIGNAL_THRESHOLD": 2.5,
+    "SIGNAL_THRESHOLD": 0,
     "PREDICTION_BOOST": 2, # Multiplier for "Insert at End" probabilities
     
     # Debugging & Output
