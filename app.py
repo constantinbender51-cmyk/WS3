@@ -4,12 +4,27 @@ import time
 from collections import defaultdict
 from typing import List, Tuple
 
-def custom_print(text: str, delay: float = 0.1):
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+N_PRICES = 20000
+MIN_PRICE = 100
+MAX_PRICE = 600
+N_CATEGORIES = 100
+TRAIN_SPLIT = 0.7
+CATEGORY_STEP = 1
+PRINT_DELAY = 0.1
+STARTING_EQUITY = 10000
+CATEGORY_TO_DOLLAR = 10  # Scaling factor for category movements to dollars
+# ============================================================================
+
+
+def custom_print(text: str, delay: float = PRINT_DELAY):
     """Print with delay"""
     print(text)
     time.sleep(delay)
 
-def generate_prices(n: int, min_price: float = 100, max_price: float = 600) -> List[float]:
+def generate_prices(n: int, min_price: float, max_price: float) -> List[float]:
     """Generate mock prices"""
     return [random.uniform(min_price, max_price) for _ in range(n)]
 
@@ -51,7 +66,7 @@ def compute_directional_probabilities(categories: List[int]) -> dict:
     probabilities = {seq: count / total_sequences for seq, count in dir_sequence_counts.items()}
     return probabilities
 
-def generate_category_variants(last_two_cats: List[int], step: int = 1) -> List[List[int]]:
+def generate_category_variants(last_two_cats: List[int], step: int) -> List[List[int]]:
     """Generate all category sequences 1 step away from last two categories"""
     c1, c2 = last_two_cats
     
@@ -74,7 +89,7 @@ def generate_category_variants(last_two_cats: List[int], step: int = 1) -> List[
     
     return variants_step2
 
-def generate_directional_variants(cat_diffs: Tuple[int, int], step: int = 1) -> List[List[int]]:
+def generate_directional_variants(cat_diffs: Tuple[int, int], step: int) -> List[List[int]]:
     """Generate directional variants based on category differences"""
     d1, d2 = cat_diffs
     
@@ -101,7 +116,7 @@ def predict_next_category(
     last_two_cats: List[int],
     cat_probs: dict,
     dir_probs: dict,
-    step: int = 1
+    step: int
 ) -> Tuple[int, str]:
     """Predict next category and action"""
     
@@ -147,10 +162,15 @@ def predict_next_category(
     
     return best_prediction, action
 
-def evaluate_predictions(actual_cats: List[int], predictions: List[Tuple[int, str]]) -> Tuple[float, float, float]:
+def evaluate_predictions(
+    actual_cats: List[int],
+    predictions: List[Tuple[int, str]],
+    starting_equity: float,
+    cat_to_dollar: float
+) -> Tuple[float, float, float]:
     """Evaluate accuracy, equity, and Sharpe ratio"""
     correct = 0
-    equity = 10000  # Starting equity
+    equity = starting_equity
     returns = []
     position = 0  # 0: no position, 1: long, -1: short
     entry_cat = 0
@@ -173,7 +193,7 @@ def evaluate_predictions(actual_cats: List[int], predictions: List[Tuple[int, st
             position = 1
             entry_cat = actual
         elif action == "sell" and position == 1:
-            pnl = (actual - entry_cat) * 10  # Scale category difference to $ amount
+            pnl = (actual - entry_cat) * cat_to_dollar
             equity += pnl
             returns.append(pnl / 1000 if pnl != 0 else 0)
             position = 0
@@ -181,7 +201,7 @@ def evaluate_predictions(actual_cats: List[int], predictions: List[Tuple[int, st
             position = -1
             entry_cat = actual
         elif action == "buy" and position == -1:
-            pnl = (entry_cat - actual) * 10
+            pnl = (entry_cat - actual) * cat_to_dollar
             equity += pnl
             returns.append(pnl / 1000 if pnl != 0 else 0)
             position = 0
@@ -190,11 +210,11 @@ def evaluate_predictions(actual_cats: List[int], predictions: List[Tuple[int, st
     if position != 0 and len(actual_cats) > 0:
         final_cat = actual_cats[-1]
         if position == 1:
-            pnl = (final_cat - entry_cat) * 10
+            pnl = (final_cat - entry_cat) * cat_to_dollar
             equity += pnl
             returns.append(pnl / 1000 if pnl != 0 else 0)
         else:
-            pnl = (entry_cat - final_cat) * 10
+            pnl = (entry_cat - final_cat) * cat_to_dollar
             equity += pnl
             returns.append(pnl / 1000 if pnl != 0 else 0)
     
@@ -216,22 +236,14 @@ def main():
     custom_print("Category-Based Price Prediction Algorithm")
     custom_print("=" * 60)
     
-    # Parameters
-    n_prices = 20000
-    min_price = 100
-    max_price = 600
-    n_categories = 100
-    train_split = 0.7
-    step = 1  # Category step
-    
-    custom_print(f"\nGenerating {n_prices} mock prices...")
-    prices = generate_prices(n_prices, min_price, max_price)
+    custom_print(f"\nGenerating {N_PRICES} mock prices...")
+    prices = generate_prices(N_PRICES, MIN_PRICE, MAX_PRICE)
     
     custom_print("Converting prices to categories...")
-    categories = [categorize_price(p, min_price, max_price, n_categories) for p in prices]
+    categories = [categorize_price(p, MIN_PRICE, MAX_PRICE, N_CATEGORIES) for p in prices]
     
     # Split data
-    split_idx = int(n_prices * train_split)
+    split_idx = int(N_PRICES * TRAIN_SPLIT)
     train_cats = categories[:split_idx]
     test_cats = categories[split_idx:]
     
@@ -255,7 +267,7 @@ def main():
     for i in range(2, len(test_cats)):
         last_two = test_cats[i-2:i]
         pred_cat, action = predict_next_category(
-            last_two, cat_probs, dir_probs, step
+            last_two, cat_probs, dir_probs, CATEGORY_STEP
         )
         predictions.append((pred_cat, action))
         
@@ -267,7 +279,7 @@ def main():
     # Evaluate
     custom_print("\nEvaluating predictions...")
     actual_test = test_cats[2:]
-    accuracy, equity, sharpe = evaluate_predictions(actual_test, predictions)
+    accuracy, equity, sharpe = evaluate_predictions(actual_test, predictions, STARTING_EQUITY, CATEGORY_TO_DOLLAR)
     
     custom_print("\n" + "=" * 60)
     custom_print("RESULTS")
