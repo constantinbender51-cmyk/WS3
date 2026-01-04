@@ -20,11 +20,16 @@ GITHUB_PAT = os.environ.get('PAT', '')
 SYMBOL = "ETHUSDT"
 INTERVAL = "1h"
 START_YEAR = 2018
-N_CATEGORIES = 1000
+N_CATEGORIES = 100
 TRAIN_SPLIT = 0.8
 SEQUENCE_LENGTH = 4  # Using last 3 hours to predict the 4th
 CATEGORY_STEP = 1    # Range of "neighboring" sequences to check
 STARTING_EQUITY = 10000
+
+# Penalty for predicting the same category as the current one.
+# Higher value forces the model to favor "change" over "status quo".
+CONTINUITY_PENALTY = 0.2 
+
 # Multiplier to make price changes meaningful in dollar terms for equity curve
 DOLLAR_MULTIPLIER = 1 
 
@@ -115,19 +120,26 @@ def compute_probs(categories: List[int], seq_len: int):
     return cp, dp
 
 def predict_next(last_n: List[int], cat_probs: dict, dir_probs: dict, step: int, seq_len: int):
-    best_prob = -1
+    best_prob = -float('inf')
     best_pred = last_n[-1]
     
-    # Simplified search: look for historical frequency of following current cat
     # Given the last_n, what is the most likely next?
     current_val = last_n[-1]
     for possible_next in range(max(0, current_val - step), min(N_CATEGORIES, current_val + step + 1)):
+        # Calculate base probability score from historical sequences
         test_seq = tuple(list(last_n) + [possible_next])
         p = cat_probs.get(test_seq, 0)
         
-        # Also look at direction
+        # Add directional probability (deltas)
         delta_seq = tuple([last_n[i+1] - last_n[i] for i in range(len(last_n)-1)] + [possible_next - last_n[-1]])
         p += dir_probs.get(delta_seq, 0)
+        
+        # APPLY PENALTY:
+        # If the model wants to predict the same category as before, reduce its score.
+        # This prevents the model from "flatlining" and forces it to only predict moves 
+        # when the probability of a move is strong.
+        if possible_next == current_val:
+            p -= CONTINUITY_PENALTY
         
         if p > best_prob:
             best_prob = p
@@ -215,7 +227,7 @@ def main():
     # Plot Equity
     plt.figure(figsize=(10, 5))
     plt.plot([h['equity'] for h in history], color='#10b981')
-    plt.title(f"{SYMBOL} Equity Curve (Since 2018 Training)")
+    plt.title(f"{SYMBOL} Equity Curve (With Continuity Penalty: {CONTINUITY_PENALTY})")
     plt.ylabel("Equity ($)")
     buf = BytesIO()
     plt.savefig(buf, format='png')
