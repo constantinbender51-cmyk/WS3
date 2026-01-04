@@ -10,7 +10,33 @@ import yfinance as yf
 import time
 
 # ==========================================
-# 0. Helper: Load .env manually
+# 0. Configuration & Parameters
+# ==========================================
+CONFIG = {
+    # Data Fetching
+    "TICKER": "SPY",
+    "START_DATE": "2020-01-01",
+    "END_DATE": "2025-01-01",
+    
+    # Strategy / Model Parameters
+    "MAX_SEQ_LEN": 4,        # Length of sequence to analyze (m)
+    "EDIT_DEPTH": 1,         # Number of edits allowed (insert/remove/swap)
+    "N_CATEGORIES": 20,      # Number of quantile bins for discretization
+    "SIGNAL_THRESHOLD": 0, # Combined probability score required to trigger a trade
+    
+    # Debugging & Output
+    "DEBUG_PRINTS": 10,      # Number of predictions to print to console
+    "PRINT_DELAY": 0.1,      # Delay in seconds for the slow print function
+    
+    # GitHub Upload
+    "GITHUB_REPO": "constantinbender51-cmyk/Models",
+    "GITHUB_BRANCH": "main",
+    "PLOT_FILENAME": "equity_curve.png",
+    "PLOT_DPI": 50
+}
+
+# ==========================================
+# 0.1 Helper: Load .env manually
 # ==========================================
 def load_env():
     """Loads environment variables from .env file if present."""
@@ -23,16 +49,16 @@ def load_env():
                     os.environ[key] = value.strip()
 
 # ==========================================
-# 0.1 Helper: Slow Print
+# 0.2 Helper: Slow Print
 # ==========================================
-def slow_print(text, delay=0.1):
+def slow_print(text, delay=CONFIG["PRINT_DELAY"]):
     print(text)
     time.sleep(delay)
 
 # ==========================================
 # 1. Data Fetching (Real Data)
 # ==========================================
-def fetch_price_data(ticker="SPY", start="2020-01-01", end="2025-01-01"):
+def fetch_price_data(ticker, start, end):
     """
     Fetches daily price data from Yahoo Finance.
     """
@@ -43,13 +69,11 @@ def fetch_price_data(ticker="SPY", start="2020-01-01", end="2025-01-01"):
         raise ValueError(f"No data found for {ticker}. Check ticker symbol or date range.")
 
     # Handle yfinance versions that return MultiIndex columns
-    # or different column structures
     price_series = None
     
     # Check for MultiIndex columns (e.g., ('Adj Close', 'SPY'))
     if isinstance(df.columns, pd.MultiIndex):
         try:
-            # Try to get Adj Close first (accounts for dividends/splits)
             price_series = df.xs('Adj Close', axis=1, level=0)
         except KeyError:
             try:
@@ -57,7 +81,6 @@ def fetch_price_data(ticker="SPY", start="2020-01-01", end="2025-01-01"):
             except KeyError:
                 pass
         
-        # If we got a DataFrame (e.g. multiple tickers), take the first column
         if isinstance(price_series, pd.DataFrame):
             price_series = price_series.iloc[:, 0]
             
@@ -71,7 +94,6 @@ def fetch_price_data(ticker="SPY", start="2020-01-01", end="2025-01-01"):
     if price_series is None:
          raise ValueError("Could not locate 'Close' or 'Adj Close' price data in response.")
 
-    # Return as DataFrame with 'price' column, drop NaNs
     clean_df = pd.DataFrame({'price': price_series.values})
     clean_df.dropna(inplace=True)
     
@@ -111,10 +133,13 @@ class SequenceModel:
 # 3. Trader Class
 # ==========================================
 class SequenceTrader:
-    def __init__(self, max_seq_len=5, edit_depth=1, n_categories=20):
+    def __init__(self, max_seq_len, edit_depth, n_categories, signal_threshold, debug_limit):
         self.max_seq_len = max_seq_len
         self.edit_depth = edit_depth
         self.n_categories = n_categories
+        self.signal_threshold = signal_threshold
+        self.debug_limit = debug_limit
+        
         self.cat_model = SequenceModel(max_seq_len)
         self.dir_model = SequenceModel(max_seq_len)
         self.bin_edges = None
@@ -191,8 +216,8 @@ class SequenceTrader:
         best_c, prob_c = self.get_best_variation(input_c, self.cat_model, alph_c)
         best_d, prob_d = self.get_best_variation(input_d, self.dir_model, alph_d)
         
-        # --- Debug Print (First 10) ---
-        if self.debug_count < 10:
+        # --- Debug Print ---
+        if self.debug_count < self.debug_limit:
             msg = (f"--- Prediction {self.debug_count + 1} ---\n"
                    f"Input Cats: {input_c}\n"
                    f"  -> Best Var: {best_c['seq']}\n"
@@ -219,9 +244,10 @@ class SequenceTrader:
             pred_dir = best_d['meta'][1]
             if pred_dir > 0: signal_score += combined_prob
             elif pred_dir < 0: signal_score -= combined_prob
-            
-        if signal_score > 2.5: return 1
-        if signal_score < -2.5: return -1
+        
+        # Use configurable threshold
+        if signal_score > self.signal_threshold: return 1
+        if signal_score < -self.signal_threshold: return -1
         return 0
 
     def run_backtest(self, prices):
@@ -301,9 +327,12 @@ def main():
     load_env()
     
     # 1. Fetch Real Data
-    # You can change ticker and dates here
     try:
-        df = fetch_price_data("SPY", start="2020-01-01", end="2025-01-01")
+        df = fetch_price_data(
+            ticker=CONFIG["TICKER"], 
+            start=CONFIG["START_DATE"], 
+            end=CONFIG["END_DATE"]
+        )
         prices = df['price'].values
     except Exception as e:
         print(f"Failed to load data: {e}")
@@ -312,7 +341,13 @@ def main():
     print(f"Loaded {len(prices)} data points.")
     
     # 2. Run Backtest
-    trader = SequenceTrader(max_seq_len=4, edit_depth=1, n_categories=20)
+    trader = SequenceTrader(
+        max_seq_len=CONFIG["MAX_SEQ_LEN"],
+        edit_depth=CONFIG["EDIT_DEPTH"],
+        n_categories=CONFIG["N_CATEGORIES"],
+        signal_threshold=CONFIG["SIGNAL_THRESHOLD"],
+        debug_limit=CONFIG["DEBUG_PRINTS"]
+    )
     equity = trader.run_backtest(prices)
     
     # 3. Stats
@@ -335,17 +370,17 @@ def main():
     plt.legend()
     plt.grid(True)
     
-    plot_filename = "equity_curve.png"
-    plt.savefig(plot_filename, dpi=50) 
+    plot_filename = CONFIG["PLOT_FILENAME"]
+    plt.savefig(plot_filename, dpi=CONFIG["PLOT_DPI"]) 
     print(f"Plot saved locally as {plot_filename} (Low Res)")
     
     # 5. Upload to GitHub
     pat = os.environ.get("PAT")
-    repo = "constantinbender51-cmyk/Models"
+    repo = CONFIG["GITHUB_REPO"]
     
     if pat:
         try:
-            upload_plot_to_github(plot_filename, repo, pat)
+            upload_plot_to_github(plot_filename, repo, pat, CONFIG["GITHUB_BRANCH"])
         except Exception as e:
             print(f"Error during upload: {e}")
     else:
