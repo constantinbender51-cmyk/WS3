@@ -10,136 +10,110 @@ def delayed_print(text, delay=0.01):
     time.sleep(delay)
 
 def get_percentile(price):
-    """
-    Converts price to percentile buckets of 100.
-    Logic: 0-99 -> 1, 100-199 -> 2, etc.
-    """
+    """Converts price to percentile buckets of 100."""
     if price >= 0:
         return (int(price) // 100) + 1
     else:
         return (int(price + 1) // 100) - 1
 
-def get_aligned_derivatives(data, start_idx, length):
-    """
-    Computes a derivative sequence of 'length' by looking at 
-    data[i] - data[i-1].
-    Handles the very first index of the dataset (index 0) by assuming 0.
-    """
-    derivs = []
-    for i in range(start_idx, start_idx + length):
-        if i == 0:
-            derivs.append(0)
-        else:
-            derivs.append(data[i] - data[i-1])
-    return tuple(derivs)
-
 def run_analysis():
-    delayed_print("--- Starting Corrected Derivative Alignment Analysis ---")
+    delayed_print("--- Starting Consensus-Based Sequence Analysis ---")
     
-    # 1. Create mock prices (Random Walk)
+    # 1. Generate Mock Data (Random Walk)
     prices = [5000]
     for _ in range(9999):
-        change = random.randint(-150, 150)
-        prices.append(prices[-1] + change)
+        prices.append(prices[-1] + random.randint(-150, 150))
     
-    # 2. Convert to percentiles
     percentiles = [get_percentile(p) for p in prices]
     
-    # Global derivative list for the whole dataset
-    global_derivatives = [0]
-    for i in range(1, len(percentiles)):
-        global_derivatives.append(percentiles[i] - percentiles[i-1])
-
-    # Split data 70/30
     split_idx = int(len(percentiles) * 0.7)
     train_perc = percentiles[:split_idx]
     test_perc = percentiles[split_idx:]
     
-    unique_train_perc = list(set(train_perc))
-    
-    delayed_print(f"Data generated. Train size: {len(train_perc)}, Test size: {len(test_perc)}")
+    # 2. Training: Build Global Frequency Maps
+    # abs_map: seq(5) -> Counter(successor)
+    # der_map: seq(5) -> Counter(successor_change) 
+    # Note: We use length 5 for both to match your requirement.
+    abs_map = defaultdict(Counter)
+    der_map = defaultdict(Counter)
 
-    # 3. Training: Build Sequence Counts
-    abs_counts = defaultdict(Counter)
-    deriv_counts = defaultdict(Counter)
-    combined_counts = defaultdict(Counter)
-
-    # We iterate through the training set to build the model
-    # Note: We need to use 'percentiles' (the full list) to get the correct 
-    # derivatives for the start of the window if i > 0.
     for i in range(split_idx - 5):
-        abs_seq = tuple(percentiles[i:i+5])
-        # Look up true derivatives using history
-        der_seq = get_aligned_derivatives(percentiles, i, 5)
+        # Absolute sequence of 5 and its successor
+        a_seq = tuple(percentiles[i:i+5])
+        a_succ = percentiles[i+5]
+        abs_map[a_seq][a_succ] += 1
         
-        successor_perc = percentiles[i+5]
-        successor_der = global_derivatives[i+5]
-        
-        abs_counts[abs_seq][successor_perc] += 1
-        deriv_counts[der_seq][successor_der] += 1
-        combined_counts[(abs_seq, der_seq)][successor_perc] += 1
+        # Derivative sequence of 5 (using true history) and its successor
+        # To get a deriv seq of 5 ending at i+4, we need indices (i-1 to i+4)
+        if i > 0:
+            d_seq = tuple(percentiles[j] - percentiles[j-1] for j in range(i, i+5))
+            d_succ = percentiles[i+5] - percentiles[i+4]
+            der_map[d_seq][d_succ] += 1
     
-    delayed_print("Training complete: Captured historical derivatives for all sequences.")
+    delayed_print("Training complete. Models populated.")
 
-    # 4. Prediction Loop (Test Set)
+    # 3. Testing with Combined Scoring
     correct_abs = 0
-    correct_deriv = 0
-    correct_combined = 0
-    correct_rand = 0
+    correct_der = 0
+    correct_comb = 0
+    total_samples = len(test_perc) - 5
     
-    totals = {"abs": 0, "deriv": 0, "combined": 0}
-    test_len = len(test_perc) - 5
-    
-    for i in range(test_len):
-        # Current index in the context of the full 'percentiles' list
-        current_full_idx = split_idx + i
+    for i in range(total_samples):
+        curr_idx = split_idx + i
         
-        abs_seq = tuple(percentiles[current_full_idx : current_full_idx + 5])
-        der_seq = get_aligned_derivatives(percentiles, current_full_idx, 5)
+        # 5-value Absolute Sequence
+        a_seq = tuple(percentiles[curr_idx : curr_idx+5])
+        # 5-value Derivative Sequence
+        d_seq = tuple(percentiles[j] - percentiles[j-1] for j in range(curr_idx, curr_idx+5))
         
-        actual_perc = percentiles[current_full_idx + 5]
-        actual_der = global_derivatives[current_full_idx + 5]
-
-        # Random Benchmark
-        if random.choice(unique_train_perc) == actual_perc:
-            correct_rand += 1
-
-        # Absolute Prediction
-        if abs_seq in abs_counts:
-            if abs_counts[abs_seq].most_common(1)[0][0] == actual_perc:
+        last_val = a_seq[-1]
+        actual_val = percentiles[curr_idx+5]
+        
+        # --- Model 1: Absolute Only (Baseline) ---
+        if a_seq in abs_map:
+            if abs_map[a_seq].most_common(1)[0][0] == actual_val:
                 correct_abs += 1
-            totals["abs"] += 1
 
-        # Derivative Prediction (Predicting the next change)
-        if der_seq in deriv_counts:
-            if deriv_counts[der_seq].most_common(1)[0][0] == actual_der:
-                correct_deriv += 1
-            totals["deriv"] += 1
+        # --- Model 2: Derivative Only (Baseline) ---
+        if d_seq in der_map:
+            pred_change = der_map[d_seq].most_common(1)[0][0]
+            if last_val + pred_change == actual_val:
+                correct_der += 1
 
-        # Combined Prediction (Highest count of the joint state)
-        if (abs_seq, der_seq) in combined_counts:
-            if combined_counts[(abs_seq, der_seq)].most_common(1)[0][0] == actual_perc:
-                correct_combined += 1
-            totals["combined"] += 1
+        # --- Model 3: Combined Consensus Model ---
+        # 1. Get all candidate successors from the absolute map
+        candidates = abs_map[a_seq] # Counter of {val: count}
+        
+        if candidates:
+            best_val = None
+            max_combined_score = -1
             
-    # 5. Final Calculations
-    acc_abs = (correct_abs / totals["abs"] * 100) if totals["abs"] > 0 else 0
-    acc_deriv = (correct_deriv / totals["deriv"] * 100) if totals["deriv"] > 0 else 0
-    acc_comb = (correct_combined / totals["combined"] * 100) if totals["combined"] > 0 else 0
-    acc_rand = (correct_rand / test_len * 100)
-    
+            for val, abs_count in candidates.items():
+                # What change does this prediction imply?
+                implied_change = val - last_val
+                
+                # How many times has the derivative expert seen this change after this d_seq?
+                der_count = der_map[d_seq][implied_change]
+                
+                # Combined Score: Sum of counts
+                combined_score = abs_count + der_count
+                
+                if combined_score > max_combined_score:
+                    max_combined_score = combined_score
+                    best_val = val
+            
+            if best_val == actual_val:
+                correct_comb += 1
+
+    # 4. Reporting
     delayed_print("\n--- FINAL RESULTS ---")
-    delayed_print(f"Random Benchmark:      {acc_rand:.2f}%")
-    delayed_print(f"Absolute Model:        {acc_abs:.2f}% (Coverage: {totals['abs']}/{test_len})")
-    delayed_print(f"Derivative Model:      {acc_deriv:.2f}% (Coverage: {totals['deriv']}/{test_len})")
-    delayed_print(f"Combined Model:        {acc_comb:.2f}% (Coverage: {totals['combined']}/{test_len})")
+    delayed_print(f"Absolute Model Accuracy:   {correct_abs/total_samples*100:.2f}%")
+    delayed_print(f"Derivative Model Accuracy: {correct_der/total_samples*100:.2f}%")
+    delayed_print(f"Combined Consensus Acc:    {correct_comb/total_samples*100:.2f}%")
     
-    delayed_print("\n--- Summary ---")
-    delayed_print(f"The combined model captures both the price level (absolute) and the momentum (derivative).")
-    if acc_comb > acc_abs:
-        delayed_print(f"Result: The joint model improved accuracy by {acc_comb - acc_abs:.2f}% over the absolute model.")
-    else:
-        delayed_print("Result: The absolute state alone was as predictive as the joint state.")
+    delayed_print("\nLogic Explanation:")
+    delayed_print("The Combined model checks absolute candidates and weights them")
+    delayed_print("by how often the resulting momentum change has occurred in history.")
 
 if __name__ == "__main__":
     run_analysis()
