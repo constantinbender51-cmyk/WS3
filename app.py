@@ -3,7 +3,7 @@ import math
 import time
 import numpy as np
 import pandas as pd
-from collections import Counter
+from collections import Counter, defaultdict
 
 # Override print to slow down output for readability (0.1s)
 _builtin_print = print
@@ -66,64 +66,82 @@ class MarketDataHandler:
         return sequence
 
 # ==============================================================================
-# 2. FREQUENCY ENGINE (Exact Counting)
+# 2. RELATIVE FREQUENCY ENGINE (Step 3 & 7)
 # ==============================================================================
 
-class FrequencyEngine:
-    def __init__(self, num_categories=40):
-        self.num_categories = num_categories
+class RelativeFrequencyEngine:
+    def __init__(self, name):
+        self.name = name
         self.history = []
+        # cache stats: {length: {'total_count': X, 'unique_count': Y, 'avg': Z}}
+        self.stats = {} 
 
     def train(self, sequence):
-        """Stores the historical sequence for pattern matching."""
-        print("Training Frequency Engine (Storing History)...")
+        """
+        Stores history and pre-computes statistics for all lengths up to ~15.
+        """
+        print(f"Training {self.name} Engine...")
         self.history = sequence
+        
+        # Pre-compute Average Occurrences for lengths 1 to 15
+        max_len_stat = 15
+        for L in range(1, max_len_stat + 1):
+            counts = Counter()
+            # Sliding window count
+            for i in range(len(self.history) - L + 1):
+                sub = tuple(self.history[i : i + L])
+                counts[sub] += 1
+            
+            unique_seqs = len(counts)
+            total_occurrences = sum(counts.values())
+            
+            if unique_seqs > 0:
+                avg = total_occurrences / unique_seqs
+            else:
+                avg = 1.0
+                
+            self.stats[L] = {
+                'avg': avg,
+                'counts': counts
+            }
 
-    def get_score(self, sub_seq):
+    def get_relative_score(self, sub_seq):
         """
-        Calculates Probability = Count / Total_Possible_Of_Length.
+        Score = Occurrence / Average_Occurrence_For_This_Length
         """
-        if not self.history or not sub_seq: return 0, 0.0
+        if not sub_seq: return 0.0
+        L = len(sub_seq)
         
-        len_sub = len(sub_seq)
-        len_hist = len(self.history)
+        # Check stats
+        if L not in self.stats:
+            return 0.0 # Length not seen/trained
         
-        if len_sub > len_hist: return 0, 0.0
+        t_seq = tuple(sub_seq)
+        count = self.stats[L]['counts'][t_seq]
+        avg = self.stats[L]['avg']
         
-        # Exact Sequence Matching
-        count = 0
-        # We scan the history
-        for i in range(len_hist - len_sub + 1):
-            if self.history[i : i + len_sub] == sub_seq:
-                count += 1
-        
-        # Total possible sequences of this specific length
-        total_possible = len_hist - len_sub + 1
-        
-        prob = count / total_possible if total_possible > 0 else 0.0
-        return count, prob
+        if avg == 0: return 0.0
+        return count / avg
 
 # ==============================================================================
-# 3. MUTATION SOLVER (The Evolutionary Core)
+# 3. RECURSIVE EVOLUTIONARY SOLVER (Steps 4, 5, 6, 7)
 # ==============================================================================
 
-class MutationSolver:
-    def __init__(self, engine, num_bins):
-        self.engine = engine
+class RecursiveSolver:
+    def __init__(self, cat_engine, dir_engine, num_bins):
+        self.cat_engine = cat_engine
+        self.dir_engine = dir_engine
         self.num_bins = num_bins
+        self.max_depth = 2 # "Edit n times" - Limit depth for performance
 
     def _repair_physics(self, seq):
-        """
-        Re-calculates Momentum tags to match Price Categories.
-        Essential after swapping/inserting to ensure sequence is valid for lookup.
-        """
-        if not seq: return []
+        """Ensures directions match category changes after mutations."""
         repaired = []
         for i in range(len(seq)):
-            cat = seq[i][1]
+            mom, cat = seq[i]
             if i == 0:
-                # Keep original start momentum if possible, else FLAT
-                mom = seq[i][0]
+                # Keep original start mom
+                pass
             else:
                 prev_cat = repaired[-1][1]
                 if cat > prev_cat: mom = 'UP'
@@ -132,108 +150,109 @@ class MutationSolver:
             repaired.append((mom, cat))
         return repaired
 
-    def generate_variants(self, input_seq):
-        """Generates all mutations: Swap, Del, Mod, Insert, Sub, Ext."""
-        pool = []
-        L = len(input_seq)
+    def _generate_edits(self, seq):
+        """
+        Generates single-step edits: Insert, Delete, Swap.
+        Used recursively.
+        """
+        edits = []
+        L = len(seq)
         
-        # 1. Original
-        pool.append({'seq': input_seq, 'type': 'orig'})
+        # 1. SWAP
+        for i in range(L - 1):
+            new_s = seq[:]
+            new_s[i], new_s[i+1] = new_s[i+1], new_s[i]
+            edits.append(new_s)
 
-        # 2. Extensions (Forecasts) - Try UP/DOWN/FLAT
-        last_cat = input_seq[-1][1]
+        # 2. DELETE
+        if L > 2:
+            for i in range(L):
+                new_s = seq[:i] + seq[i+1:]
+                edits.append(new_s)
+
+        # 3. INSERT (Forecast at end)
+        # We explicitly add possible next steps at the tail
+        last_cat = seq[-1][1]
         options = [last_cat]
         if last_cat < self.num_bins: options.append(last_cat + 1)
         if last_cat > 1: options.append(last_cat - 1)
         
         for opt in options:
-            # We append 'FLAT' as placeholder, _repair_physics fixes it later
-            ext_seq = input_seq + [('FLAT', opt)]
-            pool.append({'seq': ext_seq, 'type': 'ext'})
-
-        # 3. Sub-sequences (Shortening)
-        # We take slices from the END (most recent data must be preserved usually)
-        # But per user instruction "cde wins over Ababcde", we try all substrings
-        for start in range(L):
-            for end in range(start + 2, L + 1): # Min length 2
-                if start == 0 and end == L: continue # Skip original (already added)
-                sub = input_seq[start:end]
-                pool.append({'seq': sub, 'type': 'sub'})
-
-        # 4. Modifications (Noise adjust)
-        for i in range(L):
-            curr_mom, curr_cat = input_seq[i]
-            # +1
-            if curr_cat < self.num_bins:
-                m_seq = input_seq[:]
-                m_seq[i] = (curr_mom, curr_cat + 1)
-                pool.append({'seq': m_seq, 'type': 'mod'})
-            # -1
-            if curr_cat > 1:
-                m_seq = input_seq[:]
-                m_seq[i] = (curr_mom, curr_cat - 1)
-                pool.append({'seq': m_seq, 'type': 'mod'})
-
-        # 5. Swaps (Temporal dislocation)
-        for i in range(L - 1):
-            s_seq = input_seq[:]
-            s_seq[i], s_seq[i+1] = s_seq[i+1], s_seq[i]
-            pool.append({'seq': s_seq, 'type': 'swap'})
-
-        # 6. Deletions (Remove outlier)
-        if L > 2:
+            # We add a placeholder direction, _repair_physics fixes it
+            edits.append(seq + [('FLAT', opt)])
+            
+        # 3b. INSERT (Interpolate/Duplicate)
+        # "abc -> aabc" logic
+        if L < 12: # Prevent explosion
             for i in range(L):
-                d_seq = input_seq[:i] + input_seq[i+1:]
-                pool.append({'seq': d_seq, 'type': 'del'})
-        
-        # 7. Insertions (Interpolation)
-        # Insert average of neighbors
-        if L < 10: # Limit complexity
-            for i in range(L - 1):
-                c1 = input_seq[i][1]
-                c2 = input_seq[i+1][1]
-                avg = int((c1 + c2) / 2)
-                i_seq = input_seq[:i+1] + [('FLAT', avg)] + input_seq[i+1:]
-                pool.append({'seq': i_seq, 'type': 'ins'})
+                # Duplicate current item at i
+                edits.append(seq[:i] + [seq[i]] + seq[i:])
+                
+        return edits
 
-        return pool
+    def _get_variants_recursive(self, current_seq, current_depth, max_depth, collected):
+        """
+        Recursively generates variants up to max_depth.
+        Stores them in 'collected' set to avoid duplicates.
+        """
+        # Add current sequence to collection
+        # Repair first to ensure we only store valid physics
+        repaired = tuple(self._repair_physics(current_seq))
+        collected.add(repaired)
+        
+        if current_depth >= max_depth:
+            return
+
+        # Generate 1-step edits
+        edits = self._generate_edits(list(repaired))
+        
+        for edit in edits:
+            # Recurse
+            self._get_variants_recursive(edit, current_depth + 1, max_depth, collected)
 
     def solve(self, input_seq):
-        variants = self.generate_variants(input_seq)
-        scored = []
-        seen_hashes = set()
-
-        for v in variants:
-            # 1. Repair Physics
-            fixed_seq = self._repair_physics(v['seq'])
+        # 1. Generate ALL variants (Recursively)
+        variant_pool = set()
+        self._get_variants_recursive(input_seq, 0, self.max_depth, variant_pool)
+        
+        scored_candidates = []
+        
+        for seq_tuple in variant_pool:
+            seq = list(seq_tuple)
             
-            # 2. Deduplicate
-            s_hash = str(fixed_seq)
-            if s_hash in seen_hashes: continue
-            seen_hashes.add(s_hash)
+            # Extract Categories and Directions (Step 7)
+            cats = [x[1] for x in seq]
+            dirs = [x[0] for x in seq]
             
-            # 3. Score (Frequency / Total_Possible)
-            count, prob = self.engine.get_score(fixed_seq)
+            # Score Categories (Step 3)
+            # Score = Occurrence / Avg
+            cat_score = self.cat_engine.get_relative_score(cats)
             
-            # 4. Filter impossible sequences
-            if count > 0:
-                scored.append({
-                    'seq': fixed_seq,
-                    'count': count,
-                    'prob': prob,
-                    'type': v['type']
+            # Score Directions (Step 7)
+            dir_score = self.dir_engine.get_relative_score(dirs)
+            
+            # Total Score (Sum)
+            total_score = cat_score + dir_score
+            
+            if total_score > 0:
+                scored_candidates.append({
+                    'seq': seq,
+                    'score': total_score,
+                    'cat_score': cat_score,
+                    'dir_score': dir_score,
+                    'is_longer': len(seq) > len(input_seq)
                 })
         
-        # Sort by Probability (Desc)
-        scored.sort(key=lambda x: x['prob'], reverse=True)
+        # Sort by Total Score Descending
+        scored_candidates.sort(key=lambda x: x['score'], reverse=True)
         
-        if not scored:
-            return {'seq': input_seq, 'prob': 0.0, 'type': 'none', 'count': 0}
+        if not scored_candidates:
+            return None
             
-        return scored[0]
+        return scored_candidates[0] # Return Winner
 
 # ==============================================================================
-# 4. BACKTESTER UTILS (Preserved)
+# 4. BACKTESTER (Preserved)
 # ==============================================================================
 
 class Backtester:
@@ -261,10 +280,11 @@ class Backtester:
         rets = np.array(self.returns)
         mean = np.mean(rets)
         std = np.std(rets)
-        return (mean / std) * math.sqrt(252) if std > 0 else 0.0
+        if std == 0: return 0.0
+        return (mean / std) * math.sqrt(252)
 
 # ==============================================================================
-# 5. MAIN COMPARISON RUNNER
+# 5. MAIN EXECUTION
 # ==============================================================================
 
 if __name__ == "__main__":
@@ -279,22 +299,30 @@ if __name__ == "__main__":
 
     full_seq = market.discretize_sequence(raw_prices, num_bins=NUM_BINS)
     
-    # 70% Train, 30% Test
+    # Split
     split_idx = int(len(full_seq) * 0.7)
     train_seq = full_seq[:split_idx]
     
-    engine = FrequencyEngine(num_categories=NUM_BINS)
-    engine.train(train_seq)
+    # 1. Train Dual Engines (Categories + Directions)
+    cat_engine = RelativeFrequencyEngine("Category")
+    dir_engine = RelativeFrequencyEngine("Direction")
     
-    solver = MutationSolver(engine, NUM_BINS)
+    cat_train = [x[1] for x in train_seq]
+    dir_train = [x[0] for x in train_seq]
     
-    # Initialize Backtesters
+    cat_engine.train(cat_train)
+    dir_engine.train(dir_train)
+    
+    # 2. Init Solver
+    solver = RecursiveSolver(cat_engine, dir_engine, NUM_BINS)
+    
+    # 3. Init Backtesters
     backtesters = {L: Backtester(f"Len-{L}") for L in LENGTHS_TO_TEST}
     
-    print(f"\nComparing Evolutionary Frequency (Mutations): {LENGTHS_TO_TEST} on {SYMBOL}")
-    print(f"Training Data: {split_idx} candles | Test Data: {len(full_seq) - split_idx} candles")
-    print("\n" + "="*100)
+    print(f"\nComparing Recursive Frequency Solver (Dual Engine): {LENGTHS_TO_TEST}")
+    print("\n" + "="*120)
 
+    # Main Loop
     for i in range(split_idx, len(full_seq) - 1):
         curr_price = raw_prices[i]
         next_price = raw_prices[i+1]
@@ -306,45 +334,47 @@ if __name__ == "__main__":
 
         print(f"IDX: {i:<5} | Actual: {actual_move:<5} ({pct_change*100:+.2f}%)")
         
-        # Run each length
         for L in LENGTHS_TO_TEST:
             if i < L: continue
                 
             input_window = full_seq[i - L + 1 : i + 1]
             input_cats = [x[1] for x in input_window]
             
-            # SOLVE (Generate Mutations -> Compare Probs -> Pick Winner)
+            # SOLVE
             winner = solver.solve(input_window)
-            best_seq = winner['seq']
             
-            # DECISION LOGIC
-            # We only trade if the winner EXTENDS beyond the current timeframe
             action = "FLAT"
+            stats_str = "No Signal"
             
-            # Length check: Did it forecast?
-            if len(best_seq) > len(input_window):
-                # Check the first new value (index = len(input))
-                pred_cat = best_seq[len(input_window)][1]
-                curr_cat = input_window[-1][1]
+            if winner:
+                best_seq = winner['seq']
                 
-                if pred_cat > curr_cat: action = "BUY"
-                elif pred_cat < curr_cat: action = "SELL"
-            
+                # Step 6: Signal Logic
+                # "If the output results in an insert at the end... It is a signal"
+                # We check if the sequence grew AND the tail logic implies direction
+                if len(best_seq) > len(input_window):
+                    # Check what the value is at the 'future' index
+                    future_idx = len(input_window)
+                    if future_idx < len(best_seq):
+                        pred_cat = best_seq[future_idx][1]
+                        curr_cat = input_window[-1][1]
+                        
+                        if pred_cat > curr_cat: action = "BUY"
+                        elif pred_cat < curr_cat: action = "SELL"
+                
+                stats_str = f"S={winner['score']:.2f} (C:{winner['cat_score']:.1f}+D:{winner['dir_score']:.1f})"
+                out_cats_str = str([x[1] for x in best_seq])
+                if len(out_cats_str) > 25: out_cats_str = out_cats_str[:22] + "..."
+            else:
+                out_cats_str = "None"
+
             # Backtest
             backtesters[L].step(action, pct_change)
             
-            # Formatting
-            output_cats = [x[1] for x in best_seq]
+            # Format
+            print(f"  L={L}: {str(input_cats):<20} -> {out_cats_str:<25} | {action:<4} | {stats_str}")
             
-            # Truncate strings if too long
-            in_s = str(input_cats)
-            out_s = str(output_cats)
-            if len(out_s) > 30: out_s = out_s[:27] + "..."
-            
-            stats = f"[Type={winner['type']}, P={winner['prob']:.3f}]"
-            print(f"  L={L}: {in_s:<20} -> {out_s:<30} | {action:<4} {stats}")
-            
-        print("-" * 100)
+        print("-" * 120)
 
     # ==========================================================================
     # FINAL RESULTS
