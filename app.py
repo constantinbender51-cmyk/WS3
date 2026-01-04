@@ -23,16 +23,13 @@ class MarketDataHandler:
             
             # Handle MultiIndex columns if present (yfinance update compatibility)
             if isinstance(df.columns, pd.MultiIndex):
-                # Try to find 'Close' for the specific ticker
                 try:
                     prices = df.xs('Close', level=0, axis=1)[symbol].tolist()
                 except KeyError:
-                    # Fallback if structure is different
                     prices = df['Close'].iloc[:, 0].tolist()
             elif 'Close' in df.columns:
                 prices = df['Close'].tolist()
             else:
-                # Last resort fallback
                 prices = df.iloc[:, 0].tolist()
 
             # Clean NaNs
@@ -52,9 +49,7 @@ class MarketDataHandler:
         """Converts raw prices into (Momentum, Category) tuples."""
         if not prices or len(prices) < 2: return []
 
-        # Dynamic normalization window to avoid look-ahead bias in a real scenario,
-        # but for this statistical test, we normalize over the full range 
-        # to ensure category stability.
+        # Statistical normalization
         min_p = min(prices) * 0.95
         max_p = max(prices) * 1.05
         step = (max_p - min_p) / num_bins
@@ -66,7 +61,6 @@ class MarketDataHandler:
         prev_cat = -1
         
         for i, p in enumerate(prices):
-            # Clamp category between 1 and num_bins
             cat = int((p - min_p) / step)
             cat = max(1, min(num_bins, cat))
             
@@ -91,20 +85,15 @@ class ZScoreEngine:
         self.num_categories = num_categories
         self.mom_map = {k: v for v, k in enumerate(['UP', 'DOWN', 'FLAT'])}
         
-        # Transition Matrices (Markov Chains)
         self.mom_trans = np.zeros((3, 3))
         self.mom_start = np.zeros(3)
         self.cat_trans = np.zeros((num_categories, num_categories))
         self.cat_start = np.zeros(num_categories)
         
-        # Calibration stats: Map length -> {mu, std}
         self.stats = {} 
 
     def train(self, sequence):
-        """Builds the Markov Transition Matrices from history."""
         print("Training Markov Probabilities...")
-        
-        # Add small epsilon to avoid log(0) later (Laplace Smoothing)
         mom_counts = np.ones((3, 3)) 
         cat_counts = np.ones((self.num_categories, self.num_categories)) 
         
@@ -118,61 +107,39 @@ class ZScoreEngine:
             mom_counts[m1][m2] += 1
             cat_counts[c1][c2] += 1
             
-            # Track starting probabilities
             self.mom_start[m1] += 1
             self.cat_start[c1] += 1
 
-        # Normalize rows to probabilities
         self.mom_trans = mom_counts / mom_counts.sum(axis=1, keepdims=True)
         self.cat_trans = cat_counts / cat_counts.sum(axis=1, keepdims=True)
         self.mom_start = self.mom_start / self.mom_start.sum()
         self.cat_start = self.cat_start / self.cat_start.sum()
         
     def _get_raw_log_prob(self, seq):
-        """Calculates raw log probability of a sequence occurring."""
         if not seq: return -999.0
-        
-        # Unpack sequence
         m_idxs = [self.mom_map[m] for m, c in seq]
-        c_idxs = [c-1 for m, c in seq] # 0-indexed for array access
+        c_idxs = [c-1 for m, c in seq]
         
         log_prob = 0.0
-        
-        # Initial state probability
         log_prob += math.log(self.mom_start[m_idxs[0]] + 1e-9)
         log_prob += math.log(self.cat_start[c_idxs[0]] + 1e-9)
         
-        # Transition probabilities
         for i in range(len(seq) - 1):
-            # Momentum Transition
             p_m = self.mom_trans[m_idxs[i]][m_idxs[i+1]]
             log_prob += math.log(p_m + 1e-9)
-            
-            # Category Transition
             p_c = self.cat_trans[c_idxs[i]][c_idxs[i+1]]
             log_prob += math.log(p_c + 1e-9)
             
         return log_prob
 
     def calibrate(self, max_len=20, samples=2000):
-        """
-        Monte Carlo simulation to find the Mean and StdDev of log-probabilities
-        for every sequence length. This allows us to compare Z-scores across
-        different lengths (e.g. comparing a len-5 seq to a len-10 seq).
-        """
         print(f"Calibrating baseline statistics (Max Len: {max_len})...")
-        
         for length in range(1, max_len + 1):
             logs = []
             for _ in range(samples):
-                # Generate a random walk based on trained probabilities
                 sim_seq = []
-                
-                # Start
                 m = np.random.choice(3, p=self.mom_start)
                 c = np.random.choice(self.num_categories, p=self.cat_start)
-                
-                # Walk
                 m_hist = [m]
                 c_hist = [c]
                 
@@ -182,23 +149,17 @@ class ZScoreEngine:
                     m_hist.append(m)
                     c_hist.append(c)
                 
-                # Calculate Prob of this random walk
-                # We replicate logic of _get_raw_log_prob manually for speed/indices
                 lp = math.log(self.mom_start[m_hist[0]] + 1e-9) + math.log(self.cat_start[c_hist[0]] + 1e-9)
                 for i in range(length - 1):
                     lp += math.log(self.mom_trans[m_hist[i]][m_hist[i+1]] + 1e-9)
                     lp += math.log(self.cat_trans[c_hist[i]][c_hist[i+1]] + 1e-9)
-                
                 logs.append(lp)
             
             self.stats[length] = {'mu': np.mean(logs), 'std': np.std(logs)}
 
     def get_z_score(self, sequence):
-        """Returns statistical anomaly score (High Z = Rare/Unlikely, Low Z = Common/Likely)"""
         if not sequence: return 99.0
         L = len(sequence)
-        
-        # If length outside calibration, return high penalty
         if L not in self.stats: return 50.0 
         
         raw_lp = self._get_raw_log_prob(sequence)
@@ -206,12 +167,6 @@ class ZScoreEngine:
         std = self.stats[L]['std']
         
         if std == 0: return 0
-        
-        # We negate so that Lower Z-Score means "More Likely" (closer to mean or above)
-        # Standard Z = (X - Mu) / Std. 
-        # A very negative log-prob (rare) gives a negative Z. 
-        # We want the "Best" sequence to be the one with the HIGHEST probability.
-        # So we return -Z. Lowest output = Highest Probability.
         z = (raw_lp - mu) / std
         return -z 
 
@@ -225,12 +180,11 @@ class EvolutionarySolver:
         self.num_bins = num_bins
 
     def _repair_physics(self, seq):
-        """Ensures Momentum label matches the Price Category change."""
         repaired = []
         for i in range(len(seq)):
             cat = seq[i][1]
             if i == 0:
-                mom = seq[i][0] # Keep original start momentum estimate
+                mom = seq[i][0]
             else:
                 prev_cat = repaired[-1][1]
                 if cat > prev_cat: mom = 'UP'
@@ -239,23 +193,17 @@ class EvolutionarySolver:
             repaired.append((mom, cat))
         return repaired
 
-    def generate_mutations(self, seq, depth=1):
-        """
-        Generates mutations: Insert, Delete, Swap, Modify Value.
-        Returns a list of valid sequences.
-        """
+    def generate_mutations(self, seq):
         candidates = []
         L = len(seq)
         
-        # 1. Modify Value (Perturb category up/down)
+        # 1. Modify Value
         for i in range(L):
             curr_mom, curr_cat = seq[i]
-            # Try +1
             if curr_cat < self.num_bins:
                 new_seq = seq[:]
                 new_seq[i] = (curr_mom, curr_cat + 1)
                 candidates.append(new_seq)
-            # Try -1
             if curr_cat > 1:
                 new_seq = seq[:]
                 new_seq[i] = (curr_mom, curr_cat - 1)
@@ -268,13 +216,12 @@ class EvolutionarySolver:
             candidates.append(new_seq)
             
         # 3. Delete Index
-        if L > 2: # Don't delete if too short
+        if L > 2:
             for i in range(L):
                 new_seq = seq[:i] + seq[i+1:]
                 candidates.append(new_seq)
                 
-        # 4. Insert (Fill gap or add noise)
-        # To save time, we only insert averages of neighbors or repeats
+        # 4. Insert (Fill gap)
         for i in range(L):
             val_to_insert = seq[i]
             new_seq = seq[:i] + [val_to_insert] + seq[i:]
@@ -283,16 +230,9 @@ class EvolutionarySolver:
         return candidates
 
     def solve(self, input_seq, horizon_steps=2):
-        """
-        1. Generates Sub-sequences (Shortening).
-        2. Generates Extensions (Lengthening/Forecasting).
-        3. Generates Mutations (Swaps/Inserts/Deletes).
-        4. Returns the single sequence with the lowest Z-Score (Highest Probability).
-        """
         pool = []
         
         # A. Sub-sequences (Shortening)
-        # We generate all slices of min length 3
         L = len(input_seq)
         for length in range(3, L + 1):
             for i in range(L - length + 1):
@@ -300,10 +240,9 @@ class EvolutionarySolver:
                 pool.append({'seq': sub, 'type': 'sub'})
 
         # B. Lengthening (Forecasting)
-        # For every item currently in pool (just sub-sequences + original), 
-        # try to extend it by 1 to 'horizon_steps'
         extensions = []
-        base_candidates = [input_seq] # Focus heavy extension logic on the main input
+        # Use full input as base for extension
+        base_candidates = [input_seq] 
         
         for base in base_candidates:
             current_tips = [base]
@@ -311,24 +250,20 @@ class EvolutionarySolver:
                 new_tips = []
                 for tip in current_tips:
                     last_cat = tip[-1][1]
-                    # Try going UP, DOWN, FLAT
                     options = [last_cat]
                     if last_cat < self.num_bins: options.append(last_cat + 1)
                     if last_cat > 1: options.append(last_cat - 1)
                     
                     for opt in options:
-                        # Append raw, repair later
                         new_tip = tip + [('FLAT', opt)] 
                         new_tips.append(new_tip)
                         extensions.append(new_tip)
                 current_tips = new_tips
         
-        # Add extensions to pool
         for ext in extensions:
             pool.append({'seq': ext, 'type': 'ext'})
 
-        # C. Mutations (Noise reduction)
-        # Apply mutations to the input_seq to see if a cleaner version exists
+        # C. Mutations
         muts = self.generate_mutations(input_seq)
         for m in muts:
             pool.append({'seq': m, 'type': 'mut'})
@@ -338,15 +273,11 @@ class EvolutionarySolver:
         unique_hashes = set()
 
         for cand in pool:
-            # 1. Repair Physics (ensure UP/DOWN tags match numbers)
             fixed_seq = self._repair_physics(cand['seq'])
-            
-            # Deduplicate
             s_hash = str(fixed_seq)
             if s_hash in unique_hashes: continue
             unique_hashes.add(s_hash)
             
-            # 2. Score
             z = self.engine.get_z_score(fixed_seq)
             scored.append({
                 'seq': fixed_seq,
@@ -354,10 +285,8 @@ class EvolutionarySolver:
                 'type': cand['type']
             })
 
-        # Sort by Z-score (Lowest is best/most probable)
         scored.sort(key=lambda x: x['z'])
-        
-        return scored[0] # Return the winner
+        return scored[0]
 
 # ==============================================================================
 # 4. MAIN EXECUTION
@@ -365,10 +294,10 @@ class EvolutionarySolver:
 
 if __name__ == "__main__":
     # Settings
-    SYMBOL = "SPY"  # Standard equity ETF
+    SYMBOL = "SPY"
     PERIOD = "2y"
     NUM_BINS = 50
-    WINDOW_SIZE = 10    # Input size
+    WINDOW_SIZE = 8     # Input size
     HORIZON = 2         # How many steps forward to look
     
     # Init
@@ -392,58 +321,58 @@ if __name__ == "__main__":
     
     solver = EvolutionarySolver(engine, NUM_BINS)
     
-    print(f"\n{'IDX':<5} | {'INPUT (Last 3)':<15} | {'WINNER (Last 3)':<15} | {'ACTION':<10} | {'CONFIDENCE'}")
-    print("-" * 85)
+    print(f"\n{'IDX':<5} | {'INPUT SEQUENCE (Cats)':<40} | {'WINNING SEQUENCE':<40} | {'LEN':<5} | {'ACTION':<10}")
+    print("-" * 120)
 
     correct = 0
     total = 0
 
-    # Running on Test Data
-    # We step 1 by 1
-    for i in range(0, len(test_seq) - WINDOW_SIZE - 1, 1):
+    # Limit loop for demo purposes to last 50 entries
+    start_idx = max(0, len(test_seq) - WINDOW_SIZE - 50)
+    
+    for i in range(start_idx, len(test_seq) - WINDOW_SIZE - 1, 1):
         input_window = test_seq[i : i + WINDOW_SIZE]
-        
-        # Ground Truth (What actually happened next)
         actual_next_cat = test_seq[i + WINDOW_SIZE][1]
         
-        # Run Solver
         winner = solver.solve(input_window, horizon_steps=HORIZON)
         best_seq = winner['seq']
         
-        # Determine Logic
-        # If the best sequence is LONGER than input, it is a prediction.
-        # If shorter or same, it implies uncertainty or consolidation.
-        
         action = "HOLD"
-        predicted_cat = -1
         
+        # Logic: If the best sequence is LONGER than input, it's a prediction
         if len(best_seq) > len(input_window):
-            # The most probable path is an extension
             predicted_cat = best_seq[len(input_window)][1]
             last_input_cat = input_window[-1][1]
-            
             if predicted_cat > last_input_cat: action = "BUY"
             elif predicted_cat < last_input_cat: action = "SELL"
-            else: action = "FLAT"
         
-        # Check correctness if an action was taken
+        # Logic: If the best sequence is SHORTER, it detected noise
+        elif len(best_seq) < len(input_window):
+            action = "NOISE"
+
+        # Check correctness
         is_hit = False
-        if action != "HOLD":
+        if action in ["BUY", "SELL"]:
             total += 1
             if action == "BUY" and actual_next_cat > input_window[-1][1]: is_hit = True
             elif action == "SELL" and actual_next_cat < input_window[-1][1]: is_hit = True
-            
             if is_hit: correct += 1
 
-        # Formatting Output
-        in_str = str([x[1] for x in input_window[-3:]])
-        out_str = str([x[1] for x in best_seq[-3:]])
-        conf = f"{abs(winner['z']):.2f}"
+        # Formatting Output - SHOWING FULL SEQUENCES NOW
+        in_str = str([x[1] for x in input_window])
+        out_str = str([x[1] for x in best_seq])
         
-        print(f"{i:<5} | {in_str:<15} | {out_str:<15} | {action:<10} | {conf}")
+        # Truncate for display if too long
+        if len(in_str) > 38: in_str = "..." + in_str[-35:]
+        if len(out_str) > 38: out_str = "..." + out_str[-35:]
+        
+        len_diff = len(best_seq) - len(input_window)
+        len_display = f"{len(best_seq)} ({len_diff:+})"
 
-    print("-" * 85)
+        print(f"{i:<5} | {in_str:<40} | {out_str:<40} | {len_display:<5} | {action:<10}")
+
+    print("-" * 120)
     if total > 0:
         print(f"Accuracy: {correct}/{total} ({correct/total*100:.2f}%)")
     else:
-        print("No trades taken (System remained in HOLD/Correction mode).")
+        print("No predictions made.")
