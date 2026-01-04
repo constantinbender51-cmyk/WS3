@@ -26,8 +26,8 @@ CONFIG = {
     "SIGNAL_THRESHOLD": 2.5, # Combined probability score required to trade
     
     # Debugging & Output
-    "DEBUG_PRINTS": 10,      # Number of predictions to print
-    "PRINT_DELAY": 0.1,      # Delay for slow print
+    "DEBUG_PRINTS": 1000000, # High limit, but filtered by "Prediction Only"
+    "PRINT_DELAY": 0.05,     # Faster print
     
     # Plotting
     "PLOT_FILENAME_EQUITY": "equity_curve.png",
@@ -117,9 +117,6 @@ class SequenceModel:
         if length == 0 or length > self.max_len: return 0.0
         count = self.counts.get(sequence_tuple, 0)
         
-        # If the sequence was never seen (e.g., contains out-of-bounds categories),
-        # count will be 0, and we return 0.0. This handles the user requirement.
-        
         num_unique = len(self.unique_patterns_by_len[length])
         if num_unique == 0: return 0.0
         total_occurrences = self.total_counts_by_len[length]
@@ -168,11 +165,7 @@ class SequenceTrader:
         self.bin_edges = [self.train_min + i * self.bin_width for i in range(self.n_categories + 1)]
         
         # 2. Discretize Training Data
-        # We use the mathematical formula: floor((price - min) / width)
-        # We clamp strictly to 0..N-1 for training to match standard indices
         train_cats_raw = np.floor((train_prices - self.train_min) / self.bin_width).astype(int)
-        
-        # Handle the exact max case (it falls in bin N, needs to be N-1)
         train_cats = np.clip(train_cats_raw, 0, self.n_categories - 1)
         
         train_dirs = [0] * len(train_cats)
@@ -187,19 +180,8 @@ class SequenceTrader:
     def discretize_single_window(self, prices):
         """
         Calculates 'Virtual' bins based on training width.
-        Does NOT clamp. Allows bins < 0 and > N.
         """
-        # Math formula: floor((price - train_min) / bin_width)
-        # Note: We do not clip here. 
-        # Prices > train_max will get bin index >= n_categories.
-        # Prices < train_min will get bin index < 0.
-        
         raw_cats = np.floor((prices - self.train_min) / self.bin_width).astype(int)
-        
-        # Special handling: if we want to be consistent with Training where exact Max = N-1,
-        # we generally leave it raw for testing.
-        # E.g. If P = Max + epsilon, bin is N. That's a valid "virtual" bin.
-        
         cats = list(raw_cats)
         
         # Directions are difference of virtual bins
@@ -245,31 +227,35 @@ class SequenceTrader:
         input_c = tuple(cat_seq[-input_len:])
         input_d = tuple(dir_seq[-input_len:])
         
-        # Alphabet for edits:
-        # Categories: Only 0 to N-1 (Known Training Categories)
         alph_c = list(range(self.n_categories))
-        # Directions: Known Training Directions
         alph_d = list(self.unique_dirs)
         
         best_c, prob_c = self.get_best_variation(input_c, self.cat_model, alph_c)
         best_d, prob_d = self.get_best_variation(input_d, self.dir_model, alph_d)
         
-        # --- Debug Print ---
-        if self.debug_count < self.debug_limit:
-            msg = (f"--- Prediction {self.debug_count + 1} ---\n"
-                   f"Input Cats: {input_c} (Prob: {self.cat_model.get_probability(input_c):.4f})\n"
-                   f"  -> Best Var: {best_c['seq']}\n"
-                   f"  -> Type: {best_c['type']}, Prob: {prob_c:.4f}\n"
-                   f"Input Dirs: {input_d} (Prob: {self.dir_model.get_probability(input_d):.4f})\n"
-                   f"  -> Best Var: {best_d['seq']}\n"
-                   f"  -> Type: {best_d['type']}, Prob: {prob_d:.4f}")
+        # Detect Extensions (Prediction of future step)
+        c_is_ext = (best_c['type'] == 'insert' and best_c['meta'][0] == len(input_c))
+        d_is_ext = (best_d['type'] == 'insert' and best_d['meta'][0] == len(input_d))
+        
+        # --- Filtered Debug Print ---
+        # Only print if we are extending (Predicting)
+        if (c_is_ext or d_is_ext) and self.debug_count < self.debug_limit:
+            msg = f">>> PREDICTION EVENT {self.debug_count + 1} <<<\n"
+            if c_is_ext:
+                msg += f"  [Category] Predict: Append {best_c['meta'][1]} (Prob: {prob_c:.4f})\n"
+            else:
+                msg += f"  [Category] No Extension (Type: {best_c['type']})\n"
+                
+            if d_is_ext:
+                msg += f"  [Directn]  Predict: Append {best_d['meta'][1]} (Prob: {prob_d:.4f})\n"
+            else:
+                msg += f"  [Directn]  No Extension (Type: {best_d['type']})\n"
+            
             slow_print(msg)
             self.debug_count += 1
         # -------------------------------
 
         signal_score = 0
-        c_is_ext = (best_c['type'] == 'insert' and best_c['meta'][0] == len(input_c))
-        d_is_ext = (best_d['type'] == 'insert' and best_d['meta'][0] == len(input_d))
         combined_prob = prob_c + prob_d
         
         if c_is_ext:
