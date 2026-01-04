@@ -326,10 +326,12 @@ class SequenceTrader:
                 out_d = f"{best_d['type']} (Prob: {data['prob_d']:.2f})"
             
             slow_print(f"Sample Index: {idx}")
-            slow_print(f"  Input Cat Sequence: {data['input_c']}")
-            slow_print(f"  Output Cat Signal:  {out_c}")
-            slow_print(f"  Input Dir Sequence: {data['input_d']}")
-            slow_print(f"  Output Dir Signal:  {out_d}")
+            slow_print(f"  Input Cat Sequence:  {data['input_c']}")
+            slow_print(f"  Result Cat Sequence: {best_c['seq']}")
+            slow_print(f"  Output Cat Signal:   {out_c}")
+            slow_print(f"  Input Dir Sequence:  {data['input_d']}")
+            slow_print(f"  Result Dir Sequence: {best_d['seq']}")
+            slow_print(f"  Output Dir Signal:   {out_d}")
             slow_print("-" * 50)
             
         print("="*50 + "\n")
