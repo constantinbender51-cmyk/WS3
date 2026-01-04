@@ -9,6 +9,7 @@ import json
 import yfinance as yf
 import time
 import math
+import itertools
 
 # ==========================================
 # 0. Configuration & Parameters
@@ -19,20 +20,23 @@ CONFIG = {
     "START_DATE": "2020-01-01",
     "END_DATE": "2025-01-01",
     
-    # Strategy / Model Parameters
-    "MAX_SEQ_LEN": 4,        # Length of sequence to analyze (m)
-    "EDIT_DEPTH": 1,         # Number of edits allowed
-    "N_CATEGORIES": 20,      # Number of equal-width bins
-    "SIGNAL_THRESHOLD": 2.5, # Combined probability score required to trade
+    # Strategy / Model Parameters (Defaults, will be overwritten by Grid Search)
+    "MAX_SEQ_LEN": 4,        
+    "EDIT_DEPTH": 1,         
+    "N_CATEGORIES": 20,      
+    "SIGNAL_THRESHOLD": 2.5, 
     
     # Debugging & Output
-    "DEBUG_PRINTS": 1000000, # High limit, but filtered by "Prediction Only"
-    "PRINT_DELAY": 0.05,     # Faster print
+    "DEBUG_PRINTS": 1000000, 
+    "PRINT_DELAY": 0.05,     
+    
+    # Grid Search
+    "ENABLE_GRID_SEARCH": True,
     
     # Plotting
     "PLOT_FILENAME_EQUITY": "equity_curve.png",
     "PLOT_FILENAME_PRICE": "price_categories.png",
-    "PLOT_DPI": 100,         # Slightly higher DPI for readability of lines
+    "PLOT_DPI": 100,         
     
     # GitHub Upload
     "GITHUB_REPO": "constantinbender51-cmyk/Models",
@@ -138,33 +142,26 @@ class SequenceTrader:
         self.cat_model = SequenceModel(max_seq_len)
         self.dir_model = SequenceModel(max_seq_len)
         
-        # Discretization state
         self.train_min = None
         self.train_max = None
         self.bin_width = None
-        self.bin_edges = None # Kept for plotting
+        self.bin_edges = None 
         
         self.unique_dirs = set()
         self.equity = [1000.0]
         self.debug_count = 0
         
     def fit(self, train_prices):
-        print(f"Training on {len(train_prices)} bars...")
-        
-        # 1. Determine Min/Max and Bin Width
+        # Determine Min/Max and Bin Width
         self.train_min = np.min(train_prices)
         self.train_max = np.max(train_prices)
         price_range = self.train_max - self.train_min
-        
-        # Avoid division by zero
         if price_range == 0: price_range = 1.0
         
         self.bin_width = price_range / self.n_categories
-        
-        # Store edges for plotting later
         self.bin_edges = [self.train_min + i * self.bin_width for i in range(self.n_categories + 1)]
         
-        # 2. Discretize Training Data
+        # Discretize Training Data
         train_cats_raw = np.floor((train_prices - self.train_min) / self.bin_width).astype(int)
         train_cats = np.clip(train_cats_raw, 0, self.n_categories - 1)
         
@@ -175,20 +172,13 @@ class SequenceTrader:
         self.unique_dirs = set(train_dirs)
         self.cat_model.train(list(train_cats))
         self.dir_model.train(train_dirs)
-        print("Training Complete.")
 
     def discretize_single_window(self, prices):
-        """
-        Calculates 'Virtual' bins based on training width.
-        """
         raw_cats = np.floor((prices - self.train_min) / self.bin_width).astype(int)
         cats = list(raw_cats)
-        
-        # Directions are difference of virtual bins
         dirs = [0] * len(cats)
         for i in range(1, len(cats)):
             dirs[i] = cats[i] - cats[i-1]
-            
         return cats, dirs
 
     def generate_edits(self, seq, alphabet):
@@ -233,12 +223,11 @@ class SequenceTrader:
         best_c, prob_c = self.get_best_variation(input_c, self.cat_model, alph_c)
         best_d, prob_d = self.get_best_variation(input_d, self.dir_model, alph_d)
         
-        # Detect Extensions (Prediction of future step)
+        # Detect Extensions
         c_is_ext = (best_c['type'] == 'insert' and best_c['meta'][0] == len(input_c))
         d_is_ext = (best_d['type'] == 'insert' and best_d['meta'][0] == len(input_d))
         
         # --- Filtered Debug Print ---
-        # Only print if we are extending (Predicting)
         if (c_is_ext or d_is_ext) and self.debug_count < self.debug_limit:
             msg = f">>> PREDICTION EVENT {self.debug_count + 1} <<<\n"
             if c_is_ext:
@@ -273,6 +262,13 @@ class SequenceTrader:
         if signal_score < -self.signal_threshold: return -1
         return 0
 
+    def calculate_sharpe(self):
+        eq_series = pd.Series(self.equity)
+        if len(eq_series) < 2: return 0.0
+        returns = eq_series.pct_change().dropna()
+        if len(returns) < 2 or returns.std() == 0: return 0.0
+        return (returns.mean() / returns.std()) * np.sqrt(252)
+
     def run_backtest(self, prices):
         n = len(prices)
         split_idx = int(n * 0.5)
@@ -280,7 +276,6 @@ class SequenceTrader:
         test_data = prices[split_idx:]
         
         self.fit(train_data)
-        print(f"Testing on {len(test_data)} bars...")
         
         position = 0
         entry_price = 0
@@ -305,11 +300,69 @@ class SequenceTrader:
         return self.equity
 
 # ==========================================
-# 4. GitHub Upload Logic
+# 4. Grid Search
+# ==========================================
+def perform_grid_search(train_data):
+    """
+    Optimizes params on the Training Data (which is further split 50/50 inside run_backtest).
+    """
+    print("="*40)
+    print("STARTING GRID SEARCH")
+    print("="*40)
+    
+    # Ranges
+    r_len = range(2, 11)        # 2 to 10
+    r_depth = range(1, 5)       # 1 to 4
+    r_cats = range(10, 101, 10) # 10 to 100 in steps of 10
+    
+    best_sharpe = -999.0
+    best_params = {}
+    
+    total_iterations = len(r_len) * len(r_depth) * len(r_cats)
+    count = 0
+    
+    for length, depth, cats in itertools.product(r_len, r_depth, r_cats):
+        count += 1
+        
+        # Initialize trader with debug=0 to be silent
+        trader = SequenceTrader(
+            max_seq_len=length,
+            edit_depth=depth,
+            n_categories=cats,
+            signal_threshold=CONFIG["SIGNAL_THRESHOLD"],
+            debug_limit=0 
+        )
+        
+        # We pass the 'train_data' (which is the first 50% of the full dataset).
+        # run_backtest will split THIS data into 50% train (quarter 1) and 50% val (quarter 2).
+        # This provides a valid OOS metric for parameter selection.
+        trader.run_backtest(train_data)
+        sharpe = trader.calculate_sharpe()
+        
+        if sharpe > best_sharpe:
+            best_sharpe = sharpe
+            best_params = {
+                "MAX_SEQ_LEN": length,
+                "EDIT_DEPTH": depth,
+                "N_CATEGORIES": cats
+            }
+            print(f"[{count}/{total_iterations}] New Best: {best_params} -> Sharpe: {sharpe:.4f}")
+        else:
+            # Optional: Print progress every N steps
+            if count % 20 == 0:
+                print(f"[{count}/{total_iterations}] Current: L={length}, D={depth}, C={cats} -> Sharpe: {sharpe:.4f}")
+                
+    print("\n" + "="*40)
+    print(f"GRID SEARCH COMPLETE. Best Params: {best_params} (Sharpe: {best_sharpe:.4f})")
+    print("="*40 + "\n")
+    
+    return best_params
+
+# ==========================================
+# 5. GitHub Upload Logic
 # ==========================================
 def upload_plot_to_github(filename, repo, token, branch="main"):
     print(f"Preparing to upload {filename} to {repo}...")
-    
     try:
         with open(filename, "rb") as image_file:
             encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
@@ -318,10 +371,7 @@ def upload_plot_to_github(filename, repo, token, branch="main"):
         return
 
     url = f"https://api.github.com/repos/{repo}/contents/{filename}"
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3+json"
-    }
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
     
     check_response = requests.get(url, headers=headers)
     sha = None
@@ -329,24 +379,15 @@ def upload_plot_to_github(filename, repo, token, branch="main"):
         sha = check_response.json().get("sha")
         print(f"{filename} exists, overwriting...")
 
-    data = {
-        "message": f"Update plot: {filename}",
-        "content": encoded_string,
-        "branch": branch
-    }
-    if sha:
-        data["sha"] = sha
+    data = {"message": f"Update plot: {filename}", "content": encoded_string, "branch": branch}
+    if sha: data["sha"] = sha
 
     response = requests.put(url, headers=headers, data=json.dumps(data))
-    
-    if response.status_code in [200, 201]:
-        print(f"Successfully uploaded {filename} to GitHub.")
-    else:
-        print(f"Failed to upload {filename}. Status: {response.status_code}")
-        print(response.text)
+    if response.status_code in [200, 201]: print(f"Successfully uploaded {filename} to GitHub.")
+    else: print(f"Failed to upload {filename}. Status: {response.status_code}")
 
 # ==========================================
-# 5. Main Execution
+# 6. Main Execution
 # ==========================================
 def main():
     load_env()
@@ -365,7 +406,19 @@ def main():
 
     print(f"Loaded {len(prices)} data points.")
     
-    # 2. Run Backtest
+    # 2. Grid Search
+    if CONFIG["ENABLE_GRID_SEARCH"]:
+        # Isolate the training portion (first 50%)
+        train_len = int(len(prices) * 0.5)
+        training_data_subset = prices[:train_len]
+        
+        best_params = perform_grid_search(training_data_subset)
+        
+        # Apply Best Params
+        CONFIG.update(best_params)
+    
+    # 3. Final Backtest (on full data, testing on 2nd half)
+    print("Running Final Backtest with Optimized Parameters...")
     trader = SequenceTrader(
         max_seq_len=CONFIG["MAX_SEQ_LEN"],
         edit_depth=CONFIG["EDIT_DEPTH"],
@@ -374,59 +427,40 @@ def main():
         debug_limit=CONFIG["DEBUG_PRINTS"]
     )
     equity = trader.run_backtest(prices)
-    
-    # 3. Stats
-    eq_series = pd.Series(equity)
-    sharpe = 0.0
-    if len(eq_series) > 1 and eq_series.pct_change().std() > 0:
-        sharpe = (eq_series.pct_change().mean() / eq_series.pct_change().std()) * np.sqrt(252)
+    sharpe = trader.calculate_sharpe()
         
     print("-" * 30)
     print(f"Final Equity: ${equity[-1]:.2f}")
     print(f"Sharpe Ratio: {sharpe:.4f}")
     print("-" * 30)
 
-    # 4. Generate Plot 1: Equity Curve
+    # 4. Plots
     plt.figure(figsize=(10, 6))
     plt.plot(equity, label='Strategy Equity')
     plt.title(f'Sequence Trader Results (Sharpe: {sharpe:.2f})')
     plt.xlabel('Trades')
     plt.ylabel('Equity ($)')
-    plt.legend()
-    plt.grid(True)
-    
+    plt.legend(); plt.grid(True)
     plt.savefig(CONFIG["PLOT_FILENAME_EQUITY"], dpi=CONFIG["PLOT_DPI"]) 
     print(f"Equity plot saved as {CONFIG['PLOT_FILENAME_EQUITY']}")
-    plt.close() # Close figure to free memory
+    plt.close()
 
-    # 5. Generate Plot 2: Price with Categories
     plt.figure(figsize=(12, 8))
     plt.plot(prices, label='Price', color='black', linewidth=1)
-    
-    # Draw horizontal lines for bin edges
     if trader.bin_edges is not None:
         for i, edge in enumerate(trader.bin_edges):
-            # Skip extreme edges if they are effectively inf or equal to min/max
             plt.axhline(y=edge, color='red', linestyle='--', alpha=0.3, linewidth=0.5)
-    
-    # Vertical line for Train/Test Split
     split_idx = int(len(prices) * 0.5)
     plt.axvline(x=split_idx, color='blue', linestyle='-', linewidth=2, label='Train/Test Split')
-    
     plt.title(f'Price History vs {CONFIG["N_CATEGORIES"]} Equal-Width Bins')
-    plt.xlabel('Bars (Days)')
-    plt.ylabel('Price')
-    plt.legend()
-    # No grid for clearer view of bins
-    
+    plt.xlabel('Bars (Days)'); plt.ylabel('Price'); plt.legend()
     plt.savefig(CONFIG["PLOT_FILENAME_PRICE"], dpi=CONFIG["PLOT_DPI"])
     print(f"Price plot saved as {CONFIG['PLOT_FILENAME_PRICE']}")
     plt.close()
 
-    # 6. Upload to GitHub
+    # 5. Upload
     pat = os.environ.get("PAT")
     repo = CONFIG["GITHUB_REPO"]
-    
     if pat:
         upload_plot_to_github(CONFIG["PLOT_FILENAME_EQUITY"], repo, pat, CONFIG["GITHUB_BRANCH"])
         upload_plot_to_github(CONFIG["PLOT_FILENAME_PRICE"], repo, pat, CONFIG["GITHUB_BRANCH"])
