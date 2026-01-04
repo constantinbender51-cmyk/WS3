@@ -12,7 +12,7 @@ MIN_PRICE = 100
 MAX_PRICE = 600
 N_CATEGORIES = 100
 TRAIN_SPLIT = 0.7
-CATEGORY_STEP = 1
+CATEGORY_STEP = 1  # Change this to 2, 3, etc. to increase variant space
 PRINT_DELAY = 0.1
 STARTING_EQUITY = 10000
 CATEGORY_TO_DOLLAR = 10  # Scaling factor for category movements to dollars
@@ -66,49 +66,47 @@ def compute_directional_probabilities(categories: List[int]) -> dict:
     probabilities = {seq: count / total_sequences for seq, count in dir_sequence_counts.items()}
     return probabilities
 
-def generate_category_variants(last_two_cats: List[int], step: int) -> List[List[int]]:
-    """Generate all category sequences 1 step away from last two categories"""
+def generate_category_variants(last_two_cats: List[int], n_steps: int) -> List[List[int]]:
+    """Generate all category sequences n steps away from last two categories
+    
+    For n_steps=1: 5,4 -> 4,4  5,4  6,4  5,3  5,4  5,5
+    For n_steps=2: 5,4 -> 3,4  4,4  5,4  6,4  7,4  5,2  5,3  5,4  5,5  5,6
+    """
     c1, c2 = last_two_cats
     
-    # Edit first two categories
-    variants_step1 = [
-        [c1 - step, c2],
-        [c1 + step, c2],
-        [c1, c2 - step],
-        [c1, c2 + step]
-    ]
+    # Edit first two categories - generate all combinations within n_steps
+    variants_step1 = []
+    for delta1 in range(-n_steps, n_steps + 1):
+        for delta2 in range(-n_steps, n_steps + 1):
+            variants_step1.append([c1 + delta1, c2 + delta2])
     
-    # Append third category with 1 step variations
+    # Append third category with n_steps variations
     variants_step2 = []
     for var in variants_step1:
-        variants_step2.extend([
-            var + [c2 - step],
-            var + [c2],
-            var + [c2 + step]
-        ])
+        for delta3 in range(-n_steps, n_steps + 1):
+            variants_step2.append(var + [c2 + delta3])
     
     return variants_step2
 
-def generate_directional_variants(cat_diffs: Tuple[int, int], step: int) -> List[List[int]]:
-    """Generate directional variants based on category differences"""
+def generate_directional_variants(cat_diffs: Tuple[int, int], n_steps: int) -> List[List[int]]:
+    """Generate directional variants based on category differences
+    
+    For n_steps=1: directions (1,2) -> (0,2) (1,2) (2,2) (1,1) (1,2) (1,3)
+    For n_steps=2: directions (1,2) -> (-1,2) (0,2) (1,2) (2,2) (3,2) (1,0) (1,1) (1,2) (1,3) (1,4)
+    """
     d1, d2 = cat_diffs
     
     # Edit directional values
-    variants_step1 = [
-        [d1 - step, d2],
-        [d1 + step, d2],
-        [d1, d2 - step],
-        [d1, d2 + step]
-    ]
+    variants_step1 = []
+    for delta1 in range(-n_steps, n_steps + 1):
+        for delta2 in range(-n_steps, n_steps + 1):
+            variants_step1.append([d1 + delta1, d2 + delta2])
     
     # Append third direction
     variants_step2 = []
     for var in variants_step1:
-        variants_step2.extend([
-            var + [d2 - step],
-            var + [d2],
-            var + [d2 + step]
-        ])
+        for delta3 in range(-n_steps, n_steps + 1):
+            variants_step2.append(var + [d2 + delta3])
     
     return variants_step2
 
@@ -116,12 +114,12 @@ def predict_next_category(
     last_two_cats: List[int],
     cat_probs: dict,
     dir_probs: dict,
-    step: int
+    n_steps: int
 ) -> Tuple[int, str]:
     """Predict next category and action"""
     
     # Generate category variants
-    cat_variants = generate_category_variants(last_two_cats, step)
+    cat_variants = generate_category_variants(last_two_cats, n_steps)
     
     # Convert to directional (category differences)
     directional = [last_two_cats[1] - last_two_cats[0]]
@@ -235,6 +233,13 @@ def main():
     custom_print("=" * 60)
     custom_print("Category-Based Price Prediction Algorithm")
     custom_print("=" * 60)
+    
+    # Calculate and display variant space size
+    n_edits = (2 * CATEGORY_STEP + 1) ** 2  # Editing first two categories
+    n_appends = (2 * CATEGORY_STEP + 1)  # Appending third category
+    total_variants = n_edits * n_appends
+    custom_print(f"\nStep size: {CATEGORY_STEP}")
+    custom_print(f"Variant space size: {total_variants} variants per prediction")
     
     custom_print(f"\nGenerating {N_PRICES} mock prices...")
     prices = generate_prices(N_PRICES, MIN_PRICE, MAX_PRICE)
