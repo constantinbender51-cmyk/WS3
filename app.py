@@ -28,7 +28,7 @@ STARTING_EQUITY = 10000
 
 # Penalty for predicting the same category as the current one.
 # Higher value forces the model to favor "change" over "status quo".
-CONTINUITY_PENALTY = 0.2 
+CONTINUITY_PENALTY = 0.5
 
 # Multiplier to make price changes meaningful in dollar terms for equity curve
 DOLLAR_MULTIPLIER = 1 
