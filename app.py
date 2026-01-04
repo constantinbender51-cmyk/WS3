@@ -15,7 +15,7 @@ class MarketDataHandler:
         self.last_min = 0
         self.last_step = 0
 
-    def fetch_candles(self, symbol="SPY", period="5y"):
+    def fetch_candles(self, symbol="SPY", period="2y"):
         print(f"--- Fetching {period} data for {symbol} ---")
         try:
             df = yf.download(symbol, period=period, interval="1d", progress=False)
@@ -28,8 +28,12 @@ class MarketDataHandler:
                 prices = df['Close'].tolist()
             else:
                 prices = df.iloc[:, 0].tolist()
+            
             prices = [p for p in prices if not math.isnan(p)]
             if not prices: raise ValueError("Empty data")
+            
+            # Keep raw prices for backtesting returns
+            self.raw_prices = prices
             print(f"Loaded {len(prices)} candles.")
             return prices
         except Exception as e:
@@ -160,147 +164,209 @@ class EvolutionarySolver:
     def generate_mutations(self, seq):
         candidates = []
         L = len(seq)
-        
-        # 1. Modify Value
         for i in range(L):
             curr_mom, curr_cat = seq[i]
-            if curr_cat < self.num_bins:
-                candidates.append(seq[:i] + [(curr_mom, curr_cat + 1)] + seq[i+1:])
-            if curr_cat > 1:
-                candidates.append(seq[:i] + [(curr_mom, curr_cat - 1)] + seq[i+1:])
-
-        # 2. Swap Adjacent
+            if curr_cat < self.num_bins: candidates.append(seq[:i] + [(curr_mom, curr_cat + 1)] + seq[i+1:])
+            if curr_cat > 1: candidates.append(seq[:i] + [(curr_mom, curr_cat - 1)] + seq[i+1:])
         for i in range(L - 1):
             new_seq = seq[:]
             new_seq[i], new_seq[i+1] = new_seq[i+1], new_seq[i]
             candidates.append(new_seq)
-            
-        # 3. Delete Index
         if L > 2:
-            for i in range(L):
-                candidates.append(seq[:i] + seq[i+1:])
-                
-        # 4. Insert (Average neighbor)
-        if L < 15: # Prevent infinite growth in mutation phase
-            for i in range(L):
-                candidates.append(seq[:i] + [seq[i]] + seq[i:])
-
+            for i in range(L): candidates.append(seq[:i] + seq[i+1:])
         return candidates
 
     def solve(self, input_seq, horizon_steps=2):
-        # 1. BASE POOL: Start with the Input Sequence
         base_pool = [{'seq': input_seq, 'type': 'orig'}]
-        
-        # 2. SHORTENING: Generate all sub-sequences
         L = len(input_seq)
-        for length in range(3, L): # Min length 3, up to L-1
+        
+        # Sub-sequences
+        for length in range(3, L): 
             for i in range(L - length + 1):
-                sub = input_seq[i : i+length]
-                base_pool.append({'seq': sub, 'type': 'sub'})
+                base_pool.append({'seq': input_seq[i : i+length], 'type': 'sub'})
 
-        # 3. MUTATION: Add mutations of the original sequence
-        # (Optional: could also mutate the sub-sequences, but that explodes complexity)
+        # Mutations
         muts = self.generate_mutations(input_seq)
         for m in muts:
             base_pool.append({'seq': m, 'type': 'mut'})
 
-        # 4. EXTENSION (FORECASTING): 
-        # Crucial update: We now try to extend EVERYTHING in the base pool.
-        # This means we can predict future from full seq, OR predict future from a sub-seq.
+        # Extensions
         final_pool = []
-        
-        # Add the base items themselves (in case holding is the best option)
         final_pool.extend(base_pool)
         
         for item in base_pool:
             current_tips = [item['seq']]
-            
-            # Extend this specific candidate by N steps
             for _ in range(horizon_steps):
                 new_tips = []
                 for tip in current_tips:
                     last_cat = tip[-1][1]
-                    # Try UP, DOWN, FLAT extensions
                     options = [last_cat]
                     if last_cat < self.num_bins: options.append(last_cat + 1)
                     if last_cat > 1: options.append(last_cat - 1)
-                    
                     for opt in options:
                         new_tip = tip + [('FLAT', opt)] 
                         new_tips.append(new_tip)
-                        
-                        # Add to final pool
                         final_pool.append({'seq': new_tip, 'type': item['type'] + '+ext'})
-                
-                current_tips = new_tips # Continue extending from the new tips
+                current_tips = new_tips
 
-        # 5. EVALUATE
+        # Evaluate
         scored = []
         unique_hashes = set()
-
         for cand in final_pool:
-            # Repair logic (ensure UP/DOWN text matches numbers)
             fixed_seq = self._repair_physics(cand['seq'])
-            
             s_hash = str(fixed_seq)
             if s_hash in unique_hashes: continue
             unique_hashes.add(s_hash)
-            
             z = self.engine.get_z_score(fixed_seq)
-            scored.append({
-                'seq': fixed_seq,
-                'z': z,
-                'type': cand['type']
-            })
+            scored.append({'seq': fixed_seq, 'z': z, 'type': cand['type']})
 
-        # Lowest Z-score wins (Most "Normal"/Probable sequence)
         scored.sort(key=lambda x: x['z'])
         return scored[0]
 
 # ==============================================================================
-# 4. MAIN EXECUTION
+# 4. BACKTESTER & PORTFOLIO
+# ==============================================================================
+
+class Backtester:
+    def __init__(self, initial_capital=10000.0):
+        self.initial_capital = initial_capital
+        self.equity = [initial_capital]
+        self.returns = []
+        self.positions = [] # +1 (Long), -1 (Short), 0 (Flat)
+    
+    def on_market_step(self, predicted_signal, actual_pct_change):
+        """
+        predicted_signal: 1 (Buy), -1 (Sell), 0 (Flat)
+        actual_pct_change: The actual market move that happened AFTER the signal
+        """
+        # Calculate PnL for this step
+        # If Signal=1 and Market=+2%, we make 2%. If Signal=-1 and Market=+2%, we lose 2%.
+        step_return = predicted_signal * actual_pct_change
+        
+        # Update Equity
+        curr_equity = self.equity[-1]
+        new_equity = curr_equity * (1 + step_return)
+        
+        self.equity.append(new_equity)
+        self.returns.append(step_return)
+        self.positions.append(predicted_signal)
+        
+    def get_stats(self):
+        if not self.returns: return {}
+        
+        equity_curve = np.array(self.equity)
+        returns = np.array(self.returns)
+        
+        total_return = (equity_curve[-1] - equity_curve[0]) / equity_curve[0]
+        
+        # Annualized Statistics (Assuming Daily Data)
+        mean_ret = np.mean(returns)
+        std_ret = np.std(returns)
+        
+        # Sharpe Ratio (Mean / Std) * sqrt(252)
+        # Using 0% Risk Free Rate for simplicity of raw alpha test
+        if std_ret == 0: sharpe = 0
+        else: sharpe = (mean_ret / std_ret) * math.sqrt(252)
+        
+        # Max Drawdown
+        peak = equity_curve[0]
+        max_dd = 0
+        for val in equity_curve:
+            if val > peak: peak = val
+            dd = (peak - val) / peak
+            if dd > max_dd: max_dd = dd
+            
+        return {
+            "Total Return %": total_return * 100,
+            "Sharpe Ratio": sharpe,
+            "Max Drawdown %": max_dd * 100,
+            "Win Rate %": (np.sum(returns > 0) / len(returns)) * 100 if len(returns) > 0 else 0,
+            "Final Equity": equity_curve[-1]
+        }
+
+# ==============================================================================
+# 5. MAIN EXECUTION
 # ==============================================================================
 
 if __name__ == "__main__":
     SYMBOL = "SPY"
-    PERIOD = "2y"
+    PERIOD = "2y" # Longer period for better Sharpe calc
     NUM_BINS = 50
     WINDOW_SIZE = 8
     HORIZON = 2 
     
     market = MarketDataHandler()
-    raw_data = market.fetch_candles(SYMBOL, PERIOD)
-    if not raw_data: exit()
+    raw_prices = market.fetch_candles(SYMBOL, PERIOD)
+    if not raw_prices: exit()
 
-    full_seq = market.discretize_sequence(raw_data, num_bins=NUM_BINS)
-    split = int(len(full_seq) * 0.8)
-    train_seq = full_seq[:split]
-    test_seq = full_seq[split:]
+    full_seq = market.discretize_sequence(raw_prices, num_bins=NUM_BINS)
+    
+    # 60% Train / 40% Backtest
+    split_idx = int(len(full_seq) * 0.6)
+    train_seq = full_seq[:split_idx]
+    
+    print(f"Training on first {split_idx} days, Backtesting on remaining {len(full_seq)-split_idx} days...")
     
     engine = ZScoreEngine(num_categories=NUM_BINS)
     engine.train(train_seq)
-    
-    # Calibrate for a wide range of lengths (Shortest sub=3, Longest ext=Window+Horizon+Mutations)
     engine.calibrate(max_len=WINDOW_SIZE + HORIZON + 5)
     
     solver = EvolutionarySolver(engine, NUM_BINS)
+    backtester = Backtester()
     
-    print(f"\n{'IDX':<5} | {'WINNER SEQUENCE (Cats)':<35} | {'ORIG LEN':<8} | {'NEW LEN':<8} | {'SOURCE':<10}")
-    print("-" * 100)
-
-    # Run last 50 for demo
-    start_idx = max(0, len(test_seq) - WINDOW_SIZE - 50)
+    print("\nStarting Backtest Simulation...")
+    print(f"{'IDX':<5} | {'SIGNAL':<8} | {'ACTUAL %':<10} | {'EQUITY ($)':<12}")
+    print("-" * 50)
     
-    for i in range(start_idx, len(test_seq) - WINDOW_SIZE - 1, 1):
-        input_window = test_seq[i : i + WINDOW_SIZE]
+    # Run Backtest
+    for i in range(split_idx, len(full_seq) - WINDOW_SIZE - 1):
+        input_window = full_seq[i : i + WINDOW_SIZE]
+        
+        # Get Real Market Move for the NEXT day
+        # Note: We make decision at 'i + WINDOW_SIZE', realize PnL at 'i + WINDOW_SIZE + 1'
+        curr_price = raw_prices[i + WINDOW_SIZE]
+        next_price = raw_prices[i + WINDOW_SIZE + 1]
+        actual_pct_change = (next_price - curr_price) / curr_price
+        
+        # --- AI DECISION ---
         winner = solver.solve(input_window, horizon_steps=HORIZON)
-        
         best_seq = winner['seq']
-        orig_len = len(input_window)
-        new_len = len(best_seq)
         
-        # Display
-        out_str = str([x[1] for x in best_seq])
-        if len(out_str) > 33: out_str = "..." + out_str[-30:]
+        # Signal Logic:
+        # 1. If Extended (Length > Input) -> Forecast -> Trade
+        # 2. If Shortened (Length < Input) -> Noise -> Flat
+        # 3. If Same -> Neutral -> Flat
         
-        print(f"{i:<5} | {out_str:<35} | {orig_len:<8} | {new_len:<8} | {winner['type']:<10}")
+        signal = 0
+        if len(best_seq) > len(input_window):
+            # It's a prediction
+            pred_cat = best_seq[len(input_window)][1] # First forecasted step
+            curr_cat = input_window[-1][1]
+            
+            if pred_cat > curr_cat: signal = 1   # Long
+            elif pred_cat < curr_cat: signal = -1 # Short
+        
+        # Record to Backtester
+        backtester.on_market_step(signal, actual_pct_change)
+        
+        if i % 20 == 0: # Print every 20 steps to save space
+            print(f"{i:<5} | {signal:<8} | {actual_pct_change*100:6.2f}% | {backtester.equity[-1]:,.2f}")
+
+    # Final Stats
+    stats = backtester.get_stats()
+    
+    print("\n" + "="*40)
+    print(f"BACKTEST RESULTS ({SYMBOL})")
+    print("="*40)
+    print(f"Final Equity:   ${stats['Final Equity']:,.2f}")
+    print(f"Total Return:   {stats['Total Return %']:.2f}%")
+    print(f"Sharpe Ratio:   {stats['Sharpe Ratio']:.4f}")
+    print(f"Max Drawdown:   {stats['Max Drawdown %']:.2f}%")
+    print(f"Win Rate:       {stats['Win Rate %']:.2f}%")
+    
+    # Benchmarking (Buy & Hold)
+    start_p = raw_prices[split_idx + WINDOW_SIZE]
+    end_p = raw_prices[-1]
+    bnh_ret = (end_p - start_p) / start_p * 100
+    print("-" * 40)
+    print(f"Buy & Hold Ret: {bnh_ret:.2f}%")
