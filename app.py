@@ -182,9 +182,16 @@ def find_optimal_strategy(prices):
     # Dynamic bucket sizing based on asset price to speed up grid search
     avg_price = sum(prices) / len(prices)
     
-    # Generate logical bucket sizes based on 0.01% to 1% of price
-    # Only searching 10 variations to keep it fast
-    base_step = max(1, int(avg_price * 0.001)) 
+    # --- UPDATE TO MATCH FILE 32 LOGIC ---
+    # File 32 used buckets [10, ... 100] for ETH (Price ~2500).
+    # This ratio is roughly 0.4% (10/2500) to 4% (100/2500).
+    # Previous File 33 used 0.1% which was too small/noisy.
+    # We increase the multiplier to 0.004 (0.4%) to match the coarser, more accurate buckets.
+    
+    base_step = max(1, int(avg_price * 0.004)) 
+    
+    # Generate bucket sizes: [1*step ... 10*step]
+    # For ETH this will be approx [10, 20, ... 100]
     bucket_sizes = [base_step * i for i in range(1, 11)] 
     
     seq_lengths = [3, 4, 5, 6]
