@@ -54,8 +54,6 @@ def get_binance_data(symbol, start_str=START_DATE):
     current_start = start_ts
     
     # We only need Close price (index 4) and Close Time (index 6) for resampling
-    # Binance API: [Open time, Open, High, Low, Close, Volume, Close time, ...]
-    
     while current_start < end_ts:
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={BASE_INTERVAL}&startTime={current_start}&limit=1000"
         try:
@@ -94,10 +92,25 @@ def resample_prices(raw_data, target_freq):
 # --- 2. CORE STRATEGY LOGIC ---
 
 def get_bucket(price, bucket_size):
+    """Converts price to bucket index based on dynamic size."""
+    # Safety for extremely small sizes to prevent division by zero
+    if bucket_size <= 0: bucket_size = 1e-9
+    
     if price >= 0:
-        return (int(price) // bucket_size) + 1
+        return int(price // bucket_size)
     else:
-        return (int(price + 1) // bucket_size) - 1
+        return int(price // bucket_size) - 1
+
+def calculate_bucket_size(prices, bucket_count):
+    """Calculates bucket size based on total range and target count."""
+    min_p = min(prices)
+    max_p = max(prices)
+    price_range = max_p - min_p
+    
+    if bucket_count <= 0: return 1.0
+    
+    size = price_range / bucket_count
+    return size if size > 0 else 0.01
 
 def train_models(train_buckets, seq_len):
     abs_map = defaultdict(Counter)
@@ -147,7 +160,11 @@ def evaluate_config(prices, bucket_size, seq_len):
     if len(train) < seq_len + 10: return -1, "None", 0 # Not enough data
     
     all_vals = list(set(train))
+    if not all_vals: all_vals = [0]
+    
     all_changes = list(set(train[j] - train[j-1] for j in range(1, len(train))))
+    if not all_changes: all_changes = [0]
+        
     abs_map, der_map = train_models(train, seq_len)
     
     stats = {"Absolute": [0,0], "Derivative": [0,0], "Combined": [0,0]}
@@ -178,32 +195,124 @@ def evaluate_config(prices, bucket_size, seq_len):
             
     return best_acc, best_name, best_trades
 
+def run_portfolio_analysis(prices, top_configs):
+    """
+    Runs the 'Union' strategy on the top configurations to print final console stats.
+    """
+    models = []
+    for config in top_configs:
+        # Recalculate size from count to ensure consistency
+        b_count = config['bucket_count']
+        b_size = calculate_bucket_size(prices, b_count)
+        s_len = config['seq_len']
+        
+        buckets = [get_bucket(p, b_size) for p in prices]
+        split_idx = int(len(buckets) * 0.7)
+        train_buckets = buckets[:split_idx]
+        
+        abs_map, der_map = train_models(train_buckets, s_len)
+        
+        t_vals = list(set(train_buckets))
+        t_changes = list(set(train_buckets[j] - train_buckets[j-1] for j in range(1, len(train_buckets))))
+        
+        models.append({
+            "config": config,
+            "buckets": buckets,
+            "seq_len": s_len,
+            "split_idx": split_idx,
+            "abs_map": abs_map,
+            "der_map": der_map,
+            "all_vals": t_vals if t_vals else [0],
+            "all_changes": t_changes if t_changes else [0]
+        })
+
+    # Alignment based on raw index
+    if not models: return 0, 0
+    
+    start_test_idx = models[0]['split_idx']
+    max_seq_len = max(m['seq_len'] for m in models)
+    total_test_len = len(models[0]['buckets']) - start_test_idx - max_seq_len
+    
+    unique_correct = 0
+    unique_total = 0
+    
+    for i in range(total_test_len):
+        curr_raw_idx = start_test_idx + i
+        active_directions = [] 
+        
+        for model in models:
+            c = model['config']
+            seq_len = model['seq_len']
+            buckets = model['buckets']
+            
+            # Identify current sequence and actual next value
+            # Note: We must be careful with indices. 
+            # In evaluate_config: curr = split_idx + i. 
+            # Here: curr_raw_idx corresponds to that 'curr'.
+            
+            a_seq = tuple(buckets[curr_raw_idx : curr_raw_idx + seq_len])
+            d_seq = tuple(buckets[j] - buckets[j-1] for j in range(curr_raw_idx, curr_raw_idx + seq_len))
+            last_val = a_seq[-1]
+            actual_val = buckets[curr_raw_idx + seq_len]
+            
+            diff = actual_val - last_val
+            model_actual_dir = 1 if diff > 0 else (-1 if diff < 0 else 0)
+            
+            pred_val = get_prediction(c['model_type'], model['abs_map'], model['der_map'], 
+                                      a_seq, d_seq, last_val, model['all_vals'], model['all_changes'])
+            
+            pred_diff = pred_val - last_val
+            
+            if pred_diff != 0:
+                direction = 1 if pred_diff > 0 else -1
+                is_correct = (direction == model_actual_dir)
+                is_flat = (model_actual_dir == 0)
+                
+                active_directions.append({
+                    "dir": direction,
+                    "is_correct": is_correct,
+                    "is_flat": is_flat
+                })
+
+        if not active_directions:
+            continue
+            
+        dirs = [x['dir'] for x in active_directions]
+        has_up = 1 in dirs
+        has_down = -1 in dirs
+        
+        # Conflict check
+        if has_up and has_down:
+            continue
+            
+        any_correct = any(x['is_correct'] for x in active_directions)
+        any_wrong_direction = any((not x['is_correct'] and not x['is_flat']) for x in active_directions)
+        all_flat = all(x['is_flat'] for x in active_directions)
+        
+        if not all_flat:
+            unique_total += 1
+            if any_correct and not any_wrong_direction:
+                unique_correct += 1
+
+    return unique_correct, unique_total
+
 def find_optimal_strategy(prices):
-    # Dynamic bucket sizing based on asset price to speed up grid search
-    avg_price = sum(prices) / len(prices)
-    
-    # --- UPDATE TO MATCH FILE 32 LOGIC ---
-    # File 32 used buckets [10, ... 100] for ETH (Price ~2500).
-    # This ratio is roughly 0.4% (10/2500) to 4% (100/2500).
-    # Previous File 33 used 0.1% which was too small/noisy.
-    # We increase the multiplier to 0.004 (0.4%) to match the coarser, more accurate buckets.
-    
-    base_step = max(1, int(avg_price * 0.004)) 
-    
-    # Generate bucket sizes: [1*step ... 10*step]
-    # For ETH this will be approx [10, 20, ... 100]
-    bucket_sizes = [base_step * i for i in range(1, 11)] 
-    
-    seq_lengths = [3, 4, 5, 6]
+    # Dynamic bucket sizing based on TARGET COUNT
+    bucket_counts = [10, 25, 50, 75, 100, 150, 200, 300]
+    seq_lengths = [3, 4, 5, 6, 8]
     
     results = []
     
-    for b in bucket_sizes:
+    for b_count in bucket_counts:
+        # Calculate size for this count
+        b_size = calculate_bucket_size(prices, b_count)
+        
         for s in seq_lengths:
-            acc, mod, tr = evaluate_config(prices, b, s)
+            acc, mod, tr = evaluate_config(prices, b_size, s)
             if tr > 20: # Min trades
                 results.append({
-                    "bucket_size": b,
+                    "bucket_count": b_count, # Store count for ref
+                    "bucket_size": b_size,   # Store size for usage
                     "seq_len": s,
                     "model_type": mod,
                     "accuracy": acc,
@@ -240,9 +349,10 @@ def upload_to_github(file_path, content):
     check_resp = requests.get(url, headers=headers)
     if check_resp.status_code == 200:
         data["sha"] = check_resp.json()["sha"]
-        print(f"Updating existing file: {file_path}")
+        # print(f"Updating existing file: {file_path}") # Optional logging
     else:
-        print(f"Creating new file: {file_path}")
+        pass
+        # print(f"Creating new file: {file_path}")
         
     resp = requests.put(url, headers=headers, data=json.dumps(data))
     if resp.status_code in [200, 201]:
@@ -271,23 +381,31 @@ def main():
                 print(f"Not enough data for {tf_name}. Skipping.")
                 continue
                 
-            # 3. Optimize
+            # 3. Optimize (Bucket Count Logic)
             top_configs = find_optimal_strategy(prices)
             
             if not top_configs:
                 print(f"No valid strategy found for {asset} {tf_name}")
                 continue
-                
-            # 4. Prepare Payload
+            
+            # 4. Run Portfolio Analysis & Print Console Output
+            u_correct, u_total = run_portfolio_analysis(prices, top_configs)
+            u_acc = (u_correct / u_total * 100) if u_total > 0 else 0
+            
+            print(f"--> {asset} {tf_name} Final Combined Accuracy: {u_acc:.2f}% ({u_total} trades)")
+
+            # 5. Prepare Payload
             final_payload = {
                 "asset": asset,
                 "timeframe": tf_name,
                 "timestamp": datetime.now().isoformat(),
                 "data_points": len(prices),
+                "combined_accuracy": u_acc, # Added for record keeping
+                "combined_trades": u_total,
                 "strategy_union": top_configs 
             }
             
-            # 5. Upload
+            # 6. Upload
             filename = f"{asset}_{tf_name}.json"
             upload_to_github(filename, final_payload)
             
