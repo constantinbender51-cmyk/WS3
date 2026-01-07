@@ -121,8 +121,26 @@ def train_models(train_buckets, seq_len):
         a_succ = train_buckets[i + seq_len]
         abs_map[a_seq][a_succ] += 1
         
-        if i > 0:
-            d_seq = tuple(train_buckets[j] - train_buckets[j-1] for j in range(i, i + seq_len))
+        if seq_len > 1:
+            d_seq = tuple(train_buckets[j] - train_buckets[j-1] for j in range(i+1, i + seq_len + 1))
+            # d_seq construction check:
+            # logic in single asset: tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq)))
+            # Here: train_buckets[i:i+seq_len] is a_seq. 
+            # indices: i to i+seq_len-1.
+            # d_seq needs diffs.
+            # Let's align exactly with single asset implementation logic to be safe:
+            
+    # Re-implementing simplified loop to match single asset optimizer exactly
+    abs_map = defaultdict(Counter)
+    der_map = defaultdict(Counter)
+    
+    for i in range(len(train_buckets) - seq_len):
+        a_seq = tuple(train_buckets[i : i + seq_len])
+        a_succ = train_buckets[i + seq_len]
+        abs_map[a_seq][a_succ] += 1
+        
+        if seq_len > 1:
+            d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq)))
             d_succ = train_buckets[i + seq_len] - train_buckets[i + seq_len - 1]
             der_map[d_seq][d_succ] += 1
             
@@ -169,11 +187,19 @@ def evaluate_config(prices, bucket_size, seq_len):
     
     stats = {"Absolute": [0,0], "Derivative": [0,0], "Combined": [0,0]}
     
-    for i in range(len(test) - seq_len):
+    total_samples = len(test) - seq_len
+    
+    for i in range(total_samples):
         curr = split_idx + i
         a_seq = tuple(buckets[curr : curr+seq_len])
-        d_seq = tuple(buckets[j] - buckets[j-1] for j in range(curr, curr+seq_len))
-        last, act = a_seq[-1], buckets[curr+seq_len]
+        
+        if seq_len > 1:
+            d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq)))
+        else:
+            d_seq = ()
+            
+        last = a_seq[-1]
+        act = buckets[curr+seq_len]
         act_diff = act - last
         
         p_abs = get_prediction("Absolute", abs_map, der_map, a_seq, d_seq, last, all_vals, all_changes)
@@ -197,7 +223,8 @@ def evaluate_config(prices, bucket_size, seq_len):
 
 def run_portfolio_analysis(prices, top_configs):
     """
-    Runs the 'Union' strategy on the top configurations to print final console stats.
+    Runs the 'Majority Vote' strategy on the top configurations.
+    Updated to match single asset optimizer logic.
     """
     models = []
     for config in top_configs:
@@ -245,16 +272,18 @@ def run_portfolio_analysis(prices, top_configs):
             seq_len = model['seq_len']
             buckets = model['buckets']
             
-            # Identify current sequence and actual next value
-            # Note: We must be careful with indices. 
-            # In evaluate_config: curr = split_idx + i. 
-            # Here: curr_raw_idx corresponds to that 'curr'.
-            
+            # Sequence extraction
             a_seq = tuple(buckets[curr_raw_idx : curr_raw_idx + seq_len])
-            d_seq = tuple(buckets[j] - buckets[j-1] for j in range(curr_raw_idx, curr_raw_idx + seq_len))
+            
+            if seq_len > 1:
+                d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq)))
+            else:
+                d_seq = ()
+                
             last_val = a_seq[-1]
             actual_val = buckets[curr_raw_idx + seq_len]
             
+            # Determine actual move
             diff = actual_val - last_val
             model_actual_dir = 1 if diff > 0 else (-1 if diff < 0 else 0)
             
@@ -274,31 +303,42 @@ def run_portfolio_analysis(prices, top_configs):
                     "is_flat": is_flat
                 })
 
+        # --- Aggregate Signals (Majority Rule) ---
         if not active_directions:
             continue
             
         dirs = [x['dir'] for x in active_directions]
-        has_up = 1 in dirs
-        has_down = -1 in dirs
+        up_votes = dirs.count(1)
+        down_votes = dirs.count(-1)
         
-        # Conflict check
-        if has_up and has_down:
+        final_dir = 0
+        if up_votes > down_votes:
+            final_dir = 1
+        elif down_votes > up_votes:
+            final_dir = -1
+        else:
+            # Tie -> Abstain
             continue
-            
-        any_correct = any(x['is_correct'] for x in active_directions)
-        any_wrong_direction = any((not x['is_correct'] and not x['is_flat']) for x in active_directions)
-        all_flat = all(x['is_flat'] for x in active_directions)
         
-        if not all_flat:
-            unique_total += 1
-            if any_correct and not any_wrong_direction:
-                unique_correct += 1
+        # Identify the voters that formed the majority decision
+        winning_voters = [x for x in active_directions if x['dir'] == final_dir]
+        
+        # --- CORRECTNESS FILTER ---
+        # If ALL winning voters saw a "Flat" market, then the signal didn't encounter a testable move.
+        if all(x['is_flat'] for x in winning_voters):
+            continue 
+            
+        unique_total += 1
+        
+        # Win if ANY of the winning voters were correct
+        if any(x['is_correct'] for x in winning_voters):
+            unique_correct += 1
 
     return unique_correct, unique_total
 
 def find_optimal_strategy(prices):
-    # Dynamic bucket sizing based on TARGET COUNT
-    bucket_counts = [10, 25, 50, 75, 100, 150, 200, 300]
+    # Updated Grid Search: range 10 to 250 in steps of 10
+    bucket_counts = list(range(10, 251, 10))
     seq_lengths = [3, 4, 5, 6, 8]
     
     results = []
@@ -311,17 +351,17 @@ def find_optimal_strategy(prices):
             acc, mod, tr = evaluate_config(prices, b_size, s)
             if tr > 20: # Min trades
                 results.append({
-                    "bucket_count": b_count, # Store count for ref
-                    "bucket_size": b_size,   # Store size for usage
+                    "bucket_count": b_count, 
+                    "bucket_size": b_size,   
                     "seq_len": s,
                     "model_type": mod,
                     "accuracy": acc,
                     "trades": tr
                 })
     
-    # Return top 3 by accuracy
+    # Return top 5 by accuracy
     results.sort(key=lambda x: x['accuracy'], reverse=True)
-    return results[:3]
+    return results[:5]
 
 # --- 3. GITHUB UPLOAD ---
 
@@ -349,10 +389,8 @@ def upload_to_github(file_path, content):
     check_resp = requests.get(url, headers=headers)
     if check_resp.status_code == 200:
         data["sha"] = check_resp.json()["sha"]
-        # print(f"Updating existing file: {file_path}") # Optional logging
     else:
         pass
-        # print(f"Creating new file: {file_path}")
         
     resp = requests.put(url, headers=headers, data=json.dumps(data))
     if resp.status_code in [200, 201]:
@@ -400,7 +438,7 @@ def main():
                 "timeframe": tf_name,
                 "timestamp": datetime.now().isoformat(),
                 "data_points": len(prices),
-                "combined_accuracy": u_acc, # Added for record keeping
+                "combined_accuracy": u_acc, 
                 "combined_trades": u_total,
                 "strategy_union": top_configs 
             }
