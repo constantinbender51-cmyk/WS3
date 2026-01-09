@@ -31,6 +31,7 @@ ASSETS = [
 # Base timeframe download
 BASE_INTERVAL = "15m" 
 START_DATE = "2020-01-01"
+END_DATE = "2026-01-01"  # Hardcoded end date
 
 # Resampling Targets (Pandas frequency strings)
 TIMEFRAMES = {
@@ -43,19 +44,19 @@ TIMEFRAMES = {
 
 # --- 1. DATA FETCHING ---
 
-def get_binance_data(symbol, start_str=START_DATE):
-    """Fetches 15m historical kline data from Binance."""
-    print(f"\n[{symbol}] Fetching raw {BASE_INTERVAL} data from {start_str}...")
+def get_binance_data(symbol, start_str=START_DATE, end_str=END_DATE):
+    """Fetches 15m historical kline data from Binance within specific dates."""
+    print(f"\n[{symbol}] Fetching raw {BASE_INTERVAL} data from {start_str} to {end_str}...")
     
     start_ts = int(datetime.strptime(start_str, "%Y-%m-%d").timestamp() * 1000)
-    end_ts = int(time.time() * 1000)
+    end_ts = int(datetime.strptime(end_str, "%Y-%m-%d").timestamp() * 1000)
     
     all_candles = []
     current_start = start_ts
     
     # We only need Close price (index 4) and Close Time (index 6) for resampling
     while current_start < end_ts:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={BASE_INTERVAL}&startTime={current_start}&limit=1000"
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={BASE_INTERVAL}&startTime={current_start}&endTime={end_ts}&limit=1000"
         try:
             with urllib.request.urlopen(url) as response:
                 data = json.loads(response.read().decode())
@@ -65,7 +66,14 @@ def get_binance_data(symbol, start_str=START_DATE):
                 # Store (Close Time, Close Price)
                 batch = [(int(c[6]), float(c[4])) for c in data]
                 all_candles.extend(batch)
-                current_start = data[-1][6] + 1
+                
+                # Update start time to the last candle's close time + 1ms
+                # Check if we reached the end or if API returned less than limit (end of available data)
+                last_time = data[-1][6]
+                if last_time >= end_ts - 1:
+                    break
+                    
+                current_start = last_time + 1
                 
         except Exception as e:
             print(f"Error fetching: {e}")
@@ -113,24 +121,6 @@ def calculate_bucket_size(prices, bucket_count):
     return size if size > 0 else 0.01
 
 def train_models(train_buckets, seq_len):
-    abs_map = defaultdict(Counter)
-    der_map = defaultdict(Counter)
-    
-    for i in range(len(train_buckets) - seq_len):
-        a_seq = tuple(train_buckets[i : i + seq_len])
-        a_succ = train_buckets[i + seq_len]
-        abs_map[a_seq][a_succ] += 1
-        
-        if seq_len > 1:
-            d_seq = tuple(train_buckets[j] - train_buckets[j-1] for j in range(i+1, i + seq_len + 1))
-            # d_seq construction check:
-            # logic in single asset: tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq)))
-            # Here: train_buckets[i:i+seq_len] is a_seq. 
-            # indices: i to i+seq_len-1.
-            # d_seq needs diffs.
-            # Let's align exactly with single asset implementation logic to be safe:
-            
-    # Re-implementing simplified loop to match single asset optimizer exactly
     abs_map = defaultdict(Counter)
     der_map = defaultdict(Counter)
     
