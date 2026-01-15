@@ -46,14 +46,14 @@ TIMEFRAMES = {
     "1d": "1D"
 }
 
-# --- Grid Search ---
-BUCKET_COUNTS = range(10, 201, 10)
-SEQ_LENGTHS = [4, 5, 6, 8, 10, 12]
+# --- Grid Search (Match 100 exactly where possible) ---
+BUCKET_COUNTS = range(10, 201, 10) # User requested 10...200
+SEQ_LENGTHS = [4, 5, 6, 8, 10, 12] 
 MIN_TRADES = 15
-SCORE_THRESHOLD = 0.55
+SCORE_THRESHOLD = 0.60  # Matches app (100).py (0.6)
 
 # =========================================
-# 2. DATA UTILITIES
+# 2. DATA UTILITIES (Infrastructure)
 # =========================================
 
 def get_binance_data(symbol, start_str=START_DATE, end_str=END_DATE):
@@ -123,7 +123,7 @@ def split_data(prices):
     return prices[:train_end], prices[train_end:preval_end], prices[preval_end:]
 
 # =========================================
-# 3. CORE STRATEGY (100 LOGIC)
+# 3. STRATEGY LOGIC (EXACT 100 COPY)
 # =========================================
 
 def get_bucket(price, bucket_size):
@@ -135,7 +135,7 @@ def calculate_bucket_size(prices, bucket_count):
     min_p, max_p = min(prices), max(prices)
     price_range = max_p - min_p
     size = price_range / bucket_count
-    return size if size > 0 else 1e-9
+    return size if size > 0 else 0.01
 
 def train_models(train_buckets, seq_len):
     abs_map = defaultdict(Counter)
@@ -165,13 +165,8 @@ def get_single_prediction(mode, abs_map, der_map, a_seq, d_seq, last_val):
 
 def get_prediction(model_type, abs_map, der_map, a_seq, d_seq, last_val):
     """
-    STRICT 100 LOGIC:
-    - If Combined: Calculate directions.
-    - If conflict -> None.
-    - If Absolute exists -> Return Absolute.
-    - If Absolute missing -> Return Derivative.
+    Exact Logic from app (100).py
     """
-    
     if model_type == "Absolute":
         return get_single_prediction("Absolute", abs_map, der_map, a_seq, d_seq, last_val)
         
@@ -191,25 +186,28 @@ def get_prediction(model_type, abs_map, der_map, a_seq, d_seq, last_val):
             dir_der = 1 if pred_der > last_val else -1 if pred_der < last_val else 0
             
         if dir_abs == 0 and dir_der == 0: return None
-        
         # Conflict check
         if dir_abs != 0 and dir_der != 0 and dir_abs != dir_der: return None 
         
-        # PRIORITIZE ABSOLUTE (The "100" Preference)
+        # Priority Logic (Exact from 100)
         if dir_abs != 0: return pred_abs
         if dir_der != 0: return pred_der
             
     return None
 
 # =========================================
-# 4. OPTIMIZATION & BACKTEST
+# 4. OPTIMIZATION & ENSEMBLE
 # =========================================
 
 def backtest_segment(train_prices, test_prices, b_count, s_len, model_type):
+    # Standardize eval process: bucket size strictly from TRAIN
     b_size = calculate_bucket_size(train_prices, b_count)
+    
+    # Bucketize
     t_buckets = [get_bucket(p, b_size) for p in train_prices]
     v_buckets = [get_bucket(p, b_size) for p in test_prices]
     
+    # Train
     abs_map, der_map = train_models(t_buckets, s_len)
     
     correct = 0
@@ -221,70 +219,115 @@ def backtest_segment(train_prices, test_prices, b_count, s_len, model_type):
     for i in range(loop_range):
         slice_bkts = v_buckets[i : i + s_len + 1]
         a_seq = tuple(slice_bkts[:-1])
-        actual_next = slice_bkts[-1]
+        actual_val = slice_bkts[-1]
         last_val = a_seq[-1]
         
         d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq))) if s_len > 1 else ()
         
-        pred = get_prediction(model_type, abs_map, der_map, a_seq, d_seq, last_val)
+        pred_val = get_prediction(model_type, abs_map, der_map, a_seq, d_seq, last_val)
         
-        if pred is not None:
-            pred_diff = pred - last_val
-            act_diff = actual_next - last_val
-            if pred_diff != 0 and act_diff != 0:
+        if pred_val is not None:
+            pred_diff = pred_val - last_val
+            actual_diff = actual_val - last_val
+            
+            if pred_diff != 0 and actual_diff != 0:
                 trades += 1
-                if (pred_diff > 0 and act_diff > 0) or (pred_diff < 0 and act_diff < 0):
+                if (pred_diff > 0 and actual_diff > 0) or (pred_diff < 0 and actual_diff < 0):
                     correct += 1
                     
     acc = (correct / trades * 100) if trades > 0 else 0
     return acc, trades
 
-def run_ensemble_holdout(train_preval_prices, holdout_prices, top_configs):
+def run_final_ensemble_logic(train_preval_prices, holdout_prices, top_configs):
+    """
+    Exact Logic from 'run_final_ensemble' in app (100).py
+    - Conflict check: strictly no opposing directions.
+    - Tie-break: Sort by 'b_count' (lowest bucket count wins).
+    """
     models = []
     for cfg in top_configs:
         b_size = calculate_bucket_size(train_preval_prices, cfg['b_count'])
         t_buckets = [get_bucket(p, b_size) for p in train_preval_prices]
         h_buckets = [get_bucket(p, b_size) for p in holdout_prices]
-        abs_map, der_map = train_models(t_buckets, cfg['s_len'])
-        models.append({"cfg": cfg, "h_buckets": h_buckets, "abs": abs_map, "der": der_map})
         
-    max_s = max(c['s_len'] for c in top_configs)
-    loop_len = len(holdout_prices) - max_s
-    correct, trades = 0, 0
+        abs_map, der_map = train_models(t_buckets, cfg['s_len'])
+        
+        models.append({
+            "cfg": cfg,
+            "val_buckets": h_buckets,
+            "abs_map": abs_map,
+            "der_map": der_map
+        })
+        
+    max_seq = max(m['cfg']['s_len'] for m in models)
+    loop_len = len(holdout_prices) - max_seq
+    
+    correct = 0
+    total_trades = 0
+    abstains = 0
+    conflicts = 0
     
     for i in range(loop_len):
-        votes = []
-        for m in models:
-            s = m['cfg']['s_len']
-            end_idx = i + max_s
-            start_idx = end_idx - s
+        active_signals = []
+        
+        for model in models:
+            s_len = model['cfg']['s_len']
+            v_bkts = model['val_buckets']
+            
+            # Align indices: we want prediction for holdout[i + max_seq]
+            # using context ending at holdout[i + max_seq - 1]
+            end_idx = i + max_seq
+            start_idx = end_idx - s_len
+            
             if start_idx < 0: continue
+
+            curr_slice = v_bkts[start_idx : end_idx + 1]
+            a_seq = tuple(curr_slice[:-1])
+            actual_val = curr_slice[-1]
+            last_val = a_seq[-1]
             
-            slice_b = m['h_buckets'][start_idx : end_idx + 1]
-            a_seq = tuple(slice_b[:-1])
-            last = a_seq[-1]
-            d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq))) if s > 1 else ()
+            d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq))) if s_len > 1 else ()
             
-            pred = get_prediction(m['cfg']['model'], m['abs'], m['der'], a_seq, d_seq, last)
-            if pred is not None:
-                diff = pred - last
-                if diff != 0: votes.append(1 if diff > 0 else -1)
+            pred_val = get_prediction(model['cfg']['model'], model['abs_map'], model['der_map'], 
+                                      a_seq, d_seq, last_val)
+            
+            if pred_val is not None:
+                p_diff = pred_val - last_val
+                if p_diff != 0:
+                    direction = 1 if p_diff > 0 else -1
+                    active_signals.append({
+                        "dir": direction,
+                        "b_count": model['cfg']['b_count'], 
+                        "pred_val": pred_val,
+                        "last_val": last_val,
+                        "actual_val": actual_val # This is valid for backtesting check
+                    })
+
+        if not active_signals:
+            abstains += 1
+            continue
+            
+        directions = {x['dir'] for x in active_signals}
         
-        if not votes: continue
+        # 100 Logic: Conflict if > 1 direction
+        if len(directions) > 1:
+            conflicts += 1
+            continue 
+            
+        # 100 Logic: Sort by b_count (Winner is lowest bucket count)
+        active_signals.sort(key=lambda x: x['b_count'])
+        winner = active_signals[0]
         
-        final_dir = 0
-        if sum(votes) > 0: final_dir = 1
-        elif sum(votes) < 0: final_dir = -1
+        w_pred_diff = winner['pred_val'] - winner['last_val']
+        w_act_diff = winner['actual_val'] - winner['last_val']
         
-        if final_dir != 0:
-            act_diff = holdout_prices[i + max_s] - holdout_prices[i + max_s - 1]
-            if act_diff != 0:
-                trades += 1
-                if (final_dir == 1 and act_diff > 0) or (final_dir == -1 and act_diff < 0):
-                    correct += 1
-                    
-    acc = (correct / trades * 100) if trades > 0 else 0
-    return {"accuracy": acc, "trades": trades}
+        if w_act_diff != 0: 
+            total_trades += 1
+            if (w_pred_diff > 0 and w_act_diff > 0) or (w_pred_diff < 0 and w_act_diff < 0):
+                correct += 1
+
+    acc = (correct / total_trades * 100) if total_trades > 0 else 0
+    return {"accuracy": acc, "trades": total_trades}
 
 def serialize_map(m):
     return { "|".join(map(str, k)): dict(v) for k, v in m.items() }
@@ -329,18 +372,21 @@ def main():
                     for m in ["Absolute", "Derivative", "Combined"]:
                         acc, tr = backtest_segment(train, preval, b, s, m)
                         if tr >= MIN_TRADES:
+                            # Formula from 100: ((p_acc / 100.0) - 0.6) * p_trades
                             score = ((acc / 100.0) - SCORE_THRESHOLD) * tr
                             results.append({"b_count": b, "s_len": s, "model": m, "score": score, "acc": acc})
             
             if not results: continue
 
+            # Select Top 5
             results.sort(key=lambda x: x['score'], reverse=True)
             top_5 = results[:5]
             
-            ensemble_res = run_ensemble_holdout(train + preval, holdout, top_5)
+            # Run Final Ensemble Logic (Strict 100 version)
+            ensemble_res = run_final_ensemble_logic(train + preval, holdout, top_5)
             print(f"Holdout Result: {ensemble_res['accuracy']:.2f}% ({ensemble_res['trades']} trades)")
 
-            # Retrain on Full Data for JSON
+            # Prepare for Deployment (Retrain on Full Data)
             full_data = prices
             deployment_models = []
             for cfg in top_5:
