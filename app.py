@@ -24,14 +24,17 @@ REPO_OWNER = "constantinbender51-cmyk"
 REPO_NAME = "model-2"
 GITHUB_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/"
 
+# --- Feature Flags ---
+DELETE_PREVIOUS_ON_STARTUP = True  # <--- SET TO TRUE TO WIPE REPO ON START
+
 # --- Data Settings ---
 DATA_DIR = "data"
-BASE_INTERVAL = "1m"  # Changed to 1m to support lower timeframes
+BASE_INTERVAL = "1m"
 START_DATE = "2020-01-01"
 END_DATE = "2026-01-01"
 
 # --- Asset List ---
-ASSET_COUNT = 3  # Limit to 3 assets as requested
+ASSET_COUNT = 3
 ALL_ASSETS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", 
     "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT", "TRXUSDT",
@@ -40,16 +43,16 @@ ALL_ASSETS = [
 ]
 ASSETS = ALL_ASSETS[:ASSET_COUNT]
 
-# --- Timeframes (Short Term Focus) ---
+# --- Timeframes ---
 TIMEFRAMES = {
-    "1m": "1min",   # Pandas alias for 1 minute
+    "1m": "1min",
     "5m": "5min",
     "15m": "15min",
     "30m": "30min",
     "1h": "1H"
 }
 
-# --- Grid Search (Match 100 exactly where possible) ---
+# --- Grid Search ---
 BUCKET_COUNTS = range(25, 201, 25) 
 SEQ_LENGTHS = [5, 8, 12] 
 MIN_TRADES = 15
@@ -60,9 +63,6 @@ SCORE_THRESHOLD = 0.70
 # =========================================
 
 def print_progress_bar(iteration, total, prefix='', suffix='', decimals=1, length=50, fill='█'):
-    """
-    Call in a loop to create terminal progress bar
-    """
     percent = ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total)))
     filled_length = int(length * iteration // total)
     bar = fill * filled_length + '-' * (length - filled_length)
@@ -92,7 +92,7 @@ def get_binance_data(symbol, start_str=START_DATE, end_str=END_DATE):
             print(f"Error loading cache: {e}")
 
     # 2. Fetch
-    print(f"[{symbol}] Downloading {BASE_INTERVAL} data from Binance (This may take a while)...")
+    print(f"[{symbol}] Downloading {BASE_INTERVAL} data from Binance...")
     
     start_ts = int(datetime.strptime(start_str, "%Y-%m-%d").timestamp() * 1000)
     end_ts = int(datetime.strptime(end_str, "%Y-%m-%d").timestamp() * 1000)
@@ -108,21 +108,19 @@ def get_binance_data(symbol, start_str=START_DATE, end_str=END_DATE):
                 data = json.loads(response.read().decode())
                 
                 if not data: 
-                    # If no data returned, break to avoid infinite loop
                     print_progress_bar(total_duration, total_duration, prefix='Progress:', suffix='Done', length=40)
                     break
                 
                 batch = [[int(c[0]), float(c[4])] for c in data]
                 all_candles.extend(batch)
                 
-                # Update progress
                 current_start = data[-1][0] + 1
                 progress = min(current_start - start_ts, total_duration)
                 print_progress_bar(progress, total_duration, prefix='Progress:', suffix=f'({len(all_candles)} candles)', length=40)
                 
         except Exception as e:
             print(f"\nError fetching batch: {e}")
-            time.sleep(1) # Backoff slightly on error
+            time.sleep(1)
             continue
             
     print(f"\n[{symbol}] Download complete. Total candles: {len(all_candles)}")
@@ -134,12 +132,7 @@ def get_binance_data(symbol, start_str=START_DATE, end_str=END_DATE):
     return all_candles
 
 def resample_prices(raw_data, target_freq):
-    """
-    Resample 1m data to target frequency (e.g., '5min', '1H')
-    """
     if not raw_data: return []
-    
-    # 1m to 1m (No resampling needed, just extract prices)
     if target_freq == "1min" or target_freq == "1m":
          return [x[1] for x in raw_data]
 
@@ -148,8 +141,6 @@ def resample_prices(raw_data, target_freq):
     df = pd.DataFrame(raw_data, columns=['timestamp', 'price'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
-    
-    # Pandas resample
     resampled = df['price'].resample(target_freq).last().dropna()
     return resampled.tolist()
 
@@ -160,8 +151,54 @@ def split_data(prices):
     preval_end = int(total * 0.90)
     return prices[:train_end], prices[train_end:preval_end], prices[preval_end:]
 
+def delete_previous_files():
+    """
+    Deletes all .json strategy files from the repo to ensure a clean slate.
+    """
+    if not GITHUB_PAT: return
+    
+    print("\n--- CLEANUP: Checking for existing files to delete ---")
+    headers = {"Authorization": f"Bearer {GITHUB_PAT}", "Accept": "application/vnd.github.v3+json"}
+    
+    try:
+        # List files
+        r = requests.get(GITHUB_API_URL, headers=headers)
+        if r.status_code != 200:
+            print(f"Cleanup Skipped: Could not list files (Status {r.status_code})")
+            return
+
+        files = r.json()
+        if not isinstance(files, list):
+            return
+
+        # Filter for .json strategy files only
+        targets = [f for f in files if f['name'].endswith('.json')]
+        
+        if not targets:
+            print("No previous strategy files found.")
+            return
+
+        print(f"Found {len(targets)} existing files. Deleting...")
+
+        for f in targets:
+            del_url = f"{GITHUB_API_URL}{f['name']}"
+            payload = {
+                "message": f"Cleanup previous run: {f['name']}",
+                "sha": f['sha']
+            }
+            d_r = requests.delete(del_url, headers=headers, json=payload)
+            if d_r.status_code in [200, 202, 204]:
+                print(f"Deleted {f['name']}")
+            else:
+                print(f"Failed to delete {f['name']}: {d_r.status_code}")
+                
+        print("--- CLEANUP COMPLETE ---\n")
+        
+    except Exception as e:
+        print(f"Error during cleanup: {e}")
+
 # =========================================
-# 3. STRATEGY LOGIC (EXACT 100 COPY)
+# 3. STRATEGY LOGIC
 # =========================================
 
 def get_bucket(price, bucket_size):
@@ -204,10 +241,8 @@ def get_single_prediction(mode, abs_map, der_map, a_seq, d_seq, last_val):
 def get_prediction(model_type, abs_map, der_map, a_seq, d_seq, last_val):
     if model_type == "Absolute":
         return get_single_prediction("Absolute", abs_map, der_map, a_seq, d_seq, last_val)
-        
     elif model_type == "Derivative":
         return get_single_prediction("Derivative", abs_map, der_map, a_seq, d_seq, last_val)
-        
     elif model_type == "Combined":
         pred_abs = get_single_prediction("Absolute", abs_map, der_map, a_seq, d_seq, last_val)
         pred_der = get_single_prediction("Derivative", abs_map, der_map, a_seq, d_seq, last_val)
@@ -350,31 +385,22 @@ def run_final_ensemble_logic(train_preval_prices, holdout_prices, top_configs):
     return {"accuracy": acc, "trades": total_trades}
 
 def serialize_map(m):
-    """
-    MODIFIED: Model Pruning enabled.
-    Instead of saving the full frequency dictionary (which creates 20MB+ files),
-    we only save the single most likely outcome for each sequence.
-    
-    Old: { "seq": { "val1": 50, "val2": 2 } }
-    New: { "seq": val1 }
-    """
+    # OPTIMIZED: Saves only the winner to keep file size <2MB
     compressed = {}
     for k, v in m.items():
         if v:
-            # Take the single most common value (the winner)
-            # This discards the counts and losing alternatives
             best_val = v.most_common(1)[0][0]
             compressed["|".join(map(str, k))] = best_val
     return compressed
 
 def upload_to_github(filename, content):
     if not GITHUB_PAT: return
-    
-    # Check payload size before upload
+
+    # Check size
     content_json = json.dumps(content, indent=2)
     size_mb = len(content_json.encode('utf-8')) / (1024 * 1024)
     print(f"Prepared payload for {filename}: {size_mb:.2f} MB")
-    
+
     url = GITHUB_API_URL + filename
     headers = {"Authorization": f"Bearer {GITHUB_PAT}", "Accept": "application/vnd.github.v3+json"}
     content_b64 = base64.b64encode(content_json.encode("utf-8")).decode("utf-8")
@@ -393,20 +419,22 @@ def upload_to_github(filename, content):
 def main():
     if not GITHUB_PAT: print("WARNING: No GITHUB_PAT found.")
     
+    # --- DELETE PREVIOUS FILES IF FLAG IS SET ---
+    if DELETE_PREVIOUS_ON_STARTUP:
+        delete_previous_files()
+    
     print(f"Starting run for {ASSET_COUNT} assets on short timeframes (1m-1h)...")
 
     for asset in ASSETS:
-        # Get 1m data (Base for all short timeframes)
         raw_1m = get_binance_data(asset)
         
-        if not raw_1m or len(raw_1m) < 10000: # Higher threshold for 1m data
+        if not raw_1m or len(raw_1m) < 10000:
             print(f"Skipping {asset} (Insufficient Data)")
             continue
 
         for tf_name, tf_alias in TIMEFRAMES.items():
             print(f"\n--- Processing {asset} {tf_name} ---")
             
-            # Resample 1m -> target
             prices = resample_prices(raw_1m, tf_alias)
             
             if len(prices) < 1000: 
@@ -416,7 +444,6 @@ def main():
             train, preval, holdout = split_data(prices)
             results = []
             
-            # Grid Search
             for b in BUCKET_COUNTS:
                 for s in SEQ_LENGTHS:
                     for m in ["Absolute", "Derivative", "Combined"]:
@@ -435,7 +462,6 @@ def main():
             ensemble_res = run_final_ensemble_logic(train + preval, holdout, top_5)
             print(f"Holdout Result: {ensemble_res['accuracy']:.2f}% ({ensemble_res['trades']} trades)")
 
-            # Prepare for Deployment
             full_data = prices
             deployment_models = []
             for cfg in top_5:
