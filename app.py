@@ -1,15 +1,20 @@
 import os
 import sys
 import json
-import time
 import base64
+import time
 import requests
-import urllib.request
+import random
 from datetime import datetime
 from collections import Counter, defaultdict
-import pandas as pd
+from concurrent.futures import ProcessPoolExecutor
 
-# --- CONFIGURATION ---
+# =========================================
+# 1. CONFIGURATION
+# =========================================
+
+# --- Github Settings ---
+# Ensure you have a .env file or set PAT in environment variables
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -18,10 +23,15 @@ except ImportError:
 
 GITHUB_PAT = os.getenv("PAT")
 REPO_OWNER = "constantinbender51-cmyk"
-REPO_NAME = "Models"
+REPO_NAME = "model-2"  # Saving to model-2 as requested
 GITHUB_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/"
 
-# --- UPDATED ASSETS LIST (Kraken-Safe) ---
+# --- Data Settings ---
+DATA_DIR = "volume data"
+START_DATE = "2020-01-01"
+END_DATE = "2026-01-01"
+
+# --- Asset List (19 Assets) ---
 ASSETS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", 
     "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT", "TRXUSDT",
@@ -29,90 +39,93 @@ ASSETS = [
     "SHIBUSDT", "TONUSDT", "UNIUSDT", "ZECUSDT"
 ]
 
-BASE_INTERVAL = "15m" 
-START_DATE = "2020-01-01"
-END_DATE = "2026-01-01"
-DATA_DIR = "data"
+# --- Timeframes ---
+# We will look for these intervals in the volume data folder
+TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 
-TIMEFRAMES = {
-    "15m": None, 
-    "30m": "30min",
-    "60m": "1h",
-    "240m": "4h",
-    "1d": "1D"
-}
+# --- Optimization Grid ---
+BUCKET_COUNTS = range(10, 201, 10)  # 10, 20 ... 200
+SEQ_LENGTHS = [4, 5, 6, 8, 10, 12]
+MIN_TRADES = 15
+SCORE_THRESHOLD = 0.55  # 55% accuracy minimum to contribute to score
 
-# --- 1. DATA FETCHING ---
+# =========================================
+# 2. DATA LOADING & SPLITTING
+# =========================================
 
-def get_binance_data(symbol, start_str=START_DATE, end_str=END_DATE):
-    if not os.path.exists(DATA_DIR):
-        os.makedirs(DATA_DIR)
-
-    filename = f"{DATA_DIR}/{symbol}_{BASE_INTERVAL}_{start_str}_{end_str}.json"
-
-    if os.path.exists(filename):
-        print(f"\n[{symbol}] Found cached data at {filename}. Loading...")
-        try:
-            with open(filename, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Error loading cache: {e}. Redownloading...")
-
-    print(f"\n[{symbol}] Fetching raw {BASE_INTERVAL} data...")
-    start_ts = int(datetime.strptime(start_str, "%Y-%m-%d").timestamp() * 1000)
-    end_ts = int(datetime.strptime(end_str, "%Y-%m-%d").timestamp() * 1000)
+def get_data_from_file(symbol, interval):
+    """
+    Loads data from 'volume data/{SYMBOL}_{INTERVAL}_2020-01-01_2026-01-01.json'.
+    Returns a list of float prices.
+    """
+    file_name = f"{symbol}_{interval}_{START_DATE}_{END_DATE}.json"
+    file_path = os.path.join(DATA_DIR, file_name)
     
-    all_candles = []
-    current_start = start_ts
-    
-    while current_start < end_ts:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={BASE_INTERVAL}&startTime={current_start}&endTime={end_ts}&limit=1000"
+    if not os.path.exists(file_path):
+        # Fallback: Try to find any file matching symbol + interval if exact date match fails
+        if os.path.exists(DATA_DIR):
+            for f in os.listdir(DATA_DIR):
+                if f.startswith(f"{symbol}_{interval}") and f.endswith(".json"):
+                    file_path = os.path.join(DATA_DIR, f)
+                    break
+        else:
+            return None
+
+    if os.path.exists(file_path):
         try:
-            with urllib.request.urlopen(url) as response:
-                data = json.loads(response.read().decode())
-                if not data: break
-                batch = [(int(c[6]), float(c[4])) for c in data]
-                all_candles.extend(batch)
-                last_time = data[-1][6]
-                if last_time >= end_ts - 1: break
-                current_start = last_time + 1
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+                # Handle Binance Kline format [[t, o, h, l, c, v...], ...] or simple list
+                if isinstance(data, list):
+                    if isinstance(data[0], list) and len(data[0]) > 4:
+                        return [float(x[4]) for x in data] # Close price
+                    elif isinstance(data[0], (int, float)):
+                        return [float(x) for x in data]
+                    elif isinstance(data[0], dict) and 'close' in data[0]:
+                         return [float(x['close']) for x in data]
         except Exception as e:
-            print(f"Error fetching: {e}")
-            break
+            print(f"[ERROR] Failed to read {file_path}: {e}")
+            return None
             
-    if all_candles:
-        with open(filename, 'w') as f:
-            json.dump(all_candles, f)
-    return all_candles
+    return None
 
-def resample_prices(raw_data, target_freq):
-    if target_freq is None:
-        return [x[1] for x in raw_data]
-    df = pd.DataFrame(raw_data, columns=['timestamp', 'price'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
-    resampled = df['price'].resample(target_freq).last().dropna()
-    return resampled.tolist()
+def split_data(prices):
+    """
+    Splits data into 80% Train, 10% Pre-Validation, 10% Holdout.
+    """
+    total = len(prices)
+    if total < 500: return None, None, None
+    
+    train_end = int(total * 0.80)
+    preval_end = int(total * 0.90)
+    
+    train = prices[:train_end]
+    preval = prices[train_end:preval_end]
+    holdout = prices[preval_end:]
+    
+    return train, preval, holdout
 
-# --- 2. CORE STRATEGY ---
+# =========================================
+# 3. CORE STRATEGY LOGIC
+# =========================================
 
 def get_bucket(price, bucket_size):
-    # Math safety only: prevents division by zero. Not a strategy fallback.
-    if bucket_size <= 0: bucket_size = 1e-9 
+    if bucket_size <= 0: bucket_size = 1e-9
     return int(price // bucket_size)
 
 def calculate_bucket_size(prices, bucket_count):
+    if not prices: return 1.0
     min_p, max_p = min(prices), max(prices)
     price_range = max_p - min_p
-    if bucket_count <= 0: return 1.0
     size = price_range / bucket_count
-    # Math safety: ensure size is never absolute zero to prevent crash
-    return size if size > 0 else 1e-9
+    return size if size > 0 else 0.000001
 
 def train_models(train_buckets, seq_len):
+    """Builds probability maps."""
     abs_map = defaultdict(Counter)
     der_map = defaultdict(Counter)
     
+    # We use a sliding window
     for i in range(len(train_buckets) - seq_len):
         a_seq = tuple(train_buckets[i : i + seq_len])
         a_succ = train_buckets[i + seq_len]
@@ -125,287 +138,333 @@ def train_models(train_buckets, seq_len):
             
     return abs_map, der_map
 
-def serialize_map(model_map):
-    serialized = {}
-    for seq_tuple, counter_obj in model_map.items():
-        key_str = "|".join(map(str, seq_tuple))
-        serialized[key_str] = dict(counter_obj)
-    return serialized
-
-def prepare_deployment_models(prices, top_configs):
-    serialized_models = []
-    for config in top_configs:
-        b_count = config['bucket_count']
-        b_size = calculate_bucket_size(prices, b_count)
-        s_len = config['seq_len']
-        buckets = [get_bucket(p, b_size) for p in prices]
-        abs_map, der_map = train_models(buckets, s_len)
-        
-        model_entry = {
-            "config": config,
-            "trained_parameters": {
-                "bucket_size": b_size, 
-                "seq_len": s_len,
-                "abs_map": serialize_map(abs_map),
-                "der_map": serialize_map(der_map),
-                # We can remove 'all_vals' and 'all_changes' since we don't fallback anymore
-                "all_vals": [], 
-                "all_changes": []
-            }
-        }
-        serialized_models.append(model_entry)
-    return serialized_models
-
-# --- PREDICTION LOGIC (NO FALLBACKS) ---
-
 def get_prediction(model_type, abs_map, der_map, a_seq, d_seq, last_val):
     """
-    Returns the predicted next VALUE.
-    Returns None if the pattern is unknown (ABSTAIN).
+    Returns predicted NEXT VALUE or None.
     """
+    pred_abs = None
+    pred_der = None
+    
+    # 1. Absolute Prediction
+    if model_type in ["Absolute", "Combined"]:
+        if a_seq in abs_map:
+            pred_abs = abs_map[a_seq].most_common(1)[0][0]
+
+    # 2. Derivative Prediction
+    if model_type in ["Derivative", "Combined"]:
+        if d_seq in der_map:
+            change = der_map[d_seq].most_common(1)[0][0]
+            pred_der = last_val + change
+
+    # 3. Decision Logic
     if model_type == "Absolute":
-        # If sequence unseen, return None
-        if a_seq not in abs_map: 
-            return None 
-        return abs_map[a_seq].most_common(1)[0][0]
-    
+        return pred_abs
     elif model_type == "Derivative":
-        # If sequence unseen, return None
-        if d_seq not in der_map: 
-            return None
-        pred_change = der_map[d_seq].most_common(1)[0][0]
-        return last_val + pred_change
-    
+        return pred_der
     elif model_type == "Combined":
-        # If either map misses the sequence, we might still have partial info,
-        # BUT for "Combined" we usually want strong signals. 
-        # Strategy: Use whatever is available, but if overlap is empty, return None.
+        # Consensus logic
+        if pred_abs is None and pred_der is None: return None
+        if pred_abs is not None and pred_der is None: return pred_abs
+        if pred_abs is None and pred_der is not None: return pred_der
         
-        abs_cand = abs_map.get(a_seq, Counter())
-        der_cand = der_map.get(d_seq, Counter())
+        # Conflict check
+        diff_abs = pred_abs - last_val
+        diff_der = pred_der - last_val
         
-        # If both are empty (unseen in both), abstain
-        if not abs_cand and not der_cand:
-            return None
+        dir_abs = 1 if diff_abs > 0 else -1 if diff_abs < 0 else 0
+        dir_der = 1 if diff_der > 0 else -1 if diff_der < 0 else 0
+        
+        if dir_abs == dir_der and dir_abs != 0:
+            # If they agree on direction, prefer the one with higher frequency support? 
+            # For simplicity in Combined, we average or pick one. 
+            # Here: Prioritize Derivative as it captures momentum better.
+            return pred_der
             
-        poss = set(abs_cand.keys())
-        # Convert derivative keys to absolute values relative to last_val
-        der_poss = {last_val + c for c in der_cand.keys()}
-        
-        # We only consider values supported by BOTH if possible
-        # Or you can take the union. Here we take Union but score them.
-        all_candidates = poss.union(der_poss)
-        
-        if not all_candidates:
-            return None
-        
-        best, max_s = None, -1
-        for v in all_candidates:
-            # Score = freq in Absolute + freq in Derivative (if applicable)
-            s = abs_cand[v] + der_cand[v - last_val]
-            if s > max_s: max_s, best = s, v
-            
-        return best
-        
     return None
 
-def evaluate_config(prices, bucket_size, seq_len):
-    buckets = [get_bucket(p, bucket_size) for p in prices]
-    if len(buckets) < seq_len + 10: return -1, "None", 0
+def backtest_segment(train_prices, test_prices, b_count, s_len, model_type):
+    """
+    Train on train_prices, Test on test_prices.
+    IMPORTANT: bucket_size is calculated ONLY on train_prices to prevent lookahead bias.
+    """
+    b_size = calculate_bucket_size(train_prices, b_count)
     
-    abs_map, der_map = train_models(buckets, seq_len)
+    t_buckets = [get_bucket(p, b_size) for p in train_prices]
+    v_buckets = [get_bucket(p, b_size) for p in test_prices]
     
-    stats = {"Absolute": [0,0], "Derivative": [0,0], "Combined": [0,0]}
+    abs_map, der_map = train_models(t_buckets, s_len)
     
-    total_samples = len(buckets) - seq_len
+    correct = 0
+    trades = 0
     
-    for i in range(total_samples):
-        curr = i 
-        a_seq = tuple(buckets[curr : curr+seq_len])
-        d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq))) if seq_len > 1 else ()
-            
-        last = a_seq[-1]
-        act = buckets[curr+seq_len]
-        act_diff = act - last
+    # Iterate through test set
+    # We need 's_len' previous candles to make a prediction
+    # If test set is a continuation of train, we can use the end of train as context?
+    # Simpler: Treat test set as standalone sequence for evaluation loop, 
+    # but practically we start at index = s_len
+    
+    loop_range = len(v_buckets) - s_len
+    if loop_range <= 0: return 0, 0
+    
+    for i in range(loop_range):
+        slice_bkts = v_buckets[i : i + s_len + 1]
+        a_seq = tuple(slice_bkts[:-1])
+        actual_next = slice_bkts[-1]
+        last_val = a_seq[-1]
         
-        # Get predictions (can be None)
-        p_abs = get_prediction("Absolute", abs_map, der_map, a_seq, d_seq, last)
-        p_der = get_prediction("Derivative", abs_map, der_map, a_seq, d_seq, last)
-        p_comb = get_prediction("Combined", abs_map, der_map, a_seq, d_seq, last)
+        d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq))) if s_len > 1 else ()
         
-        for name, pred in [("Absolute", p_abs), ("Derivative", p_der), ("Combined", p_comb)]:
-            if pred is None: 
-                continue # ABSTAIN: Pattern never seen, skip trade
-                
-            p_diff = pred - last
+        pred = get_prediction(model_type, abs_map, der_map, a_seq, d_seq, last_val)
+        
+        if pred is not None:
+            pred_diff = pred - last_val
+            act_diff = actual_next - last_val
             
-            if p_diff != 0 and act_diff != 0:
-                stats[name][1] += 1
-                if (p_diff > 0 and act_diff > 0) or (p_diff < 0 and act_diff < 0):
-                    stats[name][0] += 1
+            if pred_diff != 0 and act_diff != 0:
+                trades += 1
+                if (pred_diff > 0 and act_diff > 0) or (pred_diff < 0 and act_diff < 0):
+                    correct += 1
                     
-    best_acc, best_name, best_trades = -1, "None", 0
-    for name, (corr, tot) in stats.items():
-        if tot > 0:
-            acc = (corr/tot)*100
-            if acc > best_acc: best_acc, best_name, best_trades = acc, name, tot
-            
-    return best_acc, best_name, best_trades
+    acc = (correct / trades * 100) if trades > 0 else 0
+    return acc, trades
 
-def run_portfolio_analysis(prices, top_configs):
-    models = []
-    for config in top_configs:
-        b_count = config['bucket_count']
-        b_size = calculate_bucket_size(prices, b_count)
-        s_len = config['seq_len']
-        buckets = [get_bucket(p, b_size) for p in prices]
-        abs_map, der_map = train_models(buckets, s_len)
-        models.append({
-            "config": config, "buckets": buckets, "seq_len": s_len,
-            "abs_map": abs_map, "der_map": der_map
-        })
+# =========================================
+# 4. OPTIMIZATION LOOP
+# =========================================
 
-    if not models: return 0, 0
+def optimize_asset_timeframe(asset, interval, prices):
+    train, preval, holdout = split_data(prices)
+    if train is None: return None
     
-    max_seq_len = max(m['seq_len'] for m in models)
-    total_test_len = len(models[0]['buckets']) - max_seq_len
-    
-    unique_correct = 0
-    unique_total = 0
-    
-    for i in range(total_test_len):
-        curr_raw_idx = i 
-        active_directions = [] 
-        
-        for model in models:
-            target_idx = curr_raw_idx + max_seq_len
-            start_seq_idx = target_idx - model['seq_len']
-            
-            a_seq = tuple(model['buckets'][start_seq_idx : target_idx])
-            d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq))) if model['seq_len'] > 1 else ()
-                
-            last_val = a_seq[-1]
-            
-            # Predict
-            pred_val = get_prediction(model['config']['model_type'], model['abs_map'], model['der_map'], 
-                                      a_seq, d_seq, last_val)
-            
-            if pred_val is None:
-                continue # Model abstains
-            
-            pred_diff = pred_val - last_val
-            
-            # Check correctness against reality
-            actual_val = model['buckets'][target_idx]
-            diff = actual_val - last_val
-            model_actual_dir = 1 if diff > 0 else (-1 if diff < 0 else 0)
-
-            if pred_diff != 0:
-                direction = 1 if pred_diff > 0 else -1
-                active_directions.append({
-                    "dir": direction,
-                    "is_correct": (direction == model_actual_dir),
-                    "is_flat": (model_actual_dir == 0)
-                })
-
-        if not active_directions: continue
-            
-        dirs = [x['dir'] for x in active_directions]
-        up_votes = dirs.count(1)
-        down_votes = dirs.count(-1)
-        
-        final_dir = 0
-        if up_votes > down_votes: final_dir = 1
-        elif down_votes > up_votes: final_dir = -1
-        else: continue
-        
-        winning_voters = [x for x in active_directions if x['dir'] == final_dir]
-        if all(x['is_flat'] for x in winning_voters): continue 
-            
-        unique_total += 1
-        if any(x['is_correct'] for x in winning_voters):
-            unique_correct += 1
-
-    return unique_correct, unique_total
-
-def find_optimal_strategy(prices):
-    bucket_counts = list(range(10, 251, 10))
-    seq_lengths = [3, 4, 5, 6, 8]
     results = []
     
-    for b_count in bucket_counts:
-        b_size = calculate_bucket_size(prices, b_count)
-        for s in seq_lengths:
-            acc, mod, tr = evaluate_config(prices, b_size, s)
-            if tr > 20: 
-                results.append({
-                    "bucket_count": b_count, "bucket_size": b_size,   
-                    "seq_len": s, "model_type": mod,
-                    "accuracy": acc, "trades": tr
-                })
+    # GRID SEARCH
+    # We iterate configs, train on TRAIN, test on PREVAL
+    for b in BUCKET_COUNTS:
+        for s in SEQ_LENGTHS:
+            for m in ["Absolute", "Derivative", "Combined"]:
+                # Test on Pre-Validation
+                acc, tr = backtest_segment(train, preval, b, s, m)
+                
+                if tr >= MIN_TRADES:
+                    # Score Function: Reward accuracy > 55% heavily, weighted by volume
+                    score = ((acc / 100.0) - SCORE_THRESHOLD) * tr
+                    
+                    results.append({
+                        "b_count": b,
+                        "s_len": s,
+                        "model": m,
+                        "preval_acc": acc,
+                        "preval_tr": tr,
+                        "score": score
+                    })
+                    
+    if not results: return None
     
-    results.sort(key=lambda x: x['accuracy'], reverse=True)
-    return results[:5]
-
-def upload_to_github(file_path, content):
-    if not GITHUB_PAT:
-        print("Error: No PAT found in .env")
-        return
-
-    url = GITHUB_API_URL + file_path
-    headers = {"Authorization": f"Bearer {GITHUB_PAT}", "Accept": "application/vnd.github.v3+json"}
+    # Sort by Score
+    results.sort(key=lambda x: x['score'], reverse=True)
+    top_5 = results[:5]
     
-    json_content = json.dumps(content, indent=2)
-    b64_content = base64.b64encode(json_content.encode("utf-8")).decode("utf-8")
+    # FINAL HOLDOUT TEST (ENSEMBLE)
+    # Validate the Top 5 on the Holdout set (The "100" logic)
+    ensemble_results = run_ensemble_holdout(train + preval, holdout, top_5)
     
-    data = {"message": f"Update optimized model for {file_path}", "content": b64_content}
+    # PREPARE FOR DEPLOYMENT
+    # Retrain maps on FULL DATA (Train + PreVal + Holdout) for the JSON
+    full_data = prices
+    deployment_strategies = []
     
-    check_resp = requests.get(url, headers=headers)
-    if check_resp.status_code == 200:
-        data["sha"] = check_resp.json()["sha"]
+    for cfg in top_5:
+        b_size = calculate_bucket_size(full_data, cfg['b_count'])
+        bkts = [get_bucket(p, b_size) for p in full_data]
+        abs_map, der_map = train_models(bkts, cfg['s_len'])
         
-    resp = requests.put(url, headers=headers, data=json.dumps(data))
-    if resp.status_code in [200, 201]:
-        print(f"Success: Uploaded {file_path}")
+        deployment_strategies.append({
+            "config": {
+                "bucket_count": cfg['b_count'],
+                "seq_len": cfg['s_len'],
+                "model_type": cfg['model']
+            },
+            "metrics": {
+                "preval_score": cfg['score'],
+                "preval_acc": cfg['preval_acc']
+            },
+            "params": {
+                "bucket_size": b_size,
+                "abs_map": serialize_map(abs_map),
+                "der_map": serialize_map(der_map)
+            }
+        })
+
+    return {
+        "asset": asset,
+        "interval": interval,
+        "timestamp": datetime.now().isoformat(),
+        "holdout_performance": ensemble_results,
+        "strategies": deployment_strategies
+    }
+
+def run_ensemble_holdout(train_preval_prices, holdout_prices, top_configs):
+    """
+    Simulates the ensemble trading on the Holdout set.
+    """
+    models = []
+    for cfg in top_configs:
+        # Train on known history (Train + PreVal)
+        b_size = calculate_bucket_size(train_preval_prices, cfg['b_count'])
+        t_buckets = [get_bucket(p, b_size) for p in train_preval_prices]
+        h_buckets = [get_bucket(p, b_size) for p in holdout_prices]
+        
+        abs_map, der_map = train_models(t_buckets, cfg['s_len'])
+        
+        models.append({
+            "cfg": cfg, "h_buckets": h_buckets,
+            "abs": abs_map, "der": der_map
+        })
+        
+    max_s = max(c['s_len'] for c in top_configs)
+    loop_len = len(holdout_prices) - max_s
+    
+    correct = 0
+    trades = 0
+    
+    for i in range(loop_len):
+        votes = []
+        
+        for m in models:
+            s = m['cfg']['s_len']
+            # Align indices so we look at the same "real time" moment
+            # We want prediction for holdout[i + max_s]
+            # using context ending at holdout[i + max_s - 1]
+            # The slice needs to be length s+1 ending at i+max_s
+            
+            end_idx = i + max_s
+            start_idx = end_idx - s
+            
+            if start_idx < 0: continue
+            
+            slice_b = m['h_buckets'][start_idx : end_idx + 1]
+            a_seq = tuple(slice_b[:-1])
+            actual = slice_b[-1]
+            last = a_seq[-1]
+            
+            d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq))) if s > 1 else ()
+            
+            pred = get_prediction(m['cfg']['model'], m['abs'], m['der'], a_seq, d_seq, last)
+            
+            if pred is not None:
+                diff = pred - last
+                if diff != 0:
+                    votes.append(1 if diff > 0 else -1)
+                    
+        if not votes: continue
+        
+        # Vote Aggregation
+        vote_sum = sum(votes)
+        final_dir = 0
+        if vote_sum > 0: final_dir = 1
+        elif vote_sum < 0: final_dir = -1
+        
+        if final_dir != 0:
+            # Check Reality (using price at i + max_s)
+            real_p = holdout_prices[i + max_s]
+            real_last = holdout_prices[i + max_s - 1] # Roughly
+            # More accurately:
+            # We use the buckets of the first model (or any model) to determine "Direction"
+            # But simpler: compare holdout prices directly
+            
+            act_diff = real_p - real_last
+            if act_diff != 0:
+                trades += 1
+                if (final_dir == 1 and act_diff > 0) or (final_dir == -1 and act_diff < 0):
+                    correct += 1
+                    
+    acc = (correct / trades * 100) if trades > 0 else 0
+    return {"accuracy": acc, "trades": trades}
+
+def serialize_map(m):
+    return { "|".join(map(str, k)): dict(v) for k, v in m.items() }
+
+# =========================================
+# 5. GITHUB UPLOAD
+# =========================================
+
+def upload_to_github(filename, content):
+    if not GITHUB_PAT:
+        print("Skipping Upload (No PAT)")
+        return
+        
+    url = GITHUB_API_URL + filename
+    headers = {
+        "Authorization": f"Bearer {GITHUB_PAT}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    
+    json_str = json.dumps(content, indent=2)
+    b64_content = base64.b64encode(json_str.encode("utf-8")).decode("utf-8")
+    
+    payload = {
+        "message": f"Optimization Update {filename}",
+        "content": b64_content
+    }
+    
+    # Check for existing file to get SHA
+    r = requests.get(url, headers=headers)
+    if r.status_code == 200:
+        payload["sha"] = r.json()["sha"]
+        
+    r = requests.put(url, headers=headers, json=payload)
+    if r.status_code in [200, 201]:
+        print(f"Uploaded: {filename}")
     else:
-        print(f"Failed to upload {file_path}: {resp.text}")
+        print(f"Upload Failed {filename}: {r.text}")
+
+# =========================================
+# 6. MAIN ORCHESTRATOR
+# =========================================
+
+def process_single_task(task):
+    asset, interval = task
+    print(f"Processing {asset} {interval}...")
+    
+    prices = get_data_from_file(asset, interval)
+    if not prices or len(prices) < 2000:
+        return f"Skipped {asset} {interval} (No Data)"
+        
+    result_data = optimize_asset_timeframe(asset, interval, prices)
+    
+    if result_data:
+        fname = f"{asset}_{interval}.json"
+        
+        # Console Report
+        perf = result_data['holdout_performance']
+        print(f"--> {asset} {interval} Optimized. Holdout Acc: {perf['accuracy']:.2f}% ({perf['trades']} trds)")
+        
+        upload_to_github(fname, result_data)
+        return f"Success {asset} {interval}"
+    else:
+        return f"Failed {asset} {interval} (Low Score)"
 
 def main():
-    if not GITHUB_PAT:
-        print("WARNING: 'PAT' not found. GitHub upload will fail.")
-
+    if not os.path.exists(DATA_DIR):
+        print(f"WARNING: Directory '{DATA_DIR}' not found. Ensure data is present.")
+    
+    tasks = []
     for asset in ASSETS:
-        raw_data = get_binance_data(asset)
-        if not raw_data: continue
-        
-        for tf_name, tf_pandas in TIMEFRAMES.items():
-            print(f"Processing {asset} [{tf_name}]...")
-            prices = resample_prices(raw_data, tf_pandas)
-            if len(prices) < 200: continue
-                
-            top_configs = find_optimal_strategy(prices)
-            if not top_configs:
-                print(f"No valid strategy found for {asset} {tf_name}")
-                continue
+        for tf in TIMEFRAMES:
+            tasks.append((asset, tf))
             
-            u_correct, u_total = run_portfolio_analysis(prices, top_configs)
-            u_acc = (u_correct / u_total * 100) if u_total > 0 else 0
-            
-            print(f"--> {asset} {tf_name} In-Sample Accuracy: {u_acc:.2f}% ({u_total} trades)")
-
-            serialized_strategies = prepare_deployment_models(prices, top_configs)
-            final_payload = {
-                "asset": asset, "timeframe": tf_name,
-                "timestamp": datetime.now().isoformat(),
-                "data_points": len(prices), "optimization_type": "full_dataset_fit",
-                "combined_accuracy": u_acc, "combined_trades": u_total,
-                "strategy_union": serialized_strategies 
-            }
-            
-            filename = f"{asset}_{tf_name}.json"
-            upload_to_github(filename, final_payload)
-            
-    print("\n--- FULL DATASET OPTIMIZATION & UPLOAD COMPLETE ---")
+    print(f"Starting Optimization for {len(tasks)} pairs...")
+    print(f"Split: 80% Train | 10% Pre-Val | 10% Holdout")
+    print(f"Grid: Buckets 10-200, Seqs 4-12")
+    
+    # Sequential execution to avoid API rate limits on Upload if concurrent
+    # Or parallelize calculation, synchronize upload.
+    # For safety/simplicity in this environment:
+    
+    for t in tasks:
+        msg = process_single_task(t)
+        print(msg)
 
 if __name__ == "__main__":
     main()
