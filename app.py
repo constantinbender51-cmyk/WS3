@@ -47,10 +47,10 @@ TIMEFRAMES = {
 }
 
 # --- Grid Search (Match 100 exactly where possible) ---
-BUCKET_COUNTS = range(10, 201, 10) # User requested 10...200
-SEQ_LENGTHS = [4, 5, 6, 8, 10, 12] 
+BUCKET_COUNTS = range(10, 101, 20) # User requested 10...200
+SEQ_LENGTHS = [4, 5, 6, 8] 
 MIN_TRADES = 15
-SCORE_THRESHOLD = 0.60  # Matches app (100).py (0.6)
+SCORE_THRESHOLD = 0.50  # Matches app (100).py (0.6)
 
 # =========================================
 # 2. DATA UTILITIES (Infrastructure)
