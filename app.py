@@ -26,35 +26,50 @@ GITHUB_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/content
 
 # --- Data Settings ---
 DATA_DIR = "data"
-BASE_INTERVAL = "15m"
+BASE_INTERVAL = "1m"  # Changed to 1m to support lower timeframes
 START_DATE = "2020-01-01"
 END_DATE = "2026-01-01"
 
 # --- Asset List ---
-ASSETS = [
+ASSET_COUNT = 3  # Limit to 3 assets as requested
+ALL_ASSETS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", 
     "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT", "TRXUSDT",
     "BCHUSDT", "XLMUSDT", "LTCUSDT", "SUIUSDT", "HBARUSDT",
     "SHIBUSDT", "TONUSDT", "UNIUSDT", "ZECUSDT"
 ]
+ASSETS = ALL_ASSETS[:ASSET_COUNT]
 
-# --- Timeframes ---
+# --- Timeframes (Short Term Focus) ---
 TIMEFRAMES = {
-    "15m": None,
-    "1h": "1h",
-    "4h": "4h",
-    "1d": "1D"
+    "1m": "1min",   # Pandas alias for 1 minute
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "1h": "1H"
 }
 
 # --- Grid Search (Match 100 exactly where possible) ---
-BUCKET_COUNTS = range(25, 201, 25) # User requested 10...200
+BUCKET_COUNTS = range(25, 201, 25) 
 SEQ_LENGTHS = [5, 8, 12] 
 MIN_TRADES = 15
-SCORE_THRESHOLD = 0.70  # Matches app (100).py (0.6)
+SCORE_THRESHOLD = 0.70
 
 # =========================================
 # 2. DATA UTILITIES (Infrastructure)
 # =========================================
+
+def print_progress_bar(iteration, total, prefix='', suffix='', decimals=1, length=50, fill='█'):
+    """
+    Call in a loop to create terminal progress bar
+    """
+    percent = ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total)))
+    filled_length = int(length * iteration // total)
+    bar = fill * filled_length + '-' * (length - filled_length)
+    sys.stdout.write(f'\r{prefix} |{bar}| {percent}% {suffix}')
+    sys.stdout.flush()
+    if iteration == total: 
+        sys.stdout.write('\n')
 
 def get_binance_data(symbol, start_str=START_DATE, end_str=END_DATE):
     if not os.path.exists(DATA_DIR):
@@ -77,9 +92,11 @@ def get_binance_data(symbol, start_str=START_DATE, end_str=END_DATE):
             print(f"Error loading cache: {e}")
 
     # 2. Fetch
-    print(f"[{symbol}] Downloading {BASE_INTERVAL} data from Binance...")
+    print(f"[{symbol}] Downloading {BASE_INTERVAL} data from Binance (This may take a while)...")
+    
     start_ts = int(datetime.strptime(start_str, "%Y-%m-%d").timestamp() * 1000)
     end_ts = int(datetime.strptime(end_str, "%Y-%m-%d").timestamp() * 1000)
+    total_duration = end_ts - start_ts
     
     all_candles = []
     current_start = start_ts
@@ -89,16 +106,28 @@ def get_binance_data(symbol, start_str=START_DATE, end_str=END_DATE):
         try:
             with urllib.request.urlopen(url) as response:
                 data = json.loads(response.read().decode())
-                if not data: break
+                
+                if not data: 
+                    # If no data returned, break to avoid infinite loop
+                    print_progress_bar(total_duration, total_duration, prefix='Progress:', suffix='Done', length=40)
+                    break
+                
                 batch = [[int(c[0]), float(c[4])] for c in data]
                 all_candles.extend(batch)
+                
+                # Update progress
                 current_start = data[-1][0] + 1
-                sys.stdout.write(f"\rFetched {len(all_candles)} candles...")
-                sys.stdout.flush()
+                progress = min(current_start - start_ts, total_duration)
+                print_progress_bar(progress, total_duration, prefix='Progress:', suffix=f'({len(all_candles)} candles)', length=40)
+                
         except Exception as e:
-            print(f"\nError: {e}")
-            break
+            print(f"\nError fetching batch: {e}")
+            time.sleep(1) # Backoff slightly on error
+            # Try to continue or break depending on severity (here we retry loop)
+            continue
             
+    print(f"\n[{symbol}] Download complete. Total candles: {len(all_candles)}")
+    
     if all_candles:
         with open(filename, 'w') as f:
             json.dump(all_candles, f)
@@ -106,12 +135,22 @@ def get_binance_data(symbol, start_str=START_DATE, end_str=END_DATE):
     return all_candles
 
 def resample_prices(raw_data, target_freq):
+    """
+    Resample 1m data to target frequency (e.g., '5min', '1H')
+    """
     if not raw_data: return []
+    
+    # 1m to 1m (No resampling needed, just extract prices)
+    if target_freq == "1min" or target_freq == "1m":
+         return [x[1] for x in raw_data]
+
     if target_freq is None: return [x[1] for x in raw_data]
 
     df = pd.DataFrame(raw_data, columns=['timestamp', 'price'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
+    
+    # Pandas resample
     resampled = df['price'].resample(target_freq).last().dropna()
     return resampled.tolist()
 
@@ -164,9 +203,6 @@ def get_single_prediction(mode, abs_map, der_map, a_seq, d_seq, last_val):
     return None
 
 def get_prediction(model_type, abs_map, der_map, a_seq, d_seq, last_val):
-    """
-    Exact Logic from app (100).py
-    """
     if model_type == "Absolute":
         return get_single_prediction("Absolute", abs_map, der_map, a_seq, d_seq, last_val)
         
@@ -186,10 +222,8 @@ def get_prediction(model_type, abs_map, der_map, a_seq, d_seq, last_val):
             dir_der = 1 if pred_der > last_val else -1 if pred_der < last_val else 0
             
         if dir_abs == 0 and dir_der == 0: return None
-        # Conflict check
         if dir_abs != 0 and dir_der != 0 and dir_abs != dir_der: return None 
         
-        # Priority Logic (Exact from 100)
         if dir_abs != 0: return pred_abs
         if dir_der != 0: return pred_der
             
@@ -200,14 +234,10 @@ def get_prediction(model_type, abs_map, der_map, a_seq, d_seq, last_val):
 # =========================================
 
 def backtest_segment(train_prices, test_prices, b_count, s_len, model_type):
-    # Standardize eval process: bucket size strictly from TRAIN
     b_size = calculate_bucket_size(train_prices, b_count)
-    
-    # Bucketize
     t_buckets = [get_bucket(p, b_size) for p in train_prices]
     v_buckets = [get_bucket(p, b_size) for p in test_prices]
     
-    # Train
     abs_map, der_map = train_models(t_buckets, s_len)
     
     correct = 0
@@ -239,11 +269,6 @@ def backtest_segment(train_prices, test_prices, b_count, s_len, model_type):
     return acc, trades
 
 def run_final_ensemble_logic(train_preval_prices, holdout_prices, top_configs):
-    """
-    Exact Logic from 'run_final_ensemble' in app (100).py
-    - Conflict check: strictly no opposing directions.
-    - Tie-break: Sort by 'b_count' (lowest bucket count wins).
-    """
     models = []
     for cfg in top_configs:
         b_size = calculate_bucket_size(train_preval_prices, cfg['b_count'])
@@ -274,8 +299,6 @@ def run_final_ensemble_logic(train_preval_prices, holdout_prices, top_configs):
             s_len = model['cfg']['s_len']
             v_bkts = model['val_buckets']
             
-            # Align indices: we want prediction for holdout[i + max_seq]
-            # using context ending at holdout[i + max_seq - 1]
             end_idx = i + max_seq
             start_idx = end_idx - s_len
             
@@ -300,7 +323,7 @@ def run_final_ensemble_logic(train_preval_prices, holdout_prices, top_configs):
                         "b_count": model['cfg']['b_count'], 
                         "pred_val": pred_val,
                         "last_val": last_val,
-                        "actual_val": actual_val # This is valid for backtesting check
+                        "actual_val": actual_val
                     })
 
         if not active_signals:
@@ -309,12 +332,10 @@ def run_final_ensemble_logic(train_preval_prices, holdout_prices, top_configs):
             
         directions = {x['dir'] for x in active_signals}
         
-        # 100 Logic: Conflict if > 1 direction
         if len(directions) > 1:
             conflicts += 1
             continue 
             
-        # 100 Logic: Sort by b_count (Winner is lowest bucket count)
         active_signals.sort(key=lambda x: x['b_count'])
         winner = active_signals[0]
         
@@ -351,17 +372,26 @@ def upload_to_github(filename, content):
 
 def main():
     if not GITHUB_PAT: print("WARNING: No GITHUB_PAT found.")
+    
+    print(f"Starting run for {ASSET_COUNT} assets on short timeframes (1m-1h)...")
 
     for asset in ASSETS:
-        raw_15m = get_binance_data(asset)
-        if not raw_15m or len(raw_15m) < 2000:
+        # Get 1m data (Base for all short timeframes)
+        raw_1m = get_binance_data(asset)
+        
+        if not raw_1m or len(raw_1m) < 10000: # Higher threshold for 1m data
             print(f"Skipping {asset} (Insufficient Data)")
             continue
 
         for tf_name, tf_alias in TIMEFRAMES.items():
             print(f"\n--- Processing {asset} {tf_name} ---")
-            prices = resample_prices(raw_15m, tf_alias)
-            if len(prices) < 1000: continue
+            
+            # Resample 1m -> target
+            prices = resample_prices(raw_1m, tf_alias)
+            
+            if len(prices) < 1000: 
+                print(f"Not enough data after resampling to {tf_name}")
+                continue
 
             train, preval, holdout = split_data(prices)
             results = []
@@ -372,21 +402,20 @@ def main():
                     for m in ["Absolute", "Derivative", "Combined"]:
                         acc, tr = backtest_segment(train, preval, b, s, m)
                         if tr >= MIN_TRADES:
-                            # Formula from 100: ((p_acc / 100.0) - 0.6) * p_trades
                             score = ((acc / 100.0) - SCORE_THRESHOLD) * tr
                             results.append({"b_count": b, "s_len": s, "model": m, "score": score, "acc": acc})
             
-            if not results: continue
+            if not results: 
+                print("No configurations met minimum criteria.")
+                continue
 
-            # Select Top 5
             results.sort(key=lambda x: x['score'], reverse=True)
             top_5 = results[:5]
             
-            # Run Final Ensemble Logic (Strict 100 version)
             ensemble_res = run_final_ensemble_logic(train + preval, holdout, top_5)
             print(f"Holdout Result: {ensemble_res['accuracy']:.2f}% ({ensemble_res['trades']} trades)")
 
-            # Prepare for Deployment (Retrain on Full Data)
+            # Prepare for Deployment
             full_data = prices
             deployment_models = []
             for cfg in top_5:
