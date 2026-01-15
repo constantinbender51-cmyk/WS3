@@ -25,7 +25,7 @@ REPO_NAME = "model-2"
 GITHUB_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/"
 
 # --- Data Settings ---
-DATA_DIR = "volume data"
+DATA_DIR = "data"
 BASE_INTERVAL = "15m"
 START_DATE = "2020-01-01"
 END_DATE = "2026-01-01"
