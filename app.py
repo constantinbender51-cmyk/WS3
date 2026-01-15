@@ -13,7 +13,6 @@ from collections import Counter, defaultdict
 # 1. CONFIGURATION
 # =========================================
 
-# --- Github Settings ---
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -31,7 +30,7 @@ BASE_INTERVAL = "15m"
 START_DATE = "2020-01-01"
 END_DATE = "2026-01-01"
 
-# --- Assets ---
+# --- Asset List ---
 ASSETS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", 
     "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT", "TRXUSDT",
@@ -39,29 +38,25 @@ ASSETS = [
     "SHIBUSDT", "TONUSDT", "UNIUSDT", "ZECUSDT"
 ]
 
-# --- Timeframes Mapping (Pandas Aliases) ---
+# --- Timeframes ---
 TIMEFRAMES = {
-    "15m": None,      # Base data, no resampling
+    "15m": None,
     "1h": "1h",
     "4h": "4h",
     "1d": "1D"
 }
 
-# --- Optimization Grid ---
-BUCKET_COUNTS = range(10, 201, 10)  # 10, 20 ... 200
+# --- Grid Search ---
+BUCKET_COUNTS = range(10, 201, 10)
 SEQ_LENGTHS = [4, 5, 6, 8, 10, 12]
 MIN_TRADES = 15
-SCORE_THRESHOLD = 0.55 
+SCORE_THRESHOLD = 0.55
 
 # =========================================
-# 2. DATA FETCHING & RESAMPLING (FROM 99)
+# 2. DATA UTILITIES
 # =========================================
 
 def get_binance_data(symbol, start_str=START_DATE, end_str=END_DATE):
-    """
-    Fetches 15m data from Binance or loads from local cache.
-    Returns list of [timestamp, close_price].
-    """
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
 
@@ -73,18 +68,15 @@ def get_binance_data(symbol, start_str=START_DATE, end_str=END_DATE):
         try:
             with open(filename, 'r') as f:
                 data = json.load(f)
-                # Ensure format is [[ts, price], ...]
                 if isinstance(data, list) and len(data) > 0:
-                    # Handle raw Binance format [t, o, h, l, c, v, ...]
                     if isinstance(data[0], list) and len(data[0]) > 4:
                         return [[x[0], float(x[4])] for x in data]
-                    # Handle previously saved [ts, price]
                     elif len(data[0]) == 2:
                         return data
         except Exception as e:
             print(f"Error loading cache: {e}")
 
-    # 2. Fetch from Binance
+    # 2. Fetch
     print(f"[{symbol}] Downloading {BASE_INTERVAL} data from Binance...")
     start_ts = int(datetime.strptime(start_str, "%Y-%m-%d").timestamp() * 1000)
     end_ts = int(datetime.strptime(end_str, "%Y-%m-%d").timestamp() * 1000)
@@ -98,24 +90,15 @@ def get_binance_data(symbol, start_str=START_DATE, end_str=END_DATE):
             with urllib.request.urlopen(url) as response:
                 data = json.loads(response.read().decode())
                 if not data: break
-                
-                # Keep only Timestamp and Close Price
                 batch = [[int(c[0]), float(c[4])] for c in data]
                 all_candles.extend(batch)
-                
-                last_time = data[-1][0]
-                if last_time >= end_ts - 1: break
-                current_start = last_time + 1
-                
+                current_start = data[-1][0] + 1
                 sys.stdout.write(f"\rFetched {len(all_candles)} candles...")
                 sys.stdout.flush()
         except Exception as e:
-            print(f"\nError fetching: {e}")
+            print(f"\nError: {e}")
             break
             
-    print(f"\nTotal fetched: {len(all_candles)}")
-    
-    # 3. Save Cache
     if all_candles:
         with open(filename, 'w') as f:
             json.dump(all_candles, f)
@@ -123,41 +106,25 @@ def get_binance_data(symbol, start_str=START_DATE, end_str=END_DATE):
     return all_candles
 
 def resample_prices(raw_data, target_freq):
-    """
-    Resamples [ts, price] data to target frequency using Pandas.
-    Returns a simple list of prices [p1, p2, ...].
-    """
     if not raw_data: return []
-    
-    # If no resampling needed, just return prices
-    if target_freq is None:
-        return [x[1] for x in raw_data]
+    if target_freq is None: return [x[1] for x in raw_data]
 
-    # Convert to DataFrame
     df = pd.DataFrame(raw_data, columns=['timestamp', 'price'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
-    
-    # Resample using 'last' price (Close)
     resampled = df['price'].resample(target_freq).last().dropna()
     return resampled.tolist()
-
-# =========================================
-# 3. STRATEGY UTILS (FROM 100)
-# =========================================
 
 def split_data(prices):
     total = len(prices)
     if total < 500: return None, None, None
-    
     train_end = int(total * 0.80)
     preval_end = int(total * 0.90)
-    
-    train = prices[:train_end]
-    preval = prices[train_end:preval_end]
-    holdout = prices[preval_end:]
-    
-    return train, preval, holdout
+    return prices[:train_end], prices[train_end:preval_end], prices[preval_end:]
+
+# =========================================
+# 3. CORE STRATEGY (100 LOGIC)
+# =========================================
 
 def get_bucket(price, bucket_size):
     if bucket_size <= 0: bucket_size = 1e-9
@@ -186,31 +153,56 @@ def train_models(train_buckets, seq_len):
             
     return abs_map, der_map
 
+def get_single_prediction(mode, abs_map, der_map, a_seq, d_seq, last_val):
+    if mode == "Absolute":
+        if a_seq in abs_map:
+            return abs_map[a_seq].most_common(1)[0][0]
+    elif mode == "Derivative":
+        if d_seq in der_map:
+            pred_change = der_map[d_seq].most_common(1)[0][0]
+            return last_val + pred_change
+    return None
+
 def get_prediction(model_type, abs_map, der_map, a_seq, d_seq, last_val):
-    pred_abs = None
-    pred_der = None
+    """
+    STRICT 100 LOGIC:
+    - If Combined: Calculate directions.
+    - If conflict -> None.
+    - If Absolute exists -> Return Absolute.
+    - If Absolute missing -> Return Derivative.
+    """
     
-    if model_type in ["Absolute", "Combined"] and a_seq in abs_map:
-        pred_abs = abs_map[a_seq].most_common(1)[0][0]
-
-    if model_type in ["Derivative", "Combined"] and d_seq in der_map:
-        change = der_map[d_seq].most_common(1)[0][0]
-        pred_der = last_val + change
-
-    if model_type == "Absolute": return pred_abs
-    elif model_type == "Derivative": return pred_der
-    elif model_type == "Combined":
-        if pred_abs is None and pred_der is None: return None
-        if pred_abs is not None and pred_der is None: return pred_abs
-        if pred_abs is None and pred_der is not None: return pred_der
+    if model_type == "Absolute":
+        return get_single_prediction("Absolute", abs_map, der_map, a_seq, d_seq, last_val)
         
-        # Combined logic: prefer Derivative for momentum, unless contrary
-        return pred_der
+    elif model_type == "Derivative":
+        return get_single_prediction("Derivative", abs_map, der_map, a_seq, d_seq, last_val)
+        
+    elif model_type == "Combined":
+        pred_abs = get_single_prediction("Absolute", abs_map, der_map, a_seq, d_seq, last_val)
+        pred_der = get_single_prediction("Derivative", abs_map, der_map, a_seq, d_seq, last_val)
+        
+        dir_abs = 0
+        if pred_abs is not None:
+            dir_abs = 1 if pred_abs > last_val else -1 if pred_abs < last_val else 0
+            
+        dir_der = 0
+        if pred_der is not None:
+            dir_der = 1 if pred_der > last_val else -1 if pred_der < last_val else 0
+            
+        if dir_abs == 0 and dir_der == 0: return None
+        
+        # Conflict check
+        if dir_abs != 0 and dir_der != 0 and dir_abs != dir_der: return None 
+        
+        # PRIORITIZE ABSOLUTE (The "100" Preference)
+        if dir_abs != 0: return pred_abs
+        if dir_der != 0: return pred_der
             
     return None
 
 # =========================================
-# 4. OPTIMIZATION LOGIC
+# 4. OPTIMIZATION & BACKTEST
 # =========================================
 
 def backtest_segment(train_prices, test_prices, b_count, s_len, model_type):
@@ -239,7 +231,6 @@ def backtest_segment(train_prices, test_prices, b_count, s_len, model_type):
         if pred is not None:
             pred_diff = pred - last_val
             act_diff = actual_next - last_val
-            
             if pred_diff != 0 and act_diff != 0:
                 trades += 1
                 if (pred_diff > 0 and act_diff > 0) or (pred_diff < 0 and act_diff < 0):
@@ -278,7 +269,7 @@ def run_ensemble_holdout(train_preval_prices, holdout_prices, top_configs):
             if pred is not None:
                 diff = pred - last
                 if diff != 0: votes.append(1 if diff > 0 else -1)
-                    
+        
         if not votes: continue
         
         final_dir = 0
@@ -319,7 +310,6 @@ def main():
     if not GITHUB_PAT: print("WARNING: No GITHUB_PAT found.")
 
     for asset in ASSETS:
-        # 1. Load Base Data (15m)
         raw_15m = get_binance_data(asset)
         if not raw_15m or len(raw_15m) < 2000:
             print(f"Skipping {asset} (Insufficient Data)")
@@ -327,18 +317,13 @@ def main():
 
         for tf_name, tf_alias in TIMEFRAMES.items():
             print(f"\n--- Processing {asset} {tf_name} ---")
-            
-            # 2. Resample
             prices = resample_prices(raw_15m, tf_alias)
-            if len(prices) < 1000:
-                print("Data too short after resampling.")
-                continue
+            if len(prices) < 1000: continue
 
-            # 3. Split
             train, preval, holdout = split_data(prices)
-            
-            # 4. Grid Search
             results = []
+            
+            # Grid Search
             for b in BUCKET_COUNTS:
                 for s in SEQ_LENGTHS:
                     for m in ["Absolute", "Derivative", "Combined"]:
@@ -347,18 +332,15 @@ def main():
                             score = ((acc / 100.0) - SCORE_THRESHOLD) * tr
                             results.append({"b_count": b, "s_len": s, "model": m, "score": score, "acc": acc})
             
-            if not results:
-                print("No valid configurations found.")
-                continue
+            if not results: continue
 
-            # 5. Select Top 5 & Test Holdout
             results.sort(key=lambda x: x['score'], reverse=True)
             top_5 = results[:5]
             
             ensemble_res = run_ensemble_holdout(train + preval, holdout, top_5)
             print(f"Holdout Result: {ensemble_res['accuracy']:.2f}% ({ensemble_res['trades']} trades)")
 
-            # 6. Prepare Final JSON
+            # Retrain on Full Data for JSON
             full_data = prices
             deployment_models = []
             for cfg in top_5:
