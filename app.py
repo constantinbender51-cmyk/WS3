@@ -123,7 +123,6 @@ def get_binance_data(symbol, start_str=START_DATE, end_str=END_DATE):
         except Exception as e:
             print(f"\nError fetching batch: {e}")
             time.sleep(1) # Backoff slightly on error
-            # Try to continue or break depending on severity (here we retry loop)
             continue
             
     print(f"\n[{symbol}] Download complete. Total candles: {len(all_candles)}")
@@ -351,13 +350,34 @@ def run_final_ensemble_logic(train_preval_prices, holdout_prices, top_configs):
     return {"accuracy": acc, "trades": total_trades}
 
 def serialize_map(m):
-    return { "|".join(map(str, k)): dict(v) for k, v in m.items() }
+    """
+    MODIFIED: Model Pruning enabled.
+    Instead of saving the full frequency dictionary (which creates 20MB+ files),
+    we only save the single most likely outcome for each sequence.
+    
+    Old: { "seq": { "val1": 50, "val2": 2 } }
+    New: { "seq": val1 }
+    """
+    compressed = {}
+    for k, v in m.items():
+        if v:
+            # Take the single most common value (the winner)
+            # This discards the counts and losing alternatives
+            best_val = v.most_common(1)[0][0]
+            compressed["|".join(map(str, k))] = best_val
+    return compressed
 
 def upload_to_github(filename, content):
     if not GITHUB_PAT: return
+    
+    # Check payload size before upload
+    content_json = json.dumps(content, indent=2)
+    size_mb = len(content_json.encode('utf-8')) / (1024 * 1024)
+    print(f"Prepared payload for {filename}: {size_mb:.2f} MB")
+    
     url = GITHUB_API_URL + filename
     headers = {"Authorization": f"Bearer {GITHUB_PAT}", "Accept": "application/vnd.github.v3+json"}
-    content_b64 = base64.b64encode(json.dumps(content, indent=2).encode("utf-8")).decode("utf-8")
+    content_b64 = base64.b64encode(content_json.encode("utf-8")).decode("utf-8")
     
     data = {"message": f"Update {filename}", "content": content_b64}
     r = requests.get(url, headers=headers)
