@@ -7,6 +7,8 @@ import http.server
 import socketserver
 import os
 from datetime import datetime, timedelta
+import time
+import threading
 
 # ==========================================
 # PARAMETERS
@@ -25,51 +27,60 @@ E_SIM = 0.1            # e%: Similarity threshold (0.1 = 10% difference)
 PORT = 8080
 
 # ==========================================
-# FUNCTIONS
+# GLOBAL STATE FOR LIVE TRADING
+# ==========================================
+LIVE_RESULTS = []      # Stores completed live trades
+PENDING_TRADES = []    # Stores active predictions waiting for outcome
+IS_RUNNING = True      # Thread control
+
+# ==========================================
+# HELPER FUNCTIONS
 # ==========================================
 
-def fetch(timeframe, symbol, start, end):
+def get_timeframe_seconds(tf):
+    """Converts timeframe string to seconds."""
+    unit = tf[-1]
+    val = int(tf[:-1])
+    if unit == 'm': return val * 60
+    if unit == 'h': return val * 3600
+    if unit == 'd': return val * 86400
+    return 3600 # default 1h
+
+def fetch(timeframe, symbol, start, end, limit=1000, quiet=False):
+    """Fetches OHLC data from Binance."""
     base_url = "https://api.binance.com/api/v3/klines"
     
-    # Handle both string and datetime objects
-    start_ts = int(pd.Timestamp(start).timestamp() * 1000)
-    end_ts = int(pd.Timestamp(end).timestamp() * 1000)
+    # Handle string or datetime
+    if isinstance(start, str): start_ts = int(pd.Timestamp(start).timestamp() * 1000)
+    else: start_ts = int(start.timestamp() * 1000)
+    
+    if isinstance(end, str): end_ts = int(pd.Timestamp(end).timestamp() * 1000)
+    else: end_ts = int(end.timestamp() * 1000)
     
     data = []
     current_start = start_ts
     
-    print(f"Fetching {symbol} {timeframe} from {start} to {end}...")
+    if not quiet: print(f"Fetching {symbol} {timeframe}...")
     
     while current_start < end_ts:
         params = {
-            'symbol': symbol,
-            'interval': timeframe,
-            'startTime': current_start,
-            'endTime': end_ts,
-            'limit': 1000
+            'symbol': symbol, 'interval': timeframe,
+            'startTime': current_start, 'endTime': end_ts, 'limit': limit
         }
-        
         try:
             response = requests.get(base_url, params=params)
             response.raise_for_status()
             klines = response.json()
-            
-            if not klines:
-                break
-                
+            if not klines: break
             for k in klines:
                 # O, H, L, C
                 ohlc = [float(k[1]), float(k[2]), float(k[3]), float(k[4])]
                 data.append(ohlc)
-            
-            # Update start time: last close time + 1ms
             current_start = klines[-1][6] + 1
-            
         except Exception as e:
-            print(f"Error fetching data: {e}")
+            print(f"Error: {e}")
             break
             
-    print(f"Fetched {len(data)} candles.")
     return data
 
 def deriveround(ohlc_data, a):
@@ -79,10 +90,8 @@ def deriveround(ohlc_data, a):
         prev = ohlc_data[i-1]
         d_row = []
         for j in range(4): 
-            if prev[j] == 0:
-                change = 0.0
-            else:
-                change = ((curr[j] - prev[j]) / prev[j]) * 100.0
+            if prev[j] == 0: change = 0.0
+            else: change = ((curr[j] - prev[j]) / prev[j]) * 100.0
             rounded = math.floor(change / a) * a
             d_row.append(rounded)
         derived.append(tuple(d_row))
@@ -90,136 +99,217 @@ def deriveround(ohlc_data, a):
 
 def split(derived_data, b):
     split_idx = int(len(derived_data) * (b / 100.0))
-    train = derived_data[:split_idx]
-    test = derived_data[split_idx:]
-    return train, test
+    return derived_data[:split_idx], derived_data[split_idx:]
 
 def gettop(train_data, c, d):
     sequences = []
     for i in range(len(train_data) - d + 1):
-        seq = tuple(train_data[i : i+d])
-        sequences.append(seq)
-        
+        sequences.append(tuple(train_data[i : i+d]))
     if not sequences: return []
-
     counts = Counter(sequences)
-    unique_seqs = list(counts.items()) 
-    unique_seqs.sort(key=lambda x: x[1], reverse=True)
-    
-    limit = int(len(unique_seqs) * (c / 100.0))
-    if limit < 1: limit = 1
-        
-    top_sequences = [item[0] for item in unique_seqs[:limit]]
-    print(f"Identified {len(top_sequences)} top sequences (The Model).")
-    return top_sequences
+    unique_seqs = sorted(list(counts.items()), key=lambda x: x[1], reverse=True)
+    limit = max(1, int(len(unique_seqs) * (c / 100.0)))
+    return [item[0] for item in unique_seqs[:limit]]
 
 def is_similar(seq1, seq2, e):
     if len(seq1) != len(seq2): return False
     for k in range(len(seq1)):
-        candle1 = seq1[k]
-        candle2 = seq2[k]
-        for val1, val2 in zip(candle1, candle2):
+        for val1, val2 in zip(seq1[k], seq2[k]):
             if val1 == 0:
                 if val2 != 0: return False
                 continue
-            diff = abs(val2 - val1)
-            rel_diff = diff / abs(val1)
-            if rel_diff >= e: return False
+            if (abs(val2 - val1) / abs(val1)) >= e: return False
     return True
 
 def completesimilarbeginnings(test_data, top_sequences, d, e):
     predictions = []
     begin_len = d - 1
-    
     for i in range(len(test_data) - d + 1):
-        current_window = test_data[i : i + begin_len]
-        actual_outcome = test_data[i + begin_len]
-        
-        prediction = None
+        window = test_data[i : i + begin_len]
+        outcome = test_data[i + begin_len]
+        pred = None
         for seq in top_sequences:
-            top_beginning = seq[:begin_len]
-            if is_similar(top_beginning, current_window, e):
-                prediction_candle = seq[begin_len]
-                prediction = prediction_candle[3] 
+            if is_similar(seq[:begin_len], window, e):
+                pred = seq[begin_len][3]
                 break 
-        
-        if prediction is not None:
-            actual = actual_outcome[3] 
-            predictions.append((prediction, actual))
-            
+        if pred is not None:
+            predictions.append((pred, outcome[3]))
     return predictions
 
-def process_results_for_display(results, filename_prefix):
-    """
-    Calculates metrics and generates a plot for a given set of results.
-    Returns: (stats_dict, html_table_rows)
-    """
-    trade_log = []
-    cumulative_correct = []
-    rolling_accuracy = []
+# ==========================================
+# LIVE TRADING LOGIC
+# ==========================================
+
+def live_trading_loop(top_sequences, d_len, e_sim, timeframe_str):
+    """Background thread for live prediction."""
+    global LIVE_RESULTS, PENDING_TRADES
     
-    correct_count = 0
-    total_valid = 0
-    total_pnl = 0.0
+    tf_seconds = get_timeframe_seconds(timeframe_str)
     
-    table_rows = ""
+    # Calculate max live results items (2 weeks)
+    # 2 weeks * 24h * 3600s / tf_seconds
+    max_items = int((14 * 24 * 3600) / tf_seconds)
     
-    for i, (pred, actual) in enumerate(results):
-        if pred == 0 or actual == 0:
+    print(f"\n[LIVE] Thread started. Timeframe: {timeframe_str} ({tf_seconds}s).")
+    print(f"[LIVE] Holding max {max_items} records.")
+
+    while IS_RUNNING:
+        now = datetime.now()
+        
+        # 1. Calculate time to next sync (Candle Close + 5s)
+        # Determine current candle start
+        current_ts = now.timestamp()
+        # Floor division to get start of current candle
+        candle_start = (current_ts // tf_seconds) * tf_seconds
+        next_close = candle_start + tf_seconds
+        
+        target_time = next_close + 5 # 5 seconds after close
+        sleep_duration = target_time - current_ts
+        
+        # If we are already past the +5s mark for this candle (e.g. startup), wait for next
+        if sleep_duration < 0:
+            sleep_duration += tf_seconds
+            
+        print(f"[LIVE] Sleeping {sleep_duration:.2f}s until next candle check...")
+        time.sleep(sleep_duration)
+        
+        print(f"[LIVE] Waking up at {datetime.now().strftime('%H:%M:%S')}. Processing...")
+
+        # ---------------------------------
+        # A. Resolve Pending Predictions
+        # ---------------------------------
+        # Fetch just enough recent data to resolve the pending trade
+        # We need the candle that JUST closed.
+        recent_check_start = datetime.now() - timedelta(seconds=tf_seconds*3)
+        recent_data = fetch(timeframe_str, SYMBOL, recent_check_start, datetime.now(), quiet=True)
+        
+        if len(recent_data) >= 2:
+            # The last closed candle is likely index -1 (since we are 5s into new one)
+            # Derive it
+            derived_recent = deriveround(recent_data, A_ROUND)
+            if derived_recent:
+                last_outcome_val = derived_recent[-1][3] # Close change
+                
+                # Check pending list
+                new_pending = []
+                for p_time, p_pred in PENDING_TRADES:
+                    # p_time is the timestamp when the prediction *should* be resolved
+                    # Roughly: prediction made at T, outcome valid at T + tf_seconds
+                    
+                    # Logic: The PENDING trade was made 1 cycle ago. 
+                    # We simply clear the queue because we run exactly on cycle.
+                    
+                    direction = 1 if p_pred > 0 else -1
+                    pnl = direction * last_outcome_val
+                    is_correct = (p_pred > 0 and last_outcome_val > 0) or (p_pred < 0 and last_outcome_val < 0)
+                    
+                    record = {
+                        'time': datetime.now().strftime('%Y-%m-%d %H:%M'),
+                        'pred': p_pred,
+                        'actual': last_outcome_val,
+                        'pnl': pnl,
+                        'correct': "Yes" if is_correct else "No"
+                    }
+                    
+                    LIVE_RESULTS.insert(0, record) # Prepend newest
+                    print(f"[LIVE] Resolved trade: Pred {p_pred:.2f}%, Actual {last_outcome_val:.2f}%")
+                
+                PENDING_TRADES = [] # Cleared handled trades
+                
+                # Prune list
+                if len(LIVE_RESULTS) > max_items:
+                    LIVE_RESULTS = LIVE_RESULTS[:max_items]
+
+        # ---------------------------------
+        # B. Make NEW Prediction
+        # ---------------------------------
+        # We need a sequence of length d-1 to match the "beginning"
+        # The fetch above might be enough, but let's be safe and fetch needed amount
+        needed_candles = d_len + 5 
+        fetch_start = datetime.now() - timedelta(seconds=tf_seconds * needed_candles)
+        
+        data_for_pred = fetch(timeframe_str, SYMBOL, fetch_start, datetime.now(), quiet=True)
+        
+        if len(data_for_pred) < d_len:
+            print("[LIVE] Not enough data to predict.")
             continue
             
-        total_valid += 1
+        derived_pred = deriveround(data_for_pred, A_ROUND)
         
-        direction = 1 if pred > 0 else -1
-        pnl = direction * actual
-        total_pnl += pnl
+        # The "window" is the last (d-1) derived candles
+        begin_len = d_len - 1
+        if len(derived_pred) < begin_len: continue
         
-        is_correct = (pred > 0 and actual > 0) or (pred < 0 and actual < 0)
-        if is_correct:
-            correct_count += 1
-            
-        cumulative_correct.append(correct_count)
-        rolling_accuracy.append((correct_count / total_valid) * 100)
+        current_window = derived_pred[-begin_len:] 
         
-        color = "green" if pnl > 0 else "red"
-        table_rows += f"""
-        <tr>
-            <td>{total_valid}</td>
-            <td>{pred:.2f}%</td>
-            <td>{actual:.2f}%</td>
-            <td style="color:{color}; font-weight:bold;">{pnl:.2f}%</td>
-            <td>{"Yes" if is_correct else "No"}</td>
-        </tr>
-        """
+        prediction_val = None
+        for seq in top_sequences:
+            top_beginning = seq[:begin_len]
+            if is_similar(top_beginning, current_window, e_sim):
+                prediction_val = seq[begin_len][3]
+                break
+        
+        if prediction_val is not None:
+            print(f"[LIVE] New Prediction: {prediction_val:.2f}% change expected.")
+            PENDING_TRADES.append((datetime.now(), prediction_val))
+        else:
+            print("[LIVE] No pattern match found.")
 
-    if total_valid == 0:
-        return {'valid': 0}, ""
+# ==========================================
+# VISUALIZATION & SERVER
+# ==========================================
 
-    # Generate Plot
+def process_stats(result_list):
+    """Calculates stats for a simple list of (pred, actual) tuples."""
+    if not result_list: return {'valid':0, 'accuracy':0, 'pnl':0}, ""
+    
+    valid, correct, pnl = 0, 0, 0.0
+    rows = ""
+    cumulative_acc = []
+    
+    for i, (pred, actual) in enumerate(result_list):
+        if pred == 0 or actual == 0: continue
+        valid += 1
+        is_cor = (pred > 0 and actual > 0) or (pred < 0 and actual < 0)
+        if is_cor: correct += 1
+        
+        trade_pnl = (1 if pred > 0 else -1) * actual
+        pnl += trade_pnl
+        
+        cumulative_acc.append((correct/valid)*100)
+        
+        color = "green" if trade_pnl > 0 else "red"
+        rows += f"""<tr><td>{valid}</td><td>{pred:.2f}%</td><td>{actual:.2f}%</td>
+                    <td style="color:{color}">{trade_pnl:.2f}%</td><td>{"Yes" if is_cor else "No"}</td></tr>"""
+    
+    final_acc = cumulative_acc[-1] if cumulative_acc else 0
+    return {'valid': valid, 'accuracy': final_acc, 'pnl': pnl, 'acc_hist': cumulative_acc}, rows
+
+def generate_plot(data_hist, data_recent, filename="combined.png"):
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
-    ax1.plot(rolling_accuracy, color='blue', label='Cumulative Accuracy %')
-    ax1.set_title(f'Directional Accuracy (Final: {rolling_accuracy[-1]:.2f}%)')
-    ax1.set_ylabel('Accuracy (%)')
+    
+    if data_hist: ax1.plot(data_hist, label='Historical Acc', color='blue')
+    if data_recent: ax1.plot(data_recent, label='Recent 14d Acc', color='orange')
+    
+    ax1.set_title("Strategy Accuracy Over Time")
+    ax1.legend()
     ax1.grid(True)
     
-    ax2.plot(cumulative_correct, color='green', label='Correct Predictions')
-    ax2.set_title(f'Cumulative Correct Predictions (Total: {correct_count})')
-    ax2.set_ylabel('Count')
-    ax2.grid(True)
+    # Just a placeholder for PnL or Counts on ax2
+    ax2.text(0.5, 0.5, "Live Updates Visible in Table Below", ha='center')
+    ax2.set_axis_off()
     
     plt.tight_layout()
-    plt.savefig(f'{filename_prefix}.png')
-    plt.close(fig) # Close to free memory
-    
-    stats = {
-        'valid': total_valid,
-        'accuracy': rolling_accuracy[-1],
-        'pnl': total_pnl
-    }
-    
-    return stats, table_rows
+    plt.savefig(filename)
+    plt.close(fig)
 
-def serve_results(hist_stats, hist_table, recent_stats, recent_table):
+def serve_interface(hist_data, recent_data):
+    # Process static data once
+    h_stats, h_rows = process_stats(hist_data)
+    r_stats, r_rows = process_stats(recent_data)
+    
+    generate_plot(h_stats.get('acc_hist'), r_stats.get('acc_hist'))
+
     class Handler(http.server.SimpleHTTPRequestHandler):
         def do_GET(self):
             if self.path == '/':
@@ -227,128 +317,138 @@ def serve_results(hist_stats, hist_table, recent_stats, recent_table):
                 self.send_header('Content-type', 'text/html')
                 self.end_headers()
                 
-                # HTML Structure
+                # Generate Live Rows dynamically
+                l_rows = ""
+                l_pnl = 0
+                l_valid = 0
+                l_correct = 0
+                
+                for res in LIVE_RESULTS:
+                    l_valid += 1
+                    l_pnl += res['pnl']
+                    if res['correct'] == "Yes": l_correct += 1
+                    
+                    color = "green" if res['pnl'] > 0 else "red"
+                    l_rows += f"""
+                    <tr>
+                        <td>{res['time']}</td>
+                        <td>{res['pred']:.2f}%</td>
+                        <td>{res['actual']:.2f}%</td>
+                        <td style="color:{color}; font-weight:bold;">{res['pnl']:.2f}%</td>
+                        <td>{res['correct']}</td>
+                    </tr>
+                    """
+                
+                l_acc = (l_correct / l_valid * 100) if l_valid > 0 else 0
+
                 html = f"""
                 <html>
                 <head>
-                    <title>Model Performance Report</title>
-                    <style>
-                        body {{ font-family: sans-serif; padding: 20px; max-width: 1200px; margin: auto; }}
+                    <title>Live Trading Bot</title>
+                    <meta http-equiv="refresh" content="30"> <style>
+                        body {{ font-family: 'Segoe UI', sans-serif; padding: 20px; background: #f4f4f9; }}
                         .container {{ display: flex; flex-wrap: wrap; gap: 20px; }}
-                        .section {{ flex: 1; min-width: 500px; border: 1px solid #ddd; padding: 20px; border-radius: 8px; }}
-                        table {{ border-collapse: collapse; width: 100%; margin-top: 20px; font-size: 0.9em; }}
-                        th, td {{ border: 1px solid #eee; padding: 6px; text-align: center; }}
-                        th {{ background-color: #f8f9fa; }}
+                        .section {{ flex: 1; min-width: 400px; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }}
                         h1 {{ text-align: center; color: #333; }}
-                        h2 {{ border-bottom: 2px solid #333; padding-bottom: 10px; }}
-                        .stats {{ background: #f0f4f8; padding: 15px; border-radius: 5px; margin-bottom: 15px; }}
-                        img {{ max-width: 100%; height: auto; border: 1px solid #eee; margin-top: 10px; }}
+                        h2 {{ border-bottom: 2px solid #ddd; padding-bottom: 10px; color: #555; }}
+                        table {{ width: 100%; border-collapse: collapse; font-size: 0.9em; }}
+                        th {{ background: #eee; padding: 8px; text-align: left; }}
+                        td {{ padding: 8px; border-bottom: 1px solid #eee; }}
+                        .metric {{ font-size: 1.1em; margin: 5px 0; }}
+                        .live-badge {{ background: #ff4757; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.6em; vertical-align: middle; }}
+                        .pending {{ background: #eccc68; padding: 10px; border-radius: 5px; margin-bottom: 15px; }}
                     </style>
                 </head>
                 <body>
-                    <h1>Trading Strategy Performance Report</h1>
+                    <h1>Algo Trading Dashboard</h1>
                     
                     <div class="container">
-                        <div class="section">
-                            <h2>1. Historical Validation ({START} to {END})</h2>
-                            <div class="stats">
-                                <p><strong>Total Valid Trades:</strong> {hist_stats.get('valid', 0)}</p>
-                                <p><strong>Final Accuracy:</strong> {hist_stats.get('accuracy', 0):.2f}%</p>
-                                <p><strong>Total Realized PnL:</strong> {hist_stats.get('pnl', 0):.2f}%</p>
-                            </div>
-                            <img src="historical.png" alt="Historical Results">
+                        <div class="section" style="border: 2px solid #2ed573;">
+                            <h2>3. Live Forward Test <span class="live-badge">ACTIVE</span></h2>
+                            <div class="metric"><strong>Status:</strong> Waiting for next candle...</div>
+                            <div class="metric"><strong>Valid Trades:</strong> {l_valid}</div>
+                            <div class="metric"><strong>Accuracy:</strong> {l_acc:.2f}%</div>
+                            <div class="metric"><strong>Total PnL:</strong> {l_pnl:.2f}%</div>
                             
-                            <h3>Trade Log</h3>
-                            <div style="max-height: 400px; overflow-y: scroll;">
+                            {f'<div class="pending"><strong>Pending Prediction:</strong> {PENDING_TRADES[0][1]:.2f}% (Waiting for close)</div>' if PENDING_TRADES else ''}
+                            
+                            <h3>Live Log (Max 2 Weeks)</h3>
+                            <div style="max-height: 400px; overflow-y: auto;">
                                 <table>
-                                    <thead>
-                                        <tr><th>#</th><th>Pred</th><th>Actual</th><th>PnL</th><th>Correct</th></tr>
-                                    </thead>
-                                    <tbody>{hist_table}</tbody>
+                                    <thead><tr><th>Time</th><th>Pred</th><th>Actual</th><th>PnL</th><th>Correct</th></tr></thead>
+                                    <tbody>{l_rows}</tbody>
                                 </table>
                             </div>
                         </div>
 
                         <div class="section">
-                            <h2>2. Recent Performance (Last 14 Days)</h2>
-                            <div class="stats">
-                                <p><strong>Total Valid Trades:</strong> {recent_stats.get('valid', 0)}</p>
-                                <p><strong>Final Accuracy:</strong> {recent_stats.get('accuracy', 0):.2f}%</p>
-                                <p><strong>Total Realized PnL:</strong> {recent_stats.get('pnl', 0):.2f}%</p>
-                            </div>
-                            <img src="recent.png" alt="Recent Results">
-                            
-                            <h3>Trade Log</h3>
-                            <div style="max-height: 400px; overflow-y: scroll;">
+                            <h2>2. Recent Performance (14 Days)</h2>
+                            <div class="metric"><strong>Accuracy:</strong> {r_stats['accuracy']:.2f}% | <strong>PnL:</strong> {r_stats['pnl']:.2f}%</div>
+                            <div style="max-height: 300px; overflow-y: auto;">
                                 <table>
-                                    <thead>
-                                        <tr><th>#</th><th>Pred</th><th>Actual</th><th>PnL</th><th>Correct</th></tr>
-                                    </thead>
-                                    <tbody>{recent_table}</tbody>
+                                    <thead><tr><th>#</th><th>Pred</th><th>Actual</th><th>PnL</th><th>Correct</th></tr></thead>
+                                    <tbody>{r_rows}</tbody>
                                 </table>
                             </div>
+                        </div>
+
+                        <div class="section">
+                            <h2>1. Backtest ({START} - {END})</h2>
+                            <div class="metric"><strong>Accuracy:</strong> {h_stats['accuracy']:.2f}% | <strong>PnL:</strong> {h_stats['pnl']:.2f}%</div>
+                            <img src="combined.png" style="width:100%; margin-top:10px;">
                         </div>
                     </div>
                 </body>
                 </html>
                 """
                 self.wfile.write(html.encode('utf-8'))
+            elif self.path == '/combined.png':
+                try:
+                    with open('combined.png', 'rb') as f:
+                        self.send_response(200)
+                        self.send_header('Content-type', 'image/png')
+                        self.end_headers()
+                        self.wfile.write(f.read())
+                except:
+                    self.send_error(404)
             else:
                 return http.server.SimpleHTTPRequestHandler.do_GET(self)
 
-    print(f"Serving results on http://localhost:{PORT} ...")
+    print(f"\n[SERVER] Dashboard at http://localhost:{PORT}")
     with socketserver.TCPServer(("", PORT), Handler) as httpd:
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
-            print("\nServer stopped.")
+            pass
 
 def main():
-    # -----------------------------------------
-    # 1. Historical Training & Validation
-    # -----------------------------------------
-    raw_data = fetch(TIMEFRAME, SYMBOL, START, END)
-    if len(raw_data) < D_LEN: return
-
-    derived_data = deriveround(raw_data, A_ROUND)
-    train_data, test_data = split(derived_data, B_SPLIT)
+    # 1. Backtest
+    raw = fetch(TIMEFRAME, SYMBOL, START, END)
+    derived = deriveround(raw, A_ROUND)
+    train, test = split(derived, B_SPLIT)
     
-    if D_LEN < 2:
-        print("D_LEN must be >= 2")
-        return
-        
-    # TRAIN THE MODEL (Identify Sequences)
-    top_seqs = gettop(train_data, C_TOP, D_LEN)
+    # Train Model
+    top_seqs = gettop(train, C_TOP, D_LEN)
     if not top_seqs: return
-
-    # TEST ON HISTORY
-    hist_results = completesimilarbeginnings(test_data, top_seqs, D_LEN, E_SIM)
-    hist_stats, hist_table = process_results_for_display(hist_results, "historical")
-
-    # -----------------------------------------
-    # 2. Recent Data Prediction (Last 14 Days)
-    # -----------------------------------------
+    
+    # Validate Historical
+    hist_results = completesimilarbeginnings(test, top_seqs, D_LEN, E_SIM)
+    
+    # 2. Recent 14 Days
     now = datetime.now()
-    recent_start = now - timedelta(days=14)
-    
-    # Fetch data
-    recent_raw = fetch(TIMEFRAME, SYMBOL, recent_start, now)
-    
-    recent_stats = {}
-    recent_table = ""
-    
+    recent_raw = fetch(TIMEFRAME, SYMBOL, now - timedelta(days=14), now)
+    recent_results = []
     if len(recent_raw) > D_LEN:
         recent_derived = deriveround(recent_raw, A_ROUND)
-        # Use the SAME top_seqs (Model) on NEW data
         recent_results = completesimilarbeginnings(recent_derived, top_seqs, D_LEN, E_SIM)
-        recent_stats, recent_table = process_results_for_display(recent_results, "recent")
-    else:
-        print("Not enough recent data fetched.")
-
-    # -----------------------------------------
-    # 3. Serve Report
-    # -----------------------------------------
-    serve_results(hist_stats, hist_table, recent_stats, recent_table)
+    
+    # 3. Start Live Thread
+    t = threading.Thread(target=live_trading_loop, args=(top_seqs, D_LEN, E_SIM, TIMEFRAME))
+    t.daemon = True # Kills thread when main program exits
+    t.start()
+    
+    # 4. Serve
+    serve_interface(hist_results, recent_results)
 
 if __name__ == "__main__":
     main()
