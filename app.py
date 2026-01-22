@@ -28,10 +28,6 @@ PORT = 8080
 # ==========================================
 
 def fetch(timeframe, symbol, start, end):
-    """
-    Fetches OHLC data from Binance.
-    Returns a list of [Open, High, Low, Close] floats.
-    """
     base_url = "https://api.binance.com/api/v3/klines"
     start_ts = int(pd.Timestamp(start).timestamp() * 1000)
     end_ts = int(pd.Timestamp(end).timestamp() * 1000)
@@ -59,7 +55,6 @@ def fetch(timeframe, symbol, start, end):
                 break
                 
             for k in klines:
-                # O, H, L, C are at indices 1, 2, 3, 4
                 ohlc = [float(k[1]), float(k[2]), float(k[3]), float(k[4])]
                 data.append(ohlc)
             
@@ -73,30 +68,19 @@ def fetch(timeframe, symbol, start, end):
     return data
 
 def deriveround(ohlc_data, a):
-    """
-    Applies (Candle[i] - Candle[i-1]) / Candle[i-1] for O, H, L, C.
-    Rounds result to floor based on a.
-    Returns list of [dO, dH, dL, dC].
-    """
     derived = []
-    
     for i in range(1, len(ohlc_data)):
         curr = ohlc_data[i]
         prev = ohlc_data[i-1]
-        
         d_row = []
         for j in range(4): 
             if prev[j] == 0:
                 change = 0.0
             else:
                 change = ((curr[j] - prev[j]) / prev[j]) * 100.0
-            
-            # Floor round
             rounded = math.floor(change / a) * a
             d_row.append(rounded)
-            
         derived.append(tuple(d_row))
-        
     return derived
 
 def split(derived_data, b):
@@ -106,16 +90,12 @@ def split(derived_data, b):
     return train, test
 
 def gettop(train_data, c, d):
-    """
-    Finds top c% most frequent sequences of length d in train_data.
-    """
     sequences = []
     for i in range(len(train_data) - d + 1):
         seq = tuple(train_data[i : i+d])
         sequences.append(seq)
         
-    if not sequences:
-        return []
+    if not sequences: return []
 
     counts = Counter(sequences)
     unique_seqs = list(counts.items()) 
@@ -129,11 +109,7 @@ def gettop(train_data, c, d):
     return top_sequences
 
 def is_similar(seq1, seq2, e):
-    """
-    Checks if seq1 and seq2 are similar by e%.
-    """
     if len(seq1) != len(seq2): return False
-        
     for k in range(len(seq1)):
         candle1 = seq1[k]
         candle2 = seq2[k]
@@ -141,19 +117,12 @@ def is_similar(seq1, seq2, e):
             if val1 == 0:
                 if val2 != 0: return False
                 continue
-            
             diff = abs(val2 - val1)
             rel_diff = diff / abs(val1)
-            
-            if rel_diff >= e:
-                return False
+            if rel_diff >= e: return False
     return True
 
 def completesimilarbeginnings(test_data, top_sequences, d, e):
-    """
-    Predicts using similarity logic. 
-    Returns list of (Prediction, Actual) tuples.
-    """
     predictions = []
     begin_len = d - 1
     
@@ -162,75 +131,90 @@ def completesimilarbeginnings(test_data, top_sequences, d, e):
         actual_outcome = test_data[i + begin_len]
         
         prediction = None
-        
         for seq in top_sequences:
             top_beginning = seq[:begin_len]
             if is_similar(top_beginning, current_window, e):
                 prediction_candle = seq[begin_len]
-                prediction = prediction_candle[3] # Predict Close change
+                prediction = prediction_candle[3] 
                 break 
         
         if prediction is not None:
-            actual = actual_outcome[3] # Actual Close change
+            actual = actual_outcome[3] 
             predictions.append((prediction, actual))
             
     return predictions
 
 def generate_plots_and_serve(results):
-    """
-    Calculates metrics, plots them, saves to file, and serves on port 8080.
-    """
-    valid_predictions = []
-    
-    # Process results for plotting
+    # Prepare Data
+    trade_log = []
     cumulative_correct = []
     rolling_accuracy = []
     
     correct_count = 0
     total_valid = 0
+    total_pnl = 0.0
     
-    for pred, actual in results:
-        # Exclude flat predictions or outcomes
+    # Process results
+    for i, (pred, actual) in enumerate(results):
         if pred == 0 or actual == 0:
             continue
             
         total_valid += 1
         
-        # Check direction match
-        is_correct = (pred > 0 and actual > 0) or (pred < 0 and actual < 0)
+        # PnL Calculation
+        direction = 1 if pred > 0 else -1
+        pnl = direction * actual
+        total_pnl += pnl
         
+        is_correct = (pred > 0 and actual > 0) or (pred < 0 and actual < 0)
         if is_correct:
             correct_count += 1
             
         cumulative_correct.append(correct_count)
         rolling_accuracy.append((correct_count / total_valid) * 100)
+        
+        # Store for Table
+        trade_log.append({
+            'id': total_valid,
+            'pred': pred,
+            'actual': actual,
+            'pnl': pnl,
+            'correct': "Yes" if is_correct else "No"
+        })
 
     if total_valid == 0:
         print("No valid predictions to plot.")
         return
 
-    # Create Plot
+    # Generate Plot
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
-    
-    # Subplot 1: Accuracy Over Time
     ax1.plot(rolling_accuracy, color='blue', label='Cumulative Accuracy %')
-    ax1.set_title(f'Directional Accuracy Over Time (Final: {rolling_accuracy[-1]:.2f}%)')
+    ax1.set_title(f'Directional Accuracy (Final: {rolling_accuracy[-1]:.2f}%)')
     ax1.set_ylabel('Accuracy (%)')
-    ax1.set_xlabel('Number of Trades')
     ax1.grid(True)
-    ax1.legend()
     
-    # Subplot 2: Correct Predictions Count
     ax2.plot(cumulative_correct, color='green', label='Correct Predictions')
-    ax2.set_title('Cumulative Correct Predictions')
+    ax2.set_title(f'Cumulative Correct Predictions (Total: {correct_count})')
     ax2.set_ylabel('Count')
-    ax2.set_xlabel('Number of Trades')
     ax2.grid(True)
-    ax2.legend()
     
     plt.tight_layout()
     plt.savefig('results.png')
     print("Plot saved to results.png")
+
+    # Generate HTML Table
+    table_rows = ""
+    for trade in trade_log:
+        color = "green" if trade['pnl'] > 0 else "red"
+        table_rows += f"""
+        <tr>
+            <td>{trade['id']}</td>
+            <td>{trade['pred']:.2f}%</td>
+            <td>{trade['actual']:.2f}%</td>
+            <td style="color:{color}; font-weight:bold;">{trade['pnl']:.2f}%</td>
+            <td>{trade['correct']}</td>
+        </tr>
+        """
 
     # Serve
     class Handler(http.server.SimpleHTTPRequestHandler):
@@ -241,12 +225,38 @@ def generate_plots_and_serve(results):
                 self.end_headers()
                 html = f"""
                 <html>
-                <head><title>Trading Strategy Results</title></head>
+                <head>
+                    <title>Trading Strategy Results</title>
+                    <style>
+                        body {{ font-family: sans-serif; padding: 20px; }}
+                        table {{ border-collapse: collapse; width: 100%; margin-top: 20px; }}
+                        th, td {{ border: 1px solid #ddd; padding: 8px; text-align: center; }}
+                        th {{ background-color: #f2f2f2; }}
+                        h2 {{ margin-top: 40px; }}
+                    </style>
+                </head>
                 <body>
                     <h1>Strategy Performance</h1>
                     <p><strong>Total Valid Trades:</strong> {total_valid}</p>
                     <p><strong>Final Accuracy:</strong> {rolling_accuracy[-1]:.2f}%</p>
-                    <img src="results.png" alt="Results Graph" style="max-width:100%;">
+                    <p><strong>Total Realized PnL:</strong> {total_pnl:.2f}%</p>
+                    <img src="results.png" alt="Results Graph" style="max-width:100%; border:1px solid #ddd;">
+                    
+                    <h2>Trade Log (Non-Flat Outcomes)</h2>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>Predicted Change</th>
+                                <th>Actual Change</th>
+                                <th>Realized PnL</th>
+                                <th>Direction Correct?</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {table_rows}
+                        </tbody>
+                    </table>
                 </body>
                 </html>
                 """
