@@ -6,14 +6,15 @@ import matplotlib.pyplot as plt
 import http.server
 import socketserver
 import os
+from datetime import datetime, timedelta
 
 # ==========================================
 # PARAMETERS
 # ==========================================
 TIMEFRAME = '1h'       # e.g., '1m', '5m', '1h', '1d'
 SYMBOL = 'BTCUSDT'     # Binance symbol
-START = '2023-01-01'   # Start Date
-END = '2023-06-01'     # End Date
+START = '2023-01-01'   # Training/Backtest Start
+END = '2023-06-01'     # Training/Backtest End
 
 A_ROUND = 0.5          # a%: Rounding step (floor)
 B_SPLIT = 70           # b%: Percentage of data for Split 1 (Training)
@@ -29,6 +30,8 @@ PORT = 8080
 
 def fetch(timeframe, symbol, start, end):
     base_url = "https://api.binance.com/api/v3/klines"
+    
+    # Handle both string and datetime objects
     start_ts = int(pd.Timestamp(start).timestamp() * 1000)
     end_ts = int(pd.Timestamp(end).timestamp() * 1000)
     
@@ -55,9 +58,11 @@ def fetch(timeframe, symbol, start, end):
                 break
                 
             for k in klines:
+                # O, H, L, C
                 ohlc = [float(k[1]), float(k[2]), float(k[3]), float(k[4])]
                 data.append(ohlc)
             
+            # Update start time: last close time + 1ms
             current_start = klines[-1][6] + 1
             
         except Exception as e:
@@ -105,7 +110,7 @@ def gettop(train_data, c, d):
     if limit < 1: limit = 1
         
     top_sequences = [item[0] for item in unique_seqs[:limit]]
-    print(f"Identified {len(top_sequences)} top sequences.")
+    print(f"Identified {len(top_sequences)} top sequences (The Model).")
     return top_sequences
 
 def is_similar(seq1, seq2, e):
@@ -144,8 +149,11 @@ def completesimilarbeginnings(test_data, top_sequences, d, e):
             
     return predictions
 
-def generate_plots_and_serve(results):
-    # Prepare Data
+def process_results_for_display(results, filename_prefix):
+    """
+    Calculates metrics and generates a plot for a given set of results.
+    Returns: (stats_dict, html_table_rows)
+    """
     trade_log = []
     cumulative_correct = []
     rolling_accuracy = []
@@ -154,14 +162,14 @@ def generate_plots_and_serve(results):
     total_valid = 0
     total_pnl = 0.0
     
-    # Process results
+    table_rows = ""
+    
     for i, (pred, actual) in enumerate(results):
         if pred == 0 or actual == 0:
             continue
             
         total_valid += 1
         
-        # PnL Calculation
         direction = 1 if pred > 0 else -1
         pnl = direction * actual
         total_pnl += pnl
@@ -173,21 +181,22 @@ def generate_plots_and_serve(results):
         cumulative_correct.append(correct_count)
         rolling_accuracy.append((correct_count / total_valid) * 100)
         
-        # Store for Table
-        trade_log.append({
-            'id': total_valid,
-            'pred': pred,
-            'actual': actual,
-            'pnl': pnl,
-            'correct': "Yes" if is_correct else "No"
-        })
+        color = "green" if pnl > 0 else "red"
+        table_rows += f"""
+        <tr>
+            <td>{total_valid}</td>
+            <td>{pred:.2f}%</td>
+            <td>{actual:.2f}%</td>
+            <td style="color:{color}; font-weight:bold;">{pnl:.2f}%</td>
+            <td>{"Yes" if is_correct else "No"}</td>
+        </tr>
+        """
 
     if total_valid == 0:
-        print("No valid predictions to plot.")
-        return
+        return {'valid': 0}, ""
 
     # Generate Plot
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
     ax1.plot(rolling_accuracy, color='blue', label='Cumulative Accuracy %')
     ax1.set_title(f'Directional Accuracy (Final: {rolling_accuracy[-1]:.2f}%)')
     ax1.set_ylabel('Accuracy (%)')
@@ -199,64 +208,87 @@ def generate_plots_and_serve(results):
     ax2.grid(True)
     
     plt.tight_layout()
-    plt.savefig('results.png')
-    print("Plot saved to results.png")
+    plt.savefig(f'{filename_prefix}.png')
+    plt.close(fig) # Close to free memory
+    
+    stats = {
+        'valid': total_valid,
+        'accuracy': rolling_accuracy[-1],
+        'pnl': total_pnl
+    }
+    
+    return stats, table_rows
 
-    # Generate HTML Table
-    table_rows = ""
-    for trade in trade_log:
-        color = "green" if trade['pnl'] > 0 else "red"
-        table_rows += f"""
-        <tr>
-            <td>{trade['id']}</td>
-            <td>{trade['pred']:.2f}%</td>
-            <td>{trade['actual']:.2f}%</td>
-            <td style="color:{color}; font-weight:bold;">{trade['pnl']:.2f}%</td>
-            <td>{trade['correct']}</td>
-        </tr>
-        """
-
-    # Serve
+def serve_results(hist_stats, hist_table, recent_stats, recent_table):
     class Handler(http.server.SimpleHTTPRequestHandler):
         def do_GET(self):
             if self.path == '/':
                 self.send_response(200)
                 self.send_header('Content-type', 'text/html')
                 self.end_headers()
+                
+                # HTML Structure
                 html = f"""
                 <html>
                 <head>
-                    <title>Trading Strategy Results</title>
+                    <title>Model Performance Report</title>
                     <style>
-                        body {{ font-family: sans-serif; padding: 20px; }}
-                        table {{ border-collapse: collapse; width: 100%; margin-top: 20px; }}
-                        th, td {{ border: 1px solid #ddd; padding: 8px; text-align: center; }}
-                        th {{ background-color: #f2f2f2; }}
-                        h2 {{ margin-top: 40px; }}
+                        body {{ font-family: sans-serif; padding: 20px; max-width: 1200px; margin: auto; }}
+                        .container {{ display: flex; flex-wrap: wrap; gap: 20px; }}
+                        .section {{ flex: 1; min-width: 500px; border: 1px solid #ddd; padding: 20px; border-radius: 8px; }}
+                        table {{ border-collapse: collapse; width: 100%; margin-top: 20px; font-size: 0.9em; }}
+                        th, td {{ border: 1px solid #eee; padding: 6px; text-align: center; }}
+                        th {{ background-color: #f8f9fa; }}
+                        h1 {{ text-align: center; color: #333; }}
+                        h2 {{ border-bottom: 2px solid #333; padding-bottom: 10px; }}
+                        .stats {{ background: #f0f4f8; padding: 15px; border-radius: 5px; margin-bottom: 15px; }}
+                        img {{ max-width: 100%; height: auto; border: 1px solid #eee; margin-top: 10px; }}
                     </style>
                 </head>
                 <body>
-                    <h1>Strategy Performance</h1>
-                    <p><strong>Total Valid Trades:</strong> {total_valid}</p>
-                    <p><strong>Final Accuracy:</strong> {rolling_accuracy[-1]:.2f}%</p>
-                    <p><strong>Total Realized PnL:</strong> {total_pnl:.2f}%</p>
-                    <img src="results.png" alt="Results Graph" style="max-width:100%; border:1px solid #ddd;">
+                    <h1>Trading Strategy Performance Report</h1>
                     
-                    <h2>Trade Log (Non-Flat Outcomes)</h2>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>#</th>
-                                <th>Predicted Change</th>
-                                <th>Actual Change</th>
-                                <th>Realized PnL</th>
-                                <th>Direction Correct?</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {table_rows}
-                        </tbody>
-                    </table>
+                    <div class="container">
+                        <div class="section">
+                            <h2>1. Historical Validation ({START} to {END})</h2>
+                            <div class="stats">
+                                <p><strong>Total Valid Trades:</strong> {hist_stats.get('valid', 0)}</p>
+                                <p><strong>Final Accuracy:</strong> {hist_stats.get('accuracy', 0):.2f}%</p>
+                                <p><strong>Total Realized PnL:</strong> {hist_stats.get('pnl', 0):.2f}%</p>
+                            </div>
+                            <img src="historical.png" alt="Historical Results">
+                            
+                            <h3>Trade Log</h3>
+                            <div style="max-height: 400px; overflow-y: scroll;">
+                                <table>
+                                    <thead>
+                                        <tr><th>#</th><th>Pred</th><th>Actual</th><th>PnL</th><th>Correct</th></tr>
+                                    </thead>
+                                    <tbody>{hist_table}</tbody>
+                                </table>
+                            </div>
+                        </div>
+
+                        <div class="section">
+                            <h2>2. Recent Performance (Last 14 Days)</h2>
+                            <div class="stats">
+                                <p><strong>Total Valid Trades:</strong> {recent_stats.get('valid', 0)}</p>
+                                <p><strong>Final Accuracy:</strong> {recent_stats.get('accuracy', 0):.2f}%</p>
+                                <p><strong>Total Realized PnL:</strong> {recent_stats.get('pnl', 0):.2f}%</p>
+                            </div>
+                            <img src="recent.png" alt="Recent Results">
+                            
+                            <h3>Trade Log</h3>
+                            <div style="max-height: 400px; overflow-y: scroll;">
+                                <table>
+                                    <thead>
+                                        <tr><th>#</th><th>Pred</th><th>Actual</th><th>PnL</th><th>Correct</th></tr>
+                                    </thead>
+                                    <tbody>{recent_table}</tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
                 </body>
                 </html>
                 """
@@ -272,6 +304,9 @@ def generate_plots_and_serve(results):
             print("\nServer stopped.")
 
 def main():
+    # -----------------------------------------
+    # 1. Historical Training & Validation
+    # -----------------------------------------
     raw_data = fetch(TIMEFRAME, SYMBOL, START, END)
     if len(raw_data) < D_LEN: return
 
@@ -282,11 +317,38 @@ def main():
         print("D_LEN must be >= 2")
         return
         
+    # TRAIN THE MODEL (Identify Sequences)
     top_seqs = gettop(train_data, C_TOP, D_LEN)
     if not top_seqs: return
 
-    results = completesimilarbeginnings(test_data, top_seqs, D_LEN, E_SIM)
-    generate_plots_and_serve(results)
+    # TEST ON HISTORY
+    hist_results = completesimilarbeginnings(test_data, top_seqs, D_LEN, E_SIM)
+    hist_stats, hist_table = process_results_for_display(hist_results, "historical")
+
+    # -----------------------------------------
+    # 2. Recent Data Prediction (Last 14 Days)
+    # -----------------------------------------
+    now = datetime.now()
+    recent_start = now - timedelta(days=14)
+    
+    # Fetch data
+    recent_raw = fetch(TIMEFRAME, SYMBOL, recent_start, now)
+    
+    recent_stats = {}
+    recent_table = ""
+    
+    if len(recent_raw) > D_LEN:
+        recent_derived = deriveround(recent_raw, A_ROUND)
+        # Use the SAME top_seqs (Model) on NEW data
+        recent_results = completesimilarbeginnings(recent_derived, top_seqs, D_LEN, E_SIM)
+        recent_stats, recent_table = process_results_for_display(recent_results, "recent")
+    else:
+        print("Not enough recent data fetched.")
+
+    # -----------------------------------------
+    # 3. Serve Report
+    # -----------------------------------------
+    serve_results(hist_stats, hist_table, recent_stats, recent_table)
 
 if __name__ == "__main__":
     main()
