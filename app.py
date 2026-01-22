@@ -27,7 +27,7 @@ def get_stats_and_plot():
     one_percent_wr = (one_percent_wins / len(df)) * 100 if len(df) > 0 else 0
 
     # Apply filter: Ignore all PnLs where |pnl| < 1% (0.01)
-    df_filtered = df[df['pnl'].abs() >= 0.01].copy()
+    df_filtered = df[df['pnl'].abs() >= 0.02].copy()
     pnl = df_filtered['pnl']
 
     # 2. Calculate Statistical Metrics (Filtered)
