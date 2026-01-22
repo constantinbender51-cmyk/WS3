@@ -1,69 +1,67 @@
 import requests
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-import http.server
-import socketserver
-from datetime import datetime
+import pandas as pd
+import numpy as np
+from scipy import stats
 
 # 1. Fetch Data
 URL = "https://workspace-production-9fae.up.railway.app/history"
-response = requests.get(URL)
-data = response.json()
+try:
+    response = requests.get(URL)
+    data = response.json()
+except Exception as e:
+    print(f"Error fetching data: {e}")
+    exit()
 
-# 2. Process Data (FIXED)
-# Convert string time to datetime objects for proper sorting
-for item in data:
-    item['dt'] = datetime.strptime(item['time'], "%Y-%m-%dT%H:%M:%S")
+# 2. Process Data
+df = pd.DataFrame(data)
 
-# SORT the data by time (Oldest -> Newest) so the line doesn't scribble
-data.sort(key=lambda x: x['dt'])
+# Ensure PnL is numeric
+if 'pnl' not in df.columns:
+    print("Error: 'pnl' column not found.")
+    exit()
 
-dates = [item['dt'] for item in data]
-pnls = [item['pnl'] for item in data]
-cumulative_pnl = [sum(pnls[:i+1]) for i in range(len(pnls))]
+pnl = df['pnl']
 
-# 3. Generate Plot
-fig, ax = plt.subplots(figsize=(10, 6))
-ax.plot(dates, cumulative_pnl, marker='o', linestyle='-', color='b', markersize=4)
+# 3. Calculate Distribution Metrics
+metrics = {
+    "Count (Trades)": len(pnl),
+    "Mean PnL": pnl.mean(),
+    "Median PnL": pnl.median(),
+    "Std Deviation": pnl.std(),
+    "Skewness": pnl.skew(),
+    "Kurtosis": pnl.kurtosis(),  # Fisher (excess) kurtosis
+    "Min PnL": pnl.min(),
+    "Max PnL": pnl.max(),
+    "Total PnL": pnl.sum(),
+    "Win Rate (%)": (len(pnl[pnl > 0]) / len(pnl)) * 100,
+}
 
-ax.set_title('Cumulative PnL Over Time')
-ax.set_xlabel('Time')
-ax.set_ylabel('PnL')
-ax.grid(True)
+# 4. Calculate Max Drawdown (Time-Series Metric)
+# Sort by time first to ensure drawdown is accurate
+if 'time' in df.columns:
+    df['dt'] = pd.to_datetime(df['time'])
+    df = df.sort_values('dt')
+    
+    cumulative = df['pnl'].cumsum()
+    running_max = cumulative.cummax()
+    drawdown = running_max - cumulative
+    metrics["Max Drawdown"] = drawdown.max()
 
-# Format the X-axis to handle dates beautifully (prevents text overlap)
-ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
-fig.autofmt_xdate() # Rotates and aligns ticks
+# 5. Print Report
+print("="*40)
+print("       PnL STATISTICAL REPORT       ")
+print("="*40)
 
-# Save plot
-plot_filename = "pnl_plot.png"
-plt.savefig(plot_filename)
-plt.close()
+for key, value in metrics.items():
+    print(f"{key:<20}: {value: .4f}")
 
-# 4. Serve on Port 8080
-PORT = 8080
-class PlotHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/':
-            self.send_response(200)
-            self.send_header("Content-type", "text/html")
-            self.end_headers()
-            # Added a meta refresh to auto-reload the page if you re-run the script
-            self.wfile.write(f'''
-                <html>
-                    <head><title>PnL Plot</title></head>
-                    <body>
-                        <h1>PnL History Plot</h1>
-                        <img src="{plot_filename}" style="max-width:100%">
-                    </body>
-                </html>
-            '''.encode())
-        else:
-            super().do_GET()
+print("\nINTERPRETATION:")
+if metrics['Skewness'] < 0:
+    print("- Skewness < 0: The tail is on the left. Frequent small wins, occasional large losses.")
+else:
+    print("- Skewness > 0: The tail is on the right. Frequent small losses, occasional large wins.")
 
-print(f"Serving PnL plot at http://localhost:{PORT}")
-with socketserver.TCPServer(("", PORT), PlotHandler) as httpd:
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        print("\nServer stopped.")
+if metrics['Kurtosis'] > 0:
+    print("- Kurtosis > 0: Heavy tails (Leptokurtic). Higher risk of extreme outcomes (outliers).")
+else:
+    print("- Kurtosis < 0: Light tails (Platykurtic). Fewer extreme outliers than a normal distribution.")
