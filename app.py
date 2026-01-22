@@ -14,27 +14,30 @@ PORT = 8080
 
 def get_stats_and_plot():
     # 1. Fetch and Filter Data
-    response = requests.get(URL)
-    raw_data = response.json()
-    df = pd.DataFrame(raw_data)
+    try:
+        response = requests.get(URL)
+        raw_data = response.json()
+        df = pd.DataFrame(raw_data)
+    except Exception as e:
+        return {"Error": str(e)}, ""
     
     # Sort chronologically for PnL curve
     df['dt'] = pd.to_datetime(df['time'])
     df = df.sort_values('dt')
 
-    # Calculate 1% Win Rate based on RAW data
-    one_percent_wins = len(df[df['pnl'] >= 0.01])
-    one_percent_wr = (one_percent_wins / len(df)) * 100 if len(df) > 0 else 0
+    # Calculate 2% Win Rate based on RAW data
+    two_percent_wins = len(df[df['pnl'] >= 0.02])
+    two_percent_wr = (two_percent_wins / len(df)) * 100 if len(df) > 0 else 0
 
-    # Apply filter: Ignore all PnLs where |pnl| < 1% (0.01)
+    # Apply filter: Ignore all PnLs where |pnl| < 2% (0.02)
     df_filtered = df[df['pnl'].abs() >= 0.02].copy()
     pnl = df_filtered['pnl']
 
     # 2. Calculate Statistical Metrics (Filtered)
     metrics = {
         "Total Raw Trades": len(df),
-        "Significant Trades (>=1%)": len(pnl),
-        "1% Win Rate (Overall)": f"{one_percent_wr:.2f}%",
+        "Significant Trades (>=2%)": len(pnl),
+        "2% Win Rate (Overall)": f"{two_percent_wr:.2f}%",
         "Mean PnL (Filtered)": f"{pnl.mean():.4f}",
         "Std Dev (Filtered)": f"{pnl.std():.4f}",
         "Skewness": f"{pnl.skew():.4f}",
@@ -45,13 +48,19 @@ def get_stats_and_plot():
     # 3. Generate Plot (Filtered Cumulative PnL)
     plt.figure(figsize=(10, 5))
     cumulative_pnl = pnl.cumsum()
-    plt.plot(df_filtered['dt'], cumulative_pnl, marker='o', linestyle='-', markersize=3)
-    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
-    plt.gcf().autofmt_xdate()
-    plt.title('Cumulative PnL (Trades >= 1% Absolute)')
-    plt.grid(True, alpha=0.3)
     
-    # Save plot to buffer to serve as base64 (no local file needed)
+    # Check if there is data to plot to avoid errors
+    if not df_filtered.empty:
+        plt.plot(df_filtered['dt'], cumulative_pnl, marker='o', linestyle='-', markersize=3)
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
+        plt.gcf().autofmt_xdate()
+    
+    plt.title('Cumulative PnL (Trades >= 2% Absolute)')
+    plt.grid(True, alpha=0.3)
+    plt.ylabel('PnL')
+    plt.xlabel('Time')
+    
+    # Save plot to buffer to serve as base64
     buf = io.BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight')
     plt.close()
@@ -77,7 +86,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             </style></head>
             <body>
                 <div class="container">
-                    <h1>PnL Statistical Distribution</h1>
+                    <h1>PnL Statistical Distribution (2% Threshold)</h1>
                     <table>{rows}</table>
                     <img src="data:image/png;base64,{img_str}">
                 </div>
@@ -93,4 +102,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
 print(f"Server starting at http://localhost:{PORT}")
 with socketserver.TCPServer(("", PORT), DashboardHandler) as httpd:
-    httpd.serve_forever()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
