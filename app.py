@@ -1,3 +1,4 @@
+import os
 import ccxt
 import pandas as pd
 import numpy as np
@@ -14,17 +15,17 @@ import json
 from datetime import datetime, timedelta
 
 # --- Configuration ---
-TIMEFRAME = '1h'
-SYMBOL = 'BTC/USDT'
-START = '2024-01-01 00:00:00'
-END = '2024-06-01 00:00:00'
+TIMEFRAME = os.environ.get('TIMEFRAME', '1h')
+SYMBOL = os.environ.get('SYMBOL', 'BTC/USDT')
+START = os.environ.get('START', '2024-01-01 00:00:00')
+END = os.environ.get('END', '2024-06-01 00:00:00')
 
 # Parameters
-A = 0.0          # Unused (rounding removed)
-B = 0.7          # Split % (70% training, 30% testing)
-C = 0.1          # Top % most frequent (densest) sequences to keep
-D = 4            # Sequence length (candles)
-E = 0.002        # Similarity threshold (0.1% absolute diff)
+A = float(os.environ.get('A', 0.0))          # Unused (rounding removed)
+B = float(os.environ.get('B', 0.7))          # Split % (70% training, 30% testing)
+C = float(os.environ.get('C', 0.1))          # Top % most frequent (densest) sequences to keep
+D = int(os.environ.get('D', 4))              # Sequence length (candles)
+E = float(os.environ.get('E', 0.002))        # Similarity threshold (0.1% absolute diff)
 
 # Global State
 results_html = "<h1>Initializing...</h1>"
