@@ -100,7 +100,8 @@ def fetch_binance_data(symbol, interval, start_str, end_str=None, limit=1000):
         
     else:
         # Live mode - Fetch slightly more to ensure we can verify previous candles
-        params = {'symbol': symbol, 'interval': interval, 'limit': 10}
+        # We need at least 4 closed candles + 1 open candle to be safe
+        params = {'symbol': symbol, 'interval': interval, 'limit': 15}
         try:
             response = requests.get(base_url, params=params, timeout=5)
             all_data = response.json()
@@ -355,8 +356,9 @@ def live_prediction_loop():
                 precision = res['needed_precision']
                 model = res['model']
                 
-                # Fetch recent candles (limit=10 to help with verification)
-                df_live = fetch_binance_data(symbol, INTERVAL, start_str=None, limit=10) 
+                # Fetch recent candles (limit=15)
+                # Binance API returns the currently forming candle as the last element.
+                df_live = fetch_binance_data(symbol, INTERVAL, start_str=None, limit=15) 
                 
                 if df_live.empty:
                     continue
@@ -381,9 +383,8 @@ def live_prediction_loop():
                         idx = match_indices[0]
                         
                         # We need the NEXT candle to be fully closed.
-                        # In Binance API (and most), the last candle in the list is the "open" (forming) candle.
-                        # So we need idx + 1 to exist AND idx + 1 < len(df) - 1.
-                        # This ensures idx+1 is a completed candle.
+                        # len(df_live) - 1 is the index of the OPEN candle.
+                        # We need idx + 1 < len(df_live) - 1 to ensure we aren't using the open candle as exit.
                         if idx + 1 < len(df_live) - 1:
                             next_candle_close = df_live.iloc[idx+1]['close']
                             pred = log['prediction']
@@ -421,13 +422,16 @@ def live_prediction_loop():
                             print(f"[{symbol}] Outcome Verified: {outcome_str} ({pnl:.2f})")
 
                 # -------------------------------------------
-                # 2. MAKE NEW PREDICTION
+                # 2. MAKE NEW PREDICTION (Ignoring Forming Candle)
                 # -------------------------------------------
-                if len(df_live) >= 3:
-                    last_row = df_live.iloc[-1]
-                    # Calculate rounding for last 3 candles to form sequence
-                    # We need t-2, t-1, t-0. Using tail(3).
-                    recent_closes = df_live['close'].tail(3).values
+                # Slice off the last candle (the open/forming one)
+                df_closed = df_live.iloc[:-1]
+                
+                if len(df_closed) >= 3:
+                    last_row = df_closed.iloc[-1]
+                    # Calculate rounding for last 3 CLOSED candles to form sequence
+                    # We need t-2, t-1, t-0. Using tail(3) of the closed dataframe.
+                    recent_closes = df_closed['close'].tail(3).values
                     rounded = [round(round(x / grid_size) * grid_size, precision) for x in recent_closes]
                     
                     if len(rounded) == 3:
