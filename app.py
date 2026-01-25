@@ -401,43 +401,44 @@ def live_prediction_loop():
 # ---------------------------------------------------------
 # Server & Dashboard
 # ---------------------------------------------------------
+# NOTE: Triple quotes and double curly braces {{ }} used for CSS/JS to avoid Python format errors
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
     <title>Multi-Asset Strategy Dashboard</title>
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 0; background-color: #f8f9fa; color: #333; }
-        .sidebar { width: 220px; background: #343a40; color: white; position: fixed; height: 100%; overflow-y: auto; padding-top: 20px; }
-        .sidebar h3 { text-align: center; margin-bottom: 20px; font-size: 1.2em; }
-        .nav-item { padding: 10px 20px; display: block; color: #ccc; text-decoration: none; cursor: pointer; }
-        .nav-item:hover, .nav-item.active { background: #495057; color: white; }
-        .content { margin-left: 220px; padding: 20px; }
-        .card { background: white; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); padding: 20px; margin-bottom: 20px; }
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 0; background-color: #f8f9fa; color: #333; }}
+        .sidebar {{ width: 220px; background: #343a40; color: white; position: fixed; height: 100%; overflow-y: auto; padding-top: 20px; }}
+        .sidebar h3 {{ text-align: center; margin-bottom: 20px; font-size: 1.2em; }}
+        .nav-item {{ padding: 10px 20px; display: block; color: #ccc; text-decoration: none; cursor: pointer; }}
+        .nav-item:hover, .nav-item.active {{ background: #495057; color: white; }}
+        .content {{ margin-left: 220px; padding: 20px; }}
+        .card {{ background: white; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); padding: 20px; margin-bottom: 20px; }}
         
-        table { width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; }
-        th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #ddd; word-wrap: break-word; }
-        th { background-color: #e9ecef; font-weight: 600; }
-        tr:hover { background-color: #f1f1f1; }
+        table {{ width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; }}
+        th, td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid #ddd; word-wrap: break-word; }}
+        th {{ background-color: #e9ecef; font-weight: 600; }}
+        tr:hover {{ background-color: #f1f1f1; }}
         
-        .up { color: #28a745; font-weight: bold; }
-        .down { color: #dc3545; font-weight: bold; }
-        .flat { color: #6c757d; }
-        .win { color: #28a745; font-weight: bold; }
-        .loss { color: #dc3545; font-weight: bold; }
+        .up {{ color: #28a745; font-weight: bold; }}
+        .down {{ color: #dc3545; font-weight: bold; }}
+        .flat {{ color: #6c757d; }}
+        .win {{ color: #28a745; font-weight: bold; }}
+        .loss {{ color: #dc3545; font-weight: bold; }}
         
-        .summary-metric { display: inline-block; margin-right: 30px; margin-bottom: 10px; }
-        .summary-val { font-size: 1.5em; font-weight: bold; display: block; }
-        .summary-label { font-size: 0.85em; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
+        .summary-metric {{ display: inline-block; margin-right: 30px; margin-bottom: 10px; }}
+        .summary-val {{ font-size: 1.5em; font-weight: bold; display: block; }}
+        .summary-label {{ font-size: 0.85em; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }}
 
-        .pagination { margin-top: 10px; text-align: right; }
-        .pagination button { padding: 5px 10px; cursor: pointer; background: #eee; border: 1px solid #ddd; border-radius: 3px; }
-        .pagination button:disabled { opacity: 0.5; cursor: default; }
-        .pagination span { margin: 0 10px; font-size: 0.9em; }
+        .pagination {{ margin-top: 10px; text-align: right; }}
+        .pagination button {{ padding: 5px 10px; cursor: pointer; background: #eee; border: 1px solid #ddd; border-radius: 3px; }}
+        .pagination button:disabled {{ opacity: 0.5; cursor: default; }}
+        .pagination span {{ margin: 0 10px; font-size: 0.9em; }}
 
-        .live-tag { background: #dc3545; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px; vertical-align: middle; margin-left: 5px; }
-        #detailView { display: none; }
-        .loading { color: #666; font-style: italic; }
+        .live-tag {{ background: #dc3545; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px; vertical-align: middle; margin-left: 5px; }}
+        #detailView {{ display: none; }}
+        .loading {{ color: #666; font-style: italic; }}
     </style>
 </head>
 <body>
@@ -548,27 +549,27 @@ HTML_TEMPLATE = """
     const assets = {assets_json}; 
     
     // Pagination State
-    let state = {
-        live: { page: 1, limit: 10, total: 0 },
-        outcome: { page: 1, limit: 10, total: 0 }
-    };
+    let state = {{
+        live: {{ page: 1, limit: 10, total: 0 }},
+        outcome: {{ page: 1, limit: 10, total: 0 }}
+    }};
 
     // Initial Load
     fetch('/api/summary')
         .then(response => response.json())
-        .then(data => {
+        .then(data => {{
             const tbody = document.getElementById('summaryTableBody');
             const assetList = document.getElementById('assetList');
             
-            data.forEach(row => {
+            data.forEach(row => {{
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
-                    <td><b>${row.symbol}</b></td>
-                    <td>${row.grid_size}</td>
-                    <td>${row.grid_percent}%</td>
-                    <td>${row.sharpe}</td>
-                    <td>${row.accuracy}%</td>
-                    <td class="${row.pnl >= 0 ? 'up' : 'down'}">${row.pnl}</td>
+                    <td><b>${{row.symbol}}</b></td>
+                    <td>${{row.grid_size}}</td>
+                    <td>${{row.grid_percent}}%</td>
+                    <td>${{row.sharpe}}</td>
+                    <td>${{row.accuracy}}%</td>
+                    <td class="${{row.pnl >= 0 ? 'up' : 'down'}}">${{row.pnl}}</td>
                 `;
                 tbody.appendChild(tr);
                 
@@ -577,106 +578,106 @@ HTML_TEMPLATE = """
                 link.innerText = row.symbol;
                 link.onclick = () => loadAsset(row.symbol);
                 assetList.appendChild(link);
-            });
+            }});
             
             loadLiveStats();
             loadLiveLog();
             loadOutcomesLog();
             
             // Auto Refresh Live Data
-            setInterval(() => {
-                if(document.getElementById('overviewSection').style.display !== 'none') {
+            setInterval(() => {{
+                if(document.getElementById('overviewSection').style.display !== 'none') {{
                     loadLiveLog();
                     loadOutcomesLog();
                     loadLiveStats();
-                }
-            }, 10000);
-        });
+                }}
+            }}, 10000);
+        }});
 
-    function loadLiveStats() {
+    function loadLiveStats() {{
         fetch('/api/live_stats')
         .then(r => r.json())
-        .then(data => {
+        .then(data => {{
             const html = `
                 <div class="summary-metric">
                     <span class="summary-label">Total Live PnL</span>
-                    <span class="summary-val ${data.total_pnl >= 0 ? 'up' : 'down'}">${data.total_pnl}%</span>
+                    <span class="summary-val ${{data.total_pnl >= 0 ? 'up' : 'down'}}">${{data.total_pnl}}%</span>
                 </div>
                 <div class="summary-metric">
                     <span class="summary-label">Accuracy</span>
-                    <span class="summary-val">${data.accuracy}%</span>
+                    <span class="summary-val">${{data.accuracy}}%</span>
                 </div>
                 <div class="summary-metric">
                     <span class="summary-label">Wins</span>
-                    <span class="summary-val up">${data.wins}</span>
+                    <span class="summary-val up">${{data.wins}}</span>
                 </div>
                 <div class="summary-metric">
                     <span class="summary-label">Losses</span>
-                    <span class="summary-val down">${data.losses}</span>
+                    <span class="summary-val down">${{data.losses}}</span>
                 </div>
                 <div class="summary-metric">
                     <span class="summary-label">Total Trades</span>
-                    <span class="summary-val">${data.total_trades}</span>
+                    <span class="summary-val">${{data.total_trades}}</span>
                 </div>
             `;
             document.getElementById('liveStatsContainer').innerHTML = html;
-        });
-    }
+        }});
+    }}
 
-    function changePage(type, delta) {
+    function changePage(type, delta) {{
         const s = state[type];
         const maxPage = Math.ceil(s.total / s.limit);
         const newPage = s.page + delta;
         
-        if (newPage >= 1 && newPage <= maxPage) {
+        if (newPage >= 1 && newPage <= maxPage) {{
             s.page = newPage;
             if (type === 'live') loadLiveLog();
             else loadOutcomesLog();
-        }
-    }
+        }}
+    }}
 
-    function loadLiveLog() {
-        const { page, limit } = state.live;
-        fetch(`/api/livelog?page=${page}&limit=${limit}`)
+    function loadLiveLog() {{
+        const {{ page, limit }} = state.live;
+        fetch(`/api/livelog?page=${{page}}&limit=${{limit}}`)
         .then(r => r.json())
-        .then(resp => {
+        .then(resp => {{
             state.live.total = resp.total;
             const tbody = document.getElementById('globalLiveLog');
             tbody.innerHTML = '';
             
-            resp.data.forEach(log => {
+            resp.data.forEach(log => {{
                  const tr = document.createElement('tr');
                  const pClass = log.prediction === 'UP' ? 'up' : (log.prediction === 'DOWN' ? 'down' : 'flat');
                  // Format raw sequence nicely
                  const rawDisplay = log.raw_sequence.map(v => Number(v).toFixed(4)).join(' &rarr; ');
                  
                  tr.innerHTML = `
-                    <td>${log.timestamp}</td>
-                    <td><b>${log.symbol}</b></td>
-                    <td>${rawDisplay}</td>
-                    <td class="${pClass}">${log.prediction}</td>
+                    <td>${{log.timestamp}}</td>
+                    <td><b>${{log.symbol}}</b></td>
+                    <td>${{rawDisplay}}</td>
+                    <td class="${{pClass}}">${{log.prediction}}</td>
                  `;
                  tbody.appendChild(tr);
-            });
+            }});
             
             // Update Controls
             const maxPage = Math.ceil(resp.total / limit) || 1;
-            document.getElementById('pageInfoLive').innerText = `Page ${page} of ${maxPage}`;
+            document.getElementById('pageInfoLive').innerText = `Page ${{page}} of ${{maxPage}}`;
             document.getElementById('btnPrevLive').disabled = (page === 1);
             document.getElementById('btnNextLive').disabled = (page === maxPage);
-        });
-    }
+        }});
+    }}
 
-    function loadOutcomesLog() {
-        const { page, limit } = state.outcome;
-        fetch(`/api/outcomes?page=${page}&limit=${limit}`)
+    function loadOutcomesLog() {{
+        const {{ page, limit }} = state.outcome;
+        fetch(`/api/outcomes?page=${{page}}&limit=${{limit}}`)
         .then(r => r.json())
-        .then(resp => {
+        .then(resp => {{
             state.outcome.total = resp.total;
             const tbody = document.getElementById('globalOutcomesLog');
             tbody.innerHTML = '';
             
-            resp.data.forEach(log => {
+            resp.data.forEach(log => {{
                  const tr = document.createElement('tr');
                  const pClass = log.prediction === 'UP' ? 'up' : (log.prediction === 'DOWN' ? 'down' : 'flat');
                  const outClass = log.outcome === 'CORRECT' ? 'win' : (log.outcome === 'INCORRECT' ? 'loss' : 'flat');
@@ -684,32 +685,32 @@ HTML_TEMPLATE = """
                  
                  // Handle raw sequence if available
                  let rawDisplay = "-";
-                 if(log.raw_sequence) {
+                 if(log.raw_sequence) {{
                      rawDisplay = log.raw_sequence.map(v => Number(v).toFixed(4)).join(' &rarr; ');
-                 }
+                 }}
                  
                  tr.innerHTML = `
-                    <td>${log.time_entry}</td>
-                    <td><b>${log.symbol}</b></td>
-                    <td><small>${rawDisplay}</small></td>
-                    <td class="${pClass}">${log.prediction}</td>
-                    <td>${Number(log.entry_price).toFixed(4)}</td>
-                    <td>${Number(log.exit_price).toFixed(4)}</td>
-                    <td class="${outClass}">${log.outcome}</td>
-                    <td style="color:${pnlColor}">${log.pnl.toFixed(2)}%</td>
+                    <td>${{log.time_entry}}</td>
+                    <td><b>${{log.symbol}}</b></td>
+                    <td><small>${{rawDisplay}}</small></td>
+                    <td class="${{pClass}}">${{log.prediction}}</td>
+                    <td>${{Number(log.entry_price).toFixed(4)}}</td>
+                    <td>${{Number(log.exit_price).toFixed(4)}}</td>
+                    <td class="${{outClass}}">${{log.outcome}}</td>
+                    <td style="color:${{pnlColor}}">${{log.pnl.toFixed(2)}}%</td>
                  `;
                  tbody.appendChild(tr);
-            });
+            }});
             
              // Update Controls
             const maxPage = Math.ceil(resp.total / limit) || 1;
-            document.getElementById('pageInfoOut').innerText = `Page ${page} of ${maxPage}`;
+            document.getElementById('pageInfoOut').innerText = `Page ${{page}} of ${{maxPage}}`;
             document.getElementById('btnPrevOut').disabled = (page === 1);
             document.getElementById('btnNextOut').disabled = (page === maxPage);
-        });
-    }
+        }});
+    }}
 
-    function showSummary() {
+    function showSummary() {{
         document.getElementById('overviewSection').style.display = 'block';
         document.getElementById('detailView').style.display = 'none';
         document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
@@ -717,9 +718,9 @@ HTML_TEMPLATE = """
         loadLiveLog();
         loadOutcomesLog();
         loadLiveStats();
-    }
+    }}
 
-    function loadAsset(symbol) {
+    function loadAsset(symbol) {{
         document.getElementById('overviewSection').style.display = 'none';
         document.getElementById('detailView').style.display = 'block';
         document.getElementById('detailTitle').innerText = symbol;
@@ -732,12 +733,12 @@ HTML_TEMPLATE = """
 
         fetch('/api/details?symbol=' + symbol)
             .then(r => r.json())
-            .then(data => {
+            .then(data => {{
                 const htmlStats = `
-                    <div class="summary-metric"><span class="summary-label">Sharpe Ratio</span><span class="summary-val">${data.sharpe}</span></div>
-                    <div class="summary-metric"><span class="summary-label">Accuracy</span><span class="summary-val">${data.accuracy}%</span></div>
-                    <div class="summary-metric"><span class="summary-label">Total PnL</span><span class="summary-val" style="color:${parseFloat(data.pnl) >= 0 ? 'green':'red'}">${data.pnl}</span></div>
-                    <div class="summary-metric"><span class="summary-label">Grid Size</span><span class="summary-val">${data.grid_percent}%</span></div>
+                    <div class="summary-metric"><span class="summary-label">Sharpe Ratio</span><span class="summary-val">${{data.sharpe}}</span></div>
+                    <div class="summary-metric"><span class="summary-label">Accuracy</span><span class="summary-val">${{data.accuracy}}%</span></div>
+                    <div class="summary-metric"><span class="summary-label">Total PnL</span><span class="summary-val" style="color:${{parseFloat(data.pnl) >= 0 ? 'green':'red'}}">${{data.pnl}}</span></div>
+                    <div class="summary-metric"><span class="summary-label">Grid Size</span><span class="summary-val">${{data.grid_percent}}%</span></div>
                 `;
                 document.getElementById('detailStats').innerHTML = htmlStats;
                 
@@ -748,21 +749,21 @@ HTML_TEMPLATE = """
                 
                 const tbody = document.getElementById('detailLogBody');
                 const logs = data.logs.slice(-100).reverse();
-                logs.forEach(row => {
+                logs.forEach(row => {{
                     const tr = document.createElement('tr');
                     const pnlColor = row.pnl >= 0 ? 'green' : 'red';
                     const predClass = row.prediction === 'UP' ? 'up' : (row.prediction === 'DOWN' ? 'down' : '');
                     tr.innerHTML = `
-                        <td>${row.time_t}</td>
-                        <td>[${row.rnd_t_2}, ${row.rnd_t_1}, ${row.rnd_t_0}]</td>
-                        <td class="${predClass}">${row.prediction}</td>
-                        <td>${row.actual}</td>
-                        <td style="color:${pnlColor}">${row.pnl.toFixed(4)}</td>
+                        <td>${{row.time_t}}</td>
+                        <td>[${{row.rnd_t_2}}, ${{row.rnd_t_1}}, ${{row.rnd_t_0}}]</td>
+                        <td class="${{predClass}}">${{row.prediction}}</td>
+                        <td>${{row.actual}}</td>
+                        <td style="color:${{pnlColor}}">${{row.pnl.toFixed(4)}}</td>
                     `;
                     tbody.appendChild(tr);
-                });
-            });
-    }
+                }});
+            }});
+    }}
 </script>
 </body>
 </html>
