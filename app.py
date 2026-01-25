@@ -57,6 +57,7 @@ else:
 # Structure: GLOBAL_RESULTS[symbol] = { 'best_result': ..., 'plot_b64': ..., 'model': ... }
 GLOBAL_RESULTS = {}
 GLOBAL_LIVE_LOG = [] # Shared log for all assets
+GLOBAL_LIVE_OUTCOMES = [] # Shared log for verified outcomes
 
 # ---------------------------------------------------------
 # 1. Fetch Data
@@ -98,8 +99,8 @@ def fetch_binance_data(symbol, interval, start_str, end_str=None, limit=1000):
         sys.stdout.write(f"[{symbol}] Downloaded {len(all_data)} candles.\n")
         
     else:
-        # Live mode
-        params = {'symbol': symbol, 'interval': interval, 'limit': 5}
+        # Live mode - Fetch slightly more to ensure we can verify previous candles
+        params = {'symbol': symbol, 'interval': interval, 'limit': 10}
         try:
             response = requests.get(base_url, params=params, timeout=5)
             all_data = response.json()
@@ -334,7 +335,8 @@ def save_live_prediction(symbol, timestamp, close_price, sequence, prediction):
         'symbol': symbol,
         'close_price': close_price,
         'sequence': str(sequence),
-        'prediction': prediction
+        'prediction': prediction,
+        'processed': False # Flag to check outcome later
     })
     
     print(f"[{symbol}] Prediction: {prediction} (Seq: {seq_str})")
@@ -353,13 +355,78 @@ def live_prediction_loop():
                 precision = res['needed_precision']
                 model = res['model']
                 
-                # Fetch recent candles
-                df_live = fetch_binance_data(symbol, INTERVAL, start_str=None) # Fetches last 5 candles
+                # Fetch recent candles (limit=10 to help with verification)
+                df_live = fetch_binance_data(symbol, INTERVAL, start_str=None, limit=10) 
                 
+                if df_live.empty:
+                    continue
+
+                # -------------------------------------------
+                # 1. VERIFY PENDING PREDICTIONS
+                # -------------------------------------------
+                for log in GLOBAL_LIVE_LOG:
+                    # Check only unprocessed logs for this symbol
+                    if log.get('processed', False) or log['symbol'] != symbol:
+                        continue
+                    
+                    # Log timestamp was stringified from dataframe timestamp
+                    log_ts_str = log['timestamp']
+                    
+                    # Find index of this timestamp in current live data
+                    # df_live['open_time'] is datetime, convert to string to match log
+                    match_mask = df_live['open_time'].astype(str) == log_ts_str
+                    match_indices = df_live.index[match_mask]
+                    
+                    if not match_indices.empty:
+                        idx = match_indices[0]
+                        
+                        # We need the NEXT candle to be fully closed.
+                        # In Binance API (and most), the last candle in the list is the "open" (forming) candle.
+                        # So we need idx + 1 to exist AND idx + 1 < len(df) - 1.
+                        # This ensures idx+1 is a completed candle.
+                        if idx + 1 < len(df_live) - 1:
+                            next_candle_close = df_live.iloc[idx+1]['close']
+                            pred = log['prediction']
+                            entry_price = log['close_price']
+                            
+                            pnl = 0.0
+                            is_correct = False
+                            outcome_str = "INCORRECT"
+                            
+                            if pred == 'UP':
+                                pnl = next_candle_close - entry_price
+                                if next_candle_close > entry_price:
+                                    is_correct = True
+                                    outcome_str = "CORRECT"
+                            elif pred == 'DOWN':
+                                pnl = entry_price - next_candle_close
+                                if next_candle_close < entry_price:
+                                    is_correct = True
+                                    outcome_str = "CORRECT"
+                            else:
+                                outcome_str = "FLAT"
+                            
+                            # Save Outcome
+                            outcome_data = {
+                                'time_entry': log_ts_str,
+                                'symbol': symbol,
+                                'prediction': pred,
+                                'entry_price': entry_price,
+                                'exit_price': next_candle_close,
+                                'outcome': outcome_str,
+                                'pnl': pnl
+                            }
+                            GLOBAL_LIVE_OUTCOMES.append(outcome_data)
+                            log['processed'] = True # Mark as done
+                            print(f"[{symbol}] Outcome Verified: {outcome_str} ({pnl:.2f})")
+
+                # -------------------------------------------
+                # 2. MAKE NEW PREDICTION
+                # -------------------------------------------
                 if len(df_live) >= 3:
                     last_row = df_live.iloc[-1]
                     # Calculate rounding for last 3 candles to form sequence
-                    # We need t-2, t-1, t-0
+                    # We need t-2, t-1, t-0. Using tail(3).
                     recent_closes = df_live['close'].tail(3).values
                     rounded = [round(round(x / grid_size) * grid_size, precision) for x in recent_closes]
                     
@@ -371,7 +438,8 @@ def live_prediction_loop():
                         last_ts = str(last_row['open_time'])
                         # Simple check to avoid duplicates: check if last log for this symbol has same TS
                         is_duplicate = False
-                        for log in reversed(GLOBAL_LIVE_LOG):
+                        # Check specific reversed slice to be efficient
+                        for log in reversed(GLOBAL_LIVE_LOG[-50:]): 
                             if log['symbol'] == symbol and log['timestamp'] == last_ts:
                                 is_duplicate = True
                                 break
@@ -381,8 +449,7 @@ def live_prediction_loop():
                 
                 time.sleep(1) # Small delay between symbols
             
-            # Wait for next hour check (approximate, simpler logic here just waits 60s)
-            # Real production would align with clock
+            # Wait for next check
             time.sleep(60) 
             
         except Exception as e:
@@ -414,6 +481,8 @@ HTML_TEMPLATE = """
         .up {{ color: #28a745; font-weight: bold; }}
         .down {{ color: #dc3545; font-weight: bold; }}
         .flat {{ color: #6c757d; }}
+        .win {{ color: #28a745; font-weight: bold; }}
+        .loss {{ color: #dc3545; font-weight: bold; }}
         
         .summary-metric {{ display: inline-block; margin-right: 20px; font-size: 0.9em; }}
         .summary-val {{ font-size: 1.2em; font-weight: bold; display: block; }}
@@ -467,6 +536,25 @@ HTML_TEMPLATE = """
                     </tr>
                 </thead>
                 <tbody id="globalLiveLog">
+                </tbody>
+            </table>
+        </div>
+
+        <div class="card">
+            <h3>Completed Predictions (Outcomes)</h3>
+            <table id="outcomesTable">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Symbol</th>
+                        <th>Prediction</th>
+                        <th>Entry</th>
+                        <th>Exit</th>
+                        <th>Outcome</th>
+                        <th>PnL</th>
+                    </tr>
+                </thead>
+                <tbody id="globalOutcomesLog">
                 </tbody>
             </table>
         </div>
@@ -529,8 +617,9 @@ HTML_TEMPLATE = """
                 assetList.appendChild(link);
             }});
             
-            // Populate Global Live Log
+            // Populate Global Live Logs
             renderLiveLog();
+            renderOutcomesLog();
         }});
 
     function renderLiveLog() {{
@@ -555,11 +644,41 @@ HTML_TEMPLATE = """
         }});
     }}
 
+    function renderOutcomesLog() {{
+        fetch('/api/outcomes')
+        .then(r => r.json())
+        .then(logs => {{
+            const tbody = document.getElementById('globalOutcomesLog');
+            tbody.innerHTML = '';
+            // Show last 20
+            logs.slice(0, 20).forEach(log => {{
+                 const tr = document.createElement('tr');
+                 const pClass = log.prediction === 'UP' ? 'up' : (log.prediction === 'DOWN' ? 'down' : 'flat');
+                 const outClass = log.outcome === 'CORRECT' ? 'win' : (log.outcome === 'INCORRECT' ? 'loss' : 'flat');
+                 const pnlColor = log.pnl >= 0 ? 'green' : 'red';
+                 
+                 tr.innerHTML = `
+                    <td>${{log.time_entry}}</td>
+                    <td><b>${{log.symbol}}</b></td>
+                    <td class="${{pClass}}">${{log.prediction}}</td>
+                    <td>${{log.entry_price}}</td>
+                    <td>${{log.exit_price}}</td>
+                    <td class="${{outClass}}">${{log.outcome}}</td>
+                    <td style="color:${{pnlColor}}">${{log.pnl.toFixed(4)}}</td>
+                 `;
+                 tbody.appendChild(tr);
+            }});
+        }});
+    }}
+
     function showSummary() {{
         document.getElementById('overviewSection').style.display = 'block';
         document.getElementById('detailView').style.display = 'none';
         document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
         document.querySelector('.sidebar a:first-child').classList.add('active');
+        // Refresh logs when showing summary
+        renderLiveLog();
+        renderOutcomesLog();
     }}
 
     function loadAsset(symbol) {{
@@ -659,6 +778,13 @@ class BacktestHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             # Return reversed log (newest first)
             self.wfile.write(json.dumps(GLOBAL_LIVE_LOG[::-1]).encode('utf-8'))
+            
+        elif path == '/api/outcomes':
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            # Return reversed verified outcomes (newest first)
+            self.wfile.write(json.dumps(GLOBAL_LIVE_OUTCOMES[::-1]).encode('utf-8'))
             
         elif path == '/api/details':
             sym = query.get('symbol', [None])[0]
