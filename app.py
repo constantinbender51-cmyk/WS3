@@ -239,13 +239,14 @@ def evaluate_strategy(df_original, grid_percent, verbose=False):
         next_price = row['next_close_raw']
         
         trade_pnl = 0.0
-        if prediction == 'UP':
-            trade_pnl = next_price - curr_price
-        elif prediction == 'DOWN':
-            trade_pnl = curr_price - next_price
+        if curr_price != 0:
+            if prediction == 'UP':
+                trade_pnl = ((next_price - curr_price) / curr_price) * 100
+            elif prediction == 'DOWN':
+                trade_pnl = ((curr_price - next_price) / curr_price) * 100
             
         cumulative_pnl += trade_pnl
-        hourly_returns.append(trade_pnl / curr_price if curr_price > 0 else 0)
+        hourly_returns.append(trade_pnl)
         
         test_results_list.append({
             'time_t': row['open_time'],
@@ -308,7 +309,7 @@ def create_plot(df, test_results, accuracy, total_pnl, symbol, grid_percent):
     ax2.plot(test_times, test_pnl, label='Strategy PnL', color='blue', linewidth=1.5)
     
     ax1.set_ylabel('Price')
-    ax2.set_ylabel('Cumulative PnL (USDT)')
+    ax2.set_ylabel('Cumulative PnL (%)')
     plt.title(f'{symbol} Backtest | Grid={grid_percent*100}% | Acc: {accuracy:.2f}% | PnL: {total_pnl:.4f}')
     
     buf = io.BytesIO()
@@ -395,12 +396,12 @@ def live_prediction_loop():
                             outcome_str = "INCORRECT"
                             
                             if pred == 'UP':
-                                pnl = next_candle_close - entry_price
+                                pnl = ((next_candle_close - entry_price) / entry_price) * 100
                                 if next_candle_close > entry_price:
                                     is_correct = True
                                     outcome_str = "CORRECT"
                             elif pred == 'DOWN':
-                                pnl = entry_price - next_candle_close
+                                pnl = ((entry_price - next_candle_close) / entry_price) * 100
                                 if next_candle_close < entry_price:
                                     is_correct = True
                                     outcome_str = "CORRECT"
