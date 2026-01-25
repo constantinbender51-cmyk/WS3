@@ -1,483 +1,728 @@
-import os
-import ccxt
+import http.server
+import socketserver
 import pandas as pd
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend for server
+import requests
 import matplotlib.pyplot as plt
 import io
 import base64
-import http.server
-import socketserver
-import threading
 import time
-import json
+import sys
+import math
 from datetime import datetime, timedelta
+from collections import Counter, defaultdict
+import json
+import threading
+import os
+import csv
+import urllib.parse
 
-# --- Configuration ---
-TIMEFRAME = os.environ.get('TIMEFRAME', '1h')
-SYMBOL = os.environ.get('SYMBOL', 'BTC/USDT')
-START = os.environ.get('START', '2024-01-01 00:00:00')
-END = os.environ.get('END', '2024-06-01 00:00:00')
+# ---------------------------------------------------------
+# Configuration & Assets
+# ---------------------------------------------------------
+# List of assets to track (mapped to Binance USDT pairs)
+ASSETS = [
+    "BTCUSDT",   # Bitcoin
+    "ETHUSDT",   # Ethereum
+    "XRPUSDT",   # XRP
+    "SOLUSDT",   # Solana
+    "DOGEUSDT",  # Dogecoin
+    "ADAUSDT",   # Cardano
+    "BCHUSDT",   # Bitcoin Cash
+    "LINKUSDT",  # Chainlink
+    "XLMUSDT",   # Stellar
+    "SUIUSDT",   # Sui
+    "AVAXUSDT",  # Avalanche
+    "LTCUSDT",   # Litecoin
+    "HBARUSDT",  # Hedera
+    "SHIBUSDT",  # Shiba Inu
+    "TONUSDT"    # Toncoin
+]
 
-# Parameters
-A = float(os.environ.get('A', 0.0))          # Unused (rounding removed)
-B = float(os.environ.get('B', 0.7))          # Split % (70% training, 30% testing)
-C = float(os.environ.get('C', 0.1))          # Top % most frequent (densest) sequences to keep
-D = int(os.environ.get('D', 4))              # Sequence length (candles)
-E = float(os.environ.get('E', 0.002))        # Similarity threshold (0.1% absolute diff)
+INTERVAL = os.getenv("INTERVAL", '1h')
+START_TIME = os.getenv("START_TIME", '2024-01-01')
+END_TIME = os.getenv("END_TIME", '2026-01-01')
+PORT = int(os.getenv("PORT", 8080))
+TRAIN_SPLIT_RATIO = float(os.getenv("TRAIN_SPLIT_RATIO", 0.7))
 
-# Global State
-results_html = "<h1>Initializing...</h1>"
-live_outcomes = []
-model_sequences = None
-data_global = None
+# Parse Grid Search Values from Env (comma separated) or use default
+_grid_env = os.getenv("GRID_SEARCH_VALUES")
+if _grid_env:
+    GRID_SEARCH_VALUES = [float(x.strip()) for x in _grid_env.split(',')]
+else:
+    # Default: 0.1% to 5%
+    GRID_SEARCH_VALUES = [0.001, 0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05]
 
-# API Data Containers
-backtest_data = {}
-recent_data = {}
+# Global Storage for Multi-Asset Data
+# Structure: GLOBAL_RESULTS[symbol] = { 'best_result': ..., 'plot_b64': ..., 'model': ... }
+GLOBAL_RESULTS = {}
+GLOBAL_LIVE_LOG = [] # Shared log for all assets
 
-# --- Functions ---
-
-def fetch(timeframe, symbol, start_str, end_str):
-    """Fetches OHLCV data from Binance."""
-    print(f"Fetching {symbol} {timeframe} from {start_str} to {end_str}...")
-    exchange = ccxt.binance()
-    start_ts = exchange.parse8601(start_str)
-    end_ts = exchange.parse8601(end_str)
+# ---------------------------------------------------------
+# 1. Fetch Data
+# ---------------------------------------------------------
+def fetch_binance_data(symbol, interval, start_str, end_str=None, limit=1000):
+    base_url = "https://api.binance.com/api/v3/klines"
     
-    ohlc = []
-    current_ts = start_ts
-    
-    while current_ts < end_ts:
+    if end_str:
+        print(f"[{symbol}] Fetching data from {start_str} to {end_str}...")
         try:
-            candles = exchange.fetch_ohlcv(symbol, timeframe, since=current_ts, limit=1000)
-            if not candles:
-                break
-            
-            # Filter out candles beyond end_ts
-            candles = [c for c in candles if c[0] < end_ts]
-            if not candles:
-                break
-
-            ohlc += candles
-            current_ts = candles[-1][0] + 1
-            time.sleep(0.1) 
+            start_ts = int(pd.Timestamp(start_str).timestamp() * 1000)
+            end_ts = int(pd.Timestamp(end_str).timestamp() * 1000)
         except Exception as e:
-            print(f"Error fetching: {e}")
-            break
-            
-    df = pd.DataFrame(ohlc, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    return df
-
-def deriveround(df, a=None):
-    """Applies returns calculation."""
-    df = df.copy()
-    cols = ['open', 'high', 'low', 'close']
-    for col in cols:
-        df[f'{col}_ret'] = df[col].pct_change()
-    
-    df.dropna(inplace=True)
-    return df
-
-def split(df, b):
-    split_idx = int(len(df) * b)
-    return df.iloc[:split_idx].copy(), df.iloc[split_idx:].copy()
-
-def gettop(df_split1, c, d):
-    """Finds dense patterns in Split 1."""
-    print("Training model (finding dense patterns)...")
-    
-    data_cols = ['open_ret', 'high_ret', 'low_ret', 'close_ret']
-    data_values = df_split1[data_cols].values
-    
-    # Shape: (N_windows, D, 4)
-    windows = np.lib.stride_tricks.sliding_window_view(data_values, window_shape=d, axis=0)
-    
-    N = windows.shape[0]
-    flat_windows = windows.reshape(N, -1)
-    
-    densities = np.zeros(N, dtype=int)
-    chunk_size = 1000
-    
-    for i in range(0, N, chunk_size):
-        end = min(i + chunk_size, N)
-        batch = flat_windows[i:end]
+            print(f"Error parsing dates: {e}")
+            return pd.DataFrame()
         
-        # Check distance against ALL windows (sampled or blocked if too large)
-        compare_set = flat_windows if N < 10000 else flat_windows[::5]
+        all_data = []
+        while start_ts < end_ts:
+            params = {
+                'symbol': symbol,
+                'interval': interval,
+                'startTime': start_ts,
+                'endTime': end_ts,
+                'limit': limit
+            }
+            try:
+                response = requests.get(base_url, params=params, timeout=10)
+                data = response.json()
+                if not isinstance(data, list) or len(data) == 0:
+                    break
+                all_data.extend(data)
+                last_close_time = data[-1][6]
+                start_ts = last_close_time + 1
+                time.sleep(0.05) 
+            except Exception as e:
+                print(f"[{symbol}] Error fetching data: {e}")
+                break
         
-        for j in range(len(batch)):
-            diff = np.abs(compare_set - batch[j])
-            matches = np.all(diff < E, axis=1)
-            densities[i+j] = np.sum(matches)
-            
-    top_n = int(N * c)
-    if top_n == 0: top_n = 1
-    
-    top_indices = np.argsort(densities)[-top_n:]
-    return windows[top_indices]
-
-def completesimilarbeginnings(df_target, model_patterns, e, d):
-    """Predicts on df_target using the top patterns."""
-    print("Running predictions...")
-    data_cols = ['open_ret', 'high_ret', 'low_ret', 'close_ret']
-    target_values = df_target[data_cols].values
-    timestamps = df_target['timestamp'].values
-    
-    # Extract raw close prices for entry/exit logging
-    close_prices = df_target['close'].values
-    
-    target_windows = np.lib.stride_tricks.sliding_window_view(target_values, window_shape=d, axis=0)
-    target_ts = np.lib.stride_tricks.sliding_window_view(timestamps, window_shape=d, axis=0)
-    target_prices = np.lib.stride_tricks.sliding_window_view(close_prices, window_shape=d, axis=0)
-    
-    predictions = []
-    
-    model_context = model_patterns[:, :d-1, :] # (K, D-1, 4)
-    model_outcome = model_patterns[:, -1, :]   # (K, 4)
-    model_context_flat = model_context.reshape(model_context.shape[0], -1)
-    
-    for i in range(len(target_windows)):
-        current_window = target_windows[i] # Shape (D, 4)
-        current_context = current_window[:d-1, :]
-        current_context_flat = current_context.reshape(-1)
+        sys.stdout.write(f"[{symbol}] Downloaded {len(all_data)} candles.\n")
         
-        diff = np.abs(model_context_flat - current_context_flat)
-        matches_idx = np.where(np.all(diff < e, axis=1))[0]
-        
-        if len(matches_idx) > 0:
-            matched_outcomes = model_outcome[matches_idx]
-            avg_return = np.mean(matched_outcomes[:, 3]) # Column 3 is close_ret
-            
-            predicted_dir = 1 if avg_return > 0 else -1
-            if avg_return == 0: predicted_dir = 0
-            
-            # Outcome
-            actual_ret = current_window[-1, 3] 
-            actual_dir = 1 if actual_ret > 0 else -1
-            if actual_ret == 0: actual_dir = 0
-            
-            ts = pd.to_datetime(target_ts[i, -1])
-            
-            # Prices
-            # Entry: Close of the candle BEFORE the outcome (index -2)
-            # Exit: Close of the outcome candle (index -1)
-            entry_price = target_prices[i, -2]
-            exit_price = target_prices[i, -1]
-            
-            predictions.append({
-                'timestamp': ts,
-                'predicted_dir': predicted_dir,
-                'actual_ret': actual_ret,
-                'actual_dir': actual_dir,
-                'is_correct': (predicted_dir == actual_dir) and (predicted_dir != 0),
-                'entry_price': entry_price,
-                'exit_price': exit_price
-            })
-            
-    return pd.DataFrame(predictions)
-
-def printaccuracy(predictions_df):
-    """
-    Generates HTML report and structured data dictionary.
-    """
-    if predictions_df.empty:
-        return "<h3>No predictions made (adjust E or C)</h3>", {"error": "No predictions"}
-
-    active = predictions_df[predictions_df['predicted_dir'] != 0].copy()
-    if active.empty:
-        return "<h3>No non-flat predictions</h3>", {"error": "No active predictions"}
-
-    total = len(active)
-    correct = active['is_correct'].sum()
-    accuracy = (correct / total) * 100
-    
-    active['pnl'] = active['predicted_dir'] * active['actual_ret']
-    active['cum_pnl'] = active['pnl'].cumsum()
-    
-    # --- Plot Generation ---
-    plt.figure(figsize=(10, 5))
-    plt.plot(active['timestamp'], active['cum_pnl'], label='Cumulative PnL (Strategy)')
-    plt.title(f'Strategy Performance (Acc: {accuracy:.2f}%)')
-    plt.grid(True)
-    plt.legend()
-    
-    img = io.BytesIO()
-    plt.savefig(img, format='png')
-    img.seek(0)
-    plot_url = base64.b64encode(img.getvalue()).decode()
-    plt.close()
-    
-    # --- HTML Generation ---
-    table_html = """
-    <table border="1">
-    <tr><th>Date</th><th>Pred</th><th>Entry</th><th>Exit</th><th>Actual Ret</th><th>Outcome</th><th>PnL</th></tr>
-    """
-    for _, row in active.tail(50).iterrows():
-        p_str = "UP" if row['predicted_dir'] > 0 else "DOWN"
-        color = "green" if row['is_correct'] else "red"
-        table_html += f"<tr><td>{row['timestamp']}</td><td>{p_str}</td><td>{row['entry_price']:.2f}</td><td>{row['exit_price']:.2f}</td><td>{row['actual_ret']:.4f}</td><td style='color:{color}'>{row['is_correct']}</td><td>{row['pnl']:.4f}</td></tr>"
-    table_html += "</table>"
-    
-    html_out = f"<h3>Accuracy: {accuracy:.2f}% ({correct}/{total})</h3><img src='data:image/png;base64,{plot_url}'/><br>{table_html}"
-
-    # --- API Data Generation ---
-    # Convert timestamps to string for JSON serialization
-    equity_curve = active[['timestamp', 'cum_pnl']].copy()
-    equity_curve['timestamp'] = equity_curve['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
-    
-    # Create full trade history for API
-    trade_history = active[['timestamp', 'predicted_dir', 'entry_price', 'exit_price', 'actual_ret', 'is_correct', 'pnl']].copy()
-    trade_history['timestamp'] = trade_history['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
-    
-    stats_data = {
-        "accuracy_percent": round(accuracy, 2),
-        "total_trades": int(total),
-        "correct_trades": int(correct),
-        "cumulative_pnl": float(active['cum_pnl'].iloc[-1]),
-        "equity_curve": equity_curve.to_dict(orient='records'),
-        "trade_history": trade_history.to_dict(orient='records'),
-        "plot_base64": plot_url
-    }
-    
-    return html_out, stats_data
-
-def predict_on_recent(model_patterns, df_recent, e, d):
-    preds = completesimilarbeginnings(df_recent, model_patterns, e, d)
-    return preds
-
-# --- Live Loop ---
-
-def get_seconds_to_sleep(timeframe):
-    now = datetime.utcnow()
-    unit = timeframe[-1]
-    val = int(timeframe[:-1])
-    
-    if unit == 'm': delta = timedelta(minutes=val)
-    elif unit == 'h': delta = timedelta(hours=val)
-    elif unit == 'd': delta = timedelta(days=val)
-    else: delta = timedelta(hours=1)
-
-    # Calculate next close alignment
-    if unit == 'h':
-        next_hour = now.replace(minute=0, second=0, microsecond=0) + delta
-        while next_hour < now: next_hour += delta
-        target = next_hour
-    elif unit == 'm':
-        next_min = now.replace(second=0, microsecond=0) + timedelta(minutes=val - (now.minute % val))
-        if next_min <= now: next_min += timedelta(minutes=val)
-        target = next_min
     else:
-        target = now + delta
+        # Live mode
+        params = {'symbol': symbol, 'interval': interval, 'limit': 5}
+        try:
+            response = requests.get(base_url, params=params, timeout=5)
+            all_data = response.json()
+        except Exception as e:
+            print(f"[{symbol}] Error fetching live data: {e}")
+            return pd.DataFrame()
 
-    seconds = (target - now).total_seconds() + 5 
-    return max(0, seconds)
+    if not all_data:
+        return pd.DataFrame()
 
-def live_loop():
-    global live_outcomes
+    df = pd.DataFrame(all_data, columns=[
+        'open_time', 'open', 'high', 'low', 'close', 'volume',
+        'close_time', 'quote_asset_volume', 'trades', 
+        'taker_buy_base', 'taker_buy_quote', 'ignore'
+    ])
+    
+    df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+    df['close'] = df['close'].astype(float)
+    
+    return df[['open_time', 'close']]
+
+# ---------------------------------------------------------
+# Helper: Sharpe Calculation
+# ---------------------------------------------------------
+def calculate_sharpe_ratio(returns_series, periods_per_year=24*365):
+    if len(returns_series) < 2:
+        return 0.0
+    mean_ret = np.mean(returns_series)
+    std_ret = np.std(returns_series)
+    if std_ret == 0:
+        return 0.0
+    return (mean_ret / std_ret) * np.sqrt(periods_per_year)
+
+# ---------------------------------------------------------
+# Processing & Backtesting Logic
+# ---------------------------------------------------------
+def train_model(df, grid_size, needed_precision):
+    # This function is used by the live loop to rebuild the model for the specific asset
+    df = df.copy()
+    df['rounded_close'] = ((df['close'] / grid_size).round() * grid_size).round(needed_precision)
+    df['next_rounded'] = df['rounded_close'].shift(-1)
+    
+    conditions = [
+        df['next_rounded'] > df['rounded_close'],
+        df['next_rounded'] < df['rounded_close']
+    ]
+    choices = ['UP', 'DOWN']
+    df['target_direction'] = np.select(conditions, choices, default='FLAT')
+    
+    df['t_0'] = df['rounded_close']
+    df['t_1'] = df['rounded_close'].shift(1)
+    df['t_2'] = df['rounded_close'].shift(2)
+    
+    data = df.dropna().copy()
+    
+    sequence_map = defaultdict(list)
+    for _, row in data.iterrows():
+        seq = (row['t_2'], row['t_1'], row['t_0'])
+        sequence_map[seq].append(row['target_direction'])
+        
+    final_model = {}
+    for seq, directions in sequence_map.items():
+        counts = Counter(directions)
+        most_common = counts.most_common(1)[0][0]
+        final_model[seq] = most_common
+        
+    return final_model
+
+def evaluate_strategy(df_original, grid_percent, verbose=False):
+    if df_original.empty:
+        return {'sharpe': -99, 'accuracy': 0, 'cumulative_pnl': 0}
+
+    df = df_original.copy()
+    first_close = df['close'].iloc[0]
+    grid_size = first_close * grid_percent
+    
+    if grid_size == 0:
+        needed_precision = 8
+    else:
+        needed_precision = int(math.ceil(-math.log10(grid_size))) + 2
+    needed_precision = max(2, min(needed_precision, 10))
+    
+    df['rounded_close'] = ((df['close'] / grid_size).round() * grid_size).round(needed_precision)
+    df['next_rounded'] = df['rounded_close'].shift(-1)
+    df['next_close_raw'] = df['close'].shift(-1)
+    
+    conditions = [
+        df['next_rounded'] > df['rounded_close'],
+        df['next_rounded'] < df['rounded_close']
+    ]
+    choices = ['UP', 'DOWN']
+    df['target_direction'] = np.select(conditions, choices, default='FLAT')
+    
+    df['t_0'] = df['rounded_close']
+    df['t_1'] = df['rounded_close'].shift(1)
+    df['t_2'] = df['rounded_close'].shift(2)
+
+    df['raw_t_0'] = df['close']
+    df['raw_t_1'] = df['close'].shift(1)
+    df['raw_t_2'] = df['close'].shift(2)
+    
+    data = df.dropna().copy()
+    split_idx = int(len(data) * TRAIN_SPLIT_RATIO)
+    train_df = data.iloc[:split_idx]
+    test_df = data.iloc[split_idx:]
+    
+    sequence_map = defaultdict(list)
+    for _, row in train_df.iterrows():
+        seq = (row['t_2'], row['t_1'], row['t_0'])
+        sequence_map[seq].append(row['target_direction'])
+        
+    model = {}
+    for seq, directions in sequence_map.items():
+        counts = Counter(directions)
+        model[seq] = counts.most_common(1)[0][0]
+        
+    correct_predictions = 0
+    total_predictions = 0
+    cumulative_pnl = 0.0
+    
+    test_results_list = []
+    hourly_returns = []
+    
+    for idx, row in test_df.iterrows():
+        seq = (row['t_2'], row['t_1'], row['t_0'])
+        prediction = model.get(seq, 'FLAT') 
+        actual = row['target_direction']
+        
+        if prediction != 'FLAT' and actual != 'FLAT':
+            if prediction == actual:
+                correct_predictions += 1
+            total_predictions += 1
+        
+        curr_price = row['close']
+        next_price = row['next_close_raw']
+        
+        trade_pnl = 0.0
+        if prediction == 'UP':
+            trade_pnl = next_price - curr_price
+        elif prediction == 'DOWN':
+            trade_pnl = curr_price - next_price
+            
+        cumulative_pnl += trade_pnl
+        hourly_returns.append(trade_pnl / curr_price if curr_price > 0 else 0)
+        
+        test_results_list.append({
+            'time_t': row['open_time'],
+            'rnd_t_2': row['t_2'],
+            'rnd_t_1': row['t_1'],
+            'rnd_t_0': row['t_0'],
+            'raw_t_2': row['raw_t_2'],
+            'raw_t_1': row['raw_t_1'],
+            'raw_t_0': row['raw_t_0'],
+            'prediction': prediction,
+            'actual': actual,
+            'pnl': trade_pnl,
+            'cum_pnl': cumulative_pnl,
+            'next_price_raw': next_price
+        })
+        
+    accuracy = (correct_predictions / total_predictions) * 100 if total_predictions > 0 else 0
+    sharpe = calculate_sharpe_ratio(hourly_returns)
+    
+    return {
+        'sharpe': sharpe,
+        'accuracy': accuracy,
+        'cumulative_pnl': cumulative_pnl,
+        'grid_size': grid_size,
+        'needed_precision': needed_precision,
+        'test_results': test_results_list,
+        'grid_percent': grid_percent,
+        'model': model
+    }
+
+def run_grid_search(df, symbol):
+    print(f"\n--- Grid Search: {symbol} ---")
+    best_sharpe = -float('inf')
+    best_result = None
+    
+    for gp in GRID_SEARCH_VALUES:
+        res = evaluate_strategy(df, gp, verbose=False)
+        # print(f"  Grid: {gp*100:5.2f}% | Sharpe: {res['sharpe']:6.3f}")
+        if res['sharpe'] > best_sharpe:
+            best_sharpe = res['sharpe']
+            best_result = res
+            
+    print(f"Best for {symbol}: Grid {best_result['grid_percent']*100}% | Sharpe: {best_result['sharpe']:.4f}")
+    return best_result
+
+# ---------------------------------------------------------
+# Visualization
+# ---------------------------------------------------------
+def create_plot(df, test_results, accuracy, total_pnl, symbol, grid_percent):
+    if not test_results:
+        return ""
+    plt.figure(figsize=(10, 5))
+    plt.plot(df['open_time'], df['close'], label='Price', color='gray', alpha=0.3)
+    
+    test_times = [x['time_t'] for x in test_results]
+    test_pnl = [x['cum_pnl'] for x in test_results]
+    
+    ax1 = plt.gca()
+    ax2 = ax1.twinx()
+    ax2.plot(test_times, test_pnl, label='Strategy PnL', color='blue', linewidth=1.5)
+    
+    ax1.set_ylabel('Price')
+    ax2.set_ylabel('Cumulative PnL (USDT)')
+    plt.title(f'{symbol} Backtest | Grid={grid_percent*100}% | Acc: {accuracy:.2f}% | PnL: {total_pnl:.4f}')
+    
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    image_base64 = base64.b64encode(buf.read()).decode('utf-8')
+    plt.close()
+    return image_base64
+
+# ---------------------------------------------------------
+# Live Prediction Logic
+# ---------------------------------------------------------
+def save_live_prediction(symbol, timestamp, close_price, sequence, prediction):
+    file_name = "live_prediction_log.csv"
+    file_exists = os.path.isfile(file_name)
+    
+    with open(file_name, "a") as f:
+        if not file_exists:
+            f.write("timestamp,symbol,close_price,sequence,prediction\n")
+        seq_str = f"{sequence[0]}|{sequence[1]}|{sequence[2]}"
+        f.write(f"{timestamp},{symbol},{close_price},{seq_str},{prediction}\n")
+    
+    GLOBAL_LIVE_LOG.append({
+        'timestamp': str(timestamp),
+        'symbol': symbol,
+        'close_price': close_price,
+        'sequence': str(sequence),
+        'prediction': prediction
+    })
+    
+    print(f"[{symbol}] Prediction: {prediction} (Seq: {seq_str})")
+
+def live_prediction_loop():
+    print("--- Live Prediction Service Started ---")
     while True:
         try:
-            sec = get_seconds_to_sleep(TIMEFRAME)
-            print(f"Live Loop: Sleeping {sec:.1f}s until next close...")
-            time.sleep(sec)
-            
-            print("Live Loop: Fetching latest data...")
-            exchange = ccxt.binance()
-            limit = D * 5
-            candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=limit)
-            df_live = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df_live['timestamp'] = pd.to_datetime(df_live['timestamp'], unit='ms')
-            
-            df_derived = deriveround(df_live)
-            
-            # Step 1: Resolve previous prediction
-            if len(live_outcomes) > 0 and 'outcome' not in live_outcomes[-1]:
-                last_pred = live_outcomes[-1]
+            for symbol in ASSETS:
+                # We need the optimized grid size for this symbol
+                if symbol not in GLOBAL_RESULTS:
+                    continue
                 
-                if len(df_derived) >= 2:
-                    actual_close_ret = df_derived.iloc[-2]['close_ret']
-                    actual_dir = 1 if actual_close_ret > 0 else -1
-                    if actual_close_ret == 0: actual_dir = 0
+                res = GLOBAL_RESULTS[symbol]['best_result']
+                grid_size = res['grid_size']
+                precision = res['needed_precision']
+                model = res['model']
+                
+                # Fetch recent candles
+                df_live = fetch_binance_data(symbol, INTERVAL, start_str=None) # Fetches last 5 candles
+                
+                if len(df_live) >= 3:
+                    last_row = df_live.iloc[-1]
+                    # Calculate rounding for last 3 candles to form sequence
+                    # We need t-2, t-1, t-0
+                    recent_closes = df_live['close'].tail(3).values
+                    rounded = [round(round(x / grid_size) * grid_size, precision) for x in recent_closes]
                     
-                    exit_price = df_live.iloc[-2]['close']
-                    entry_price = last_pred.get('entry_price', exit_price)
-                    raw_return = (exit_price - entry_price) / entry_price if entry_price > 0 else 0
-                    
-                    if last_pred['pred_dir'] == 0:
-                        last_pred['outcome'] = "Flat"
-                        last_pred['pnl'] = 0.0
-                    else:
-                        last_pred['outcome'] = (last_pred['pred_dir'] == actual_dir)
-                        last_pred['pnl'] = last_pred['pred_dir'] * raw_return
-
-                    last_pred['actual_ret'] = actual_close_ret
-                    last_pred['exit_price'] = exit_price
+                    if len(rounded) == 3:
+                        seq = (rounded[0], rounded[1], rounded[2])
+                        prediction = model.get(seq, 'FLAT')
+                        
+                        # Only log if new hour/timestamp
+                        last_ts = str(last_row['open_time'])
+                        # Simple check to avoid duplicates: check if last log for this symbol has same TS
+                        is_duplicate = False
+                        for log in reversed(GLOBAL_LIVE_LOG):
+                            if log['symbol'] == symbol and log['timestamp'] == last_ts:
+                                is_duplicate = True
+                                break
+                        
+                        if not is_duplicate:
+                            save_live_prediction(symbol, last_ts, recent_closes[-1], seq, prediction)
+                
+                time.sleep(1) # Small delay between symbols
             
-            # Step 2: Make NEW prediction
-            if len(df_derived) >= D:
-                recent_context = df_derived.iloc[-D:-1][['open_ret', 'high_ret', 'low_ret', 'close_ret']].values
-                recent_context_flat = recent_context.reshape(-1)
-                
-                model_context = model_sequences[:, :D-1, :]
-                model_context_flat = model_context.reshape(model_context.shape[0], -1)
-                
-                diff = np.abs(model_context_flat - recent_context_flat)
-                matches_idx = np.where(np.all(diff < E, axis=1))[0]
-                
-                entry_price = df_live.iloc[-2]['close']
-                
-                if len(matches_idx) > 0:
-                    model_outcomes = model_sequences[matches_idx, -1, :]
-                    avg_ret = np.mean(model_outcomes[:, 3])
-                    pred_dir = 1 if avg_ret > 0 else -1
-                    if avg_ret == 0: pred_dir = 0
-                    
-                    live_outcomes.append({
-                        'time': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
-                        'pred_dir': pred_dir,
-                        'matches': int(len(matches_idx)), # ensure int for JSON
-                        'entry_price': entry_price
-                    })
-                else:
-                    live_outcomes.append({
-                        'time': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
-                        'pred_dir': 0,
-                        'matches': 0,
-                        'note': 'No Match',
-                        'entry_price': entry_price
-                    })
+            # Wait for next hour check (approximate, simpler logic here just waits 60s)
+            # Real production would align with clock
+            time.sleep(60) 
             
-            if len(live_outcomes) > 336:
-                live_outcomes.pop(0)
-                
         except Exception as e:
-            print(f"Live loop error: {e}")
+            print(f"Live Loop Error: {e}")
             time.sleep(60)
 
-# --- Web Server & API ---
+# ---------------------------------------------------------
+# Server & Dashboard
+# ---------------------------------------------------------
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Multi-Asset Strategy Dashboard</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 0; background-color: #f8f9fa; color: #333; }}
+        .sidebar {{ width: 220px; background: #343a40; color: white; position: fixed; height: 100%; overflow-y: auto; padding-top: 20px; }}
+        .sidebar h3 {{ text-align: center; margin-bottom: 20px; font-size: 1.2em; }}
+        .nav-item {{ padding: 10px 20px; display: block; color: #ccc; text-decoration: none; cursor: pointer; }}
+        .nav-item:hover, .nav-item.active {{ background: #495057; color: white; }}
+        .content {{ margin-left: 220px; padding: 20px; }}
+        .card {{ background: white; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); padding: 20px; margin-bottom: 20px; }}
+        
+        table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+        th, td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid #ddd; }}
+        th {{ background-color: #e9ecef; font-weight: 600; }}
+        tr:hover {{ background-color: #f1f1f1; }}
+        
+        .up {{ color: #28a745; font-weight: bold; }}
+        .down {{ color: #dc3545; font-weight: bold; }}
+        .flat {{ color: #6c757d; }}
+        
+        .summary-metric {{ display: inline-block; margin-right: 20px; font-size: 0.9em; }}
+        .summary-val {{ font-size: 1.2em; font-weight: bold; display: block; }}
+        
+        #detailView {{ display: none; }}
+        .loading {{ color: #666; font-style: italic; }}
+        
+        .live-tag {{ background: #dc3545; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px; vertical-align: middle; margin-left: 5px; }}
+    </style>
+</head>
+<body>
 
-class CustomJSONEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        if isinstance(obj, np.floating):
-            return float(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        if isinstance(obj, datetime):
-            return obj.isoformat()
-        return super().default(obj)
+<div class="sidebar">
+    <h3>Portfolio</h3>
+    <a class="nav-item active" onclick="showSummary()">Overview</a>
+    <div id="assetList">
+        </div>
+</div>
 
-class Handler(http.server.SimpleHTTPRequestHandler):
+<div class="content">
+    <div id="overviewSection">
+        <div class="card">
+            <h2>Portfolio Overview</h2>
+            <p>Backtest Period: {start} to {end} | Interval: {interval}</p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Asset</th>
+                        <th>Grid Size</th>
+                        <th>Grid %</th>
+                        <th>Sharpe</th>
+                        <th>Accuracy</th>
+                        <th>Total PnL</th>
+                    </tr>
+                </thead>
+                <tbody id="summaryTableBody">
+                    </tbody>
+            </table>
+        </div>
+        
+        <div class="card">
+            <h3>Recent Live Predictions <span class="live-tag">LIVE</span></h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Symbol</th>
+                        <th>Price</th>
+                        <th>Sequence</th>
+                        <th>Prediction</th>
+                    </tr>
+                </thead>
+                <tbody id="globalLiveLog">
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div id="detailView">
+        <h2 id="detailTitle">Asset Details</h2>
+        
+        <div class="card">
+            <div id="detailStats"></div>
+            <div id="detailPlot" style="text-align:center; margin-top:15px;"></div>
+        </div>
+
+        <div class="card">
+            <h3>Backtest Log (Last 100 Trades)</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Input Seq</th>
+                        <th>Prediction</th>
+                        <th>Actual</th>
+                        <th>PnL</th>
+                    </tr>
+                </thead>
+                <tbody id="detailLogBody"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<script>
+    const assets = {assets_json}; // List of symbols
+    
+    // Fetch Summary Data on Load
+    fetch('/api/summary')
+        .then(response => response.json())
+        .then(data => {{
+            const tbody = document.getElementById('summaryTableBody');
+            const assetList = document.getElementById('assetList');
+            
+            data.forEach(row => {{
+                // Populate Summary Table
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td><b>${{row.symbol}}</b></td>
+                    <td>${{row.grid_size}}</td>
+                    <td>${{row.grid_percent}}%</td>
+                    <td>${{row.sharpe}}</td>
+                    <td>${{row.accuracy}}%</td>
+                    <td class="${{row.pnl >= 0 ? 'up' : 'down'}}">${{row.pnl}}</td>
+                `;
+                tbody.appendChild(tr);
+                
+                // Populate Sidebar
+                const link = document.createElement('a');
+                link.className = 'nav-item';
+                link.innerText = row.symbol;
+                link.onclick = () => loadAsset(row.symbol);
+                assetList.appendChild(link);
+            }});
+            
+            // Populate Global Live Log
+            renderLiveLog();
+        }});
+
+    function renderLiveLog() {{
+        fetch('/api/livelog')
+        .then(r => r.json())
+        .then(logs => {{
+            const tbody = document.getElementById('globalLiveLog');
+            tbody.innerHTML = '';
+            // Show last 10
+            logs.slice(0, 15).forEach(log => {{
+                 const tr = document.createElement('tr');
+                 const pClass = log.prediction === 'UP' ? 'up' : (log.prediction === 'DOWN' ? 'down' : 'flat');
+                 tr.innerHTML = `
+                    <td>${{log.timestamp}}</td>
+                    <td><b>${{log.symbol}}</b></td>
+                    <td>${{log.close_price}}</td>
+                    <td>${{log.sequence}}</td>
+                    <td class="${{pClass}}">${{log.prediction}}</td>
+                 `;
+                 tbody.appendChild(tr);
+            }});
+        }});
+    }}
+
+    function showSummary() {{
+        document.getElementById('overviewSection').style.display = 'block';
+        document.getElementById('detailView').style.display = 'none';
+        document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+        document.querySelector('.sidebar a:first-child').classList.add('active');
+    }}
+
+    function loadAsset(symbol) {{
+        document.getElementById('overviewSection').style.display = 'none';
+        document.getElementById('detailView').style.display = 'block';
+        document.getElementById('detailTitle').innerText = symbol;
+        document.getElementById('detailStats').innerHTML = '<p class="loading">Loading data...</p>';
+        document.getElementById('detailPlot').innerHTML = '';
+        document.getElementById('detailLogBody').innerHTML = '';
+
+        // Update Sidebar Active State
+        document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+        event.target.classList.add('active');
+
+        fetch('/api/details?symbol=' + symbol)
+            .then(r => r.json())
+            .then(data => {{
+                // Stats
+                const htmlStats = `
+                    <div class="summary-metric"><span class="summary-val">${{data.sharpe}}</span>Sharpe Ratio</div>
+                    <div class="summary-metric"><span class="summary-val">${{data.accuracy}}%</span>Accuracy</div>
+                    <div class="summary-metric"><span class="summary-val" style="color:${{data.pnl >= 0 ? 'green':'red'}}">${{data.pnl}}</span>Total PnL</div>
+                    <div class="summary-metric"><span class="summary-val">${{data.grid_percent}}%</span>Grid Size</div>
+                `;
+                document.getElementById('detailStats').innerHTML = htmlStats;
+                
+                // Plot
+                const img = document.createElement('img');
+                img.src = "data:image/png;base64," + data.plot;
+                img.style.maxWidth = "100%";
+                document.getElementById('detailPlot').appendChild(img);
+                
+                // Log (Limit to last 100 for perf)
+                const tbody = document.getElementById('detailLogBody');
+                const logs = data.logs.slice(-100).reverse();
+                logs.forEach(row => {{
+                    const tr = document.createElement('tr');
+                    const pnlColor = row.pnl >= 0 ? 'green' : 'red';
+                    const predClass = row.prediction === 'UP' ? 'up' : (row.prediction === 'DOWN' ? 'down' : '');
+                    tr.innerHTML = `
+                        <td>${{row.time_t}}</td>
+                        <td>[${{row.rnd_t_2}}, ${{row.rnd_t_1}}, ${{row.rnd_t_0}}]</td>
+                        <td class="${{predClass}}">${{row.prediction}}</td>
+                        <td>${{row.actual}}</td>
+                        <td style="color:${{pnlColor}}">${{row.pnl.toFixed(4)}}</td>
+                    `;
+                    tbody.appendChild(tr);
+                }});
+            }});
+    }}
+</script>
+
+</body>
+</html>
+"""
+
+class BacktestHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        global results_html, live_outcomes, backtest_data, recent_data
-        
-        # --- API Routes ---
-        if self.path == '/api/current':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            data = live_outcomes[-1] if live_outcomes else {"status": "waiting for data"}
-            self.wfile.write(json.dumps(data, cls=CustomJSONEncoder).encode())
-            return
-            
-        elif self.path == '/api/live':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(live_outcomes, cls=CustomJSONEncoder).encode())
-            return
-            
-        elif self.path == '/api/backtest':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(backtest_data, cls=CustomJSONEncoder).encode())
-            return
-            
-        elif self.path == '/api/recent':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(recent_data, cls=CustomJSONEncoder).encode())
-            return
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        query = urllib.parse.parse_qs(parsed.query)
 
-        # --- Default HTML Route ---
-        live_html = "<h2>Live Outcomes (Last 2 weeks)</h2><table border='1'><tr><th>Time</th><th>Pred</th><th>Matches</th><th>Entry</th><th>Exit</th><th>Outcome</th><th>PnL</th></tr>"
-        for item in reversed(live_outcomes):
-            outcome_str = item.get('outcome', 'Pending...')
-            pnl_str = f"{item.get('pnl', 0):.4f}" if 'pnl' in item else "-"
-            entry_s = f"{item.get('entry_price', 0):.2f}"
-            exit_s = f"{item.get('exit_price', 0):.2f}" if 'exit_price' in item else "-"
+        if path == '/':
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            html = HTML_TEMPLATE.format(
+                assets_json=json.dumps(ASSETS),
+                start=START_TIME,
+                end=END_TIME,
+                interval=INTERVAL
+            )
+            self.wfile.write(html.encode('utf-8'))
             
-            pred_s = "UP" if item['pred_dir'] == 1 else ("DOWN" if item['pred_dir'] == -1 else "FLAT")
-            live_html += f"<tr><td>{item['time']}</td><td>{pred_s}</td><td>{item['matches']}</td><td>{entry_s}</td><td>{exit_s}</td><td>{outcome_str}</td><td>{pnl_str}</td></tr>"
-        live_html += "</table>"
-        
-        full_page = f"""
-        <html><head><title>Pattern Matcher</title>
-        <meta http-equiv="refresh" content="30">
-        </head><body>
-        <h1>Market Pattern Matcher: {SYMBOL} {TIMEFRAME}</h1>
-        <p>API Endpoints: <a href="/api/current">/api/current</a>, <a href="/api/live">/api/live</a>, <a href="/api/backtest">/api/backtest</a>, <a href="/api/recent">/api/recent</a></p>
-        {results_html}
-        <hr>
-        {live_html}
-        </body></html>
-        """
-        
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html')
-        self.end_headers()
-        self.wfile.write(full_page.encode())
+        elif path == '/api/summary':
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            
+            summary = []
+            for sym in ASSETS:
+                if sym in GLOBAL_RESULTS:
+                    r = GLOBAL_RESULTS[sym]['best_result']
+                    summary.append({
+                        'symbol': sym,
+                        'grid_size': f"{r['grid_size']:.{r['needed_precision']}f}",
+                        'grid_percent': f"{r['grid_percent']*100:.2f}",
+                        'sharpe': f"{r['sharpe']:.3f}",
+                        'accuracy': f"{r['accuracy']:.1f}",
+                        'pnl': f"{r['cumulative_pnl']:.2f}"
+                    })
+            self.wfile.write(json.dumps(summary).encode('utf-8'))
+            
+        elif path == '/api/livelog':
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            # Return reversed log (newest first)
+            self.wfile.write(json.dumps(GLOBAL_LIVE_LOG[::-1]).encode('utf-8'))
+            
+        elif path == '/api/details':
+            sym = query.get('symbol', [None])[0]
+            if sym and sym in GLOBAL_RESULTS:
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                
+                data = GLOBAL_RESULTS[sym]
+                res = data['best_result']
+                
+                # Format logs for JSON
+                logs_out = []
+                for r in res['test_results']:
+                    logs_out.append({
+                        'time_t': str(r['time_t']),
+                        'rnd_t_2': r['rnd_t_2'], 'rnd_t_1': r['rnd_t_1'], 'rnd_t_0': r['rnd_t_0'],
+                        'prediction': r['prediction'],
+                        'actual': r['actual'],
+                        'pnl': r['pnl']
+                    })
+                    
+                resp_obj = {
+                    'sharpe': f"{res['sharpe']:.3f}",
+                    'accuracy': f"{res['accuracy']:.2f}",
+                    'pnl': f"{res['cumulative_pnl']:.4f}",
+                    'grid_percent': f"{res['grid_percent']*100:.2f}",
+                    'plot': data['plot_b64'],
+                    'logs': logs_out
+                }
+                self.wfile.write(json.dumps(resp_obj).encode('utf-8'))
+            else:
+                self.send_response(404)
+                self.end_headers()
 
-def run_server():
-    with socketserver.TCPServer(("", 8080), Handler) as httpd:
-        print("Serving on port 8080")
+def main_loop():
+    print(f"Starting Multi-Asset Backtest for: {', '.join(ASSETS)}")
+    
+    # 1. Backtest Loop
+    for sym in ASSETS:
+        df = fetch_binance_data(sym, INTERVAL, START_TIME, END_TIME)
+        if not df.empty:
+            best_res = run_grid_search(df, sym)
+            plot_b64 = create_plot(df, best_res['test_results'], best_res['accuracy'], 
+                                   best_res['cumulative_pnl'], sym, best_res['grid_percent'])
+            
+            GLOBAL_RESULTS[sym] = {
+                'best_result': best_res,
+                'plot_b64': plot_b64
+            }
+        else:
+            print(f"Skipping {sym} (No Data)")
+            
+    print("\nAll backtests complete. Starting Server & Live Loop...")
+    
+    # 2. Start Live Loop Thread
+    t = threading.Thread(target=live_prediction_loop, daemon=True)
+    t.start()
+    
+    # 3. Start Server
+    handler = BacktestHandler
+    with socketserver.TCPServer(("", PORT), handler) as httpd:
+        print(f"Serving Dashboard at http://localhost:{PORT}")
         httpd.serve_forever()
 
-# --- Main ---
-
-def main():
-    global model_sequences, results_html, data_global, backtest_data, recent_data
-    
-    df = fetch(TIMEFRAME, SYMBOL, START, END)
-    df_derived = deriveround(df, A)
-    data_global = df_derived
-    
-    split1, split2 = split(df_derived, B)
-    print(f"Split 1 size: {len(split1)}, Split 2 size: {len(split2)}")
-    
-    model_sequences = gettop(split1, C, D)
-    print(f"Model trained. {len(model_sequences)} patterns retained.")
-    
-    preds = completesimilarbeginnings(split2, model_sequences, E, D)
-    
-    recent_start = (datetime.utcnow() - timedelta(days=14)).isoformat()
-    recent_end = datetime.utcnow().isoformat()
-    df_recent = fetch(TIMEFRAME, SYMBOL, recent_start, recent_end)
-    df_recent_derived = deriveround(df_recent)
-    preds_recent = predict_on_recent(model_sequences, df_recent_derived, E, D)
-    
-    # Store both HTML and Data
-    html_split2, backtest_data = printaccuracy(preds)
-    html_recent, recent_data = printaccuracy(preds_recent)
-    
-    results_html = f"""
-    <h2>Backtest (Split 2)</h2>
-    {html_split2}
-    <hr>
-    <h2>Recent 14 Days Performance</h2>
-    {html_recent}
-    """
-    
-    t_live = threading.Thread(target=live_loop)
-    t_live.daemon = True
-    t_live.start()
-    
-    run_server()
-
 if __name__ == "__main__":
-    main()
+    main_loop()
