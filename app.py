@@ -20,23 +20,10 @@ import urllib.parse
 # ---------------------------------------------------------
 # Configuration & Assets
 # ---------------------------------------------------------
-# List of assets to track (mapped to Binance USDT pairs)
 ASSETS = [
-    "BTCUSDT",   # Bitcoin
-    "ETHUSDT",   # Ethereum
-    "XRPUSDT",   # XRP
-    "SOLUSDT",   # Solana
-    "DOGEUSDT",  # Dogecoin
-    "ADAUSDT",   # Cardano
-    "BCHUSDT",   # Bitcoin Cash
-    "LINKUSDT",  # Chainlink
-    "XLMUSDT",   # Stellar
-    "SUIUSDT",   # Sui
-    "AVAXUSDT",  # Avalanche
-    "LTCUSDT",   # Litecoin
-    "HBARUSDT",  # Hedera
-    "SHIBUSDT",  # Shiba Inu
-    "TONUSDT"    # Toncoin
+    "BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "DOGEUSDT", 
+    "ADAUSDT", "BCHUSDT", "LINKUSDT", "XLMUSDT", "SUIUSDT", 
+    "AVAXUSDT", "LTCUSDT", "HBARUSDT", "SHIBUSDT", "TONUSDT"
 ]
 
 INTERVAL = os.getenv("INTERVAL", '1h')
@@ -45,19 +32,16 @@ END_TIME = os.getenv("END_TIME", '2026-01-01')
 PORT = int(os.getenv("PORT", 8080))
 TRAIN_SPLIT_RATIO = float(os.getenv("TRAIN_SPLIT_RATIO", 0.7))
 
-# Parse Grid Search Values from Env (comma separated) or use default
 _grid_env = os.getenv("GRID_SEARCH_VALUES")
 if _grid_env:
     GRID_SEARCH_VALUES = [float(x.strip()) for x in _grid_env.split(',')]
 else:
-    # Default: 0.1% to 5%
     GRID_SEARCH_VALUES = [0.001, 0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05]
 
-# Global Storage for Multi-Asset Data
-# Structure: GLOBAL_RESULTS[symbol] = { 'best_result': ..., 'plot_b64': ..., 'model': ... }
+# Global Storage
 GLOBAL_RESULTS = {}
-GLOBAL_LIVE_LOG = [] # Shared log for all assets
-GLOBAL_LIVE_OUTCOMES = [] # Shared log for verified outcomes
+GLOBAL_LIVE_LOG = []      # Pending predictions
+GLOBAL_LIVE_OUTCOMES = [] # Verified completed trades
 
 # ---------------------------------------------------------
 # 1. Fetch Data
@@ -66,6 +50,7 @@ def fetch_binance_data(symbol, interval, start_str, end_str=None, limit=1000):
     base_url = "https://api.binance.com/api/v3/klines"
     
     if end_str:
+        # Backtest mode
         print(f"[{symbol}] Fetching data from {start_str} to {end_str}...")
         try:
             start_ts = int(pd.Timestamp(start_str).timestamp() * 1000)
@@ -99,8 +84,7 @@ def fetch_binance_data(symbol, interval, start_str, end_str=None, limit=1000):
         sys.stdout.write(f"[{symbol}] Downloaded {len(all_data)} candles.\n")
         
     else:
-        # Live mode - Fetch slightly more to ensure we can verify previous candles
-        # We need at least 4 closed candles + 1 open candle to be safe
+        # Live mode
         params = {'symbol': symbol, 'interval': interval, 'limit': 15}
         try:
             response = requests.get(base_url, params=params, timeout=5)
@@ -138,38 +122,6 @@ def calculate_sharpe_ratio(returns_series, periods_per_year=24*365):
 # ---------------------------------------------------------
 # Processing & Backtesting Logic
 # ---------------------------------------------------------
-def train_model(df, grid_size, needed_precision):
-    # This function is used by the live loop to rebuild the model for the specific asset
-    df = df.copy()
-    df['rounded_close'] = ((df['close'] / grid_size).round() * grid_size).round(needed_precision)
-    df['next_rounded'] = df['rounded_close'].shift(-1)
-    
-    conditions = [
-        df['next_rounded'] > df['rounded_close'],
-        df['next_rounded'] < df['rounded_close']
-    ]
-    choices = ['UP', 'DOWN']
-    df['target_direction'] = np.select(conditions, choices, default='FLAT')
-    
-    df['t_0'] = df['rounded_close']
-    df['t_1'] = df['rounded_close'].shift(1)
-    df['t_2'] = df['rounded_close'].shift(2)
-    
-    data = df.dropna().copy()
-    
-    sequence_map = defaultdict(list)
-    for _, row in data.iterrows():
-        seq = (row['t_2'], row['t_1'], row['t_0'])
-        sequence_map[seq].append(row['target_direction'])
-        
-    final_model = {}
-    for seq, directions in sequence_map.items():
-        counts = Counter(directions)
-        most_common = counts.most_common(1)[0][0]
-        final_model[seq] = most_common
-        
-    return final_model
-
 def evaluate_strategy(df_original, grid_percent, verbose=False):
     if df_original.empty:
         return {'sharpe': -99, 'accuracy': 0, 'cumulative_pnl': 0}
@@ -284,7 +236,6 @@ def run_grid_search(df, symbol):
     
     for gp in GRID_SEARCH_VALUES:
         res = evaluate_strategy(df, gp, verbose=False)
-        # print(f"  Grid: {gp*100:5.2f}% | Sharpe: {res['sharpe']:6.3f}")
         if res['sharpe'] > best_sharpe:
             best_sharpe = res['sharpe']
             best_result = res
@@ -322,33 +273,34 @@ def create_plot(df, test_results, accuracy, total_pnl, symbol, grid_percent):
 # ---------------------------------------------------------
 # Live Prediction Logic
 # ---------------------------------------------------------
-def save_live_prediction(symbol, timestamp, close_price, sequence, prediction):
+def save_live_prediction(symbol, timestamp, raw_seq, grid_seq, prediction):
     file_name = "live_prediction_log.csv"
     file_exists = os.path.isfile(file_name)
     
+    grid_str = f"{grid_seq[0]}|{grid_seq[1]}|{grid_seq[2]}"
+    raw_str  = f"{raw_seq[0]}|{raw_seq[1]}|{raw_seq[2]}"
+    
     with open(file_name, "a") as f:
         if not file_exists:
-            f.write("timestamp,symbol,close_price,sequence,prediction\n")
-        seq_str = f"{sequence[0]}|{sequence[1]}|{sequence[2]}"
-        f.write(f"{timestamp},{symbol},{close_price},{seq_str},{prediction}\n")
+            f.write("timestamp,symbol,raw_sequence,grid_sequence,prediction\n")
+        f.write(f"{timestamp},{symbol},{raw_str},{grid_str},{prediction}\n")
     
     GLOBAL_LIVE_LOG.append({
         'timestamp': str(timestamp),
         'symbol': symbol,
-        'close_price': close_price,
-        'sequence': str(sequence),
+        'raw_sequence': raw_seq,
+        'grid_sequence': grid_seq,
         'prediction': prediction,
-        'processed': False # Flag to check outcome later
+        'processed': False
     })
     
-    print(f"[{symbol}] Prediction: {prediction} (Seq: {seq_str})")
+    print(f"[{symbol}] Prediction: {prediction} (Raw: {raw_seq})")
 
 def live_prediction_loop():
     print("--- Live Prediction Service Started ---")
     while True:
         try:
             for symbol in ASSETS:
-                # We need the optimized grid size for this symbol
                 if symbol not in GLOBAL_RESULTS:
                     continue
                 
@@ -358,7 +310,6 @@ def live_prediction_loop():
                 model = res['model']
                 
                 # Fetch recent candles (limit=15)
-                # Binance API returns the currently forming candle as the last element.
                 df_live = fetch_binance_data(symbol, INTERVAL, start_str=None, limit=15) 
                 
                 if df_live.empty:
@@ -368,47 +319,32 @@ def live_prediction_loop():
                 # 1. VERIFY PENDING PREDICTIONS
                 # -------------------------------------------
                 for log in GLOBAL_LIVE_LOG:
-                    # Check only unprocessed logs for this symbol
                     if log.get('processed', False) or log['symbol'] != symbol:
                         continue
                     
-                    # Log timestamp was stringified from dataframe timestamp
                     log_ts_str = log['timestamp']
-                    
-                    # Find index of this timestamp in current live data
-                    # df_live['open_time'] is datetime, convert to string to match log
                     match_mask = df_live['open_time'].astype(str) == log_ts_str
                     match_indices = df_live.index[match_mask]
                     
                     if not match_indices.empty:
                         idx = match_indices[0]
-                        
-                        # We need the NEXT candle to be fully closed.
-                        # len(df_live) - 1 is the index of the OPEN candle.
-                        # We need idx + 1 < len(df_live) - 1 to ensure we aren't using the open candle as exit.
+                        # Ensure next candle is closed
                         if idx + 1 < len(df_live) - 1:
                             next_candle_close = df_live.iloc[idx+1]['close']
                             pred = log['prediction']
-                            entry_price = log['close_price']
+                            # Entry price is the last element of the raw sequence (t_0)
+                            entry_price = log['raw_sequence'][-1]
                             
                             pnl = 0.0
-                            is_correct = False
-                            outcome_str = "INCORRECT"
+                            outcome_str = "FLAT"
                             
                             if pred == 'UP':
                                 pnl = ((next_candle_close - entry_price) / entry_price) * 100
-                                if next_candle_close > entry_price:
-                                    is_correct = True
-                                    outcome_str = "CORRECT"
+                                outcome_str = "CORRECT" if next_candle_close > entry_price else "INCORRECT"
                             elif pred == 'DOWN':
                                 pnl = ((entry_price - next_candle_close) / entry_price) * 100
-                                if next_candle_close < entry_price:
-                                    is_correct = True
-                                    outcome_str = "CORRECT"
-                            else:
-                                outcome_str = "FLAT"
+                                outcome_str = "CORRECT" if next_candle_close < entry_price else "INCORRECT"
                             
-                            # Save Outcome
                             outcome_data = {
                                 'time_entry': log_ts_str,
                                 'symbol': symbol,
@@ -416,45 +352,46 @@ def live_prediction_loop():
                                 'entry_price': entry_price,
                                 'exit_price': next_candle_close,
                                 'outcome': outcome_str,
-                                'pnl': pnl
+                                'pnl': pnl,
+                                'raw_sequence': log['raw_sequence']
                             }
                             GLOBAL_LIVE_OUTCOMES.append(outcome_data)
-                            log['processed'] = True # Mark as done
+                            log['processed'] = True
                             print(f"[{symbol}] Outcome Verified: {outcome_str} ({pnl:.2f})")
 
                 # -------------------------------------------
-                # 2. MAKE NEW PREDICTION (Ignoring Forming Candle)
+                # 2. MAKE NEW PREDICTION
                 # -------------------------------------------
-                # Slice off the last candle (the open/forming one)
-                df_closed = df_live.iloc[:-1]
+                df_closed = df_live.iloc[:-1] # Exclude forming candle
                 
                 if len(df_closed) >= 3:
                     last_row = df_closed.iloc[-1]
-                    # Calculate rounding for last 3 CLOSED candles to form sequence
-                    # We need t-2, t-1, t-0. Using tail(3) of the closed dataframe.
-                    recent_closes = df_closed['close'].tail(3).values
-                    rounded = [round(round(x / grid_size) * grid_size, precision) for x in recent_closes]
+                    # Get raw closes for t-2, t-1, t-0
+                    raw_closes = df_closed['close'].tail(3).values
+                    # Convert to floats
+                    raw_closes = [float(x) for x in raw_closes]
+                    
+                    # Calculate grid closes for model lookup
+                    rounded = [round(round(x / grid_size) * grid_size, precision) for x in raw_closes]
                     
                     if len(rounded) == 3:
                         seq = (rounded[0], rounded[1], rounded[2])
                         prediction = model.get(seq, 'FLAT')
                         
-                        # Only log if new hour/timestamp
                         last_ts = str(last_row['open_time'])
-                        # Simple check to avoid duplicates: check if last log for this symbol has same TS
+                        
+                        # Duplicate Check
                         is_duplicate = False
-                        # Check specific reversed slice to be efficient
                         for log in reversed(GLOBAL_LIVE_LOG[-50:]): 
                             if log['symbol'] == symbol and log['timestamp'] == last_ts:
                                 is_duplicate = True
                                 break
                         
                         if not is_duplicate:
-                            save_live_prediction(symbol, last_ts, recent_closes[-1], seq, prediction)
+                            save_live_prediction(symbol, last_ts, raw_closes, seq, prediction)
                 
-                time.sleep(1) # Small delay between symbols
+                time.sleep(1)
             
-            # Wait for next check
             time.sleep(60) 
             
         except Exception as e:
@@ -470,32 +407,37 @@ HTML_TEMPLATE = """
 <head>
     <title>Multi-Asset Strategy Dashboard</title>
     <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 0; background-color: #f8f9fa; color: #333; }}
-        .sidebar {{ width: 220px; background: #343a40; color: white; position: fixed; height: 100%; overflow-y: auto; padding-top: 20px; }}
-        .sidebar h3 {{ text-align: center; margin-bottom: 20px; font-size: 1.2em; }}
-        .nav-item {{ padding: 10px 20px; display: block; color: #ccc; text-decoration: none; cursor: pointer; }}
-        .nav-item:hover, .nav-item.active {{ background: #495057; color: white; }}
-        .content {{ margin-left: 220px; padding: 20px; }}
-        .card {{ background: white; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); padding: 20px; margin-bottom: 20px; }}
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 0; background-color: #f8f9fa; color: #333; }
+        .sidebar { width: 220px; background: #343a40; color: white; position: fixed; height: 100%; overflow-y: auto; padding-top: 20px; }
+        .sidebar h3 { text-align: center; margin-bottom: 20px; font-size: 1.2em; }
+        .nav-item { padding: 10px 20px; display: block; color: #ccc; text-decoration: none; cursor: pointer; }
+        .nav-item:hover, .nav-item.active { background: #495057; color: white; }
+        .content { margin-left: 220px; padding: 20px; }
+        .card { background: white; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); padding: 20px; margin-bottom: 20px; }
         
-        table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-        th, td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid #ddd; }}
-        th {{ background-color: #e9ecef; font-weight: 600; }}
-        tr:hover {{ background-color: #f1f1f1; }}
+        table { width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; }
+        th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #ddd; word-wrap: break-word; }
+        th { background-color: #e9ecef; font-weight: 600; }
+        tr:hover { background-color: #f1f1f1; }
         
-        .up {{ color: #28a745; font-weight: bold; }}
-        .down {{ color: #dc3545; font-weight: bold; }}
-        .flat {{ color: #6c757d; }}
-        .win {{ color: #28a745; font-weight: bold; }}
-        .loss {{ color: #dc3545; font-weight: bold; }}
+        .up { color: #28a745; font-weight: bold; }
+        .down { color: #dc3545; font-weight: bold; }
+        .flat { color: #6c757d; }
+        .win { color: #28a745; font-weight: bold; }
+        .loss { color: #dc3545; font-weight: bold; }
         
-        .summary-metric {{ display: inline-block; margin-right: 20px; font-size: 0.9em; }}
-        .summary-val {{ font-size: 1.2em; font-weight: bold; display: block; }}
-        
-        #detailView {{ display: none; }}
-        .loading {{ color: #666; font-style: italic; }}
-        
-        .live-tag {{ background: #dc3545; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px; vertical-align: middle; margin-left: 5px; }}
+        .summary-metric { display: inline-block; margin-right: 30px; margin-bottom: 10px; }
+        .summary-val { font-size: 1.5em; font-weight: bold; display: block; }
+        .summary-label { font-size: 0.85em; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
+
+        .pagination { margin-top: 10px; text-align: right; }
+        .pagination button { padding: 5px 10px; cursor: pointer; background: #eee; border: 1px solid #ddd; border-radius: 3px; }
+        .pagination button:disabled { opacity: 0.5; cursor: default; }
+        .pagination span { margin: 0 10px; font-size: 0.9em; }
+
+        .live-tag { background: #dc3545; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px; vertical-align: middle; margin-left: 5px; }
+        #detailView { display: none; }
+        .loading { color: #666; font-style: italic; }
     </style>
 </head>
 <body>
@@ -503,15 +445,20 @@ HTML_TEMPLATE = """
 <div class="sidebar">
     <h3>Portfolio</h3>
     <a class="nav-item active" onclick="showSummary()">Overview</a>
-    <div id="assetList">
-        </div>
+    <div id="assetList"></div>
 </div>
 
 <div class="content">
     <div id="overviewSection">
         <div class="card">
-            <h2>Portfolio Overview</h2>
-            <p>Backtest Period: {start} to {end} | Interval: {interval}</p>
+            <h2>Live Performance <span class="live-tag">AGGREGATED</span></h2>
+            <div id="liveStatsContainer">
+                <span class="loading">Calculating...</span>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>Portfolio Backtest Overview</h3>
             <table>
                 <thead>
                     <tr>
@@ -523,35 +470,39 @@ HTML_TEMPLATE = """
                         <th>Total PnL</th>
                     </tr>
                 </thead>
-                <tbody id="summaryTableBody">
-                    </tbody>
+                <tbody id="summaryTableBody"></tbody>
             </table>
         </div>
         
         <div class="card">
-            <h3>Recent Live Predictions <span class="live-tag">LIVE</span></h3>
+            <h3>Pending Predictions <span class="live-tag">LIVE</span></h3>
+            <div style="margin-bottom:10px; font-size:0.9em; color:#666;">Refreshes every 10 seconds</div>
             <table>
                 <thead>
                     <tr>
-                        <th>Time</th>
-                        <th>Symbol</th>
-                        <th>Price</th>
-                        <th>Sequence</th>
-                        <th>Prediction</th>
+                        <th style="width:150px">Time</th>
+                        <th style="width:80px">Symbol</th>
+                        <th>Raw Input Candles (t-2, t-1, t-0)</th>
+                        <th style="width:80px">Prediction</th>
                     </tr>
                 </thead>
-                <tbody id="globalLiveLog">
-                </tbody>
+                <tbody id="globalLiveLog"></tbody>
             </table>
+            <div class="pagination">
+                <button onclick="changePage('live', -1)" id="btnPrevLive">Previous</button>
+                <span id="pageInfoLive">Page 1</span>
+                <button onclick="changePage('live', 1)" id="btnNextLive">Next</button>
+            </div>
         </div>
 
         <div class="card">
-            <h3>Completed Predictions (Outcomes)</h3>
-            <table id="outcomesTable">
+            <h3>Completed History (Outcomes)</h3>
+            <table>
                 <thead>
                     <tr>
-                        <th>Time</th>
-                        <th>Symbol</th>
+                        <th style="width:150px">Time</th>
+                        <th style="width:80px">Symbol</th>
+                        <th>Raw Input</th>
                         <th>Prediction</th>
                         <th>Entry</th>
                         <th>Exit</th>
@@ -559,20 +510,22 @@ HTML_TEMPLATE = """
                         <th>PnL</th>
                     </tr>
                 </thead>
-                <tbody id="globalOutcomesLog">
-                </tbody>
+                <tbody id="globalOutcomesLog"></tbody>
             </table>
+            <div class="pagination">
+                <button onclick="changePage('outcome', -1)" id="btnPrevOut">Previous</button>
+                <span id="pageInfoOut">Page 1</span>
+                <button onclick="changePage('outcome', 1)" id="btnNextOut">Next</button>
+            </div>
         </div>
     </div>
 
     <div id="detailView">
         <h2 id="detailTitle">Asset Details</h2>
-        
         <div class="card">
             <div id="detailStats"></div>
             <div id="detailPlot" style="text-align:center; margin-top:15px;"></div>
         </div>
-
         <div class="card">
             <h3>Backtest Log (Last 100 Trades)</h3>
             <table>
@@ -592,101 +545,181 @@ HTML_TEMPLATE = """
 </div>
 
 <script>
-    const assets = {assets_json}; // List of symbols
+    const assets = {assets_json}; 
     
-    // Fetch Summary Data on Load
+    // Pagination State
+    let state = {
+        live: { page: 1, limit: 10, total: 0 },
+        outcome: { page: 1, limit: 10, total: 0 }
+    };
+
+    // Initial Load
     fetch('/api/summary')
         .then(response => response.json())
-        .then(data => {{
+        .then(data => {
             const tbody = document.getElementById('summaryTableBody');
             const assetList = document.getElementById('assetList');
             
-            data.forEach(row => {{
-                // Populate Summary Table
+            data.forEach(row => {
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
-                    <td><b>${{row.symbol}}</b></td>
-                    <td>${{row.grid_size}}</td>
-                    <td>${{row.grid_percent}}%</td>
-                    <td>${{row.sharpe}}</td>
-                    <td>${{row.accuracy}}%</td>
-                    <td class="${{row.pnl >= 0 ? 'up' : 'down'}}">${{row.pnl}}</td>
+                    <td><b>${row.symbol}</b></td>
+                    <td>${row.grid_size}</td>
+                    <td>${row.grid_percent}%</td>
+                    <td>${row.sharpe}</td>
+                    <td>${row.accuracy}%</td>
+                    <td class="${row.pnl >= 0 ? 'up' : 'down'}">${row.pnl}</td>
                 `;
                 tbody.appendChild(tr);
                 
-                // Populate Sidebar
                 const link = document.createElement('a');
                 link.className = 'nav-item';
                 link.innerText = row.symbol;
                 link.onclick = () => loadAsset(row.symbol);
                 assetList.appendChild(link);
-            }});
+            });
             
-            // Populate Global Live Logs
-            renderLiveLog();
-            renderOutcomesLog();
-        }});
+            loadLiveStats();
+            loadLiveLog();
+            loadOutcomesLog();
+            
+            // Auto Refresh Live Data
+            setInterval(() => {
+                if(document.getElementById('overviewSection').style.display !== 'none') {
+                    loadLiveLog();
+                    loadOutcomesLog();
+                    loadLiveStats();
+                }
+            }, 10000);
+        });
 
-    function renderLiveLog() {{
-        fetch('/api/livelog')
+    function loadLiveStats() {
+        fetch('/api/live_stats')
         .then(r => r.json())
-        .then(logs => {{
+        .then(data => {
+            const html = `
+                <div class="summary-metric">
+                    <span class="summary-label">Total Live PnL</span>
+                    <span class="summary-val ${data.total_pnl >= 0 ? 'up' : 'down'}">${data.total_pnl}%</span>
+                </div>
+                <div class="summary-metric">
+                    <span class="summary-label">Accuracy</span>
+                    <span class="summary-val">${data.accuracy}%</span>
+                </div>
+                <div class="summary-metric">
+                    <span class="summary-label">Wins</span>
+                    <span class="summary-val up">${data.wins}</span>
+                </div>
+                <div class="summary-metric">
+                    <span class="summary-label">Losses</span>
+                    <span class="summary-val down">${data.losses}</span>
+                </div>
+                <div class="summary-metric">
+                    <span class="summary-label">Total Trades</span>
+                    <span class="summary-val">${data.total_trades}</span>
+                </div>
+            `;
+            document.getElementById('liveStatsContainer').innerHTML = html;
+        });
+    }
+
+    function changePage(type, delta) {
+        const s = state[type];
+        const maxPage = Math.ceil(s.total / s.limit);
+        const newPage = s.page + delta;
+        
+        if (newPage >= 1 && newPage <= maxPage) {
+            s.page = newPage;
+            if (type === 'live') loadLiveLog();
+            else loadOutcomesLog();
+        }
+    }
+
+    function loadLiveLog() {
+        const { page, limit } = state.live;
+        fetch(`/api/livelog?page=${page}&limit=${limit}`)
+        .then(r => r.json())
+        .then(resp => {
+            state.live.total = resp.total;
             const tbody = document.getElementById('globalLiveLog');
             tbody.innerHTML = '';
-            // Show last 10
-            logs.slice(0, 15).forEach(log => {{
+            
+            resp.data.forEach(log => {
                  const tr = document.createElement('tr');
                  const pClass = log.prediction === 'UP' ? 'up' : (log.prediction === 'DOWN' ? 'down' : 'flat');
+                 // Format raw sequence nicely
+                 const rawDisplay = log.raw_sequence.map(v => Number(v).toFixed(4)).join(' &rarr; ');
+                 
                  tr.innerHTML = `
-                    <td>${{log.timestamp}}</td>
-                    <td><b>${{log.symbol}}</b></td>
-                    <td>${{log.close_price}}</td>
-                    <td>${{log.sequence}}</td>
-                    <td class="${{pClass}}">${{log.prediction}}</td>
+                    <td>${log.timestamp}</td>
+                    <td><b>${log.symbol}</b></td>
+                    <td>${rawDisplay}</td>
+                    <td class="${pClass}">${log.prediction}</td>
                  `;
                  tbody.appendChild(tr);
-            }});
-        }});
-    }}
+            });
+            
+            // Update Controls
+            const maxPage = Math.ceil(resp.total / limit) || 1;
+            document.getElementById('pageInfoLive').innerText = `Page ${page} of ${maxPage}`;
+            document.getElementById('btnPrevLive').disabled = (page === 1);
+            document.getElementById('btnNextLive').disabled = (page === maxPage);
+        });
+    }
 
-    function renderOutcomesLog() {{
-        fetch('/api/outcomes')
+    function loadOutcomesLog() {
+        const { page, limit } = state.outcome;
+        fetch(`/api/outcomes?page=${page}&limit=${limit}`)
         .then(r => r.json())
-        .then(logs => {{
+        .then(resp => {
+            state.outcome.total = resp.total;
             const tbody = document.getElementById('globalOutcomesLog');
             tbody.innerHTML = '';
-            // Show last 20
-            logs.slice(0, 20).forEach(log => {{
+            
+            resp.data.forEach(log => {
                  const tr = document.createElement('tr');
                  const pClass = log.prediction === 'UP' ? 'up' : (log.prediction === 'DOWN' ? 'down' : 'flat');
                  const outClass = log.outcome === 'CORRECT' ? 'win' : (log.outcome === 'INCORRECT' ? 'loss' : 'flat');
                  const pnlColor = log.pnl >= 0 ? 'green' : 'red';
                  
+                 // Handle raw sequence if available
+                 let rawDisplay = "-";
+                 if(log.raw_sequence) {
+                     rawDisplay = log.raw_sequence.map(v => Number(v).toFixed(4)).join(' &rarr; ');
+                 }
+                 
                  tr.innerHTML = `
-                    <td>${{log.time_entry}}</td>
-                    <td><b>${{log.symbol}}</b></td>
-                    <td class="${{pClass}}">${{log.prediction}}</td>
-                    <td>${{log.entry_price}}</td>
-                    <td>${{log.exit_price}}</td>
-                    <td class="${{outClass}}">${{log.outcome}}</td>
-                    <td style="color:${{pnlColor}}">${{log.pnl.toFixed(4)}}</td>
+                    <td>${log.time_entry}</td>
+                    <td><b>${log.symbol}</b></td>
+                    <td><small>${rawDisplay}</small></td>
+                    <td class="${pClass}">${log.prediction}</td>
+                    <td>${Number(log.entry_price).toFixed(4)}</td>
+                    <td>${Number(log.exit_price).toFixed(4)}</td>
+                    <td class="${outClass}">${log.outcome}</td>
+                    <td style="color:${pnlColor}">${log.pnl.toFixed(2)}%</td>
                  `;
                  tbody.appendChild(tr);
-            }});
-        }});
-    }}
+            });
+            
+             // Update Controls
+            const maxPage = Math.ceil(resp.total / limit) || 1;
+            document.getElementById('pageInfoOut').innerText = `Page ${page} of ${maxPage}`;
+            document.getElementById('btnPrevOut').disabled = (page === 1);
+            document.getElementById('btnNextOut').disabled = (page === maxPage);
+        });
+    }
 
-    function showSummary() {{
+    function showSummary() {
         document.getElementById('overviewSection').style.display = 'block';
         document.getElementById('detailView').style.display = 'none';
         document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
         document.querySelector('.sidebar a:first-child').classList.add('active');
-        // Refresh logs when showing summary
-        renderLiveLog();
-        renderOutcomesLog();
-    }}
+        loadLiveLog();
+        loadOutcomesLog();
+        loadLiveStats();
+    }
 
-    function loadAsset(symbol) {{
+    function loadAsset(symbol) {
         document.getElementById('overviewSection').style.display = 'none';
         document.getElementById('detailView').style.display = 'block';
         document.getElementById('detailTitle').innerText = symbol;
@@ -694,48 +727,43 @@ HTML_TEMPLATE = """
         document.getElementById('detailPlot').innerHTML = '';
         document.getElementById('detailLogBody').innerHTML = '';
 
-        // Update Sidebar Active State
         document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
         event.target.classList.add('active');
 
         fetch('/api/details?symbol=' + symbol)
             .then(r => r.json())
-            .then(data => {{
-                // Stats
+            .then(data => {
                 const htmlStats = `
-                    <div class="summary-metric"><span class="summary-val">${{data.sharpe}}</span>Sharpe Ratio</div>
-                    <div class="summary-metric"><span class="summary-val">${{data.accuracy}}%</span>Accuracy</div>
-                    <div class="summary-metric"><span class="summary-val" style="color:${{data.pnl >= 0 ? 'green':'red'}}">${{data.pnl}}</span>Total PnL</div>
-                    <div class="summary-metric"><span class="summary-val">${{data.grid_percent}}%</span>Grid Size</div>
+                    <div class="summary-metric"><span class="summary-label">Sharpe Ratio</span><span class="summary-val">${data.sharpe}</span></div>
+                    <div class="summary-metric"><span class="summary-label">Accuracy</span><span class="summary-val">${data.accuracy}%</span></div>
+                    <div class="summary-metric"><span class="summary-label">Total PnL</span><span class="summary-val" style="color:${parseFloat(data.pnl) >= 0 ? 'green':'red'}">${data.pnl}</span></div>
+                    <div class="summary-metric"><span class="summary-label">Grid Size</span><span class="summary-val">${data.grid_percent}%</span></div>
                 `;
                 document.getElementById('detailStats').innerHTML = htmlStats;
                 
-                // Plot
                 const img = document.createElement('img');
                 img.src = "data:image/png;base64," + data.plot;
                 img.style.maxWidth = "100%";
                 document.getElementById('detailPlot').appendChild(img);
                 
-                // Log (Limit to last 100 for perf)
                 const tbody = document.getElementById('detailLogBody');
                 const logs = data.logs.slice(-100).reverse();
-                logs.forEach(row => {{
+                logs.forEach(row => {
                     const tr = document.createElement('tr');
                     const pnlColor = row.pnl >= 0 ? 'green' : 'red';
                     const predClass = row.prediction === 'UP' ? 'up' : (row.prediction === 'DOWN' ? 'down' : '');
                     tr.innerHTML = `
-                        <td>${{row.time_t}}</td>
-                        <td>[${{row.rnd_t_2}}, ${{row.rnd_t_1}}, ${{row.rnd_t_0}}]</td>
-                        <td class="${{predClass}}">${{row.prediction}}</td>
-                        <td>${{row.actual}}</td>
-                        <td style="color:${{pnlColor}}">${{row.pnl.toFixed(4)}}</td>
+                        <td>${row.time_t}</td>
+                        <td>[${row.rnd_t_2}, ${row.rnd_t_1}, ${row.rnd_t_0}]</td>
+                        <td class="${predClass}">${row.prediction}</td>
+                        <td>${row.actual}</td>
+                        <td style="color:${pnlColor}">${row.pnl.toFixed(4)}</td>
                     `;
                     tbody.appendChild(tr);
-                }});
-            }});
-    }}
+                });
+            });
+    }
 </script>
-
 </body>
 </html>
 """
@@ -762,7 +790,6 @@ class BacktestHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
-            
             summary = []
             for sym in ASSETS:
                 if sym in GLOBAL_RESULTS:
@@ -777,19 +804,63 @@ class BacktestHandler(http.server.BaseHTTPRequestHandler):
                     })
             self.wfile.write(json.dumps(summary).encode('utf-8'))
             
+        elif path == '/api/live_stats':
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            
+            total_pnl = sum([x['pnl'] for x in GLOBAL_LIVE_OUTCOMES])
+            wins = len([x for x in GLOBAL_LIVE_OUTCOMES if x['outcome'] == 'CORRECT'])
+            losses = len([x for x in GLOBAL_LIVE_OUTCOMES if x['outcome'] == 'INCORRECT'])
+            total = wins + losses
+            acc = (wins / total * 100) if total > 0 else 0
+            
+            stats = {
+                'total_pnl': f"{total_pnl:.2f}",
+                'accuracy': f"{acc:.1f}",
+                'wins': wins,
+                'losses': losses,
+                'total_trades': total
+            }
+            self.wfile.write(json.dumps(stats).encode('utf-8'))
+
         elif path == '/api/livelog':
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
-            # Return reversed log (newest first)
-            self.wfile.write(json.dumps(GLOBAL_LIVE_LOG[::-1]).encode('utf-8'))
+            
+            # Pagination Logic
+            page = int(query.get('page', [1])[0])
+            limit = int(query.get('limit', [10])[0])
+            
+            # Reverse list to show newest first
+            full_list = GLOBAL_LIVE_LOG[::-1]
+            total = len(full_list)
+            
+            start = (page - 1) * limit
+            end = start + limit
+            sliced = full_list[start:end]
+            
+            resp = {'data': sliced, 'total': total, 'page': page}
+            self.wfile.write(json.dumps(resp).encode('utf-8'))
             
         elif path == '/api/outcomes':
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
-            # Return reversed verified outcomes (newest first)
-            self.wfile.write(json.dumps(GLOBAL_LIVE_OUTCOMES[::-1]).encode('utf-8'))
+            
+            page = int(query.get('page', [1])[0])
+            limit = int(query.get('limit', [10])[0])
+            
+            full_list = GLOBAL_LIVE_OUTCOMES[::-1]
+            total = len(full_list)
+            
+            start = (page - 1) * limit
+            end = start + limit
+            sliced = full_list[start:end]
+            
+            resp = {'data': sliced, 'total': total, 'page': page}
+            self.wfile.write(json.dumps(resp).encode('utf-8'))
             
         elif path == '/api/details':
             sym = query.get('symbol', [None])[0]
@@ -801,7 +872,6 @@ class BacktestHandler(http.server.BaseHTTPRequestHandler):
                 data = GLOBAL_RESULTS[sym]
                 res = data['best_result']
                 
-                # Format logs for JSON
                 logs_out = []
                 for r in res['test_results']:
                     logs_out.append({
