@@ -1,95 +1,74 @@
-import requests
-import threading
+import os
 import sys
-import json
-import io
-from tqdm import tqdm  # pip install tqdm
+import requests
+import pandas as pd
 
-# Configuration for data sources
-DATA_SOURCES = {
-    "BTC": "https://ohlcendpoint.up.railway.app/data/btc?limit=4000000",
-    "ETH": "https://ohlcendpoint.up.railway.app/data/eth?limit=4000000"
-}
+# --- Configuration ---
+BASE_URL = "https://ohlcendpoint.up.railway.app"
+DATA_DIR = "./downloaded_ohlc_data"
+# List of tickers based on the previous context provided in the prompt
+SYMBOLS = [
+    "BTC", "ETH", "XRP", "SOL", "DOGE",
+    "ADA", "BCH", "LINK", "XLM", "SUI",
+    "AVAX", "LTC", "HBAR", "SHIB", "TON",
+]
 
-def _execute_streaming_download(symbol: str, url: str, position: int) -> None:
+# --- Force Unbuffered Logging ---
+sys.stdout.reconfigure(line_buffering=True)
+
+def initiate_download_sequence():
     """
-    Handles streaming download with chunked iteration to support progress visualization.
-    Uses a BytesIO buffer to reconstruct the payload in memory before JSON parsing.
-    
-    Args:
-        symbol: The asset symbol (e.g., BTC).
-        url: The endpoint URL.
-        position: The line offset for the progress bar (for multi-threaded display).
+    Iterates through the symbol list and downloads the corresponding CSV 
+    files from the endpoint. 
     """
-    buffer = io.BytesIO()
+    print("--- INITIALIZING AUTO-DOWNLOAD SEQUENCE ---")
     
-    try:
-        # stream=True is required to prevent immediate content download
-        with requests.get(url, stream=True, timeout=300) as response:
-            response.raise_for_status()
-            
-            # Extract header content length for progress calculation
-            total_size = int(response.headers.get('content-length', 0))
-            chunk_size = 8192  # 8KB chunks
+    if not os.path.exists(DATA_DIR):
+        try:
+            os.makedirs(DATA_DIR)
+            print(f"Created data directory: {os.path.abspath(DATA_DIR)}")
+        except OSError as e:
+            print(f"CRITICAL: Failed to create directory {DATA_DIR}. Error: {e}")
+            return
 
-            # Initialize tqdm with specific position to handle multi-threading
-            with tqdm(
-                total=total_size, 
-                unit='B', 
-                unit_scale=True, 
-                desc=symbol, 
-                position=position, 
-                leave=True,
-                mininterval=1.0 # Prevent log flooding in container environments
-            ) as pbar:
-                for chunk in response.iter_content(chunk_size=chunk_size):
-                    if chunk:
-                        buffer.write(chunk)
-                        pbar.update(len(chunk))
+    for ticker in SYMBOLS:
+        # Construct the URL based on the API structure provided in the context
+        url = f"{BASE_URL}/download/{ticker}"
+        # Standardizing filename convention to match the source script's logic (Symbol_USDT)
+        filename = os.path.join(DATA_DIR, f"{ticker}_USDT.csv")
         
-        # Reset buffer cursor to beginning before reading
-        buffer.seek(0)
+        print(f"[{ticker}] Initiating download from {url}...")
         
-        # Decode bytes to string, then load JSON
-        # This maintains the complexity of manual buffer management
-        payload = json.loads(buffer.read().decode('utf-8'))
+        try:
+            # Using stream=True to handle potentially large files without loading into memory at once
+            with requests.get(url, stream=True) as r:
+                if r.status_code == 200:
+                    with open(filename, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk: 
+                                f.write(chunk)
+                    
+                    # Verification step: ensure the file is valid CSV readable by pandas
+                    # This maintains the complexity of data integrity checks.
+                    try:
+                        df = pd.read_csv(filename)
+                        row_count = len(df)
+                        print(f"[{ticker}] SUCCESS: Downloaded and verified {row_count} rows.")
+                    except pd.errors.EmptyDataError:
+                        print(f"[{ticker}] WARNING: File downloaded but contains no data.")
+                    except Exception as pd_e:
+                        print(f"[{ticker}] WARNING: File downloaded but failed CSV parsing: {pd_e}")
+                        
+                else:
+                    print(f"[{ticker}] FAILURE: Server returned status code {r.status_code}")
+        
+        except requests.exceptions.RequestException as e:
+            print(f"[{ticker}] ERROR: Network or connection failure - {e}")
+        except Exception as e:
+            print(f"[{ticker}] ERROR: Unexpected error - {e}")
 
-        # Validate structure
-        if "data" in payload and isinstance(payload["data"], list):
-            record_count = len(payload["data"])
-            # Using tqdm.write to avoid interfering with progress bars
-            tqdm.write(f"Success: {symbol} - Retrieved {record_count} records.")
-        else:
-            tqdm.write(f"Failure: {symbol} - Invalid JSON structure.")
+    print("--- AUTO-DOWNLOAD SEQUENCE COMPLETED ---")
 
-    except requests.exceptions.RequestException as e:
-        tqdm.write(f"Failure: {symbol} - Network Error: {e}")
-    except json.JSONDecodeError as e:
-        tqdm.write(f"Failure: {symbol} - JSON Decode Error: {e}")
-    except Exception as e:
-        tqdm.write(f"Failure: {symbol} - Unexpected Error: {e}")
-    finally:
-        buffer.close()
-
-def _initialize_startup_tasks():
-    threads = []
-    print("System startup: Initiating background data ingestion with progress tracking...", flush=True)
-    
-    # Enumerate sources to assign specific progress bar positions (0, 1, etc.)
-    for index, (symbol, endpoint) in enumerate(DATA_SOURCES.items()):
-        downloader_thread = threading.Thread(
-            target=_execute_streaming_download, 
-            args=(symbol, endpoint, index),
-            name=f"Downloader-{symbol}"
-        )
-        downloader_thread.start()
-        threads.append(downloader_thread)
-
-    # Block main thread until downloads complete
-    for t in threads:
-        t.join()
-
-    print("All startup tasks completed.", flush=True)
-
-if __name__ == "__main__":
-    _initialize_startup_tasks()
+# --- Execution Entry Point ---
+# The task is triggered immediately on import or execution.
+initiate_download_sequence()
