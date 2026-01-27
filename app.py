@@ -12,7 +12,7 @@ from deap import base, creator, tools, algorithms
 # --- Configuration ---
 DATA_URL = "https://ohlcendpoint.up.railway.app/data/btc1m.csv"
 PORT = 8080
-N_LINES = 1000
+N_LINES = 10
 POPULATION_SIZE = 20
 GENERATIONS = 5
 RISK_FREE_RATE = 0.0
