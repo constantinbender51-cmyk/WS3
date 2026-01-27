@@ -37,13 +37,13 @@ def get_data():
         else:
             raise ValueError("No valid date column found.")
 
-        df.dropna(subset=['dt', 'close'], inplace=True) # Open/High/Low irrelevant now
+        df.dropna(subset=['dt', 'close'], inplace=True)
         df.set_index('dt', inplace=True)
         df.sort_index(inplace=True)
 
         print(f"Raw 1m Data: {len(df)} rows")
 
-        # Resample to 1H (Close only matters really, but we keep structure)
+        # Resample to 1H (Close Only)
         df_1h = df.resample('1h').agg({
             'close': 'last'
         }).dropna()
@@ -63,10 +63,12 @@ def get_data():
         print(f"CRITICAL DATA ERROR: {e}")
         exit(1)
 
-# --- 2. Strategy Logic (CLOSE PRICE ONLY) ---
+# --- 2. Strategy Logic (NO REVERSALS - HOLD UNTIL SL/TP) ---
 def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
     """
-    Executes the Grid Reversal Strategy using CLOSE prices only.
+    Executes the Grid Strategy:
+    - Close Price Only.
+    - No Reversals: Once in a trade, ignore lines until SL or TP is hit.
     """
     closes = df['close'].values
     times = df.index
@@ -75,7 +77,6 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
     equity_curve = [equity]
     position = 0 
     entry_price = 0.0
-    entry_line_val = -1.0 
     
     trades = []
     hourly_log = []
@@ -90,8 +91,9 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
         prev_c = closes[i-1]
         ts = times[i]
         
-        # --- Detailed Logging Logic ---
+        # --- Detailed Logging ---
         if detailed_log_trades > 0 and trades_completed < detailed_log_trades:
+            # Nearest Lines
             idx = np.searchsorted(lines, current_c)
             val_below = lines[idx-1] if idx > 0 else -999.0
             val_above = lines[idx] if idx < len(lines) else 999999.0
@@ -122,9 +124,9 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
             hourly_log.append(log_entry)
             print(f"[HOURLY] {ts} | Px: {current_c:.2f} | Pos: {pos_str} | SL: {log_entry['Active SL']} | TP: {log_entry['Active TP']} | Eq: {equity:.2f}")
 
-        # --- Strategy Execution ---
+        # --- Logic ---
         
-        # 1. Exit Logic (Based on Close Price)
+        # 1. If IN POSITION: Check SL/TP Only (Ignore Grid)
         if position != 0:
             pn_l = 0
             exit_price = 0
@@ -134,9 +136,9 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
             if position == 1: # Long
                 sl_price = entry_price * (1 - stop_pct)
                 tp_price = entry_price * (1 + profit_pct)
-                # Check Close vs SL/TP
+                
                 if current_c <= sl_price:
-                    exit_price = current_c # Exit at close, not SL level (Slippage)
+                    exit_price = current_c
                     pn_l = (exit_price - entry_price) / entry_price
                     triggered_exit = True
                     reason = "SL"
@@ -149,7 +151,7 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
             elif position == -1: # Short
                 sl_price = entry_price * (1 + stop_pct)
                 tp_price = entry_price * (1 - profit_pct)
-                # Check Close vs SL/TP
+                
                 if current_c >= sl_price:
                     exit_price = current_c
                     pn_l = (entry_price - exit_price) / entry_price
@@ -167,57 +169,40 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
                 trades.append({'time': times[i], 'type': 'Exit', 'price': exit_price, 'pnl': pn_l, 'equity': equity, 'reason': reason})
                 equity_curve.append(equity)
                 trades_completed += 1
+                # Trade closed. Do NOT check for entry in same candle (simple assumption).
                 continue 
+            
+            # If not triggered, just HOLD. Do not check grid.
+            equity_curve.append(equity)
+            continue
 
-        # 2. Grid Logic (Path: Prev_Close -> Current_Close)
-        
+        # 2. If FLAT: Check Grid for Entry
+        # Path: Prev Close -> Current Close
         touched_lines = []
-        move_signal = 0 # 1 for Long Trigger (Price Down), -1 for Short Trigger (Price Up)
+        move_signal = 0 
         
         if current_c > prev_c:
-            # Price moved UP. Lines crossed are those > prev_c and <= current_c
-            # Trigger SHORT (-1)
+            # Up move -> Short
             idx_start = np.searchsorted(lines, prev_c, side='right')
             idx_end = np.searchsorted(lines, current_c, side='right')
             touched_lines = lines[idx_start:idx_end]
             move_signal = -1
             
         elif current_c < prev_c:
-            # Price moved DOWN. Lines crossed are those < prev_c and >= current_c
-            # Trigger LONG (1)
+            # Down move -> Long
             idx_start = np.searchsorted(lines, current_c)
             idx_end = np.searchsorted(lines, prev_c)
-            # Searchsorted gives ascending, we need descending for price moving down
             touched_lines = lines[idx_start:idx_end][::-1] 
             move_signal = 1
             
         if len(touched_lines) > 0:
-            for line in touched_lines:
-                if position == 0:
-                    position = move_signal
-                    entry_price = line
-                    entry_line_val = line
-                    trades.append({'time': times[i], 'type': 'Short' if position == -1 else 'Long', 'price': entry_price, 'pnl': 0, 'equity': equity, 'reason': 'Entry'})
-                    break 
-                
-                elif position != 0:
-                    if line == entry_line_val: continue
-                    
-                    # Reverse
-                    exit_price = line
-                    if position == 1: pn_l = (exit_price - entry_price) / entry_price
-                    else: pn_l = (entry_price - exit_price) / entry_price
-                        
-                    equity *= (1 + pn_l)
-                    trades.append({'time': times[i], 'type': 'ReversalClose', 'price': exit_price, 'pnl': pn_l, 'equity': equity, 'reason': 'Reverse'})
-                    trades_completed += 1
-                    
-                    position = move_signal
-                    entry_price = line
-                    entry_line_val = line
-                    trades.append({'time': times[i], 'type': 'Short' if position == -1 else 'Long', 'price': entry_price, 'pnl': 0, 'equity': equity, 'reason': 'ReverseEntry'})
-                    break
-
+            # Take the first line hit
+            line = touched_lines[0]
+            
+            position = move_signal
+            entry_price = line
+            trades.append({'time': times[i], 'type': 'Short' if position == -1 else 'Long', 'price': entry_price, 'pnl': 0, 'equity': equity, 'reason': 'Entry'})
+            
         equity_curve.append(equity)
 
     return equity_curve, trades, hourly_log
@@ -278,7 +263,7 @@ def generate_report(best_ind, train_data, test_data, train_curve, test_curve, te
     plt.plot(test_data.index, test_data['close'], color='black', alpha=0.6, label='Price', linewidth=0.8)
     
     lines = best_ind[2:]
-    min_test = test_data['close'].min() # Using close
+    min_test = test_data['close'].min()
     max_test = test_data['close'].max()
     margin = (max_test - min_test) * 0.1
     visible_lines = [l for l in lines if (min_test - margin) < l < (max_test + margin)]
@@ -312,13 +297,13 @@ def generate_report(best_ind, train_data, test_data, train_curve, test_curve, te
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Grid Reversal Strategy Results</title>
+        <title>Grid GA Strategy Results</title>
         <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
         <style>body {{ padding: 20px; }} h3 {{ margin-top: 30px; }} th {{ position: sticky; top: 0; background: white; }}</style>
     </head>
     <body>
         <div class="container-fluid">
-            <h1 class="mb-4">Grid Reversal GA Results</h1>
+            <h1 class="mb-4">Grid Strategy (No Reversals) GA Results</h1>
             <div class="row">
                 <div class="col-md-4">{params_html}</div>
                 <div class="col-md-8 text-right">
@@ -355,7 +340,6 @@ if __name__ == "__main__":
     train_df, test_df = get_data()
     print(f"Data Loaded. Train: {len(train_df)}, Test: {len(test_df)}")
     
-    # Use Close mins/maxs for GA range init
     min_p, max_p = train_df['close'].min(), train_df['close'].max()
     toolbox = setup_ga(min_p, max_p)
     toolbox.register("evaluate", evaluate_genome, df_train=train_df)
