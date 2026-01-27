@@ -12,7 +12,7 @@ from deap import base, creator, tools, algorithms
 # --- Configuration ---
 DATA_URL = "https://ohlcendpoint.up.railway.app/data/btc1m.csv"
 PORT = 8080
-N_LINES = 1000
+N_LINES = 100
 POPULATION_SIZE = 20
 GENERATIONS = 5
 RISK_FREE_RATE = 0.0
@@ -68,8 +68,9 @@ def get_data():
 # --- 2. Strategy Logic ---
 def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
     """
-    Executes the Grid Strategy (No Reversals).
-    Includes logic to prioritize the FIRST line crossed if multiple lines are hit.
+    Executes the Grid Strategy with Intra-Candle Logic.
+    - Opens on line cross.
+    - Closes on NEXT line cross OR SL/TP (whichever comes first).
     """
     opens = df['open'].values
     highs = df['high'].values
@@ -92,27 +93,18 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
     trades_completed = 0
     
     for i in range(1, len(df)):
-        current_o = opens[i]
-        current_h = highs[i]
         current_l = lows[i]
+        current_h = highs[i]
         current_c = closes[i]
         prev_c = closes[i-1]
         ts = times[i]
         
-        # --- Detailed Logging Logic (Hourly) ---
+        # --- Detailed Logging (Hourly Snapshot) ---
         if detailed_log_trades > 0 and trades_completed < detailed_log_trades:
-            # Find nearest lines
             idx = np.searchsorted(lines, current_c)
+            val_below = lines[idx-1] if idx > 0 else -999.0
+            val_above = lines[idx] if idx < len(lines) else 999999.0
             
-            # Line below
-            if idx == 0: val_below = -999.0 # None below
-            else: val_below = lines[idx-1]
-            
-            # Line above
-            if idx >= len(lines): val_above = 999999.0 # None above
-            else: val_above = lines[idx]
-            
-            # Active Orders
             act_sl = np.nan
             act_tp = np.nan
             pos_str = "FLAT"
@@ -137,78 +129,106 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
                 "Equity": f"{equity:.2f}"
             }
             hourly_log.append(log_entry)
-            print(f"[HOURLY] {ts} | Px: {current_c:.2f} | Pos: {pos_str} | SL: {log_entry['Active SL']} | TP: {log_entry['Active TP']} | Eq: {equity:.2f}")
 
-        # --- Strategy Execution ---
+        # --- Intra-Candle Simulation ---
+        # 1. Identify all lines touched in this candle
+        idx_start = np.searchsorted(lines, current_l)
+        idx_end = np.searchsorted(lines, current_h, side='right')
+        touched_lines = lines[idx_start:idx_end]
         
-        # Exit Logic
-        if position != 0:
-            pn_l = 0
-            exit_price = 0
-            triggered_exit = False
-            reason = ""
+        # 2. Sort lines by proximity to PREVIOUS CLOSE to simulate path
+        #    We assume price moves from PrevClose -> Line A -> Line B...
+        if len(touched_lines) > 0:
+            touched_lines = sorted(touched_lines, key=lambda x: abs(x - prev_c))
+        
+        # Track the "last processed price" to calculate SL/TP hits between lines
+        last_price_ref = prev_c if position == 0 else entry_price
+        
+        for line in touched_lines:
             
-            if position == 1:
-                sl_price = entry_price * (1 - stop_pct)
-                tp_price = entry_price * (1 + profit_pct)
-                if current_l <= sl_price:
-                    exit_price = sl_price
-                    pn_l = (exit_price - entry_price) / entry_price
-                    triggered_exit = True
-                    reason = "SL"
-                elif current_h >= tp_price:
-                    exit_price = tp_price
-                    pn_l = (exit_price - entry_price) / entry_price
-                    triggered_exit = True
-                    reason = "TP"
-            
-            elif position == -1:
-                sl_price = entry_price * (1 + stop_pct)
-                tp_price = entry_price * (1 - profit_pct)
-                if current_h >= sl_price:
-                    exit_price = sl_price
-                    pn_l = (entry_price - exit_price) / entry_price
-                    triggered_exit = True
-                    reason = "SL"
-                elif current_l <= tp_price:
-                    exit_price = tp_price
-                    pn_l = (entry_price - exit_price) / entry_price
-                    triggered_exit = True
-                    reason = "TP"
-            
-            if triggered_exit:
-                equity *= (1 + pn_l)
-                position = 0
-                trades.append({'time': times[i], 'type': 'Exit', 'price': exit_price, 'pnl': pn_l, 'equity': equity, 'reason': reason})
-                equity_curve.append(equity)
-                trades_completed += 1
-                continue 
-
-        # Entry Logic (No Reversals, Pick First Line)
-        if position == 0:
-            idx_start = np.searchsorted(lines, current_l)
-            idx_end = np.searchsorted(lines, current_h, side='right')
-            touched_lines = lines[idx_start:idx_end]
-            
-            if len(touched_lines) > 0:
-                # UPDATED LOGIC: Sort touched lines by proximity to previous close
-                # This ensures we pick the "first" line encountered as price moved away from prev_c
-                touched_lines = sorted(touched_lines, key=lambda x: abs(x - prev_c))
+            # --- A. CHECK EXIT (If Position is Open) ---
+            if position != 0:
+                # We are moving from last_price_ref -> line.
+                # Did we hit SL or TP in this segment?
                 
-                for line in touched_lines:
-                    new_signal = 0
-                    if line > prev_c: new_signal = -1
-                    elif line < prev_c: new_signal = 1
+                sl_hit = False
+                tp_hit = False
+                exit_p = 0.0
+                reason = ""
+                
+                if position == 1: # Long
+                    sl_price = entry_price * (1 - stop_pct)
+                    tp_price = entry_price * (1 + profit_pct)
                     
-                    if new_signal == 0: continue
+                    # Logic: If SL is between last ref and current line (or beyond line in adverse dir)
+                    # Note: We sort lines by distance. 
+                    # If we are Long, SL is below entry.
+                    # If 'line' is below 'sl_price', we hit SL.
+                    if line <= sl_price: 
+                        sl_hit = True
+                        exit_p = sl_price
+                    elif line >= tp_price:
+                        tp_hit = True
+                        exit_p = tp_price
+                        
+                elif position == -1: # Short
+                    sl_price = entry_price * (1 + stop_pct)
+                    tp_price = entry_price * (1 - profit_pct)
                     
-                    # Execute Entry
+                    if line >= sl_price: 
+                        sl_hit = True
+                        exit_p = sl_price
+                    elif line <= tp_price:
+                        tp_hit = True
+                        exit_p = tp_price
+
+                # Execute SL/TP Exit if triggered
+                if sl_hit or tp_hit:
+                    pn_l = (exit_p - entry_price) / entry_price if position == 1 else (entry_price - exit_p) / entry_price
+                    equity *= (1 + pn_l)
+                    trades.append({'time': ts, 'type': 'Exit', 'price': exit_p, 'pnl': pn_l, 'equity': equity, 'reason': 'SL' if sl_hit else 'TP'})
+                    position = 0
+                    trades_completed += 1
+                    # After SL/TP, we are Flat. The loop continues to process this 'line' as a potential NEW entry point?
+                    # If we hit SL *before* reaching the line, we effectively stopped there.
+                    # Ideally we stop processing this path to be conservative, or assume price continued to 'line'.
+                    # We will continue, allowing re-entry if the line itself is a valid signal.
+                
+                else:
+                    # We reached the grid line without hitting SL/TP.
+                    # Rule: "If a line_prices value is crossed during a trade. Close the position."
+                    # We exclude the entry line itself to avoid instant closing on signal noise.
+                    if line != entry_line_val:
+                        exit_p = line
+                        pn_l = (exit_p - entry_price) / entry_price if position == 1 else (entry_price - exit_p) / entry_price
+                        equity *= (1 + pn_l)
+                        trades.append({'time': ts, 'type': 'GridExit', 'price': exit_p, 'pnl': pn_l, 'equity': equity, 'reason': 'LineCross'})
+                        position = 0
+                        trades_completed += 1
+
+            # --- B. CHECK ENTRY (If Position is Flat) ---
+            if position == 0:
+                # Rule: Open on first, etc. 
+                # We check signal relative to last reference (simulating crossing)
+                
+                # Signal Logic:
+                # If Line > Prev (Upside Cross) -> Short (Fade)
+                # If Line < Prev (Downside Cross) -> Long (Fade)
+                
+                new_signal = 0
+                if line > last_price_ref: new_signal = -1
+                elif line < last_price_ref: new_signal = 1
+                
+                if new_signal != 0:
                     position = new_signal
                     entry_price = line
                     entry_line_val = line
-                    trades.append({'time': times[i], 'type': 'Short' if position == -1 else 'Long', 'price': entry_price, 'pnl': 0, 'equity': equity, 'reason': 'Entry'})
-                    break # Stop after the first valid line is triggered
+                    trades.append({'time': ts, 'type': 'Short' if position == -1 else 'Long', 'price': entry_price, 'pnl': 0, 'equity': equity, 'reason': 'Entry'})
+            
+            # Update reference for next iteration in this candle
+            last_price_ref = line
 
+        # End of Candle Equity Record
         equity_curve.append(equity)
 
     return equity_curve, trades, hourly_log
@@ -304,13 +324,13 @@ def generate_report(best_ind, train_data, test_data, train_curve, test_curve, te
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Grid Strategy Results (No Reversal)</title>
+        <title>Grid Strategy Results (Dynamic Exit)</title>
         <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
         <style>body {{ padding: 20px; }} h3 {{ margin-top: 30px; }} th {{ position: sticky; top: 0; background: white; }}</style>
     </head>
     <body>
         <div class="container-fluid">
-            <h1 class="mb-4">Grid Strategy (No Reversal) GA Results</h1>
+            <h1 class="mb-4">Grid Strategy (Dynamic Exit) GA Results</h1>
             <div class="row">
                 <div class="col-md-4">{params_html}</div>
                 <div class="col-md-8 text-right">
