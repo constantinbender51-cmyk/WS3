@@ -66,7 +66,11 @@ def get_data():
         exit(1)
 
 # --- 2. Strategy Logic ---
-def run_backtest(df, stop_pct, profit_pct, lines):
+def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
+    """
+    Executes the Grid Reversal Strategy.
+    detailed_log_trades: If > 0, records hourly state until this many trades are completed.
+    """
     opens = df['open'].values
     highs = df['high'].values
     lows = df['low'].values
@@ -80,18 +84,69 @@ def run_backtest(df, stop_pct, profit_pct, lines):
     entry_line_val = -1.0 
     
     trades = []
+    hourly_log = []
+    
+    # Sort lines for binary search
     lines = np.sort(lines)
     
+    trades_completed = 0
+    
     for i in range(1, len(df)):
+        current_o = opens[i]
         current_h = highs[i]
         current_l = lows[i]
+        current_c = closes[i]
         prev_c = closes[i-1]
+        ts = times[i]
+        
+        # --- Detailed Logging Logic (Hourly) ---
+        if detailed_log_trades > 0 and trades_completed < detailed_log_trades:
+            # Find nearest lines
+            idx = np.searchsorted(lines, current_c)
+            
+            # Line below
+            if idx == 0: val_below = -999.0 # None below
+            else: val_below = lines[idx-1]
+            
+            # Line above
+            if idx >= len(lines): val_above = 999999.0 # None above
+            else: val_above = lines[idx]
+            
+            # Active Orders
+            act_sl = np.nan
+            act_tp = np.nan
+            pos_str = "FLAT"
+            
+            if position == 1:
+                pos_str = "LONG"
+                act_sl = entry_price * (1 - stop_pct)
+                act_tp = entry_price * (1 + profit_pct)
+            elif position == -1:
+                pos_str = "SHORT"
+                act_sl = entry_price * (1 + stop_pct)
+                act_tp = entry_price * (1 - profit_pct)
+            
+            log_entry = {
+                "Timestamp": str(ts),
+                "Price": f"{current_c:.2f}",
+                "Nearest Below": f"{val_below:.2f}" if val_below != -999 else "None",
+                "Nearest Above": f"{val_above:.2f}" if val_above != 999999 else "None",
+                "Position": pos_str,
+                "Active SL": f"{act_sl:.2f}" if not np.isnan(act_sl) else "-",
+                "Active TP": f"{act_tp:.2f}" if not np.isnan(act_tp) else "-",
+                "Equity": f"{equity:.2f}"
+            }
+            hourly_log.append(log_entry)
+            print(f"[HOURLY] {ts} | Px: {current_c:.2f} | Pos: {pos_str} | SL: {log_entry['Active SL']} | TP: {log_entry['Active TP']} | Eq: {equity:.2f}")
+
+        # --- Strategy Execution ---
         
         # Exit Logic
         if position != 0:
             pn_l = 0
             exit_price = 0
             triggered_exit = False
+            reason = ""
             
             if position == 1:
                 sl_price = entry_price * (1 - stop_pct)
@@ -126,6 +181,7 @@ def run_backtest(df, stop_pct, profit_pct, lines):
                 position = 0
                 trades.append({'time': times[i], 'type': 'Exit', 'price': exit_price, 'pnl': pn_l, 'equity': equity, 'reason': reason})
                 equity_curve.append(equity)
+                trades_completed += 1
                 continue 
 
         # Entry/Reversal Logic
@@ -157,6 +213,7 @@ def run_backtest(df, stop_pct, profit_pct, lines):
                         
                     equity *= (1 + pn_l)
                     trades.append({'time': times[i], 'type': 'ReversalClose', 'price': exit_price, 'pnl': pn_l, 'equity': equity, 'reason': 'Reverse'})
+                    trades_completed += 1 # A reversal counts as closing a trade
                     
                     position = new_signal
                     entry_price = line
@@ -166,7 +223,7 @@ def run_backtest(df, stop_pct, profit_pct, lines):
 
         equity_curve.append(equity)
 
-    return equity_curve, trades
+    return equity_curve, trades, hourly_log
 
 def calculate_sharpe(equity_curve):
     if len(equity_curve) < 2: return -999.0
@@ -193,7 +250,7 @@ def evaluate_genome(individual, df_train):
     stop_pct = np.clip(individual[0], STOP_PCT_RANGE[0], STOP_PCT_RANGE[1])
     profit_pct = np.clip(individual[1], PROFIT_PCT_RANGE[0], PROFIT_PCT_RANGE[1])
     lines = np.array(individual[2:])
-    eq_curve, _ = run_backtest(df_train, stop_pct, profit_pct, lines)
+    eq_curve, _, _ = run_backtest(df_train, stop_pct, profit_pct, lines, detailed_log_trades=0)
     return (calculate_sharpe(eq_curve),)
 
 def mutate_custom(individual, indpb, min_p, max_p):
@@ -207,8 +264,8 @@ def mutate_custom(individual, indpb, min_p, max_p):
     return individual,
 
 # --- 4. Server & Visualization ---
-def generate_report(best_ind, train_data, test_data, train_curve, test_curve, test_trades):
-    plt.figure(figsize=(14, 12)) # Increased height for better visibility
+def generate_report(best_ind, train_data, test_data, train_curve, test_curve, test_trades, hourly_log):
+    plt.figure(figsize=(14, 12))
     
     # 1. Equity Curve
     plt.subplot(2, 1, 1)
@@ -221,20 +278,12 @@ def generate_report(best_ind, train_data, test_data, train_curve, test_curve, te
     # 2. Full Price Action with Lines
     plt.subplot(2, 1, 2)
     plt.title("Full Test Set Price Action & Grid Lines")
-    
-    # Plot Full Test Data
     plt.plot(test_data.index, test_data['close'], color='black', alpha=0.6, label='Price', linewidth=0.8)
     
-    # Plot All Lines
     lines = best_ind[2:]
-    # Calculate bounds of the test set to avoid plotting lines far outside visible range (optional, but cleaner)
     min_test = test_data['low'].min()
     max_test = test_data['high'].max()
     margin = (max_test - min_test) * 0.1
-    
-    # Filter only lines that are relevant to this price area to keep file size optimized, 
-    # or plot all if user strictly meant ALL lines regardless of where price is.
-    # Given "Full price plot", we plot lines within the vertical range of the plot.
     visible_lines = [l for l in lines if (min_test - margin) < l < (max_test + margin)]
     
     for l in visible_lines:
@@ -250,8 +299,11 @@ def generate_report(best_ind, train_data, test_data, train_curve, test_curve, te
     
     trades_df = pd.DataFrame(test_trades)
     trades_html = trades_df.to_html(classes='table table-striped table-sm', index=False, max_rows=500) if not trades_df.empty else "No trades."
-    full_data_html = test_data.head(50).to_html(classes='table table-bordered table-sm')
     
+    # Hourly Log Table
+    hourly_df = pd.DataFrame(hourly_log)
+    hourly_html = hourly_df.to_html(classes='table table-bordered table-sm table-hover', index=False) if not hourly_df.empty else "No hourly data recorded."
+
     params_html = f"""
     <ul class="list-group">
         <li class="list-group-item"><strong>Stop Loss:</strong> {best_ind[0]*100:.4f}%</li>
@@ -266,7 +318,7 @@ def generate_report(best_ind, train_data, test_data, train_curve, test_curve, te
     <head>
         <title>Grid Reversal Strategy Results</title>
         <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
-        <style>body {{ padding: 20px; }} h3 {{ margin-top: 30px; }}</style>
+        <style>body {{ padding: 20px; }} h3 {{ margin-top: 30px; }} th {{ position: sticky; top: 0; background: white; }}</style>
     </head>
     <body>
         <div class="container-fluid">
@@ -283,9 +335,13 @@ def generate_report(best_ind, train_data, test_data, train_curve, test_curve, te
             <hr>
             <h3>Trade Log (Test Set)</h3>
             <div style="max-height: 400px; overflow-y: scroll; border: 1px solid #ddd;">{trades_html}</div>
+            
             <hr>
-            <h3>Data Sample</h3>
-            {full_data_html}
+            <h3>Hourly Details (First 5 Trades Timeline)</h3>
+            <p class="text-muted">Hourly snapshot of price, nearest grid lines, and active orders for the duration of the first 5 trades.</p>
+            <div style="max-height: 600px; overflow-y: scroll; border: 1px solid #ddd;">
+                {hourly_html}
+            </div>
         </div>
     </body>
     </html>
@@ -322,11 +378,13 @@ if __name__ == "__main__":
     best_ind = hof[0]
     print(f"Best Sharpe Train: {best_ind.fitness.values[0]:.4f}")
     
-    train_curve, _ = run_backtest(train_df, best_ind[0], best_ind[1], np.array(best_ind[2:]))
-    test_curve, test_trades = run_backtest(test_df, best_ind[0], best_ind[1], np.array(best_ind[2:]))
+    # Run backtest again, this time logging detailed hourly info for first 5 trades
+    print("Running Final Test...")
+    train_curve, _, _ = run_backtest(train_df, best_ind[0], best_ind[1], np.array(best_ind[2:]), detailed_log_trades=0)
+    test_curve, test_trades, hourly_log = run_backtest(test_df, best_ind[0], best_ind[1], np.array(best_ind[2:]), detailed_log_trades=5)
     print(f"Test Sharpe: {calculate_sharpe(test_curve):.4f}")
 
-    HTML_REPORT = generate_report(best_ind, train_df, test_df, train_curve, test_curve, test_trades)
+    HTML_REPORT = generate_report(best_ind, train_df, test_df, train_curve, test_curve, test_trades, hourly_log)
     
     print(f"Serving on {PORT}...")
     with socketserver.TCPServer(("", PORT), ResultsHandler) as httpd:
