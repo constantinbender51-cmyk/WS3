@@ -1,324 +1,230 @@
-import http.server
-import socketserver
+import sys
+import time
 import json
 import threading
-import time
-import uuid
-import requests
-import pandas as pd
-import io
-from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Optional
-from enum import Enum
+import logging
+from typing import Dict, List, Optional
 
-# ==========================================
-# 1. BLOCKING DATA DOWNLOAD (Global Scope)
-# ==========================================
-DATA_URL = "https://ohlcendpoint.up.railway.app/data/btc1m.csv"
+# Third-party libraries
+import websocket # pip install websocket-client
+from binance import ThreadedWebsocketManager, ThreadedDepthCacheManager # pip install python-binance
 
-print(f"[*] Initializing module. Starting blocking download from {DATA_URL}...")
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
-try:
-    # Blocking request immediately on import
-    response = requests.get(DATA_URL)
-    response.raise_for_status()
-    
-    # Parse CSV data into DataFrame
-    # Assuming standard OHLC columns; handling potentially dirty data implicitly by pandas
-    GLOBAL_OHLC_DATA = pd.read_csv(io.StringIO(response.text))
-    print(f"[*] Data download complete. Loaded {len(GLOBAL_OHLC_DATA)} rows.")
+class KrakenAutoClient:
+    """
+    Connects to Kraken WebSockets automatically on instantiation.
+    Maintains complexity: Raw WebSocket implementation without wrapper libraries.
+    """
+    WS_URL = 'wss://ws.kraken.com/'
 
-except Exception as e:
-    # Critical failure in initialization
-    print(f"[!] CRITICAL: Failed to download or parse data: {e}")
-    GLOBAL_OHLC_DATA = pd.DataFrame()
-
-# ==========================================
-# 2. TRADING & ORDER LOGIC
-# ==========================================
-
-class OrderSide(Enum):
-    BUY = "BUY"
-    SELL = "SELL"
-
-class OrderType(Enum):
-    LIMIT = "LIMIT"
-    STOP_LOSS = "STOP_LOSS"
-    TAKE_PROFIT = "TAKE_PROFIT"
-
-class OrderStatus(Enum):
-    PENDING = "PENDING"
-    FILLED = "FILLED"
-    CANCELLED = "CANCELLED"
-
-@dataclass
-class Order:
-    id: str
-    symbol: str
-    side: OrderSide
-    order_type: OrderType
-    price: float
-    quantity: float
-    status: OrderStatus = OrderStatus.PENDING
-    parent_id: Optional[str] = None  # Trace back to the filled order that triggered this (for TP/SL)
-
-@dataclass
-class Position:
-    symbol: str
-    side: OrderSide
-    entry_price: float
-    quantity: float
-    
-    @property
-    def unrealized_pnl_pct(self, current_price: float) -> float:
-        if self.side == OrderSide.BUY:
-            return (current_price - self.entry_price) / self.entry_price
-        else:
-            return (self.entry_price - current_price) / self.entry_price
-
-class TradingEngine:
-    def __init__(self, data: pd.DataFrame, start_balance: float = 10000.0):
-        self.data = data
-        self.balance = start_balance
-        self.equity = start_balance
-        self.orders: List[Order] = []
-        self.positions: List[Position] = []
-        self.realized_pnl = 0.0
-        self.current_price = 0.0
-        self.current_index = 0
+    def __init__(self, pairs: List[str]):
+        self.logger = logging.getLogger("KrakenClient")
+        self.pairs = pairs
+        self.ws: Optional[websocket.WebSocketApp] = None
+        self.wst: Optional[threading.Thread] = None
         
-        # Configuration
-        self.trade_qty = 0.1  # Fixed quantity for simplicity
-        self.limit_offset = 0.005  # 0.5%
-        self.sl_offset = 0.005     # 0.5%
-        self.tp_offset = 0.01      # 1.0%
+        # Automatic startup mechanism
+        self._initiate_connection()
 
-    def get_state(self):
-        """Returns the current state for the API."""
-        return {
-            "current_price": self.current_price,
-            "balance": self.balance,
-            "equity": self.equity,
-            "realized_pnl": self.realized_pnl,
-            "open_positions": len(self.positions),
-            "pending_orders": [asdict(o) for o in self.orders if o.status == OrderStatus.PENDING],
-            "active_triggers": {
-                "stop_losses": [o.price for o in self.orders if o.order_type == OrderType.STOP_LOSS and o.status == OrderStatus.PENDING],
-                "take_profits": [o.price for o in self.orders if o.order_type == OrderType.TAKE_PROFIT and o.status == OrderStatus.PENDING]
-            }
-        }
-
-    def place_order(self, side: OrderSide, order_type: OrderType, price: float, qty: float, parent_id: str = None):
-        order = Order(
-            id=str(uuid.uuid4())[:8],
-            symbol="BTC",
-            side=side,
-            order_type=order_type,
-            price=price,
-            quantity=qty,
-            parent_id=parent_id
+    def _initiate_connection(self):
+        """Internal method to start the WS connection immediately."""
+        self.logger.info("Initializing Kraken WebSocket connection...")
+        websocket.enableTrace(False)
+        self.ws = websocket.WebSocketApp(
+            self.WS_URL,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close,
+            on_open=self._on_open
         )
-        self.orders.append(order)
-        # print(f"Placed {order_type.name} {side.name} @ {price:.2f}")
-
-    def on_fill(self, filled_order: Order):
-        """Handle logic when an order is filled (Entry, TP, or SL)."""
-        filled_order.status = OrderStatus.FILLED
         
-        # Calculate PnL if closing a position
-        if filled_order.order_type in [OrderType.TAKE_PROFIT, OrderType.STOP_LOSS]:
-            # Close the position logic (FIFO or matching)
-            # For this complex simulation, we simply remove the matching position
-            match_side = OrderSide.SELL if filled_order.side == OrderSide.BUY else OrderSide.BUY
-            
-            # Find a matching position to close
-            for pos in self.positions:
-                if pos.side == match_side:
-                    pnl = (filled_order.price - pos.entry_price) * pos.quantity if pos.side == OrderSide.BUY else (pos.entry_price - filled_order.price) * pos.quantity
-                    self.balance += pnl
-                    self.realized_pnl += pnl
-                    self.positions.remove(pos)
-                    print(f"[-] Position Closed via {filled_order.order_type.name}. PnL: {pnl:.2f}")
-                    break
-                    
-        elif filled_order.order_type == OrderType.LIMIT:
-            # Entry logic: Create Position
-            new_pos = Position(symbol="BTC", side=filled_order.side, entry_price=filled_order.price, quantity=filled_order.quantity)
-            self.positions.append(new_pos)
-            print(f"[+] Position Opened: {filled_order.side.name} @ {filled_order.price:.2f}")
+        # Daemon thread to ensure it doesn't block program exit if needed
+        self.wst = threading.Thread(target=self.ws.run_forever)
+        self.wst.daemon = True
+        self.wst.start()
+        self.logger.info("Kraken background thread started.")
 
-            # 3. When an order is executed place a 0.5% stop loss and a 1% take profit
-            if filled_order.side == OrderSide.BUY:
-                sl_price = filled_order.price * (1 - self.sl_offset)
-                tp_price = filled_order.price * (1 + self.tp_offset)
-                sl_side, tp_side = OrderSide.SELL, OrderSide.SELL
-            else:
-                sl_price = filled_order.price * (1 + self.sl_offset)
-                tp_price = filled_order.price * (1 - self.tp_offset)
-                sl_side, tp_side = OrderSide.BUY, OrderSide.BUY
-
-            self.place_order(sl_side, OrderType.STOP_LOSS, sl_price, filled_order.quantity, parent_id=filled_order.id)
-            self.place_order(tp_side, OrderType.TAKE_PROFIT, tp_price, filled_order.quantity, parent_id=filled_order.id)
-
-    def process_market_tick(self, high: float, low: float, close: float):
-        """Simulate order matching against High/Low of the minute candle."""
-        self.current_price = close
+    def _on_open(self, ws):
+        self.logger.info("Kraken Connection Opened. Auto-subscribing...")
         
-        # Check trigger conditions for all pending orders
-        # We must iterate a copy because we might modify the list
-        for order in list(self.orders):
-            if order.status != OrderStatus.PENDING:
-                continue
+        # Subscribe to Ticker (Tick Data)
+        ticker_payload = {
+            "event": "subscribe",
+            "pair": self.pairs,
+            "subscription": {"name": "ticker"}
+        }
+        ws.send(json.dumps(ticker_payload))
+        self.logger.info(f"Subscribed to Ticker: {self.pairs}")
 
-            executed = False
-            
-            # BUY Logic
-            if order.side == OrderSide.BUY:
-                # Limit Buy: Low <= Price
-                if order.order_type == OrderType.LIMIT and low <= order.price:
-                    executed = True
-                # SL Buy (Short cover): High >= Price
-                elif order.order_type == OrderType.STOP_LOSS and high >= order.price:
-                    executed = True
-                # TP Buy (Short cover): Low <= Price
-                elif order.order_type == OrderType.TAKE_PROFIT and low <= order.price:
-                    executed = True
-            
-            # SELL Logic
-            elif order.side == OrderSide.SELL:
-                # Limit Sell: High >= Price
-                if order.order_type == OrderType.LIMIT and high >= order.price:
-                    executed = True
-                # SL Sell (Long exit): Low <= Price
-                elif order.order_type == OrderType.STOP_LOSS and low <= order.price:
-                    executed = True
-                # TP Sell (Long exit): High >= Price
-                elif order.order_type == OrderType.TAKE_PROFIT and high >= order.price:
-                    executed = True
+        # Subscribe to Order Book (Depth) - maintaining full precision
+        book_payload = {
+            "event": "subscribe",
+            "pair": self.pairs,
+            "subscription": {"name": "book", "depth": 100}
+        }
+        ws.send(json.dumps(book_payload))
+        self.logger.info(f"Subscribed to OrderBook (100 depth): {self.pairs}")
 
-            if executed:
-                self.on_fill(order)
-
-    def run_strategy_step(self, close_price: float):
+    def _on_message(self, ws, message):
         """
-        2. Every minute place a buy lmt order 0.5% lower and sell order 0.5% higher
+        Complex handling of raw JSON messages.
+        Differentiates between heartbeats, system status, and data channels.
         """
-        buy_limit_price = close_price * (1 - self.limit_offset)
-        sell_limit_price = close_price * (1 + self.limit_offset)
-
-        self.place_order(OrderSide.BUY, OrderType.LIMIT, buy_limit_price, self.trade_qty)
-        self.place_order(OrderSide.SELL, OrderType.LIMIT, sell_limit_price, self.trade_qty)
-
-    def update_equity(self):
-        """Mark to market."""
-        unrealized = 0.0
-        for pos in self.positions:
-            if pos.side == OrderSide.BUY:
-                unrealized += (self.current_price - pos.entry_price) * pos.quantity
-            else:
-                unrealized += (pos.entry_price - self.current_price) * pos.quantity
-        self.equity = self.balance + unrealized
-
-# Global Engine Instance
-ENGINE = TradingEngine(GLOBAL_OHLC_DATA)
-
-# ==========================================
-# 3. SERVER IMPLEMENTATION (Port 8080)
-# ==========================================
-
-class TradingInfoHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        # Serve JSON state
-        self.send_response(200)
-        self.send_header('Content-type', 'application/json')
-        self.end_headers()
-        
-        state = ENGINE.get_state()
-        
-        # Custom JSON encoder for Enums
-        class EnumEncoder(json.JSONEncoder):
-            def default(self, obj):
-                if isinstance(obj, Enum):
-                    return obj.name
-                return super().default(obj)
-
-        self.wfile.write(json.dumps(state, cls=EnumEncoder, indent=2).encode('utf-8'))
-
-    def log_message(self, format, *args):
-        return # Silence console noise
-
-def start_server():
-    port = 8080
-    handler = TradingInfoHandler
-    with socketserver.TCPServer(("", port), handler) as httpd:
-        print(f"[*] Serving PnL and Triggers on port {port}")
-        httpd.serve_forever()
-
-# ==========================================
-# 4. MAIN EXECUTION LOOP
-# ==========================================
-
-def simulation_loop():
-    """
-    Iterates through the downloaded data to simulate the 'Every Minute' logic.
-    Includes a sleep to allow the server to be queried in real-time.
-    """
-    if GLOBAL_OHLC_DATA.empty:
-        print("[!] No data to process.")
-        return
-
-    print(f"[*] Starting simulation loop over {len(GLOBAL_OHLC_DATA)} candles...")
-    
-    # Identify column names (handling case sensitivity or variations standard in crypto csvs)
-    # Falling back to index-based if specific names aren't found, assuming: time, open, high, low, close...
-    cols = GLOBAL_OHLC_DATA.columns.str.lower()
-    
-    # Helper to safe-get column data
-    def get_col(name, idx):
-        if name in cols:
-            return GLOBAL_OHLC_DATA.iloc[idx][name]
-        # Fallback map for common OHLC indices
-        map_idx = {'open': 1, 'high': 2, 'low': 3, 'close': 4}
-        return GLOBAL_OHLC_DATA.iloc[idx, map_idx.get(name, 4)]
-
-    for i in range(len(GLOBAL_OHLC_DATA)):
         try:
-            # Extract candle data
-            row = GLOBAL_OHLC_DATA.iloc[i]
-            # Assumes columns exist, or uses pandas smart indexing. 
-            # We standardize to 'close', 'high', 'low' if possible, otherwise rely on iloc/standard names
-            # Adjust these keys based on the actual CSV format from the endpoint
-            c = row.get('close') or row.iloc[4] 
-            h = row.get('high') or row.iloc[2]
-            l = row.get('low') or row.iloc[3]
+            data = json.loads(message)
             
-            # 1. Process Order Execution (Mocking the 'during the minute' movement)
-            ENGINE.process_market_tick(float(h), float(l), float(c))
-            
-            # 2. Update Equity
-            ENGINE.update_equity()
-            
-            # 3. Strategy Logic (Every minute place orders)
-            ENGINE.run_strategy_step(float(c))
-            
-            # Simulation delay to allow time for checking port 8080
-            # Running at 10x speed (0.1s per minute) to make it observable but not instant
-            time.sleep(0.5) 
-            
-            if i % 10 == 0:
-                print(f"Step {i}/{len(GLOBAL_OHLC_DATA)} | Price: {c} | Equity: {ENGINE.equity:.2f}")
+            # Filter heartbeats
+            if isinstance(data, dict) and data.get("event") == "heartbeat":
+                return 
+
+            # Handle System Events
+            if isinstance(data, dict) and "event" in data:
+                self.logger.debug(f"System Event: {data}")
+                return
+
+            # Handle Channel Data (List format in Kraken V1)
+            # Format: [channelID, {data}, channelName, pair]
+            if isinstance(data, list):
+                channel_name = data[-2]
+                pair = data[-1]
+                
+                if channel_name == "book-100":
+                    self._process_orderbook(data, pair)
+                elif channel_name == "ticker":
+                    self._process_tick(data, pair)
 
         except Exception as e:
-            print(f"Error in simulation step {i}: {e}")
-            break
+            self.logger.error(f"Message processing error: {e}")
 
-if __name__ == "__main__":
-    # Start Web Server in separate thread
-    server_thread = threading.Thread(target=start_server, daemon=True)
-    server_thread.start()
+    def _process_orderbook(self, data, pair):
+        """
+        Kraken sends snapshots (as/bs) initially, then updates (a/b).
+        Complexity: Real implementation requires merging these updates into a local map.
+        """
+        payload = data[1]
+        if "as" in payload or "bs" in payload:
+            self.logger.info(f"[Kraken][{pair}] OrderBook SNAPSHOT received.")
+            # In a full impl, you would store this snapshot
+        elif "a" in payload or "b" in payload:
+            # Differential update
+            # self.logger.info(f"[Kraken][{pair}] OrderBook UPDATE received.")
+            pass
 
-    # Give server a moment to bind
-    time.sleep(1)
+    def _process_tick(self, data, pair):
+        """
+        Process tick data (c: close price/lot volume).
+        """
+        # Ticker format: [channelID, {c: [price, vol], ...}, 'ticker', pair]
+        payload = data[1]
+        if 'c' in payload:
+            price = payload['c'][0]
+            vol = payload['c'][1]
+            self.logger.info(f"[Kraken][{pair}] TICK: {price} (Vol: {vol})")
 
-    # Start Simulation
-    simulation_loop()
+    def _on_error(self, ws, error):
+        self.logger.error(f"Kraken Error: {error}")
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        self.logger.warning("Kraken Connection Closed.")
+
+
+class BinanceAutoClient:
+    """
+    Uses python-binance Managers. 
+    Complexity: Uses ThreadedDepthCacheManager for accurate local order book replication
+    and ThreadedWebsocketManager for raw tick streams.
+    """
+    def __init__(self, symbol: str):
+        self.logger = logging.getLogger("BinanceClient")
+        self.symbol = symbol.upper()
+        
+        # Initialize Managers
+        self.twm = ThreadedWebsocketManager()
+        self.dcm = ThreadedDepthCacheManager()
+        
+        # Automatic startup
+        self._initiate_streams()
+
+    def _initiate_streams(self):
+        self.logger.info("Initializing Binance Stream Managers...")
+        
+        # Start the internal event loops
+        self.twm.start()
+        self.dcm.start()
+
+        # 1. Start Trade Stream (Tick Data)
+        self.logger.info(f"Subscribing to Binance Trade Stream: {self.symbol}")
+        self.twm.start_trade_socket(
+            callback=self._handle_trade_message,
+            symbol=self.symbol
+        )
+
+        # 2. Start Depth Cache (Order Book)
+        # This handles the complexity of fetching a REST snapshot and applying WS updates
+        self.logger.info(f"Subscribing to Binance Depth Cache: {self.symbol}")
+        self.dcm.start_depth_cache(
+            callback=self._handle_depth_message,
+            symbol=self.symbol,
+            refresh_interval=None # Set to None to maintain connection indefinitely
+        )
+
+    def _handle_trade_message(self, msg):
+        """
+        Handles raw trade events.
+        msg['e'] = event type, msg['p'] = price, msg['q'] = quantity
+        """
+        if msg['e'] == 'error':
+            self.logger.error(f"Binance Trade Error: {msg}")
+        else:
+            price = msg['p']
+            qty = msg['q']
+            # self.logger.info(f"[Binance][{self.symbol}] TRADE: {price} (Qty: {qty})")
+
+    def _handle_depth_message(self, depth_cache):
+        """
+        Receives a DepthCache object which is automatically kept in sync.
+        This hides the complexity of U/u ids but ensures data integrity.
+        """
+        if depth_cache is not None:
+            best_bid = depth_cache.get_bids()[0]
+            best_ask = depth_cache.get_asks()[0]
+            self.logger.info(f"[Binance][{self.symbol}] BOOK: Bid {best_bid[0]} | Ask {best_ask[0]}")
+        else:
+            self.logger.warning("Binance Depth Cache update failed")
+
+    def stop(self):
+        self.twm.stop()
+        self.dcm.stop()
+
+# --- Execution Block ---
+# Automatically runs on script execution or import
+try:
+    # 1. Initialize Kraken (XBT/USD)
+    kraken_pairs = ["XBT/USD"]
+    kraken_client = KrakenAutoClient(kraken_pairs)
+
+    # 2. Initialize Binance (BTCUSDT)
+    binance_symbol = "BTCUSDT"
+    binance_client = BinanceAutoClient(binance_symbol)
+
+    print("----------------------------------------------------------------")
+    print(">> DATA STREAMS INITIATED <<")
+    print("Both exchanges are now streaming data in background threads.")
+    print("Press Ctrl+C to stop.")
+    print("----------------------------------------------------------------")
+
+    # Keep main thread alive to allow background threads to work
+    if __name__ == "__main__":
+        while True:
+            time.sleep(1)
+
+except KeyboardInterrupt:
+    print("\nStopping clients...")
+    binance_client.stop()
+    # Kraken thread is daemon, will die with main
+    print("Shutdown complete.")
