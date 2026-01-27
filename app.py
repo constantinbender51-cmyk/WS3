@@ -69,7 +69,7 @@ def get_data():
 def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
     """
     Executes the Grid Strategy (No Reversals).
-    detailed_log_trades: If > 0, records hourly state until this many trades are completed.
+    Includes logic to prioritize the FIRST line crossed if multiple lines are hit.
     """
     opens = df['open'].values
     highs = df['high'].values
@@ -184,15 +184,17 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
                 trades_completed += 1
                 continue 
 
-        # Entry Logic (No Reversals)
-        # We only look for new entries if we are FLAT (position == 0).
-        # If we are in a trade, we wait for SL/TP to hit in the block above.
+        # Entry Logic (No Reversals, Pick First Line)
         if position == 0:
             idx_start = np.searchsorted(lines, current_l)
             idx_end = np.searchsorted(lines, current_h, side='right')
             touched_lines = lines[idx_start:idx_end]
             
             if len(touched_lines) > 0:
+                # UPDATED LOGIC: Sort touched lines by proximity to previous close
+                # This ensures we pick the "first" line encountered as price moved away from prev_c
+                touched_lines = sorted(touched_lines, key=lambda x: abs(x - prev_c))
+                
                 for line in touched_lines:
                     new_signal = 0
                     if line > prev_c: new_signal = -1
@@ -205,7 +207,7 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
                     entry_price = line
                     entry_line_val = line
                     trades.append({'time': times[i], 'type': 'Short' if position == -1 else 'Long', 'price': entry_price, 'pnl': 0, 'equity': equity, 'reason': 'Entry'})
-                    break 
+                    break # Stop after the first valid line is triggered
 
         equity_curve.append(equity)
 
