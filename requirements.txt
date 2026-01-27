@@ -1,10 +1,11 @@
-python-binance 
-websocket-client
-tqdm
-ccxt
-scipy
-yfinance
+deap
 numpy
 pandas
 matplotlib
 requests
+scipy
+yfinance
+ccxt
+tqdm
+websocket-client
+python-binance
