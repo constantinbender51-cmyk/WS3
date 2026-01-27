@@ -1,435 +1,418 @@
-import requests
 import pandas as pd
 import numpy as np
-import io
 import matplotlib.pyplot as plt
-import http.server
-import socketserver
-import threading
+import io
 import base64
 import random
-import time
-from datetime import datetime
-from io import BytesIO
+import http.server
+import socketserver
+import warnings
+from deap import base, creator, tools, algorithms
+from copy import deepcopy
 
-# ==========================================
-# 1. Configuration & Data Acquisition
-# ==========================================
-
-URL = "https://ohlcendpoint.up.railway.app/data/btc1m.csv"
+# --- Configuration ---
+DATA_URL = "https://ohlcendpoint.up.railway.app/data/btc1m.csv"
 PORT = 8080
+N_LINES = 1000
+POPULATION_SIZE = 20  # Adjusted for execution speed; increase for deeper search
+GENERATIONS = 5
+RISK_FREE_RATE = 0.0
 
-def download_and_process_data(url):
-    print(f"Downloading data from {url}...")
+# Ranges
+STOP_PCT_RANGE = (0.001, 0.02)   # 0.1% to 2%
+PROFIT_PCT_RANGE = (0.0004, 0.05) # 0.04% to 5%
+
+warnings.filterwarnings("ignore")
+
+# --- 1. Data Ingestion & Processing ---
+def get_data():
+    print(f"Downloading data from {DATA_URL}...")
     try:
-        response = requests.get(url)
-        response.raise_for_status()
-        
-        # Assuming CSV format: timestamp, open, high, low, close, volume
-        # We try to infer columns or assume standard naming
-        df = pd.read_csv(io.StringIO(response.text))
-        
-        # Standardize column names
+        df = pd.read_csv(DATA_URL)
+        # Ensure column mapping matches source
         df.columns = [c.lower() for c in df.columns]
-        
-        # Parse Dates
-        if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df.set_index('timestamp', inplace=True)
-        elif 'date' in df.columns:
-            df['date'] = pd.to_datetime(df['date'])
-            df.set_index('date', inplace=True)
+        if 'timestamp' not in df.columns:
+            # Fallback if no header, assuming standard structure or first col is time
+            df = pd.read_csv(DATA_URL, header=None)
+            df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
             
-        # 2. Resample to 1h OHLC
-        print("Resampling to 1h OHLC...")
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df.set_index('timestamp', inplace=True)
+        
+        # Resample to 1H
         df_1h = df.resample('1h').agg({
             'open': 'first',
             'high': 'max',
             'low': 'min',
-            'close': 'last',
-            'volume': 'sum'
+            'close': 'last'
         }).dropna()
         
-        return df_1h
+        # Split Train (70%) / Test (30%)
+        split_idx = int(len(df_1h) * 0.7)
+        train = df_1h.iloc[:split_idx]
+        test = df_1h.iloc[split_idx:]
         
+        return train, test
     except Exception as e:
-        print(f"Error obtaining data: {e}")
-        # Fallback for demonstration if URL fails or limits are hit
-        print("Generating synthetic data for functional verification...")
-        dates = pd.date_range(start="2023-01-01", periods=5000, freq='1h')
-        prices = 20000 + np.cumsum(np.random.randn(5000) * 50)
-        df_fake = pd.DataFrame({
-            'open': prices,
-            'high': prices + 10,
-            'low': prices - 10,
-            'close': prices + np.random.randn(5000),
-            'volume': np.abs(np.random.randn(5000) * 100)
-        }, index=dates)
-        return df_fake
+        print(f"Error getting data: {e}")
+        exit()
 
-# ==========================================
-# 3. Strategy Logic (The Core Complexity)
-# ==========================================
-
-class StrategyEngine:
-    def __init__(self, stop_pct, profit_pct, n_lines, line_prices, data):
-        self.stop_pct = stop_pct / 100.0
-        self.profit_pct = profit_pct / 100.0
-        self.n_lines = int(n_lines)
-        self.sorted_lines = np.sort(line_prices)
-        self.data = data.copy()
-        
-    def run_backtest(self):
-        # Arrays for performance
-        opens = self.data['open'].values
-        highs = self.data['high'].values
-        lows = self.data['low'].values
-        closes = self.data['close'].values
-        timestamps = self.data.index
-        
-        n = len(self.data)
-        equity = [10000.0] # Start with $10k
-        position = 0 # 0: None, 1: Long, -1: Short
-        entry_price = 0.0
-        trades = []
-        
-        # Pre-calculation optimization: 
-        # We need to know where lines are relative to prices quickly.
-        # However, grid logic is path dependent.
-        
-        for i in range(n):
-            current_open = opens[i]
-            current_high = highs[i]
-            current_low = lows[i]
-            current_close = closes[i]
-            current_equity = equity[-1]
-            
-            # Logic Step:
-            # "Iterate through all prices... any line_prices value above current triggers short..."
-            # "If a line_prices value is reached while in a position the position reverses"
-            
-            # Intra-candle simulation (simplified to High/Low bounds for speed, 
-            # but preserving logic order: Open -> Low/High -> Close)
-            
-            # We assume price moves Open -> Low -> High -> Close or Open -> High -> Low -> Close.
-            # For neutrality, we check if lines are triggered within the [Low, High] range.
-            
-            # Find lines involved in this candle
-            # Use searchsorted to find relevant grid lines within range [current_low, current_high]
-            
-            start_idx = np.searchsorted(self.sorted_lines, current_low, side='left')
-            end_idx = np.searchsorted(self.sorted_lines, current_high, side='right')
-            
-            touched_lines = self.sorted_lines[start_idx:end_idx]
-            
-            # If no lines touched, check TP/SL for existing position
-            if len(touched_lines) == 0:
-                if position != 0:
-                    self._check_exit(position, entry_price, current_low, current_high, trades, equity, current_open)
-                    # If exited, position becomes 0
-                    if trades and trades[-1]['type'] in ['stop_loss', 'take_profit'] and trades[-1]['exit_idx'] == i:
-                        position = 0
-                equity.append(current_equity) # Mark-to-market approximation
-                continue
-
-            # If lines ARE touched, we have reversal/entry triggers.
-            # Complex Logic: Which happened first? 
-            # We will prioritize Reversals over SL/TP if a line is hit, 
-            # because the prompt implies lines represent immediate triggers.
-            
-            for line in touched_lines:
-                # Logic: "any value above... triggers short"
-                # If we are Long (1), and we hit a line ABOVE entry? 
-                # Or simply, if price touches line X, and line X > previous_close?
-                
-                # We define "Above" relative to the price *before* touching it.
-                # If price is rising to touch a line, that line is above. -> Short.
-                # If price is falling to touch a line, that line is below. -> Long.
-                
-                # Since we don't have tick data, we infer direction.
-                # If Open < Line <= High -> Price rose to touch it -> Trigger Short (Reversal)
-                # If Open > Line >= Low -> Price fell to touch it -> Trigger Long (Reversal)
-                
-                triggered_short = (current_open < line <= current_high)
-                triggered_long = (current_open > line >= current_low)
-                
-                if position == 1 and triggered_short:
-                    # Reverse Long to Short
-                    pnl = (line - entry_price) / entry_price
-                    new_equity = equity[-1] * (1 + pnl)
-                    equity[-1] = new_equity
-                    trades.append({'type': 'reversal_short', 'entry': entry_price, 'exit': line, 'pnl': pnl, 'exit_idx': i})
-                    
-                    # New Position
-                    position = -1
-                    entry_price = line
-                    
-                elif position == -1 and triggered_long:
-                    # Reverse Short to Long
-                    pnl = (entry_price - line) / entry_price
-                    new_equity = equity[-1] * (1 + pnl)
-                    equity[-1] = new_equity
-                    trades.append({'type': 'reversal_long', 'entry': entry_price, 'exit': line, 'pnl': pnl, 'exit_idx': i})
-                    
-                    # New Position
-                    position = 1
-                    entry_price = line
-                    
-                elif position == 0:
-                    # New Entry
-                    if triggered_short:
-                        position = -1
-                        entry_price = line
-                    elif triggered_long:
-                        position = 1
-                        entry_price = line
-
-            # After processing lines, check if SL/TP was hit on the NEW position 
-            # (or existing if not reversed) within the remainder of the candle.
-            if position != 0:
-                self._check_exit(position, entry_price, current_low, current_high, trades, equity, current_open)
-                if trades and trades[-1]['type'] in ['stop_loss', 'take_profit'] and trades[-1]['exit_idx'] == i:
-                    position = 0
-
-            equity.append(equity[-1])
-
-        # Calculate metrics
-        equity_curve = np.array(equity)
-        returns = pd.Series(equity_curve).pct_change().dropna()
-        
-        if len(returns) < 2 or returns.std() == 0:
-            sharpe = 0.0
-        else:
-            sharpe = (returns.mean() / returns.std()) * np.sqrt(24 * 365) # Annualized (hourly)
-            
-        return sharpe, equity_curve, trades
-
-    def _check_exit(self, position, entry, low, high, trades, equity, open_p):
-        # Helper to check standard SL/TP
-        if position == 1:
-            stop_price = entry * (1 - self.stop_pct)
-            take_price = entry * (1 + self.profit_pct)
-            
-            # Check Low for Stop
-            if low <= stop_price:
-                pnl = (stop_price - entry) / entry
-                equity[-1] = equity[-1] * (1 + pnl)
-                trades.append({'type': 'stop_loss', 'entry': entry, 'exit': stop_price, 'pnl': pnl, 'exit_idx': -1})
-                return
-            
-            # Check High for Profit
-            if high >= take_price:
-                pnl = (take_price - entry) / entry
-                equity[-1] = equity[-1] * (1 + pnl)
-                trades.append({'type': 'take_profit', 'entry': entry, 'exit': take_price, 'pnl': pnl, 'exit_idx': -1})
-                return
-
-        elif position == -1:
-            stop_price = entry * (1 + self.stop_pct)
-            take_price = entry * (1 - self.profit_pct)
-            
-            if high >= stop_price:
-                pnl = (entry - stop_price) / entry
-                equity[-1] = equity[-1] * (1 + pnl)
-                trades.append({'type': 'stop_loss', 'entry': entry, 'exit': stop_price, 'pnl': pnl, 'exit_idx': -1})
-                return
-                
-            if low <= take_price:
-                pnl = (entry - take_price) / entry
-                equity[-1] = equity[-1] * (1 + pnl)
-                trades.append({'type': 'take_profit', 'entry': entry, 'exit': take_price, 'pnl': pnl, 'exit_idx': -1})
-                return
-
-
-# ==========================================
-# 4. Genetic Algorithm (Parameter Optimization)
-# ==========================================
-
-class GeneticOptimizer:
-    def __init__(self, train_data, pop_size=20, generations=5):
-        self.train_data = train_data
-        self.pop_size = pop_size
-        self.generations = generations
-        self.min_price = train_data['low'].min()
-        self.max_price = train_data['high'].max()
-        
-    def create_individual(self):
-        # Genome: [stop_pct, profit_pct, n_lines]
-        # line_prices is derived from n_lines (equidistant) to maintain feasibility 
-        # while respecting the prompt's request for line_price configuration.
-        return {
-            'stop_pct': random.uniform(0.1, 2.0),
-            'profit_pct': random.uniform(0.04, 5.0),
-            'n_lines': random.randint(10, 10000)
-        }
-        
-    def fitness(self, ind):
-        # Generate the lines based on n_lines and min/max
-        lines = np.linspace(self.min_price, self.max_price, int(ind['n_lines']))
-        engine = StrategyEngine(ind['stop_pct'], ind['profit_pct'], ind['n_lines'], lines, self.train_data)
-        sharpe, _, _ = engine.run_backtest()
-        return sharpe
-
-    def crossover(self, p1, p2):
-        child = {}
-        child['stop_pct'] = (p1['stop_pct'] + p2['stop_pct']) / 2
-        child['profit_pct'] = (p1['profit_pct'] + p2['profit_pct']) / 2
-        child['n_lines'] = int((p1['n_lines'] + p2['n_lines']) / 2)
-        return child
+# --- 2. Strategy Logic ---
+def run_backtest(df, stop_pct, profit_pct, lines):
+    """
+    Executes the Grid Reversal Strategy.
+    lines: np.array of 1000 price levels.
+    """
+    # Pre-computation for speed
+    opens = df['open'].values
+    highs = df['high'].values
+    lows = df['low'].values
+    closes = df['close'].values
+    times = df.index
     
-    def mutate(self, ind):
-        if random.random() < 0.3:
-            ind['stop_pct'] = np.clip(ind['stop_pct'] + random.uniform(-0.2, 0.2), 0.1, 2.0)
-        if random.random() < 0.3:
-            ind['profit_pct'] = np.clip(ind['profit_pct'] + random.uniform(-0.5, 0.5), 0.04, 5.0)
-        if random.random() < 0.3:
-            ind['n_lines'] = int(np.clip(ind['n_lines'] + random.randint(-100, 100), 10, 10000))
-        return ind
-
-    def run(self):
-        population = [self.create_individual() for _ in range(self.pop_size)]
+    equity = 10000.0
+    equity_curve = [equity]
+    position = 0 # 1 (Long), -1 (Short), 0 (Flat)
+    entry_price = 0.0
+    entry_line_val = -1.0 # The specific line value that triggered the current trade
+    
+    trades = []
+    
+    # Sort lines for efficient searching (though we iterate, sorted helps visualization/logic)
+    # Note: The GA can optimize lines to be anywhere, we sort them for the logic check if needed,
+    # but strictly the genome order doesn't matter, just values.
+    # To optimize lookup:
+    lines = np.sort(lines)
+    
+    for i in range(1, len(df)):
+        current_o = opens[i]
+        current_h = highs[i]
+        current_l = lows[i]
+        current_c = closes[i]
+        prev_c = closes[i-1]
         
-        for g in range(self.generations):
-            scored_pop = []
-            print(f"GA Generation {g+1}/{self.generations} processing...")
-            for ind in population:
-                score = self.fitness(ind)
-                scored_pop.append((ind, score))
+        # 1. Check Exit conditions (SL/TP) if in position
+        if position != 0:
+            pn_l = 0
+            exit_price = 0
+            triggered_exit = False
             
-            scored_pop.sort(key=lambda x: x[1], reverse=True)
-            print(f"Gen {g+1} Best Sharpe: {scored_pop[0][1]:.4f}")
+            # Long Exit Logic
+            if position == 1:
+                sl_price = entry_price * (1 - stop_pct)
+                tp_price = entry_price * (1 + profit_pct)
+                
+                # Check Low for SL
+                if current_l <= sl_price:
+                    exit_price = sl_price
+                    pn_l = (exit_price - entry_price) / entry_price
+                    triggered_exit = True
+                    reason = "SL"
+                # Check High for TP
+                elif current_h >= tp_price:
+                    exit_price = tp_price
+                    pn_l = (exit_price - entry_price) / entry_price
+                    triggered_exit = True
+                    reason = "TP"
             
-            # Selection (Top 50%)
-            survivors = [x[0] for x in scored_pop[:self.pop_size//2]]
+            # Short Exit Logic
+            elif position == -1:
+                sl_price = entry_price * (1 + stop_pct)
+                tp_price = entry_price * (1 - profit_pct)
+                
+                # Check High for SL
+                if current_h >= sl_price:
+                    exit_price = sl_price
+                    pn_l = (entry_price - exit_price) / entry_price
+                    triggered_exit = True
+                    reason = "SL"
+                # Check Low for TP
+                elif current_l <= tp_price:
+                    exit_price = tp_price
+                    pn_l = (entry_price - exit_price) / entry_price
+                    triggered_exit = True
+                    reason = "TP"
             
-            # Breeding
-            new_pop = survivors[:]
-            while len(new_pop) < self.pop_size:
-                p1, p2 = random.sample(survivors, 2)
-                child = self.crossover(p1, p2)
-                child = self.mutate(child)
-                new_pop.append(child)
-            
-            population = new_pop
-            
-        # Return best
-        best_ind = scored_pop[0][0]
-        return best_ind
+            if triggered_exit:
+                equity *= (1 + pn_l)
+                position = 0
+                trades.append({
+                    'time': times[i], 'type': 'Exit', 'price': exit_price, 
+                    'pnl': pn_l, 'equity': equity, 'reason': reason
+                })
+                # Position is now closed, continue to check for new entries within same candle?
+                # To avoid complexity of multiple trades per candle, we assume we are flat for rest of candle
+                equity_curve.append(equity)
+                continue 
 
-# ==========================================
-# 5. Result Serving (HTML Generation)
-# ==========================================
+        # 2. Check Grid Crossings (Entry or Reversal)
+        # We look for lines intersected by the candle range [current_l, current_h]
+        # Logic: 
+        # Short Trigger: Line is ABOVE prev_close (Resistance). Price hits it (goes up).
+        # Long Trigger: Line is BELOW prev_close (Support). Price hits it (goes down).
+        
+        # Optimization: Find lines within range [Low, High]
+        # usage of searchsorted is faster than where for sorted arrays
+        idx_start = np.searchsorted(lines, current_l)
+        idx_end = np.searchsorted(lines, current_h, side='right')
+        touched_lines = lines[idx_start:idx_end]
+        
+        if len(touched_lines) > 0:
+            for line in touched_lines:
+                # Determine direction relative to previous close
+                # If Line > Prev Close -> We hit it from below -> Short
+                # If Line < Prev Close -> We hit it from above -> Long
+                
+                new_signal = 0
+                if line > prev_c:
+                    new_signal = -1
+                elif line < prev_c:
+                    new_signal = 1
+                
+                if new_signal == 0: continue # Line exactly equal to prev close, unlikely but ignore
+                
+                # REVERSAL / ENTRY LOGIC
+                if position == 0:
+                    # Enter
+                    position = new_signal
+                    entry_price = line
+                    entry_line_val = line
+                    trades.append({
+                        'time': times[i], 'type': 'Short' if position == -1 else 'Long', 
+                        'price': entry_price, 'pnl': 0, 'equity': equity, 'reason': 'Entry'
+                    })
+                    break # Take first valid signal in candle logic
+                
+                elif position != 0:
+                    # Check Reversal Constraint 13: A line can't flip itself
+                    if line == entry_line_val:
+                        continue
+                    
+                    # Reverse Logic: If we hit a new line
+                    # Close current
+                    exit_price = line
+                    if position == 1:
+                        pn_l = (exit_price - entry_price) / entry_price
+                    else:
+                        pn_l = (entry_price - exit_price) / entry_price
+                        
+                    equity *= (1 + pn_l)
+                    trades.append({
+                        'time': times[i], 'type': 'ReversalClose', 'price': exit_price, 
+                        'pnl': pn_l, 'equity': equity, 'reason': 'Reverse'
+                    })
+                    
+                    # Open Opposite
+                    position = new_signal
+                    entry_price = line
+                    entry_line_val = line
+                    trades.append({
+                        'time': times[i], 'type': 'Short' if position == -1 else 'Long', 
+                        'price': entry_price, 'pnl': 0, 'equity': equity, 'reason': 'ReverseEntry'
+                    })
+                    break # Process one reversal per candle max
 
-def generate_report(test_data, best_params, equity_curve, trades):
-    # 1. Plotting
-    plt.figure(figsize=(12, 6))
-    plt.plot(equity_curve, label='Equity Curve')
-    plt.title(f"Strategy Performance (Sharpe optimized)\nParams: Stop={best_params['stop_pct']:.2f}%, Profit={best_params['profit_pct']:.2f}%, N_lines={best_params['n_lines']}")
+        equity_curve.append(equity)
+
+    return equity_curve, trades
+
+def calculate_sharpe(equity_curve):
+    if len(equity_curve) < 2: return -999.0
+    returns = pd.Series(equity_curve).pct_change().dropna()
+    if returns.std() == 0: return -999.0
+    # Annualized Sharpe (assuming hourly data -> 24*365 = 8760)
+    sharpe = np.sqrt(8760) * (returns.mean() / returns.std())
+    return sharpe
+
+# --- 3. Genetic Algorithm ---
+
+def setup_ga(min_price, max_price):
+    creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+    creator.create("Individual", list, fitness=creator.FitnessMax)
+
+    toolbox = base.Toolbox()
+
+    # Attribute generators
+    toolbox.register("attr_stop", random.uniform, STOP_PCT_RANGE[0], STOP_PCT_RANGE[1])
+    toolbox.register("attr_profit", random.uniform, PROFIT_PCT_RANGE[0], PROFIT_PCT_RANGE[1])
+    toolbox.register("attr_line", random.uniform, min_price, max_price)
+
+    # Structure: [Stop, Profit, Line1, Line2, ... Line1000]
+    toolbox.register("individual", tools.initCycle, creator.Individual,
+                     (toolbox.attr_stop, toolbox.attr_profit) + (toolbox.attr_line,)*N_LINES, n=1)
+    
+    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+    return toolbox
+
+def evaluate_genome(individual, df_train):
+    stop_pct = individual[0]
+    profit_pct = individual[1]
+    lines = np.array(individual[2:])
+    
+    # Enforce constraints softly or hard reset?
+    # GA might push values out of bounds, clip them
+    stop_pct = np.clip(stop_pct, STOP_PCT_RANGE[0], STOP_PCT_RANGE[1])
+    profit_pct = np.clip(profit_pct, PROFIT_PCT_RANGE[0], PROFIT_PCT_RANGE[1])
+    
+    eq_curve, _ = run_backtest(df_train, stop_pct, profit_pct, lines)
+    sharpe = calculate_sharpe(eq_curve)
+    return (sharpe,)
+
+def mutate_custom(individual, indpb, min_p, max_p):
+    # Mutation for Stop/Profit
+    if random.random() < indpb:
+        individual[0] += random.gauss(0, 0.005)
+        individual[0] = np.clip(individual[0], STOP_PCT_RANGE[0], STOP_PCT_RANGE[1])
+    if random.random() < indpb:
+        individual[1] += random.gauss(0, 0.005)
+        individual[1] = np.clip(individual[1], PROFIT_PCT_RANGE[0], PROFIT_PCT_RANGE[1])
+    
+    # Mutation for Lines
+    for i in range(2, len(individual)):
+        if random.random() < (indpb / 10): # Lower prob for lines to keep stability
+            # Move line slightly
+            shift = random.gauss(0, (max_p - min_p) * 0.01) 
+            individual[i] += shift
+            individual[i] = np.clip(individual[i], min_p, max_p)
+            
+    return individual,
+
+# --- 4. Server & Visualization ---
+
+def generate_report(best_ind, train_data, test_data, train_curve, test_curve, test_trades):
+    # Plotting
+    plt.figure(figsize=(14, 8))
+    plt.subplot(2, 1, 1)
+    plt.title("Equity Curve: Training (Blue) vs Test (Orange)")
+    plt.plot(train_curve, label='Training Equity')
+    plt.plot(range(len(train_curve), len(train_curve)+len(test_curve)), test_curve, label='Test Equity')
     plt.legend()
     plt.grid(True)
     
-    img = BytesIO()
-    plt.savefig(img, format='png')
-    img.seek(0)
-    plot_url = base64.b64encode(img.getvalue()).decode()
+    plt.subplot(2, 1, 2)
+    plt.title("Price Action & Optimized Grid (Last 500 hours of Test)")
+    subset = test_data.iloc[-500:]
+    plt.plot(subset.index, subset['close'], color='black', alpha=0.5)
+    
+    # Plot a subset of lines to avoid clutter, or all if feasible
+    lines = best_ind[2:]
+    # Only plot lines near the price action of the subset
+    min_sub = subset['low'].min()
+    max_sub = subset['high'].max()
+    active_lines = [l for l in lines if min_sub * 0.95 < l < max_sub * 1.05]
+    
+    for l in active_lines:
+        plt.axhline(y=l, color='blue', alpha=0.1, linewidth=0.5)
+        
+    plt.tight_layout()
+    
+    img_io = io.BytesIO()
+    plt.savefig(img_io, format='png')
+    img_io.seek(0)
+    plot_url = base64.b64encode(img_io.getvalue()).decode()
     plt.close()
-
-    # 2. Table Data
-    trades_df = pd.DataFrame(trades)
+    
+    # Tables
+    trades_df = pd.DataFrame(test_trades)
     if not trades_df.empty:
         trades_html = trades_df.to_html(classes='table table-striped', index=False)
-        stats_html = f"""
-        <ul>
-            <li>Total Trades: {len(trades)}</li>
-            <li>Final Equity: {equity_curve[-1]:.2f}</li>
-            <li>Win Rate: {len(trades_df[trades_df['pnl'] > 0]) / len(trades_df) * 100:.2f}%</li>
-        </ul>
-        """
     else:
-        trades_html = "<p>No trades executed on Test Set</p>"
-        stats_html = ""
+        trades_html = "<p>No trades generated in Test set.</p>"
+        
+    full_data_html = test_data.head(100).to_html(classes='table table-sm') # Show sample of OHLC
+    
+    params_html = f"""
+    <ul>
+        <li><strong>Stop Loss:</strong> {best_ind[0]*100:.4f}%</li>
+        <li><strong>Take Profit:</strong> {best_ind[1]*100:.4f}%</li>
+        <li><strong>Total Lines:</strong> {N_LINES}</li>
+    </ul>
+    """
 
-    # 3. HTML Template
-    html = f"""
+    html_content = f"""
     <html>
     <head>
-        <title>Algorithmic Trading Results</title>
+        <title>Grid Reversal Strategy Results</title>
         <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
     </head>
-    <body class="container mt-5">
-        <h1>Backtest Results</h1>
+    <body class="p-4">
+        <h1>Grid Reversal GA Results</h1>
         <hr>
-        <h3>Optimal Parameters</h3>
-        <ul>
-            <li>Stop Percent: {best_params['stop_pct']}</li>
-            <li>Profit Percent: {best_params['profit_pct']}</li>
-            <li>Number of Lines: {best_params['n_lines']}</li>
-        </ul>
+        <h3>Parameters</h3>
+        {params_html}
+        <h3>Performance Charts</h3>
+        <img src="data:image/png;base64,{plot_url}" style="width:100%; max-width:1200px;">
         <hr>
-        <h3>Performance Chart</h3>
-        <img src="data:image/png;base64,{plot_url}" style="width:100%">
-        <hr>
-        <h3>Statistics</h3>
-        {stats_html}
-        <h3>Full Trade Log</h3>
+        <h3>Trade Log (Test Set)</h3>
         <div style="max-height: 500px; overflow-y: scroll;">
             {trades_html}
         </div>
-        <h3>Full Price Data Head</h3>
-        <div style="max-height: 300px; overflow-y: scroll;">
-            {test_data.head(100).to_html(classes='table table-sm')}
-        </div>
+        <hr>
+        <h3>Data Sample (First 100 Test Candles)</h3>
+        {full_data_html}
     </body>
     </html>
     """
-    return html
+    return html_content
 
-class Handler(http.server.SimpleHTTPRequestHandler):
+class ResultsHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/html")
+        self.send_header('Content-type', 'text/html')
         self.end_headers()
-        self.wfile.write(bytes(REPORT_HTML, "utf8"))
+        self.wfile.write(HTML_REPORT.encode('utf-8'))
 
-# ==========================================
-# 6. Main Execution Flow
-# ==========================================
-
+# --- Main Execution Flow ---
 if __name__ == "__main__":
-    # 1. Download
-    df_ohlc = download_and_process_data(URL)
+    # 1. Load Data
+    train_df, test_df = get_data()
+    print(f"Data Loaded. Train: {len(train_df)} rows, Test: {len(test_df)} rows.")
     
-    # 3. Split Train/Test (70/30)
-    split_idx = int(len(df_ohlc) * 0.7)
-    train_set = df_ohlc.iloc[:split_idx]
-    test_set = df_ohlc.iloc[split_idx:]
-    
-    print(f"Training Data: {len(train_set)} candles")
-    print(f"Test Data: {len(test_set)} candles")
+    min_price = train_df['low'].min()
+    max_price = train_df['high'].max()
+    print(f"Price Bounds for Grid: {min_price} - {max_price}")
 
-    # 4. & 7. & 8. Genetic Algorithm Optimization
+    # 2. Setup GA
+    toolbox = setup_ga(min_price, max_price)
+    toolbox.register("evaluate", evaluate_genome, df_train=train_df)
+    toolbox.register("mate", tools.cxTwoPoint) # Simple crossover for array
+    toolbox.register("mutate", mutate_custom, indpb=0.1, min_p=min_price, max_p=max_price)
+    toolbox.register("select", tools.selTournament, tournsize=3)
+
+    # 3. Run GA
     print("Starting Genetic Algorithm Optimization...")
-    ga = GeneticOptimizer(train_set, pop_size=20, generations=5)
-    best_params = ga.run()
+    pop = toolbox.population(n=POPULATION_SIZE)
     
-    print("Optimization Complete.")
-    print(f"Best Parameters: {best_params}")
+    # Store Hall of Fame
+    hof = tools.HallOfFame(1)
     
-    # Run on Test Set
-    print("Running on Test Set...")
-    lines = np.linspace(train_set['low'].min(), train_set['high'].max(), int(best_params['n_lines']))
+    stats = tools.Statistics(lambda ind: ind.fitness.values)
+    stats.register("avg", np.mean)
+    stats.register("max", np.max)
+
+    pop, log = algorithms.eaSimple(pop, toolbox, cxpb=0.5, mutpb=0.2, ngen=GENERATIONS, 
+                                   stats=stats, halloffame=hof, verbose=True)
+
+    best_ind = hof[0]
+    print(f"Best Sharpe on Train: {best_ind.fitness.values[0]:.4f}")
     
-    # Note: Using min/max of TRAIN set for lines to avoid lookahead bias, 
-    # though price in Test might drift outside this grid (Strategy limitation accepted).
-    engine = StrategyEngine(best_params['stop_pct'], best_params['profit_pct'], best_params['n_lines'], lines, test_set)
-    sharpe, equity, trades = engine.run_backtest()
+    # 4. Final Tests
+    print("Running Final Test on Test Set...")
+    train_curve, _ = run_backtest(train_df, best_ind[0], best_ind[1], np.array(best_ind[2:]))
+    test_curve, test_trades = run_backtest(test_df, best_ind[0], best_ind[1], np.array(best_ind[2:]))
     
-    # 10. Serve Results
-    REPORT_HTML = generate_report(test_set, best_params, equity, trades)
+    test_sharpe = calculate_sharpe(test_curve)
+    print(f"Sharpe on Test Set: {test_sharpe:.4f}")
+
+    # 5. Serve Results
+    HTML_REPORT = generate_report(best_ind, train_df, test_df, train_curve, test_curve, test_trades)
     
-    print(f"Serving results at http://localhost:{PORT}")
-    with socketserver.TCPServer(("", PORT), Handler) as httpd:
+    print(f"Serving results on port {PORT}...")
+    with socketserver.TCPServer(("", PORT), ResultsHandler) as httpd:
+        print("Server running. Open http://localhost:8080")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
-            print("\nServer stopped.")
+            httpd.server_close()
+            print("Server stopped.")
