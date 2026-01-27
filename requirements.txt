@@ -1,3 +1,5 @@
+python-binance 
+websocket-client
 tqdm
 ccxt
 scipy
