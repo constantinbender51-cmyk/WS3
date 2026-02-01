@@ -1,234 +1,252 @@
-import ccxt
+import requests
 import pandas as pd
+import plotly.graph_objects as go
+from dash import Dash, dcc, html
+from dash.dependencies import Input, Output
+from collections import deque
+import statistics
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import io
-import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from datetime import datetime
 
-# --- Global Storage ---
-CHART_BUFFER = None
+# --- Configuration ---
+SYMBOL = "PF_XBTUSD"
+URL = "https://futures.kraken.com/derivatives/api/v3/orderbook"
+PORT = 8080
+UPDATE_INTERVAL_MS = 5000  # 5 seconds
+MAX_HISTORY = 720  # 60 minutes
+POSITION_SIZE_USD = 10000  # Target position size in USD
 
-# --- 1. Robust Data Fetching ---
-def fetch_data_strict():
-    print(f"[{datetime.now()}] FETCHING: ETH/USDT 1h (2020-Present)...")
-    exchange = ccxt.binance()
-    limit = 1000
-    since = exchange.parse8601('2020-01-01T00:00:00Z')
-    now = exchange.milliseconds()
-    
-    all_ohlcv = []
-    
-    while since < now:
-        try:
-            ohlcv = exchange.fetch_ohlcv('ETH/USDT', '1h', since=since, limit=limit)
-            if not ohlcv: break
-            all_ohlcv.extend(ohlcv)
-            since = ohlcv[-1][0] + 3600000 
-            time.sleep(0.05) 
-        except Exception as e:
-            print(f"Fetch Error: {e}")
-            break
+# --- Paper Trading Engine ---
+class PaperTrader:
+    def __init__(self, initial_balance=10000):
+        self.balance = initial_balance
+        self.position = 0.0
+        self.avg_entry_price = 0.0
+        self.realized_pnl = 0.0
+        self.fees_paid = 0.0
+        self.trade_log = deque(maxlen=50)
+        self.reference_price = 0.0
+
+        # Cost Model: 0.05% Taker Fee (Market Order) + 0.01% Slippage
+        self.FEE_RATE = 0.0005      
+        self.SLIPPAGE_RATE = 0.0001 
+        self.TOTAL_COST_RATE = self.FEE_RATE + self.SLIPPAGE_RATE 
+
+    def rebalance_position(self, direction, current_price):
+        """
+        Ensures position matches the target direction.
+        Only trades if the current position is neutral or opposing the signal.
+        """
+        self.reference_price = current_price
+        
+        # Determine Target Quantity (BTC)
+        # If price is 50k, target is 0.2 BTC
+        target_qty = POSITION_SIZE_USD / current_price
+        
+        if direction == 'short':
+            target_qty = -target_qty
+        
+        trade_needed = 0.0
+        
+        # Logic: Only trade if we are not already in the correct direction
+        # This prevents fee churn from micro-adjustments
+        if direction == 'long':
+            if self.position <= 0: # We are Short or Neutral, need to go Long
+                trade_needed = target_qty - self.position
+        elif direction == 'short':
+            if self.position >= 0: # We are Long or Neutral, need to go Short
+                trade_needed = target_qty - self.position
+
+        if abs(trade_needed) > 1e-9:
+            self._execute_trade(trade_needed, current_price, f"Flip to {direction.upper()}")
+
+    def _execute_trade(self, size, price, reason):
+        # 1. Calculate Transaction Cost
+        trade_value = abs(size * price) 
+        cost = trade_value * self.TOTAL_COST_RATE 
+        self.fees_paid += cost
+        self.balance -= cost 
+
+        # 2. PnL Calculation
+        # If reducing position (closing) or flipping
+        if (self.position > 1e-9 and size < 0) or (self.position < -1e-9 and size > 0):
+            closing_qty = min(abs(size), abs(self.position))
+            pnl = (price - self.avg_entry_price) * closing_qty
+            if self.position < 0: pnl = -pnl # Short PnL logic
             
-    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df = df.drop_duplicates(subset='timestamp').sort_values('timestamp').reset_index(drop=True)
-    print(f"[{datetime.now()}] DATA LOADED: {len(df)} candles.")
-    return df
-
-# --- 2. Strict Collision Solver ---
-
-def get_cone_bound(start_val, n, direction, rate=0.001):
-    """
-    Generates a cone boundary.
-    direction=1: Max possible upward path (1.001^t)
-    direction=-1: Max possible downward path (0.999^t)
-    """
-    t = np.arange(n)
-    log_v = np.log(start_val) + t * np.log(1 + direction * rate)
-    return np.exp(log_v)
-
-def solve_month_strict(prices, start_val, rate=0.001):
-    n = len(prices)
-    best_area = -1.0
-    best_path = None
-    
-    # Pre-calculate Forward Reachability from Start
-    # These are the physical limits of the line.
-    fwd_max = get_cone_bound(start_val, n, 1, rate)
-    fwd_min = get_cone_bound(start_val, n, -1, rate)
-
-    # Iterate potential crossing points k
-    # We ignore the very first and last few ticks to ensure a clear crossing
-    for k in range(2, n - 2):
-        target = prices[k]
-        
-        # 1. Physical Reachability Check
-        if not (fwd_min[k] <= target <= fwd_max[k]):
-            continue
-
-        # We test two Topologies:
-        # A: Start ABOVE -> Cross -> End BELOW
-        # B: Start BELOW -> Cross -> End ABOVE
-        
-        # Optimization: Filter based on start_val vs Price[0]
-        # (If we start far above, we can't be in 'Below' mode)
-        candidates = []
-        if start_val >= prices[0]: candidates.append('A')
-        if start_val <= prices[0]: candidates.append('B')
-        
-        for mode in candidates:
-            # --- PHASE 1: PRE-CROSSING (0 to k) ---
-            dist_bwd = np.arange(k + 1)[::-1]
+            self.realized_pnl += pnl
+            self.balance += pnl
             
-            if mode == 'A': # ABOVE -> BELOW
-                # Strategy: Stay HIGH (Maximize Area)
-                # Upper Bound = Min(Start_Fwd_Max, Target_Bwd_Max)
-                # Target Bwd Max: The highest value that can drop to Target
-                bwd_limit = target * np.power(1 - rate, -dist_bwd)
-                seg_pre = np.minimum(fwd_max[:k+1], bwd_limit)
-                
-                # COLLISION CHECK: Did we hit the price early?
-                # We require Line > Price strictly (epsilon buffer)
-                if np.any(seg_pre[:-1] <= prices[:k]): 
-                    continue # Invalid: Crossed/Touched too early
-
-            else: # BELOW -> ABOVE
-                # Strategy: Stay LOW (Maximize Area)
-                # Lower Bound = Max(Start_Fwd_Min, Target_Bwd_Min)
-                # Target Bwd Min: The lowest value that can rise to Target
-                bwd_limit = target * np.power(1 + rate, -dist_bwd)
-                seg_pre = np.maximum(fwd_min[:k+1], bwd_limit)
-                
-                # COLLISION CHECK
-                if np.any(seg_pre[:-1] >= prices[:k]): 
-                    continue # Invalid
-
-            # --- PHASE 2: POST-CROSSING (k to End) ---
-            len_post = n - k
-            
-            if mode == 'A': # ... -> BELOW
-                # Strategy: Dive LOW fast (Maximize Area)
-                seg_post = get_cone_bound(target, len_post, -1, rate)
-                
-                # COLLISION CHECK: Does price drop below us?
-                # We require Line < Price strictly
-                if np.any(seg_post[1:] >= prices[k+1:]):
-                    continue # Invalid: Price crossed back over us
-                    
-            else: # ... -> ABOVE
-                # Strategy: Fly HIGH fast
-                seg_post = get_cone_bound(target, len_post, 1, rate)
-                
-                # COLLISION CHECK
-                if np.any(seg_post[1:] <= prices[k+1:]):
-                    continue # Invalid
-
-            # --- Valid Path Found ---
-            full_path = np.concatenate([seg_pre, seg_post[1:]])
-            area = np.sum(np.abs(full_path - prices))
-            
-            if area > best_area:
-                best_area = area
-                best_path = full_path
-
-    # Fallback: If no valid single-crossing path exists (Very rare, requires extreme volatility > 0.1%/hr sustained)
-    if best_path is None:
-        # Fallback Strategy: Hug the price. 
-        # If we can't maximize area, we minimize distance to ensure at least we track the price 
-        # and maybe get a crossing by chance or minimal violation.
-        # But per instruction "Always possible", this branch should ideally not trigger.
-        print(f"Warn: No strict solution for segment starting {start_val}. Fallback to clamping.")
-        # Return a clamped version of price to stay within volatility limits of start_val
-        # This prevents the visual "explosion" seen in your screenshot.
-        acc = [start_val]
-        for p in prices[1:]:
-            prev = acc[-1]
-            # Clamp p to be within prev * (1 +/- 0.001)
-            clamped = np.clip(p, prev * 0.999, prev * 1.001)
-            acc.append(clamped)
-        return np.array(acc)
+        # 3. Update Position
+        new_pos = self.position + size
         
-    return best_path
-
-def optimize_all(df):
-    df['period'] = df['timestamp'].dt.to_period('M')
-    full_line = []
-    
-    # Initialize at Price[0]
-    current_val = df['close'].iloc[0]
-    
-    periods = sorted(df['period'].unique())
-    print(f"[{datetime.now()}] OPTIMIZING: Processing {len(periods)} months...")
-    
-    for p in periods:
-        prices = df.loc[df['period'] == p, 'close'].values
-        
-        path = solve_month_strict(prices, current_val)
-        full_line.append(path)
-        current_val = path[-1]
-        
-    final_line = np.concatenate(full_line)
-    
-    # Safety clip length
-    if len(final_line) > len(df): final_line = final_line[:len(df)]
-    return final_line
-
-# --- 3. Visualization ---
-
-def generate_chart():
-    df = fetch_data_strict()
-    optimized = optimize_all(df)
-    
-    plt.figure(figsize=(16, 9), dpi=100)
-    plt.style.use('dark_background')
-    
-    # Plot Price
-    plt.plot(df['timestamp'], df['close'], color='#555555', linewidth=0.8, label='ETH Price')
-    
-    # Plot Optimized Line
-    plt.plot(df['timestamp'], optimized, color='#00ff00', linewidth=1.2, label='Max Area Line (1 Cross/Month)')
-    
-    plt.title("ETH/USDT: Strict Topological Optimization (0.1% Volatility Limit)")
-    plt.xlabel("Date")
-    plt.ylabel("Price")
-    plt.legend()
-    plt.grid(True, alpha=0.15)
-    plt.tight_layout()
-    
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png')
-    buf.seek(0)
-    plt.close()
-    return buf
-
-# --- 4. Server ---
-
-class ChartHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        global CHART_BUFFER
-        if self.path == '/':
-            self.send_response(200)
-            self.send_header('Content-type', 'image/png')
-            self.end_headers()
-            self.wfile.write(CHART_BUFFER.getvalue())
+        if abs(new_pos) < 1e-9: 
+            self.position = 0.0
+            self.avg_entry_price = 0.0
+        elif (self.position >= 0 and size > 0) or (self.position <= 0 and size < 0):
+            # Increasing position (averaging in) - though with this logic we usually jump straight to target
+            total_cost = (self.position * self.avg_entry_price) + (size * price)
+            self.avg_entry_price = total_cost / new_pos
+            self.position = new_pos
         else:
-            self.send_error(404)
+            # Crossing 0 (Flip)
+            self.position = new_pos
+            self.avg_entry_price = price # Entry price resets at the flip
 
-def run():
-    global CHART_BUFFER
-    CHART_BUFFER = generate_chart()
-    
-    server = HTTPServer(('', 8080), ChartHandler)
-    print(f"[{datetime.now()}] SERVER RUNNING on 8080")
+        self.trade_log.append(f"{reason} | {size:+.4f} @ {price:.2f} | Fee: ${cost:.2f}")
+
+    def get_stats(self):
+        unrealized = 0.0
+        if self.position != 0:
+            unrealized = (self.reference_price - self.avg_entry_price) * self.position
+        
+        return {
+            'balance': self.balance,
+            'position': self.position,
+            'realized': self.realized_pnl,
+            'unrealized': unrealized,
+            'fees': self.fees_paid,
+            'total_equity': self.balance + unrealized
+        }
+
+# --- Global State ---
+ratio_history = deque(maxlen=MAX_HISTORY)
+trader = PaperTrader()
+
+app = Dash(__name__)
+
+def fetch_order_book():
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    server.server_close()
+        response = requests.get(URL, params={'symbol': SYMBOL}, timeout=3)
+        response.raise_for_status()
+        data = response.json()
+        if data.get('result') == 'success':
+            return data.get('orderBook', {})
+        return None
+    except:
+        return None
+
+def process_data(order_book):
+    bids = pd.DataFrame(order_book.get('bids', []), columns=['price', 'size']).astype(float)
+    bids = bids.sort_values(by='price', ascending=False)
+    bids['cumulative'] = bids['size'].cumsum()
+
+    asks = pd.DataFrame(order_book.get('asks', []), columns=['price', 'size']).astype(float)
+    asks = asks.sort_values(by='price', ascending=True)
+    asks['cumulative'] = asks['size'].cumsum()
+    return bids, asks
+
+def build_figure(bids, asks, title, mid):
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(x=bids['price'], y=bids['cumulative'], fill='tozeroy', name='Bids', line=dict(color='green')))
+    fig.add_trace(go.Scatter(x=asks['price'], y=asks['cumulative'], fill='tozeroy', name='Asks', line=dict(color='red')))
+
+    # Add vertical line for mid price
+    fig.add_vline(x=mid, line_width=1, line_dash="dash", line_color="white")
+
+    fig.update_layout(
+        title=title, 
+        xaxis_title="Price", 
+        yaxis_title="Vol", 
+        template="plotly_dark", 
+        height=500, 
+        margin=dict(l=40, r=40, t=40, b=40)
+    )
+    return fig
+
+app.layout = html.Div([
+    html.H2(f"Kraken: {SYMBOL} | Directional Strategy", style={'textAlign': 'center', 'color': '#eee', 'fontFamily': 'sans-serif'}),
+    
+    # --- Paper Trading Account Panel ---
+    html.Div([
+        html.Div([
+            html.H4("Equity", style={'margin': '0', 'color': '#aaa'}),
+            html.H2(id='equity-display', style={'margin': '5px', 'color': '#fff'})
+        ], style={'flex': 1, 'textAlign': 'center', 'borderRight': '1px solid #444'}),
+        html.Div([
+            html.H4("Unrealized PnL", style={'margin': '0', 'color': '#aaa'}),
+            html.H2(id='pnl-display', style={'margin': '5px'})
+        ], style={'flex': 1, 'textAlign': 'center', 'borderRight': '1px solid #444'}),
+        html.Div([
+            html.H4("Fees Paid", style={'margin': '0', 'color': '#aaa'}),
+            html.H2(id='fees-display', style={'margin': '5px', 'color': '#FF851B'})
+        ], style={'flex': 1, 'textAlign': 'center', 'borderRight': '1px solid #444'}),
+        html.Div([
+            html.H4("Position", style={'margin': '0', 'color': '#aaa'}),
+            html.H2(id='pos-display', style={'margin': '5px'})
+        ], style={'flex': 1, 'textAlign': 'center'}),
+        html.Div([
+            html.H4("Signal", style={'margin': '0', 'color': '#aaa'}),
+            html.H2(id='status-display', style={'margin': '5px'})
+        ], style={'flex': 1, 'textAlign': 'center', 'borderLeft': '1px solid #444'}),
+    ], style={'display': 'flex', 'backgroundColor': '#222', 'marginBottom': '20px', 'padding': '10px', 'borderRadius': '8px'}),
+
+    # --- Metrics ---
+    html.Div([
+        html.Div([html.H5("Current 10% Ratio"), html.H3(id='ratio-val')], style={'display': 'inline-block', 'width': '45%', 'textAlign': 'center', 'color': '#ccc'}),
+        html.Div([html.H5("60m Avg Ratio"), html.H3(id='avg-val')], style={'display': 'inline-block', 'width': '45%', 'textAlign': 'center', 'color': '#ccc'})
+    ], style={'textAlign': 'center'}),
+
+    dcc.Graph(id='ten-percent-chart'),
+    dcc.Interval(id='timer', interval=UPDATE_INTERVAL_MS, n_intervals=0)
+], style={'backgroundColor': '#111', 'padding': '20px', 'minHeight': '100vh', 'fontFamily': 'sans-serif'})
+
+@app.callback(
+    [Output('ten-percent-chart', 'figure'),
+     Output('ratio-val', 'children'), Output('avg-val', 'children'),
+     Output('equity-display', 'children'), Output('pnl-display', 'children'),
+     Output('pnl-display', 'style'), Output('fees-display', 'children'),
+     Output('pos-display', 'children'), Output('pos-display', 'style'),
+     Output('status-display', 'children'), Output('status-display', 'style')],
+    [Input('timer', 'n_intervals')]
+)
+def update(n):
+    ob = fetch_order_book()
+    if not ob: return go.Figure(), "-", "-", "-", "-", {}, "-", "-", {}, "OFFLINE", {'color': 'red'}
+
+    bids, asks = process_data(ob)
+    best_bid = bids['price'].iloc[0]
+    best_ask = asks['price'].iloc[0]
+    mid = (best_bid + best_ask) / 2
+
+    # 1. Calc 10% Ratio
+    b_10 = bids[bids['price'] >= mid * 0.90]
+    a_10 = asks[asks['price'] <= mid * 1.10]
+    
+    vb, va = b_10['size'].sum(), a_10['size'].sum()
+    ratio = 0 if va == 0 else 1 - (vb / va)
+    
+    ratio_history.append(ratio)
+    avg_60m = statistics.mean(ratio_history) if ratio_history else 0
+
+    # 2. Strategy Logic: Simple Directional Flip
+    direction = 'neutral'
+    status_txt = "NEUTRAL"
+    status_col = {'color': '#999'}
+
+    if avg_60m < 0:
+        direction = 'short'
+        status_txt = "SHORT"
+        status_col = {'color': '#FF4136'}
+    elif avg_60m > 0:
+        direction = 'long'
+        status_txt = "LONG"
+        status_col = {'color': '#2ECC40'}
+
+    # 3. Execute Flip
+    if direction != 'neutral':
+        trader.rebalance_position(direction, mid)
+
+    stats = trader.get_stats()
+
+    pnl_col = {'color': '#2ECC40'} if stats['unrealized'] >= 0 else {'color': '#FF4136'}
+    pos_col = {'color': '#2ECC40'} if stats['position'] > 0 else ({'color': '#FF4136'} if stats['position'] < 0 else {'color': '#ccc'})
+    
+    fig = build_figure(b_10, a_10, f"Depth ±10% ({mid:.1f})", mid)
+
+    return (fig, f"{ratio:.4f}", f"{avg_60m:.4f}", 
+            f"${stats['total_equity']:,.2f}", f"${stats['unrealized']:,.2f}", pnl_col,
+            f"${stats['fees']:,.2f}", f"{stats['position']:.4f}", pos_col, status_txt, status_col)
 
 if __name__ == '__main__':
-    run()
+    app.run(debug=False, port=PORT, host='0.0.0.0')
