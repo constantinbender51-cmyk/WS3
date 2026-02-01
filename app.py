@@ -34,12 +34,10 @@ class PaperTrader:
     def rebalance_position(self, direction, current_price):
         """
         Ensures position matches the target direction.
-        Only trades if the current position is neutral or opposing the signal.
         """
         self.reference_price = current_price
         
         # Determine Target Quantity (BTC)
-        # If price is 50k, target is 0.2 BTC
         target_qty = POSITION_SIZE_USD / current_price
         
         if direction == 'short':
@@ -48,7 +46,6 @@ class PaperTrader:
         trade_needed = 0.0
         
         # Logic: Only trade if we are not already in the correct direction
-        # This prevents fee churn from micro-adjustments
         if direction == 'long':
             if self.position <= 0: # We are Short or Neutral, need to go Long
                 trade_needed = target_qty - self.position
@@ -67,11 +64,10 @@ class PaperTrader:
         self.balance -= cost 
 
         # 2. PnL Calculation
-        # If reducing position (closing) or flipping
         if (self.position > 1e-9 and size < 0) or (self.position < -1e-9 and size > 0):
             closing_qty = min(abs(size), abs(self.position))
             pnl = (price - self.avg_entry_price) * closing_qty
-            if self.position < 0: pnl = -pnl # Short PnL logic
+            if self.position < 0: pnl = -pnl 
             
             self.realized_pnl += pnl
             self.balance += pnl
@@ -83,14 +79,12 @@ class PaperTrader:
             self.position = 0.0
             self.avg_entry_price = 0.0
         elif (self.position >= 0 and size > 0) or (self.position <= 0 and size < 0):
-            # Increasing position (averaging in) - though with this logic we usually jump straight to target
             total_cost = (self.position * self.avg_entry_price) + (size * price)
             self.avg_entry_price = total_cost / new_pos
             self.position = new_pos
         else:
-            # Crossing 0 (Flip)
             self.position = new_pos
-            self.avg_entry_price = price # Entry price resets at the flip
+            self.avg_entry_price = price 
 
         self.trade_log.append(f"{reason} | {size:+.4f} @ {price:.2f} | Fee: ${cost:.2f}")
 
@@ -141,7 +135,6 @@ def build_figure(bids, asks, title, mid):
     fig.add_trace(go.Scatter(x=bids['price'], y=bids['cumulative'], fill='tozeroy', name='Bids', line=dict(color='green')))
     fig.add_trace(go.Scatter(x=asks['price'], y=asks['cumulative'], fill='tozeroy', name='Asks', line=dict(color='red')))
 
-    # Add vertical line for mid price
     fig.add_vline(x=mid, line_width=1, line_dash="dash", line_color="white")
 
     fig.update_layout(
@@ -155,7 +148,7 @@ def build_figure(bids, asks, title, mid):
     return fig
 
 app.layout = html.Div([
-    html.H2(f"Kraken: {SYMBOL} | Directional Strategy", style={'textAlign': 'center', 'color': '#eee', 'fontFamily': 'sans-serif'}),
+    html.H2(f"Kraken: {SYMBOL} | Trend Follower", style={'textAlign': 'center', 'color': '#eee', 'fontFamily': 'sans-serif'}),
     
     # --- Paper Trading Account Panel ---
     html.Div([
@@ -214,24 +207,31 @@ def update(n):
     a_10 = asks[asks['price'] <= mid * 1.10]
     
     vb, va = b_10['size'].sum(), a_10['size'].sum()
+    
+    # Formula: 1 - (Bids / Asks)
+    # If Bids > Asks -> Ratio is Negative
+    # If Asks > Bids -> Ratio is Positive
     ratio = 0 if va == 0 else 1 - (vb / va)
     
     ratio_history.append(ratio)
     avg_60m = statistics.mean(ratio_history) if ratio_history else 0
 
-    # 2. Strategy Logic: Simple Directional Flip
+    # 2. Strategy Logic: Trend Following
     direction = 'neutral'
     status_txt = "NEUTRAL"
     status_col = {'color': '#999'}
 
+    # Negative Avg means Bids > Asks -> GO LONG
     if avg_60m < 0:
-        direction = 'short'
-        status_txt = "SHORT"
-        status_col = {'color': '#FF4136'}
-    elif avg_60m > 0:
         direction = 'long'
-        status_txt = "LONG"
+        status_txt = "LONG (Bids > Asks)"
         status_col = {'color': '#2ECC40'}
+        
+    # Positive Avg means Asks > Bids -> GO SHORT
+    elif avg_60m > 0:
+        direction = 'short'
+        status_txt = "SHORT (Asks > Bids)"
+        status_col = {'color': '#FF4136'}
 
     # 3. Execute Flip
     if direction != 'neutral':
