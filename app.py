@@ -2,135 +2,194 @@ import ccxt
 import pandas as pd
 import numpy as np
 import matplotlib
-matplotlib.use('Agg') # Headless backend
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import io
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from datetime import datetime, timedelta
 
-# --- 1. Data Fetching ---
-def fetch_data():
+# --- 1. Data Fetching (Pagination) ---
+
+def fetch_history_from_2020(symbol='ETH/USDT', timeframe='1h'):
     exchange = ccxt.binance()
-    # Fetch approx 3 months of data (24 * 90 = 2160)
-    ohlcv = exchange.fetch_ohlcv('ETH/USDT', '1h', limit=1000) 
-    # Note: Binance API limit is 1000 per call, using 1000 for speed/demo consistency
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    # Binance limit per request
+    limit = 1000 
+    since = exchange.parse8601('2020-01-01T00:00:00Z')
+    now = exchange.milliseconds()
+    
+    all_ohlcv = []
+    
+    print(f"Fetching data from 2020 for {symbol}...")
+    
+    while since < now:
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
+            if not ohlcv:
+                break
+            
+            all_ohlcv.extend(ohlcv)
+            
+            # Update 'since' to the last timestamp + 1 timeframe duration
+            last_timestamp = ohlcv[-1][0]
+            since = last_timestamp + 60 * 60 * 1000 # +1 hour in ms
+            
+            # Rate limit mitigation
+            # time.sleep(exchange.rateLimit / 1000) 
+            
+            # Progress indicator (optional, keeps logs dense)
+            if len(all_ohlcv) % 5000 == 0:
+                print(f"Fetched {len(all_ohlcv)} candles...")
+                
+        except Exception as e:
+            print(f"Fetch error: {e}")
+            break
+            
+    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    
+    # Drop duplicates if any overlap occurred
+    df = df.drop_duplicates(subset='timestamp').reset_index(drop=True)
+    print(f"Total rows fetched: {len(df)}")
     return df
 
 # --- 2. Optimization Logic ---
+
 def get_cone(start_val, steps, direction, rate=0.001):
-    """
-    Generates a volatility cone. 
-    direction=1 for max boundary (1.001^t), -1 for min boundary (0.999^t).
-    """
     t = np.arange(steps)
-    # Log-space calculation for stability: P_t = P_0 * (1 +/- rate)^t
+    # P_t = P_0 * (1 +/- rate)^t
     log_v = np.log(start_val) + t * np.log(1 + (direction * rate))
     return np.exp(log_v)
 
+def generate_inertial_path(start_val, prices, rate=0.001):
+    """
+    Fallback generator.
+    If exact crossing is impossible, this path adheres strictly to the 
+    volatility constraint (0.1%) while attempting to converge with price.
+    It eliminates the vertical jump artifact.
+    """
+    n = len(prices)
+    path = np.zeros(n)
+    current = start_val
+    path[0] = current
+    
+    # Pre-compute log factors
+    log_up = np.log(1 + rate)
+    log_down = np.log(1 - rate)
+    
+    for t in range(1, n):
+        target = prices[t]
+        # Determine direction towards target
+        if target > current:
+            # Move up max allowed amount
+            # Check if we can reach target in one step (unlikely but possible)
+            next_max = current * np.exp(log_up)
+            current = min(next_max, target)
+        else:
+            # Move down max allowed amount
+            next_min = current * np.exp(log_down)
+            current = max(next_min, target)
+        path[t] = current
+        
+    return path
+
 def solve_segment(prices, start_val, rate=0.001):
-    """
-    Greedy optimizer for a single month.
-    Returns the path that maximizes area with exactly 1 crossing.
-    """
     n = len(prices)
     best_area = -1
     best_path = None
     
-    # Pre-calculate forward reachability from start_val
-    # We only need the relevant boundary for the chosen polarity, but we calc both.
+    # Optimization: If N is large, stride the search.
+    # For 1h candles over 1 month (approx 720), stride=1 is fine.
+    # If partial month is very short, ensure stride doesn't skip.
+    stride = 1 if n < 1000 else 5
+    
     fwd_max = get_cone(start_val, n, 1, rate)
     fwd_min = get_cone(start_val, n, -1, rate)
 
-    # Iterate over every possible crossing index k
-    # Stride=1 ensures accuracy; increase stride for performance if N is large.
-    for k in range(1, n-1): 
+    # Search for crossing point k
+    # We restrict k to be at least 1 step in and 1 step before end
+    for k in range(1, n-1, stride): 
         target = prices[k]
         
-        # Check if target is reachable from start
+        # Pruning: Is target reachable from start?
         if not (fwd_min[k] <= target <= fwd_max[k]):
             continue
 
-        # Two topological modes:
-        # Mode A: Start ABOVE price -> Cross at k -> End BELOW price
-        # Mode B: Start BELOW price -> Cross at k -> End ABOVE price
+        scenarios = [('above', 'below'), ('below', 'above')]
         
-        modes = [('above', 'below'), ('below', 'above')]
-        
-        for pre_mode, post_mode in modes:
-            # 1. Backward Reachability from Crossing (k to 0)
-            # To maximize area before k:
-            # If 'above', we want highest possible path (Min of FwdMax and BwdMax)
-            # If 'below', we want lowest possible path (Max of FwdMin and BwdMin)
-            
-            # Generate backward cone from target
+        for pre_mode, post_mode in scenarios:
+            # --- Backward Reachability (0 to k) ---
             bwd_len = k + 1
             if pre_mode == 'above':
-                # We need upper bound. 
-                # Backward from target, max possible value at t < k is target * (1.001)^(k-t)
-                # This is equivalent to generating a "max" cone from target and reversing it.
-                bwd_cone = get_cone(target, bwd_len, 1, rate)[::-1] # High values back to 0
-                # The actual valid upper bound is min(fwd constraint, bwd constraint)
-                segment_pre = np.minimum(fwd_max[:bwd_len], bwd_cone)
+                # Upper bound: Min(FwdMax, BwdMaxFromTarget)
+                bwd_cone = get_cone(target, bwd_len, 1, rate)[::-1]
+                seg_pre = np.minimum(fwd_max[:bwd_len], bwd_cone)
             else:
-                # We need lower bound.
-                bwd_cone = get_cone(target, bwd_len, -1, rate)[::-1] # Low values back to 0
-                segment_pre = np.maximum(fwd_min[:bwd_len], bwd_cone)
-                
-            # 2. Forward Reachability from Crossing (k to end)
-            # To maximize area after k:
-            # If 'below', we want lowest possible path (FwdMin from target)
-            # If 'above', we want highest possible path (FwdMax from target)
+                # Lower bound: Max(FwdMin, BwdMinFromTarget)
+                bwd_cone = get_cone(target, bwd_len, -1, rate)[::-1]
+                seg_pre = np.maximum(fwd_min[:bwd_len], bwd_cone)
+            
+            # check validity of pre-segment (cannot cross bounds)
+            if pre_mode == 'above' and np.any(seg_pre < fwd_min[:bwd_len]): continue
+            if pre_mode == 'below' and np.any(seg_pre > fwd_max[:bwd_len]): continue
+
+            # --- Forward Reachability (k to end) ---
             post_len = n - k
             if post_mode == 'below':
-                segment_post = get_cone(target, post_len, -1, rate)
+                seg_post = get_cone(target, post_len, -1, rate)
             else:
-                segment_post = get_cone(target, post_len, 1, rate)
-                
+                seg_post = get_cone(target, post_len, 1, rate)
+
             # Stitch
-            # segment_pre ends at k, segment_post starts at k. 
-            # Slice post to avoid duplicate k
-            full_path = np.concatenate([segment_pre, segment_post[1:]])
+            full_path = np.concatenate([seg_pre, seg_post[1:]])
             
-            # 3. Validate Constraints
-            # Constraint: Strictly 1 crossing
-            # We check sign changes. 
+            # --- Verify Crossing Count ---
             diff = full_path - prices
             signs = np.sign(diff)
-            # Filter zeros (touching line is not a cross until it passes)
-            clean_signs = signs[signs != 0]
-            if len(clean_signs) == 0: continue # unlikely
-            crossings = np.count_nonzero(np.diff(clean_signs))
+            # Forward propagate zeros to avoid false crossing counts on exact touches
+            for i in range(1, n):
+                if signs[i] == 0: signs[i] = signs[i-1]
+                
+            crossings = np.count_nonzero(np.diff(signs))
             
             if crossings != 1:
                 continue
-                
-            # Constraint: Deviation <= 0.1% (Implicit in cone construction, but stitching point needs check)
-            # The join at k is continuous (both are `target`), so step change is valid if cones are valid.
             
-            # Calculate Area
             area = np.sum(np.abs(diff))
-            
             if area > best_area:
                 best_area = area
                 best_path = full_path
 
-    return best_path if best_path is not None else prices # Fallback
+    # FALLBACK
+    if best_path is None:
+        # User reported a jump. 
+        # The jump happens because we returned 'prices' previously.
+        # Now we return a volatility-compliant path that drifts.
+        return generate_inertial_path(start_val, prices, rate)
+        
+    return best_path
 
 def calculate_full_trajectory():
-    df = fetch_data()
+    df = fetch_history_from_2020()
     df['month'] = df['timestamp'].dt.to_period('M')
     
     full_line_segments = []
     
-    # Initialize start value at the first price
+    # Initialization
+    # We must ensure the very first point matches price[0]
     current_val = df['close'].iloc[0]
     
-    grouped = df.groupby('month')
-    for name, group in grouped:
+    # Process Group by Group
+    # Note: groupby preserves order of keys, but we double check sort
+    groups = df.groupby('month', sort=False)
+    
+    for name, group in groups:
         prices = group['close'].values
         
-        # Solve
+        # Constraint: L[0] must equal current_val (from previous month's end)
+        # Note: If this is the very first month, current_val == prices[0]
+        # If this is subsequent month, prices[0] might be different from current_val
+        # The solver calculates path relative to current_val.
+        
         path = solve_segment(prices, current_val)
         
         full_line_segments.append(path)
@@ -138,15 +197,18 @@ def calculate_full_trajectory():
         
     final_line = np.concatenate(full_line_segments)
     
-    # Handle length mismatch if grouping dropped indices (rare/edge case)
+    # Length alignment check
     if len(final_line) != len(df):
-        # Truncate or pad. For simplicity, we re-slice df
-        df = df.iloc[:len(final_line)]
+        print(f"Warning: Length mismatch. DF: {len(df)}, Line: {len(final_line)}")
+        # Truncate to match shortest
+        min_len = min(len(df), len(final_line))
+        df = df.iloc[:min_len]
+        final_line = final_line[:min_len]
         
     df['optimized'] = final_line
     return df
 
-# --- 3. Visualization & Server ---
+# --- 3. Visualization Server ---
 
 class ChartHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -155,21 +217,26 @@ class ChartHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'image/png')
             self.end_headers()
             
-            # Generate Plot
             df = calculate_full_trajectory()
             
-            plt.figure(figsize=(12, 6), dpi=100)
+            # Plotting
+            plt.figure(figsize=(14, 7), dpi=100)
             plt.style.use('dark_background')
             
-            plt.plot(df['timestamp'], df['close'], label='ETH Price', color='#555555', linewidth=1)
-            plt.plot(df['timestamp'], df['optimized'], label='Max Area Line', color='#00ff00', linewidth=1.5)
+            # Sub-sample for performance if needed (e.g. every 4th point)
+            # df_plot = df.iloc[::4] 
+            df_plot = df
             
-            plt.title("ETH/USDT: Area Maximization (1 Cross/Month, 0.1% Vol Limit)")
+            plt.plot(df_plot['timestamp'], df_plot['close'], label='ETH Price', color='#444444', linewidth=0.8)
+            plt.plot(df_plot['timestamp'], df_plot['optimized'], label='Constrained Line', color='#00ff00', linewidth=1.2)
+            
+            plt.title("ETH/USDT 2020-Present: Area Maximization (No Discontinuities)")
+            plt.xlabel("Date")
+            plt.ylabel("Price")
             plt.legend()
-            plt.grid(True, alpha=0.2)
+            plt.grid(True, alpha=0.15)
             plt.tight_layout()
             
-            # Save to buffer
             buf = io.BytesIO()
             plt.savefig(buf, format='png')
             buf.seek(0)
@@ -182,7 +249,7 @@ class ChartHandler(BaseHTTPRequestHandler):
 def run_server():
     server_address = ('', 8080)
     httpd = HTTPServer(server_address, ChartHandler)
-    print("Serving Matplotlib chart on port 8080...")
+    print("Serving chart on port 8080...")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
