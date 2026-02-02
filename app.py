@@ -9,7 +9,6 @@ import io
 import numpy as np
 import time
 
-# Check for Numba
 try:
     from numba import njit
     HAS_NUMBA = True
@@ -56,19 +55,12 @@ def fetch_data():
             
     data = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
-    
-    # Pre-calculate 365 SMA
     data['sma'] = data['close'].rolling(window=365*24).mean()
     
     return data
 
 @njit(fastmath=True)
 def optimize_regime_sharpe(opens, highs, lows, closes, smas, target_above_sma):
-    """
-    Optimizes for the new strategy:
-    1. Open Long + Short every hour at Open.
-    2. Close at SL, TP, or Hourly Close (whichever comes first).
-    """
     n = len(opens)
     fee_rate = 0.0002
     
@@ -76,7 +68,7 @@ def optimize_regime_sharpe(opens, highs, lows, closes, smas, target_above_sma):
     best_tp = 5.0
     best_sl = 2.0
     
-    # Search Range: 0.2% to 10.0%
+    # Grid Search 0.2% - 10%
     for tp_int in range(2, 101, 2): 
         for sl_int in range(2, 101, 2):
             tp_pct = tp_int / 10.0
@@ -91,7 +83,11 @@ def optimize_regime_sharpe(opens, highs, lows, closes, smas, target_above_sma):
             sum_returns_sq = 0.0
             count = 0
             
-            # Loop strictly for stats calculation
+            # State tracking: Did we close previous hour?
+            # Start assumed closed, so we pay initial entry
+            l_closed_prev = True
+            s_closed_prev = True
+            
             for i in range(n):
                 op = opens[i]
                 sma = smas[i]
@@ -99,52 +95,72 @@ def optimize_regime_sharpe(opens, highs, lows, closes, smas, target_above_sma):
                 # Check Regime
                 is_above = op > sma
                 if is_above != target_above_sma:
+                    # If we skip an hour due to regime change, we consider positions closed
+                    l_closed_prev = True
+                    s_closed_prev = True
                     continue
                 
                 hi = highs[i]
                 lo = lows[i]
                 cl = closes[i]
                 
-                # --- Hourly Reset Logic ---
+                # --- LONG LEG ---
+                l_entry_fee = 0.0
+                if l_closed_prev:
+                    l_entry_fee = op * fee_rate
                 
-                # LONG Leg
-                l_entry = op
+                l_sl_price = op * l_sl_mult
+                l_tp_price = op * l_tp_mult
+                
                 l_pnl = 0.0
-                # Calc Exits
-                l_sl_price = l_entry * l_sl_mult
-                l_tp_price = l_entry * l_tp_mult
+                l_exit_fee = 0.0
                 
-                # Logic: Did we hit SL or TP?
-                # Assumption: If Low <= SL, we hit SL. If High >= TP, we hit TP.
-                # Conflict: If both hit? Standard conservative: SL hit first.
                 if lo <= l_sl_price:
-                    l_exit = l_sl_price
-                    l_pnl = (l_exit - l_entry) - (l_entry * fee_rate) - (l_exit * fee_rate)
+                    # Hit SL
+                    l_pnl = l_sl_price - op
+                    l_exit_fee = l_sl_price * fee_rate
+                    l_closed_prev = True # Forced close, must re-enter next
                 elif hi >= l_tp_price:
-                    l_exit = l_tp_price
-                    l_pnl = (l_exit - l_entry) - (l_entry * fee_rate) - (l_exit * fee_rate)
+                    # Hit TP
+                    l_pnl = l_tp_price - op
+                    l_exit_fee = l_tp_price * fee_rate
+                    l_closed_prev = True
                 else:
-                    l_exit = cl
-                    l_pnl = (l_exit - l_entry) - (l_entry * fee_rate) - (l_exit * fee_rate)
-                    
-                # SHORT Leg
-                s_entry = op
+                    # Time Exit (Hold)
+                    l_pnl = cl - op
+                    l_exit_fee = 0.0 # No fee, just roll
+                    l_closed_prev = False # Position stays open
+                
+                l_net = l_pnl - l_entry_fee - l_exit_fee
+                
+                # --- SHORT LEG ---
+                s_entry_fee = 0.0
+                if s_closed_prev:
+                    s_entry_fee = op * fee_rate
+                
+                s_sl_price = op * s_sl_mult
+                s_tp_price = op * s_tp_mult
+                
                 s_pnl = 0.0
-                s_sl_price = s_entry * s_sl_mult
-                s_tp_price = s_entry * s_tp_mult
+                s_exit_fee = 0.0
                 
                 if hi >= s_sl_price:
-                    s_exit = s_sl_price
-                    s_pnl = (s_entry - s_exit) - (s_entry * fee_rate) - (s_exit * fee_rate)
+                    s_pnl = op - s_sl_price
+                    s_exit_fee = s_sl_price * fee_rate
+                    s_closed_prev = True
                 elif lo <= s_tp_price:
-                    s_exit = s_tp_price
-                    s_pnl = (s_entry - s_exit) - (s_entry * fee_rate) - (s_exit * fee_rate)
+                    s_pnl = op - s_tp_price
+                    s_exit_fee = s_tp_price * fee_rate
+                    s_closed_prev = True
                 else:
-                    s_exit = cl
-                    s_pnl = (s_entry - s_exit) - (s_entry * fee_rate) - (s_exit * fee_rate)
-                    
-                # Net PnL for this hour
-                net_pnl = l_pnl + s_pnl
+                    s_pnl = op - cl
+                    s_exit_fee = 0.0
+                    s_closed_prev = False
+                
+                s_net = s_pnl - s_entry_fee - s_exit_fee
+                
+                # Total
+                net_pnl = l_net + s_net
                 
                 sum_returns += net_pnl
                 sum_returns_sq += (net_pnl * net_pnl)
@@ -164,7 +180,7 @@ def optimize_regime_sharpe(opens, highs, lows, closes, smas, target_above_sma):
                         
     return best_tp, best_sl, best_sharpe
 
-def calculate_strategy_hourly(data, tp_above, sl_above, tp_below, sl_below):
+def calculate_strategy_hourly_smart_fees(data, tp_above, sl_above, tp_below, sl_below):
     n = len(data)
     timestamps = data['timestamp'].values
     opens = data['open'].values
@@ -173,12 +189,14 @@ def calculate_strategy_hourly(data, tp_above, sl_above, tp_below, sl_below):
     closes = data['close'].values
     smas = data['sma'].values
     
-    # Cumulative PnL arrays for plotting
     net_equity = np.zeros(n)
-    
     trades = []
     current_cum_pnl = 0.0
     fee_rate = 0.0002
+    
+    # State tracking
+    l_closed_prev = True
+    s_closed_prev = True
     
     # Pre-calc multipliers
     tp_mult_above_l = 1 + tp_above / 100.0
@@ -201,7 +219,7 @@ def calculate_strategy_hourly(data, tp_above, sl_above, tp_below, sl_below):
         
         is_above = op > sma
         
-        # Select Multipliers
+        # Determine Multipliers
         if is_above:
             l_tp_m, l_sl_m = tp_mult_above_l, sl_mult_above_l
             s_tp_m, s_sl_m = tp_mult_above_s, sl_mult_above_s
@@ -209,55 +227,71 @@ def calculate_strategy_hourly(data, tp_above, sl_above, tp_below, sl_below):
             l_tp_m, l_sl_m = tp_mult_below_l, sl_mult_below_l
             s_tp_m, s_sl_m = tp_mult_below_s, sl_mult_below_s
             
-        # --- LONG CALC ---
+        # --- LONG ---
+        l_entry_fee = op * fee_rate if l_closed_prev else 0.0
+        
         l_sl_price = op * l_sl_m
         l_tp_price = op * l_tp_m
         
         l_exit = 0.0
         l_status = ""
+        l_exit_fee = 0.0
         
         if lo <= l_sl_price:
             l_exit = l_sl_price
             l_status = "SL"
+            l_exit_fee = l_sl_price * fee_rate
+            l_closed_prev = True
         elif hi >= l_tp_price:
             l_exit = l_tp_price
             l_status = "TP"
+            l_exit_fee = l_tp_price * fee_rate
+            l_closed_prev = True
         else:
             l_exit = cl
-            l_status = "TIME" # Hourly Close
+            l_status = "TIME"
+            l_exit_fee = 0.0
+            l_closed_prev = False
             
-        l_pnl = (l_exit - op) - (op * fee_rate) - (l_exit * fee_rate)
+        l_pnl = (l_exit - op) - l_entry_fee - l_exit_fee
         
-        # --- SHORT CALC ---
+        # --- SHORT ---
+        s_entry_fee = op * fee_rate if s_closed_prev else 0.0
+        
         s_sl_price = op * s_sl_m
         s_tp_price = op * s_tp_m
         
         s_exit = 0.0
         s_status = ""
+        s_exit_fee = 0.0
         
         if hi >= s_sl_price:
             s_exit = s_sl_price
             s_status = "SL"
+            s_exit_fee = s_sl_price * fee_rate
+            s_closed_prev = True
         elif lo <= s_tp_price:
             s_exit = s_tp_price
             s_status = "TP"
+            s_exit_fee = s_tp_price * fee_rate
+            s_closed_prev = True
         else:
             s_exit = cl
             s_status = "TIME"
+            s_exit_fee = 0.0
+            s_closed_prev = False
             
-        s_pnl = (op - s_exit) - (op * fee_rate) - (s_exit * fee_rate)
+        s_pnl = (op - s_exit) - s_entry_fee - s_exit_fee
         
-        # Net for this candle
+        # Net
         net_pnl = l_pnl + s_pnl
         current_cum_pnl += net_pnl
         net_equity[i] = current_cum_pnl
         
-        # Log Interesting Trades (Only log if NOT Time/Time to reduce spam? 
-        # Or log all? Let's log if at least one side triggered)
+        # Log trades that incurred an action
         if l_status != "TIME" or s_status != "TIME":
              trades.append({
                 'entry_time': pd.to_datetime(ts),
-                'exit_time': pd.to_datetime(ts) + pd.Timedelta(hours=1),
                 'regime': 'Above' if is_above else 'Below',
                 'l_status': l_status,
                 's_status': s_status,
@@ -282,15 +316,9 @@ def index():
         return "Data not loaded", 500
 
     calc_data = df.dropna(subset=['sma']).reset_index(drop=True)
-    net_equity, trades = calculate_strategy_hourly(calc_data, tp_above, sl_above, tp_below, sl_below)
-    
-    # Store equity in DF for plotting convenience
-    # (Creating a temporary copy to avoid global state pollution)
-    plot_df = calc_data.copy()
-    plot_df['net_equity'] = net_equity
+    net_equity, trades = calculate_strategy_hourly_smart_fees(calc_data, tp_above, sl_above, tp_below, sl_below)
     
     rows = ""
-    # Show last 50 triggered trades
     for t in reversed(trades[-50:]):
         color = "#00ff00" if t['pnl'] > 0 else "#ff0000"
         rows += f"""
@@ -320,7 +348,7 @@ def index():
             </style>
             <script>
                 function runOptimization() {{
-                    document.getElementById('optimize-status').innerText = "Optimizing Hourly Reset Strategy... Please wait.";
+                    document.getElementById('optimize-status').innerText = "Optimizing Smart Fee Strategy... Please wait.";
                     fetch('/optimize_split')
                         .then(response => response.json())
                         .then(data => {{
@@ -338,8 +366,8 @@ def index():
         </head>
         <body>
             <div class="container">
-                <h2>ETH/USDT Hourly Reset Strategy</h2>
-                <p>Opens L+S every hour. Closes at TP, SL, or End of Hour.</p>
+                <h2>ETH/USDT Smart Hourly Reset (No Hold Fees)</h2>
+                <p>Positions roll over fee-free if no TP/SL triggered.</p>
                 
                 <form action="/" method="get">
                     <div class="params-box">
@@ -359,13 +387,13 @@ def index():
                     </div>
                 </form>
                 
-                <button onclick="runOptimization()">Run Split Optimization</button>
+                <button onclick="runOptimization()">Run Optimization</button>
                 <div id="optimize-status"></div>
                 
                 <br>
                 <img src="/plot.png?sl_above={sl_above}&tp_above={tp_above}&sl_below={sl_below}&tp_below={tp_below}" style="border: 1px solid #555; max-width: 100%; margin-top: 20px;">
                 
-                <h3>Recent Triggered Events (Non-Time Exits)</h3>
+                <h3>Triggered Trade Events</h3>
                 <div class="scroll-table">
                     <table>
                         <thead>
@@ -373,7 +401,7 @@ def index():
                                 <th>Entry Time</th>
                                 <th>Regime</th>
                                 <th>Status (Long/Short)</th>
-                                <th>Net PnL</th>
+                                <th>Net PnL (w/ Fees)</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -437,7 +465,7 @@ def plot_png():
     if plot_data.empty:
         return "Not enough data", 400
     
-    net_equity, _ = calculate_strategy_hourly(plot_data, tp_a, sl_a, tp_b, sl_b)
+    net_equity, _ = calculate_strategy_hourly_smart_fees(plot_data, tp_a, sl_a, tp_b, sl_b)
     
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), dpi=100, gridspec_kw={'height_ratios': [2, 1]}, sharex=True)
     
@@ -458,7 +486,7 @@ def plot_png():
     ax1.grid(True, alpha=0.2)
     
     ax2.plot(plot_data['timestamp'], net_equity, color='cyan', linewidth=2, label='Net Equity')
-    ax2.set_title(f'Hourly Reset Equity (Cumulative PnL)')
+    ax2.set_title(f'Smart Hourly Reset (Fee on Trigger Only)')
     ax2.set_ylabel('PnL (USDT)')
     ax2.legend(loc='upper left')
     ax2.grid(True, alpha=0.2)
