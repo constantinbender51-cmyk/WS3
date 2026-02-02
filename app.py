@@ -70,35 +70,27 @@ def get_pnl_series(prices, highs, lows, entry_price, is_long, tp_pct, sl_pct):
         hit_sl = highs >= sl_price
         
     # Find first index of exit (if any)
-    # argmax returns 0 if False everywhere, need to check if any True exists
     first_tp_idx = np.argmax(hit_tp) if hit_tp.any() else n
     first_sl_idx = np.argmax(hit_sl) if hit_sl.any() else n
     
     exit_idx = min(first_tp_idx, first_sl_idx)
     
     # Calculate PnL
-    # Before exit: Unrealized PnL
-    # After exit: Realized PnL (constant)
-    
     current_pnl = (prices - entry_price) if is_long else (entry_price - prices)
     
+    # Create a writable copy of the values array
+    pnl_values = current_pnl.values.copy()
+    
     if exit_idx < n:
-        # Determine exit price
-        # If both hit on same candle, assumption: SL hit first (conservative) or TP?
-        # Standard backtest assumption: If Open is closer to SL, SL hit. 
-        # Here we just take the level price.
         if first_sl_idx <= first_tp_idx:
             final_pnl = (sl_price - entry_price) if is_long else (entry_price - sl_price)
         else:
             final_pnl = (tp_price - entry_price) if is_long else (entry_price - tp_price)
             
-        # Overwrite PnL after exit
-        # Using numpy slicing for performance
-        pnl_values = current_pnl.values
+        # Overwrite PnL after exit on the copy
         pnl_values[exit_idx:] = final_pnl
-        return pnl_values
-    else:
-        return current_pnl.values
+        
+    return pnl_values
 
 @app.route('/')
 def index():
