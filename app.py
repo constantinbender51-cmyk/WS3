@@ -62,13 +62,6 @@ def run_backtest(df):
     
     # Active trades list: [entry_price, tp_price, sl_price, direction (1/-1), entry_index]
     active_trades = []
-    closed_pnl = []
-    
-    # Performance optimization: Pre-calculate regimes
-    # Regime 1: Price > SMA (TP=4%, SL=0.5%)
-    # Regime 2: Price <= SMA (TP=4%, SL=3%)
-    # Entry logic: "Every hour place a long and a short"
-    # Using Close of current candle as Entry for next hour's processing
     
     for i in range(n - 1):
         current_close = closes[i]
@@ -93,7 +86,6 @@ def run_backtest(df):
         active_trades.append([current_close, short_tp, short_sl, -1, i])
         
         # Process Active Trades against Next Candle (i+1)
-        next_open = opens[i+1]
         next_high = highs[i+1]
         next_low = lows[i+1]
         
@@ -109,7 +101,6 @@ def run_backtest(df):
             pnl = 0.0
             
             if direction == 1: # Long
-                # Conservative assumption: Check Low (SL) first
                 if next_low <= sl:
                     hit_sl = True
                     pnl = -sl_pct
@@ -117,10 +108,9 @@ def run_backtest(df):
                     hit_tp = True
                     pnl = tp_pct
             else: # Short
-                # Conservative assumption: Check High (SL) first
                 if next_high >= sl:
                     hit_sl = True
-                    pnl = -sl_pct # SL pct is magnitude
+                    pnl = -sl_pct 
                 elif next_low <= tp:
                     hit_tp = True
                     pnl = tp_pct
@@ -133,9 +123,8 @@ def run_backtest(df):
         active_trades = remaining_trades
         equity_curve.append(equity_curve[-1] + hourly_pnl)
 
-    # Align equity curve with dataframe index (offset by 1 due to execution on next candle)
-    # Truncate to match length
-    return times[1:], equity_curve
+    # Return full times array to match equity_curve length (n)
+    return times, equity_curve
 
 class PlotHandler(BaseHTTPRequestHandler):
     def do_GET(self):
