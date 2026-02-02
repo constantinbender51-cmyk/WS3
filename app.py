@@ -18,7 +18,7 @@ class Config:
     START_TIME = "2024-01-01"
     
     # Backtest Settings
-    LEVELS_COUNT = 5        # Increased count slightly for grid density
+    LEVELS_COUNT = 10      # Increased count slightly for grid density
     TRAIN_SPLIT = 0.8 
     ANNUALIZATION_FACTOR = 365 * 6 
     
