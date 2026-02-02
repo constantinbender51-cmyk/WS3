@@ -26,12 +26,16 @@ class Config:
     POPULATION_SIZE = 50
     GENERATIONS = 15
     MUTATION_RATE = 0.2
-    ELITISM_COUNT = 2       # Keep top 2 best performers unchanged
+    ELITISM_COUNT = 2
     
     # GA Mutation/Bound Constraints
     SL_MIN = 0.01           
     SL_MAX = 0.10           
+    TP_MIN = 0.02           # Min Take Profit 2%
+    TP_MAX = 0.30           # Max Take Profit 30%
+    
     SL_MUTATION_SIGMA = 0.01
+    TP_MUTATION_SIGMA = 0.02
     PRICE_MUTATION_PCT = 0.05
     
     # Server Settings
@@ -91,7 +95,7 @@ def fetch_ohlc(symbol, interval, start_str):
 # ==========================================
 # 2. BACKTEST ENGINE
 # ==========================================
-def backtest(df, long_levels, short_levels, stop_loss_pct):
+def backtest(df, long_levels, short_levels, stop_loss_pct, take_profit_pct):
     highs = df["high"].values
     lows = df["low"].values
     times = df["open_time"].values
@@ -116,6 +120,7 @@ def backtest(df, long_levels, short_levels, stop_loss_pct):
                         'entry_price': level,
                         'entry_time': t,
                         'sl_price': level * (1 - stop_loss_pct),
+                        'tp_price': level * (1 + take_profit_pct),
                         'status': 'open'
                     })
 
@@ -127,6 +132,7 @@ def backtest(df, long_levels, short_levels, stop_loss_pct):
                         'entry_price': level,
                         'entry_time': t,
                         'sl_price': level * (1 + stop_loss_pct),
+                        'tp_price': level * (1 - take_profit_pct),
                         'status': 'open'
                     })
         
@@ -134,16 +140,40 @@ def backtest(df, long_levels, short_levels, stop_loss_pct):
         for trade in active_trades[:]:
             pnl = 0.0
             closed = False
+            exit_p = 0.0
             
             if trade['type'] == 'long':
-                if l <= trade['sl_price']:
+                sl_hit = l <= trade['sl_price']
+                tp_hit = h >= trade['tp_price']
+                
+                if sl_hit and tp_hit:
+                    # Conservative: Assume SL hit first in conflicting candle
                     exit_p = trade['sl_price']
+                    pnl = (exit_p - trade['entry_price']) / trade['entry_price']
+                    closed = True
+                elif sl_hit:
+                    exit_p = trade['sl_price']
+                    pnl = (exit_p - trade['entry_price']) / trade['entry_price']
+                    closed = True
+                elif tp_hit:
+                    exit_p = trade['tp_price']
                     pnl = (exit_p - trade['entry_price']) / trade['entry_price']
                     closed = True
             
             elif trade['type'] == 'short':
-                if h >= trade['sl_price']:
+                sl_hit = h >= trade['sl_price']
+                tp_hit = l <= trade['tp_price']
+                
+                if sl_hit and tp_hit:
                     exit_p = trade['sl_price']
+                    pnl = (trade['entry_price'] - exit_p) / trade['entry_price']
+                    closed = True
+                elif sl_hit:
+                    exit_p = trade['sl_price']
+                    pnl = (trade['entry_price'] - exit_p) / trade['entry_price']
+                    closed = True
+                elif tp_hit:
+                    exit_p = trade['tp_price']
                     pnl = (trade['entry_price'] - exit_p) / trade['entry_price']
                     closed = True
             
@@ -178,7 +208,7 @@ def backtest(df, long_levels, short_levels, stop_loss_pct):
     return np.array(equity_curve), trades, equity
 
 # ==========================================
-# 3. GENETIC ALGORITHM (ELITISM + CORRECTED FITNESS)
+# 3. GENETIC ALGORITHM
 # ==========================================
 class GeneticOptimizer:
     def __init__(self, data):
@@ -190,18 +220,20 @@ class GeneticOptimizer:
     def init_population(self):
         pop = []
         for _ in range(Config.POPULATION_SIZE):
+            # Genome: [Longs..., Shorts..., SL, TP]
             longs = np.random.uniform(self.price_min, self.price_max, self.levels_cnt)
             shorts = np.random.uniform(self.price_min, self.price_max, self.levels_cnt)
             sl = np.random.uniform(Config.SL_MIN, Config.SL_MAX)
-            genome = np.concatenate([longs, shorts, [sl]])
+            tp = np.random.uniform(Config.TP_MIN, Config.TP_MAX)
+            
+            genome = np.concatenate([longs, shorts, [sl, tp]])
             pop.append(genome)
         return pop
 
     def calculate_sharpe(self, equity_curve):
         returns = np.diff(equity_curve)
         if len(returns) < 2 or np.std(returns) == 0:
-            return 0.0 # Return 0 instead of massive negative to allow exploration
-            
+            return 0.0 
         mean_ret = np.mean(returns)
         std_ret = np.std(returns)
         sharpe = (mean_ret / std_ret) * np.sqrt(Config.ANNUALIZATION_FACTOR)
@@ -210,21 +242,37 @@ class GeneticOptimizer:
     def fitness(self, genome):
         longs = genome[:self.levels_cnt]
         shorts = genome[self.levels_cnt:2*self.levels_cnt]
-        sl = genome[-1]
+        sl = genome[-2]
+        tp = genome[-1]
         
-        if sl <= 0: return -99.0
+        # Hard Constraints
+        if sl <= 0 or tp <= 0: return -99.0
         
-        equity_curve, _, _ = backtest(self.data, longs, shorts, sl)
+        equity_curve, _, _ = backtest(self.data, longs, shorts, sl, tp)
         return self.calculate_sharpe(equity_curve)
 
     def mutate(self, genome):
         idx = random.randint(0, len(genome)-1)
-        if idx < 2 * self.levels_cnt:
+        
+        # Indices: 0 to 2*CNT-1 are prices. 
+        # 2*CNT is SL. 
+        # 2*CNT+1 is TP.
+        
+        price_cutoff = 2 * self.levels_cnt
+        
+        if idx < price_cutoff:
+            # Price level mutation
             shift = np.random.normal(0, (self.price_max - self.price_min) * Config.PRICE_MUTATION_PCT)
             genome[idx] += shift
-        else:
+        elif idx == price_cutoff:
+            # SL mutation
             genome[idx] += np.random.normal(0, Config.SL_MUTATION_SIGMA)
             genome[idx] = np.clip(genome[idx], 0.001, 0.2)
+        else:
+            # TP mutation
+            genome[idx] += np.random.normal(0, Config.TP_MUTATION_SIGMA)
+            genome[idx] = np.clip(genome[idx], 0.001, 0.5)
+            
         return genome
 
     def crossover(self, p1, p2):
@@ -241,7 +289,6 @@ class GeneticOptimizer:
         for g in range(Config.GENERATIONS):
             scores = [self.fitness(ind) for ind in pop]
             
-            # Identify Best
             max_s = np.max(scores)
             best_idx = np.argmax(scores)
             if max_s > best_score:
@@ -250,12 +297,10 @@ class GeneticOptimizer:
             
             print(f"[GA] Gen {g+1}/{Config.GENERATIONS} | Max Sharpe: {max_s:.4f}")
             
-            # ELITISM: Keep top N strategies specifically to prevent regression
-            sorted_indices = np.argsort(scores)[::-1] # Descending
+            sorted_indices = np.argsort(scores)[::-1]
             new_pop = [pop[i] for i in sorted_indices[:Config.ELITISM_COUNT]]
             
             while len(new_pop) < Config.POPULATION_SIZE:
-                # Tournament Selection
                 p1 = pop[np.argmax([scores[random.randint(0, len(pop)-1)] for _ in range(3)])]
                 p2 = pop[np.argmax([scores[random.randint(0, len(pop)-1)] for _ in range(3)])]
                 c1, c2 = self.crossover(p1, p2)
@@ -335,12 +380,19 @@ def generate_html(trades, pnl, sharpe):
             <h3>Equity Curve</h3><img src="pnl_plot.png" style="max-width:100%">
             <h3>Trade Log</h3>
             <table>
-                <tr><th>Type</th><th>Entry</th><th>Exit</th><th>PnL</th></tr>
+                <tr><th>Type</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Status</th></tr>
     """
     
     for t in trades:
         color = "profit" if t['pnl'] > 0 else "loss"
-        html += f"<tr><td>{t['type']}</td><td>{t['entry_price']:.2f}</td><td>{t['exit_price']:.2f}</td><td class='{color}'>{t['pnl']:.4f}</td></tr>"
+        html += f"""
+        <tr>
+            <td>{t['type']}</td>
+            <td>{t['entry_price']:.2f}</td>
+            <td>{t['exit_price']:.2f}</td>
+            <td class='{color}'>{t['pnl']:.4f}</td>
+            <td>{t['status']}</td>
+        </tr>"""
         
     html += "</table></div></body></html>"
     
@@ -369,19 +421,20 @@ if __name__ == "__main__":
     
     print(f"[SYSTEM] Data Split: Train={len(train_data)}, Test={len(test_data)}")
     
-    print("[SYSTEM] Starting Genetic Optimization (Target: Sharpe Ratio)...")
+    print("[SYSTEM] Starting Genetic Optimization (Target: Sharpe Ratio + TP)...")
     ga = GeneticOptimizer(train_data)
     best_genome = ga.run()
     
     opt_longs = best_genome[:Config.LEVELS_COUNT]
     opt_shorts = best_genome[Config.LEVELS_COUNT:2*Config.LEVELS_COUNT]
-    opt_sl = best_genome[-1]
+    opt_sl = best_genome[-2]
+    opt_tp = best_genome[-1]
     
-    print(f"[RESULT] Optimized Params (Train):\n Longs: {opt_longs}\n Shorts: {opt_shorts}\n SL: {opt_sl:.4f}")
+    print(f"[RESULT] Optimized Params:\n Longs: {opt_longs}\n Shorts: {opt_shorts}")
+    print(f" SL: {opt_sl:.4f} | TP: {opt_tp:.4f}")
     
     print("[SYSTEM] Running Test on Out-of-Sample Data...")
-    # SWAP REVERTED: Standard argument order
-    equity_curve, trades, total_pnl = backtest(test_data, opt_longs, opt_shorts, opt_sl)
+    equity_curve, trades, total_pnl = backtest(test_data, opt_longs, opt_shorts, opt_sl, opt_tp)
     
     test_sharpe = ga.calculate_sharpe(equity_curve)
     print(f"[RESULT] Test Sharpe: {test_sharpe:.4f}")
