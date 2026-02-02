@@ -19,7 +19,7 @@ class Config:
     
     # Backtest Settings
     LEVELS_COUNT = 5        # Increased count slightly for grid density
-    TRAIN_SPLIT = 0.6       
+    TRAIN_SPLIT = 0.8 
     ANNUALIZATION_FACTOR = 365 * 6 
     
     # Genetic Algorithm Settings
