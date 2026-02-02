@@ -50,17 +50,12 @@ class PaperTrader:
         self._execute_trade('long', base_qty, mid, "Entry Long")
         self._execute_trade('short', -base_qty, mid, "Entry Short")
 
-        # 2. Take Profit Ladder (0.12% to 4% - 6 Orders)
-        tp_pcts = np.linspace(0.0012, 0.04, 6)
-        tp_qty = base_qty / 6
+        # 2. Hard Take Profit (2% - Single Order)
+        # Long TP (Sell Limit @ +2%)
+        self.active_orders.append({'scope': 'long', 'side': 'sell', 'type': 'limit', 'price': mid * 1.02, 'size': base_qty})
         
-        # Place Long TPs (Sell Limit)
-        for pct in tp_pcts:
-            self.active_orders.append({'scope': 'long', 'side': 'sell', 'type': 'limit', 'price': mid * (1 + pct), 'size': tp_qty})
-            
-        # Place Short TPs (Buy Limit)
-        for pct in tp_pcts:
-            self.active_orders.append({'scope': 'short', 'side': 'buy', 'type': 'limit', 'price': mid * (1 - pct), 'size': tp_qty})
+        # Short TP (Buy Limit @ -2%)
+        self.active_orders.append({'scope': 'short', 'side': 'buy', 'type': 'limit', 'price': mid * 0.98, 'size': base_qty})
 
         # 3. Hard Stop Loss (5% - Single Order)
         # Long Stop (Sell Stop @ -5%)
@@ -106,7 +101,7 @@ class PaperTrader:
                 if ask <= order['price']:
                     qty = min(order['size'], abs(curr_pos_size))
                     if qty > 1e-9:
-                        self._execute_trade(scope, qty, order['price'], "Short TP")
+                        self._execute_trade(scope, qty, order['price'], "Short TP 2%")
                         executed = True
             
             # Limit Sell (Long TP)
@@ -114,13 +109,12 @@ class PaperTrader:
                 if bid >= order['price']:
                     qty = min(order['size'], abs(curr_pos_size))
                     if qty > 1e-9:
-                        self._execute_trade(scope, -qty, order['price'], "Long TP")
+                        self._execute_trade(scope, -qty, order['price'], "Long TP 2%")
                         executed = True
             
             # Stop Buy (Short Hard Stop)
             elif order['type'] == 'stop' and order['side'] == 'buy':
                 if ask >= order['price']:
-                    # Close entire remaining short position
                     qty = abs(curr_pos_size)
                     if qty > 1e-9:
                         self._execute_trade(scope, qty, order['price'], "Short Stop 5%")
@@ -129,7 +123,6 @@ class PaperTrader:
             # Stop Sell (Long Hard Stop)
             elif order['type'] == 'stop' and order['side'] == 'sell':
                 if bid <= order['price']:
-                    # Close entire remaining long position
                     qty = abs(curr_pos_size)
                     if qty > 1e-9:
                         self._execute_trade(scope, -qty, order['price'], "Long Stop 5%")
@@ -251,7 +244,7 @@ def build_figure(bids, asks, title, log_scale=False, active_orders=None):
     return fig
 
 app.layout = html.Div([
-    html.H2(f"Kraken: {SYMBOL} + Hedge Bot (4H | Stop: 5% or Ratio > 0.1)", style={'textAlign': 'center', 'color': '#eee', 'fontFamily': 'sans-serif'}),
+    html.H2(f"Kraken: {SYMBOL} + Hedge Bot (4H | TP: 2% | SL: 5%)", style={'textAlign': 'center', 'color': '#eee', 'fontFamily': 'sans-serif'}),
     
     html.Div([
         html.Div([
@@ -319,8 +312,6 @@ def update(n):
 
     # 2. Strategy Logic
     trader.check_entry_signal(mid)
-    
-    # Process ticks (Passed avg_60m for conditional stop)
     trader.process_tick(best_bid, best_ask, avg_60m)
     
     stats = trader.get_stats(mid)
