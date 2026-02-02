@@ -65,7 +65,7 @@ def serve_plot(df):
     ])
     
     print("Serving plot on port 8080...")
-    app.run_server(debug=False, port=8080, host='0.0.0.0')
+    app.run(debug=False, port=8080, host='0.0.0.0')
 
 if __name__ == "__main__":
     df = fetch_data()
