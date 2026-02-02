@@ -14,35 +14,29 @@ URL = "https://futures.kraken.com/derivatives/api/v3/orderbook"
 PORT = 8080
 UPDATE_INTERVAL_MS = 5000  # 5 seconds
 MAX_HISTORY = 720  # 60 minutes
-ORDER_USD_VALUE = 1000 # $1000 per side (Long and Short)
+ORDER_USD_VALUE = 1000 
 STRATEGY_INTERVAL_HOURS = 4
 
 # --- Paper Trading Engine (Hedge Mode) ---
 class PaperTrader:
     def __init__(self, initial_balance=10000):
         self.balance = initial_balance
-        
-        # Hedge Mode State
         self.positions = {
             'long': {'size': 0.0, 'entry': 0.0},
             'short': {'size': 0.0, 'entry': 0.0}
         }
-        
         self.realized_pnl = 0.0
         self.fees_paid = 0.0
         self.active_orders = [] 
         self.trade_log = deque(maxlen=50)
         self.last_entry_time = None
 
-        # Cost Model: 0.2% Fee + 0.1% Slippage = 0.3% per side
         self.FEE_RATE = 0.002      
         self.SLIPPAGE_RATE = 0.001 
         self.TOTAL_COST_RATE = self.FEE_RATE + self.SLIPPAGE_RATE 
 
     def check_entry_signal(self, current_price):
         now = datetime.datetime.now()
-        
-        # Check 4-hour Timer
         if self.last_entry_time is None or (now - self.last_entry_time).total_seconds() >= STRATEGY_INTERVAL_HOURS * 3600:
             self._open_positions(current_price)
             self.last_entry_time = now
@@ -50,58 +44,67 @@ class PaperTrader:
         return False
 
     def _open_positions(self, mid):
-        # Calculate Base Size
         base_qty = ORDER_USD_VALUE / mid 
         
-        # 1. Execute Market Entry (Hedge: Long + Short)
+        # 1. Market Entries
         self._execute_trade('long', base_qty, mid, "Entry Long")
         self._execute_trade('short', -base_qty, mid, "Entry Short")
 
-        # 2. Generate Arrays
-        # TP: 0.12% to 4% (6 orders)
+        # 2. Take Profit Ladder (0.12% to 4% - 6 Orders)
         tp_pcts = np.linspace(0.0012, 0.04, 6)
         tp_qty = base_qty / 6
         
-        # SL: 0.12% to 2% (3 orders)
-        sl_pcts = np.linspace(0.0012, 0.02, 3)
-        sl_qty = base_qty / 3
-
-        # 3. Place Long Exits (TP = Sell Limit, SL = Sell Stop)
+        # Place Long TPs (Sell Limit)
         for pct in tp_pcts:
-            price = mid * (1 + pct)
-            self.active_orders.append({'scope': 'long', 'side': 'sell', 'type': 'limit', 'price': price, 'size': tp_qty})
+            self.active_orders.append({'scope': 'long', 'side': 'sell', 'type': 'limit', 'price': mid * (1 + pct), 'size': tp_qty})
             
-        for pct in sl_pcts:
-            price = mid * (1 - pct)
-            self.active_orders.append({'scope': 'long', 'side': 'sell', 'type': 'stop', 'price': price, 'size': sl_qty})
-
-        # 4. Place Short Exits (TP = Buy Limit, SL = Buy Stop)
+        # Place Short TPs (Buy Limit)
         for pct in tp_pcts:
-            price = mid * (1 - pct)
-            self.active_orders.append({'scope': 'short', 'side': 'buy', 'type': 'limit', 'price': price, 'size': tp_qty})
-            
-        for pct in sl_pcts:
-            price = mid * (1 + pct)
-            self.active_orders.append({'scope': 'short', 'side': 'buy', 'type': 'stop', 'price': price, 'size': sl_qty})
+            self.active_orders.append({'scope': 'short', 'side': 'buy', 'type': 'limit', 'price': mid * (1 - pct), 'size': tp_qty})
 
-    def process_tick(self, bid, ask):
+        # 3. Hard Stop Loss (5% - Single Order)
+        # Long Stop (Sell Stop @ -5%)
+        self.active_orders.append({'scope': 'long', 'side': 'sell', 'type': 'stop', 'price': mid * 0.95, 'size': base_qty})
+        
+        # Short Stop (Buy Stop @ +5%)
+        self.active_orders.append({'scope': 'short', 'side': 'buy', 'type': 'stop', 'price': mid * 1.05, 'size': base_qty})
+
+    def close_all(self, bid, ask, reason):
+        """Immediate Market Close for all positions"""
+        # Close Long (Sell at Bid)
+        if self.positions['long']['size'] > 1e-9:
+            self._execute_trade('long', -self.positions['long']['size'], bid, reason)
+        
+        # Close Short (Buy at Ask)
+        if abs(self.positions['short']['size']) > 1e-9:
+            # Short size is negative, so we pass positive size to buy/close
+            self._execute_trade('short', abs(self.positions['short']['size']), ask, reason)
+            
+        self.active_orders = []
+
+    def process_tick(self, bid, ask, avg_60m):
+        # 1. Check Signal Stop (Ratio > 0.1 ABS)
+        if abs(avg_60m) > 0.1:
+            if abs(self.positions['long']['size']) > 1e-9 or abs(self.positions['short']['size']) > 1e-9:
+                self.close_all(bid, ask, f"Ratio Stop ({avg_60m:.2f})")
+            return
+
+        # 2. Process Pending Orders
         filled_indices = []
-
         for i, order in enumerate(self.active_orders):
             executed = False
             scope = order['scope']
-            # Safety check: if position closed, cancel remaining orders for that scope (optional, but good practice)
-            # Keeping it simple: Allow orders to execute if position exists
-            
             curr_pos_size = self.positions[scope]['size']
+            
+            # Orphan check
             if abs(curr_pos_size) < 1e-9:
-                filled_indices.append(i) # Cancel orphaned orders
+                filled_indices.append(i)
                 continue
 
             # Limit Buy (Short TP)
             if order['type'] == 'limit' and order['side'] == 'buy':
                 if ask <= order['price']:
-                    qty = min(order['size'], abs(curr_pos_size)) # Cap at remaining pos
+                    qty = min(order['size'], abs(curr_pos_size))
                     if qty > 1e-9:
                         self._execute_trade(scope, qty, order['price'], "Short TP")
                         executed = True
@@ -114,20 +117,22 @@ class PaperTrader:
                         self._execute_trade(scope, -qty, order['price'], "Long TP")
                         executed = True
             
-            # Stop Buy (Short SL)
+            # Stop Buy (Short Hard Stop)
             elif order['type'] == 'stop' and order['side'] == 'buy':
                 if ask >= order['price']:
-                    qty = min(order['size'], abs(curr_pos_size))
+                    # Close entire remaining short position
+                    qty = abs(curr_pos_size)
                     if qty > 1e-9:
-                        self._execute_trade(scope, qty, order['price'], "Short SL")
+                        self._execute_trade(scope, qty, order['price'], "Short Stop 5%")
                         executed = True 
             
-            # Stop Sell (Long SL)
+            # Stop Sell (Long Hard Stop)
             elif order['type'] == 'stop' and order['side'] == 'sell':
                 if bid <= order['price']:
-                    qty = min(order['size'], abs(curr_pos_size))
+                    # Close entire remaining long position
+                    qty = abs(curr_pos_size)
                     if qty > 1e-9:
-                        self._execute_trade(scope, -qty, order['price'], "Long SL")
+                        self._execute_trade(scope, -qty, order['price'], "Long Stop 5%")
                         executed = True
 
             if executed:
@@ -137,7 +142,6 @@ class PaperTrader:
             del self.active_orders[i]
 
     def _execute_trade(self, scope, size, price, reason):
-        # 1. Transaction Cost
         trade_value = abs(size * price) 
         cost = trade_value * self.TOTAL_COST_RATE 
         self.fees_paid += cost
@@ -147,41 +151,31 @@ class PaperTrader:
         old_size = pos_data['size']
         old_entry = pos_data['entry']
 
-        # 2. Logic for Hedge Buckets
-        # If increasing position (Long buy or Short sell)
+        # Increase Position
         if (scope == 'long' and size > 0) or (scope == 'short' and size < 0):
             new_size = old_size + size
-            # Update weighted average entry
             if abs(new_size) > 1e-9:
                 total_cost = (old_size * old_entry) + (size * price)
                 pos_data['entry'] = total_cost / new_size
             pos_data['size'] = new_size
             
-        # If decreasing position (Long sell or Short buy) -> Realize PnL
+        # Decrease Position (Realize PnL)
         else:
             closing_qty = min(abs(size), abs(old_size))
             pnl = (price - old_entry) * closing_qty
-            
-            # Inverse PnL for shorts
-            if scope == 'short': 
-                pnl = -pnl # (Entry - Exit) * Qty, but here formulation is (Exit - Entry) * Qty
-                # Short: Entry 50k, Exit 40k. Price - Entry = -10k. Qty (pos) is negative? 
-                # Let's standardize: 
-                # Long: (Exit - Entry) * Qty
-                # Short: (Entry - Exit) * Qty
+            if scope == 'short': pnl = -pnl 
             
             self.realized_pnl += pnl
             self.balance += pnl
+            pos_data['size'] += size 
             
-            pos_data['size'] += size # size is negative for sell, positive for buy
             if abs(pos_data['size']) < 1e-9:
                 pos_data['size'] = 0.0
                 pos_data['entry'] = 0.0
 
-        self.trade_log.append(f"[{scope.upper()}] {reason} | {size:+.4f} @ {price:.2f} | PnL: {self.realized_pnl:.2f}")
+        self.trade_log.append(f"[{scope.upper()}] {reason} | {size:+.4f} @ {price:.2f}")
 
     def get_stats(self, current_price):
-        # Calculate Unrealized PnL for both buckets
         unrealized_long = 0.0
         unrealized_short = 0.0
         
@@ -189,16 +183,11 @@ class PaperTrader:
             unrealized_long = (current_price - self.positions['long']['entry']) * self.positions['long']['size']
             
         if abs(self.positions['short']['size']) > 1e-9:
-            # Short PnL: (Entry - Current) * Abs(Size) 
-            # OR: (Current - Entry) * NegativeSize
             unrealized_short = (current_price - self.positions['short']['entry']) * self.positions['short']['size']
 
         total_unrealized = unrealized_long + unrealized_short
-        net_position = self.positions['long']['size'] + self.positions['short']['size'] # Should be near 0 if perfectly hedged initially
-
         return {
             'balance': self.balance,
-            'position': net_position, # Net exposure
             'long_pos': self.positions['long']['size'],
             'short_pos': self.positions['short']['size'],
             'realized': self.realized_pnl,
@@ -236,7 +225,6 @@ def process_data(order_book):
 
 def build_figure(bids, asks, title, log_scale=False, active_orders=None):
     fig = go.Figure()
-
     fig.add_trace(go.Scatter(x=bids['price'], y=bids['cumulative'], fill='tozeroy', name='Bids', line=dict(color='green')))
     fig.add_trace(go.Scatter(x=asks['price'], y=asks['cumulative'], fill='tozeroy', name='Asks', line=dict(color='red')))
 
@@ -244,7 +232,6 @@ def build_figure(bids, asks, title, log_scale=False, active_orders=None):
         y_max = max(bids['cumulative'].max(), asks['cumulative'].max())
         y_level = y_max * 0.5
         
-        # Color code by Scope
         for o in active_orders:
             color = 'cyan' if o['scope'] == 'long' else 'orange'
             symbol = 'triangle-up' if o['side'] == 'buy' else 'triangle-down'
@@ -253,12 +240,9 @@ def build_figure(bids, asks, title, log_scale=False, active_orders=None):
                 color = 'magenta'
             
             fig.add_trace(go.Scatter(
-                x=[o['price']], 
-                y=[y_level], 
-                mode='markers', 
+                x=[o['price']], y=[y_level], mode='markers', 
                 marker=dict(symbol=symbol, size=10, color=color), 
-                name=f"{o['scope']} {o['type']}",
-                showlegend=False
+                name=f"{o['scope']} {o['type']}", showlegend=False
             ))
 
     layout_args = dict(title=title, xaxis_title="Price", yaxis_title="Vol", template="plotly_dark", height=400, margin=dict(l=40, r=40, t=40, b=40))
@@ -267,9 +251,8 @@ def build_figure(bids, asks, title, log_scale=False, active_orders=None):
     return fig
 
 app.layout = html.Div([
-    html.H2(f"Kraken: {SYMBOL} + Hedge Bot (4H)", style={'textAlign': 'center', 'color': '#eee', 'fontFamily': 'sans-serif'}),
+    html.H2(f"Kraken: {SYMBOL} + Hedge Bot (4H | Stop: 5% or Ratio > 0.1)", style={'textAlign': 'center', 'color': '#eee', 'fontFamily': 'sans-serif'}),
     
-    # --- Paper Trading Account Panel ---
     html.Div([
         html.Div([
             html.H4("Equity", style={'margin': '0', 'color': '#aaa'}),
@@ -293,7 +276,6 @@ app.layout = html.Div([
         ], style={'flex': 1, 'textAlign': 'center', 'borderLeft': '1px solid #444'}),
     ], style={'display': 'flex', 'backgroundColor': '#222', 'marginBottom': '20px', 'padding': '10px', 'borderRadius': '8px'}),
 
-    # --- Metrics ---
     html.Div([
         html.Div([html.H5("Current Ratio"), html.H3(id='ratio-val')], style={'display': 'inline-block', 'width': '45%', 'textAlign': 'center', 'color': '#ccc'}),
         html.Div([html.H5("60m Avg Ratio"), html.H3(id='avg-val')], style={'display': 'inline-block', 'width': '45%', 'textAlign': 'center', 'color': '#ccc'})
@@ -323,11 +305,9 @@ def update(n):
     best_ask = asks['price'].iloc[0]
     mid = (best_bid + best_ask) / 2
 
-    # 1. Calc Ratio (Kept for visualization, disconnected from logic)
+    # 1. Calc Ratio
     b_sub = bids[bids['price'] >= mid * 0.98]
     a_sub = asks[asks['price'] <= mid * 1.02]
-    
-    # 10% Depth
     b_10 = bids[bids['price'] >= mid * 0.90]
     a_10 = asks[asks['price'] <= mid * 1.10]
     
@@ -337,11 +317,12 @@ def update(n):
     ratio_history.append(ratio)
     avg_60m = statistics.mean(ratio_history) if ratio_history else 0
 
-    # 2. Strategy Logic (4H Interval)
-    entered = trader.check_entry_signal(mid)
+    # 2. Strategy Logic
+    trader.check_entry_signal(mid)
     
-    # Processing
-    trader.process_tick(best_bid, best_ask)
+    # Process ticks (Passed avg_60m for conditional stop)
+    trader.process_tick(best_bid, best_ask, avg_60m)
+    
     stats = trader.get_stats(mid)
 
     pnl_col = {'color': '#2ECC40'} if stats['unrealized'] >= 0 else {'color': '#FF4136'}
