@@ -1,150 +1,169 @@
-import ccxt
+import http.server
+import socketserver
+import requests
 import pandas as pd
 import numpy as np
-import pygad
-import time
+import matplotlib.pyplot as plt
+import io
+import base64
 from datetime import datetime, timedelta
 
 # ==========================================
-# 1. Fetch Data
+# 1. Data Fetching (Binance API via requests)
 # ==========================================
-def fetch_data():
-    exchange = ccxt.binance()
-    symbol = 'ETH/USDT'
-    timeframe = '1h'
+def get_binance_data():
+    base_url = "https://api.binance.com/api/v3/klines"
+    # Fetch approx 30 days of 1h data (24 * 30 = 720 candles). Limit 1000 is sufficient.
+    params = {
+        'symbol': 'ETHUSDT',
+        'interval': '1h',
+        'limit': 1000
+    }
+    response = requests.get(base_url, params=params)
+    data = response.json()
     
-    # Calculate timestamp for 30 days ago
-    since = exchange.parse8601((datetime.now() - timedelta(days=30)).isoformat())
+    df = pd.DataFrame(data, columns=[
+        'open_time', 'open', 'high', 'low', 'close', 'volume',
+        'close_time', 'q_vol', 'num_trades', 'tbb_base', 'tbb_quote', 'ignore'
+    ])
     
-    all_ohlcv = []
-    while True:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
-        if not ohlcv:
-            break
-        since = ohlcv[-1][0] + 1
-        all_ohlcv += ohlcv
-        if len(ohlcv) < 1000:
-            break
+    # Convert to floats
+    cols = ['open', 'high', 'low', 'close']
+    df[cols] = df[cols].astype(float)
+    df['timestamp'] = pd.to_datetime(df['open_time'], unit='ms')
+    
+    # Filter last 30 days
+    cutoff = datetime.now() - timedelta(days=30)
+    df = df[df['timestamp'] > cutoff].reset_index(drop=True)
+    
+    return df
+
+# ==========================================
+# 2. Vectorized Backtesting Engine
+# ==========================================
+def backtest(df, sl_pct, tp_pct):
+    open_arr = df['open'].values
+    high_arr = df['high'].values
+    low_arr = df['low'].values
+    close_arr = df['close'].values
+    
+    # -- Long --
+    long_tp = open_arr * (1 + tp_pct)
+    long_sl = open_arr * (1 - sl_pct)
+    
+    # Logic: Assume SL hit first if both in range (Conservative)
+    l_hit_sl = low_arr <= long_sl
+    l_hit_tp = high_arr >= long_tp
+    
+    # PnL logic
+    l_pnl = (close_arr - open_arr) / open_arr # Default: Close
+    l_pnl = np.where(l_hit_sl, -sl_pct, l_pnl) # SL overrides Close
+    l_pnl = np.where(l_hit_tp & ~l_hit_sl, tp_pct, l_pnl) # TP overrides Close if no SL
+    
+    # -- Short --
+    short_tp = open_arr * (1 - tp_pct)
+    short_sl = open_arr * (1 + sl_pct)
+    
+    s_hit_sl = high_arr >= short_sl
+    s_hit_tp = low_arr <= short_tp
+    
+    s_pnl = (open_arr - close_arr) / open_arr
+    s_pnl = np.where(s_hit_sl, -sl_pct, s_pnl)
+    s_pnl = np.where(s_hit_tp & ~s_hit_sl, tp_pct, s_pnl)
+    
+    # Combined returns
+    return l_pnl + s_pnl
+
+# ==========================================
+# 3. Grid Search Optimization
+# ==========================================
+def optimize_strategy(df):
+    best_sharpe = -999
+    best_params = (0, 0)
+    best_curve = []
+    
+    # Search space: 0.1% to 5.0%
+    range_pct = np.linspace(0.001, 0.05, 50) 
+    
+    # Iterate grid
+    for sl in range_pct:
+        for tp in range_pct:
+            returns = backtest(df, sl, tp)
             
-    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    
-    # Return numpy arrays for speed in backtesting
-    return df['open'].values, df['high'].values, df['low'].values, df['close'].values
+            if np.std(returns) == 0:
+                continue
+                
+            sharpe = (np.mean(returns) / np.std(returns)) * np.sqrt(24 * 365)
+            
+            if sharpe > best_sharpe:
+                best_sharpe = sharpe
+                best_params = (sl, tp)
+                best_curve = np.cumsum(returns)
+                
+    return best_params, best_sharpe, best_curve
 
 # ==========================================
-# 2. Backtest Engine (Vectorized)
+# 4. HTTP Server Handler
 # ==========================================
-def run_strategy(solution, open_arr, high_arr, low_arr, close_arr):
-    """
-    Simulates placing a Long and Short every hour.
-    Exit Logic:
-    - Long: TP at Open * (1 + tp_pct), SL at Open * (1 - sl_pct)
-    - Short: TP at Open * (1 - tp_pct), SL at Open * (1 + sl_pct)
-    - Time Exit: If neither hit, close at candle Close.
-    - Constraint: If Low <= SL and High >= TP in same candle, assume SL hit first (conservative).
-    """
-    sl_pct, tp_pct = solution[0], solution[1]
-    
-    # --- LONG POSITIONS ---
-    long_tp_price = open_arr * (1 + tp_pct)
-    long_sl_price = open_arr * (1 - sl_pct)
-    
-    # Check hits
-    long_hit_sl = low_arr <= long_sl_price
-    long_hit_tp = high_arr >= long_tp_price
-    
-    # Result calculation
-    # Default: Close at market close
-    long_pnl = (close_arr - open_arr) / open_arr
-    
-    # Overwrite with TP/SL logic
-    # Priority: SL hit (conservative assumption) -> then TP -> else Market Close
-    # If SL hit: Return is -SL%
-    long_pnl = np.where(long_hit_sl, -sl_pct, long_pnl)
-    # If TP hit AND NOT SL hit: Return is +TP%
-    long_pnl = np.where(long_hit_tp & (~long_hit_sl), tp_pct, long_pnl)
-
-    # --- SHORT POSITIONS ---
-    short_tp_price = open_arr * (1 - tp_pct)
-    short_sl_price = open_arr * (1 + sl_pct)
-    
-    short_hit_sl = high_arr >= short_sl_price
-    short_hit_tp = low_arr <= short_tp_price
-    
-    # Default: Close at market close (inverse logic for short)
-    short_pnl = (open_arr - close_arr) / open_arr
-    
-    # Overwrite
-    short_pnl = np.where(short_hit_sl, -sl_pct, short_pnl)
-    short_pnl = np.where(short_hit_tp & (~short_hit_sl), tp_pct, short_pnl)
-    
-    # Combine Returns (Hourly rebalance implies sum of returns)
-    total_returns = long_pnl + short_pnl
-    
-    return total_returns
-
-def calculate_sharpe(returns):
-    if np.std(returns) == 0:
-        return -9999
-    # Annualized Sharpe (assuming hourly data: 24 * 365)
-    sharpe = (np.mean(returns) / np.std(returns)) * np.sqrt(24 * 365)
-    return sharpe
+class BacktestHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            # Run Logic
+            df = get_binance_data()
+            (best_sl, best_tp), sharpe, curve = optimize_strategy(df)
+            
+            # Generate Plot
+            plt.figure(figsize=(10, 6))
+            plt.plot(curve, label=f'Best Strategy (SL={best_sl*100:.1f}%, TP={best_tp*100:.1f}%)')
+            plt.title(f'ETH/USDT 30D Hourly Volatility Strategy\nSharpe: {sharpe:.2f}')
+            plt.xlabel('Hours')
+            plt.ylabel('Cumulative Return (Unleveraged)')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            
+            # Save to buffer
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png')
+            buf.seek(0)
+            img_base64 = base64.b64encode(buf.read()).decode('utf-8')
+            plt.close()
+            
+            # Generate HTML
+            html = f"""
+            <html>
+            <head><title>Bot Results</title></head>
+            <body style="font-family: monospace; padding: 20px; background: #f0f0f0;">
+                <h1>Optimization Results</h1>
+                <div style="background: white; padding: 20px; border-radius: 5px;">
+                    <h3>Parameters</h3>
+                    <ul>
+                        <li><b>Stop Loss:</b> {best_sl*100:.2f}%</li>
+                        <li><b>Take Profit:</b> {best_tp*100:.2f}%</li>
+                        <li><b>Max Sharpe Ratio:</b> {sharpe:.4f}</li>
+                    </ul>
+                    <h3>Visualization</h3>
+                    <img src="data:image/png;base64,{img_base64}" />
+                </div>
+            </body>
+            </html>
+            """
+            
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(html.encode('utf-8'))
+            
+        except Exception as e:
+            self.send_response(500)
+            self.wfile.write(str(e).encode('utf-8'))
 
 # ==========================================
-# 3. Genetic Algorithm Optimization
+# 5. Main Execution
 # ==========================================
-# Load data once globally to avoid passing large arrays repeatedly
-try:
-    OPEN, HIGH, LOW, CLOSE = fetch_data()
-    print(f"Fetched {len(OPEN)} candles.")
-except Exception as e:
-    print(f"Data fetch failed: {e}")
-    exit()
-
-def fitness_func(ga_instance, solution, solution_idx):
-    # Genes: [SL_pct, TP_pct]
-    # Penalize negative SL/TP or illogical values
-    if solution[0] <= 0 or solution[1] <= 0:
-        return -9999
+if __name__ == "__main__":
+    PORT = 8080
+    Handler = BacktestHandler
     
-    returns = run_strategy(solution, OPEN, HIGH, LOW, CLOSE)
-    sharpe = calculate_sharpe(returns)
-    return sharpe
-
-# Configuration
-fitness_function = fitness_func
-num_generations = 30
-num_parents_mating = 4
-sol_per_pop = 20
-num_genes = 2
-
-# Gene space: SL and TP between 0.1% and 10%
-gene_space = [{'low': 0.001, 'high': 0.1}, {'low': 0.001, 'high': 0.1}]
-
-ga_instance = pygad.GA(
-    num_generations=num_generations,
-    num_parents_mating=num_parents_mating,
-    fitness_func=fitness_function,
-    sol_per_pop=sol_per_pop,
-    num_genes=num_genes,
-    gene_space=gene_space,
-    parent_selection_type="rws",
-    keep_parents=1,
-    crossover_type="single_point",
-    mutation_type="random",
-    mutation_percent_genes=10
-)
-
-print("Starting optimization...")
-ga_instance.run()
-
-# ==========================================
-# Output
-# ==========================================
-solution, solution_fitness, solution_idx = ga_instance.best_solution()
-print("\n--- Optimization Results ---")
-print(f"Best Solution Parameters:")
-print(f"  SL: {solution[0]*100:.2f}%")
-print(f"  TP: {solution[1]*100:.2f}%")
-print(f"Max Annualized Sharpe Ratio: {solution_fitness:.4f}")
+    print(f"Serving visualization on http://localhost:{PORT}")
+    with socketserver.TCPServer(("", PORT), Handler) as httpd:
+        httpd.serve_forever()
