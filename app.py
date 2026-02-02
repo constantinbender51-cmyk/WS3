@@ -15,11 +15,13 @@ class Config:
     # Exchange Settings
     SYMBOL = "BTCUSDT"
     INTERVAL = "4h"
-    START_TIME = "2024-01-01"
+    START_TIME = "2024-01-01"  # Updated to 2024
     
     # Backtest Settings
-    LEVELS_COUNT = 3        # Number of Long and Short levels (each)
-    TRAIN_SPLIT = 0.6       # Data split (0.6 = 60% training)
+    LEVELS_COUNT = 3        
+    TRAIN_SPLIT = 0.6       
+    RISK_FREE_RATE = 0.0    
+    ANNUALIZATION_FACTOR = 365 * 6 
     
     # Genetic Algorithm Settings
     POPULATION_SIZE = 50
@@ -27,10 +29,10 @@ class Config:
     MUTATION_RATE = 0.2
     
     # GA Mutation/Bound Constraints
-    SL_MIN = 0.01           # 1% Stop Loss Min
-    SL_MAX = 0.10           # 10% Stop Loss Max
+    SL_MIN = 0.01           
+    SL_MAX = 0.10           
     SL_MUTATION_SIGMA = 0.01
-    PRICE_MUTATION_PCT = 0.05  # Percentage of price range for mutation std dev
+    PRICE_MUTATION_PCT = 0.05
     
     # Server Settings
     PORT = 8080
@@ -176,7 +178,7 @@ def backtest(df, long_levels, short_levels, stop_loss_pct):
     return np.array(equity_curve), trades, equity
 
 # ==========================================
-# 3. GENETIC ALGORITHM
+# 3. GENETIC ALGORITHM (SHARPE OPTIMIZED)
 # ==========================================
 class GeneticOptimizer:
     def __init__(self, data):
@@ -195,6 +197,15 @@ class GeneticOptimizer:
             pop.append(genome)
         return pop
 
+    def calculate_sharpe(self, equity_curve):
+        returns = np.diff(equity_curve)
+        if np.std(returns) == 0:
+            return -9999.0
+        mean_ret = np.mean(returns)
+        std_ret = np.std(returns)
+        sharpe = (mean_ret / std_ret) * np.sqrt(Config.ANNUALIZATION_FACTOR)
+        return sharpe
+
     def fitness(self, genome):
         longs = genome[:self.levels_cnt]
         shorts = genome[self.levels_cnt:2*self.levels_cnt]
@@ -202,17 +213,19 @@ class GeneticOptimizer:
         
         if sl <= 0: return -9999.0
         
-        _, _, total_pnl = backtest(self.data, longs, shorts, sl)
-        return total_pnl
+        equity_curve, _, total_pnl = backtest(self.data, longs, shorts, sl)
+        
+        if total_pnl < 0:
+            return -100.0 + total_pnl
+            
+        return self.calculate_sharpe(equity_curve)
 
     def mutate(self, genome):
         idx = random.randint(0, len(genome)-1)
         if idx < 2 * self.levels_cnt:
-            # Price level mutation
             shift = np.random.normal(0, (self.price_max - self.price_min) * Config.PRICE_MUTATION_PCT)
             genome[idx] += shift
         else:
-            # SL mutation
             genome[idx] += np.random.normal(0, Config.SL_MUTATION_SIGMA)
             genome[idx] = np.clip(genome[idx], 0.001, 0.2)
         return genome
@@ -236,19 +249,15 @@ class GeneticOptimizer:
                 best_score = max_s
                 best_genome = pop[np.argmax(scores)]
             
-            print(f"[GA] Gen {g+1}/{Config.GENERATIONS} | Max PnL: {max_s:.4f}")
+            print(f"[GA] Gen {g+1}/{Config.GENERATIONS} | Max Sharpe: {max_s:.4f}")
             
             new_pop = []
             while len(new_pop) < Config.POPULATION_SIZE:
-                # Tournament Selection
                 p1 = pop[np.argmax([scores[random.randint(0, len(pop)-1)] for _ in range(3)])]
                 p2 = pop[np.argmax([scores[random.randint(0, len(pop)-1)] for _ in range(3)])]
-                
                 c1, c2 = self.crossover(p1, p2)
-                
                 if random.random() < Config.MUTATION_RATE: c1 = self.mutate(c1)
                 if random.random() < Config.MUTATION_RATE: c2 = self.mutate(c2)
-                
                 new_pop.extend([c1, c2])
             
             pop = new_pop[:Config.POPULATION_SIZE]
@@ -286,7 +295,7 @@ def generate_plots(df, trades, equity_curve, long_levels, short_levels):
         plt.scatter([t['exit_time'] for t in short_entries], [t['exit_price'] for t in short_entries], 
                     marker='x', color='black', s=30)
                     
-    plt.title(f"Strategy Execution: {Config.SYMBOL}")
+    plt.title(f"Strategy Execution: {Config.SYMBOL} (Reversed Levels)")
     plt.grid(True, alpha=0.3)
     plt.savefig(f"{Config.OUTPUT_DIR}/price_plot.png")
     plt.close()
@@ -299,7 +308,7 @@ def generate_plots(df, trades, equity_curve, long_levels, short_levels):
     plt.savefig(f"{Config.OUTPUT_DIR}/pnl_plot.png")
     plt.close()
 
-def generate_html(trades, pnl):
+def generate_html(trades, pnl, sharpe):
     html = f"""
     <html>
     <head>
@@ -316,8 +325,9 @@ def generate_html(trades, pnl):
     </head>
     <body>
         <div class="container">
-            <h1>Strategy Report: {Config.SYMBOL}</h1>
+            <h1>Strategy Report: {Config.SYMBOL} (Reversed Test)</h1>
             <h2>Total PnL: <span class="{ 'profit' if pnl > 0 else 'loss' }">{pnl:.4f} R</span></h2>
+            <h2>Sharpe Ratio: {sharpe:.4f}</h2>
             <h3>Price Action</h3><img src="price_plot.png" style="max-width:100%">
             <h3>Equity Curve</h3><img src="pnl_plot.png" style="max-width:100%">
             <h3>Trade Log</h3>
@@ -356,7 +366,7 @@ if __name__ == "__main__":
     
     print(f"[SYSTEM] Data Split: Train={len(train_data)}, Test={len(test_data)}")
     
-    print("[SYSTEM] Starting Genetic Optimization...")
+    print("[SYSTEM] Starting Genetic Optimization (Target: Sharpe Ratio)...")
     ga = GeneticOptimizer(train_data)
     best_genome = ga.run()
     
@@ -364,12 +374,17 @@ if __name__ == "__main__":
     opt_shorts = best_genome[Config.LEVELS_COUNT:2*Config.LEVELS_COUNT]
     opt_sl = best_genome[-1]
     
-    print(f"[RESULT] Optimized Params:\n Longs: {opt_longs}\n Shorts: {opt_shorts}\n SL: {opt_sl:.4f}")
+    print(f"[RESULT] Optimized Params (Train):\n Longs: {opt_longs}\n Shorts: {opt_shorts}\n SL: {opt_sl:.4f}")
     
-    print("[SYSTEM] Running Test on Out-of-Sample Data...")
-    equity_curve, trades, total_pnl = backtest(test_data, opt_longs, opt_shorts, opt_sl)
+    print("[SYSTEM] Running Test on Out-of-Sample Data (Reversed Levels)...")
+    # SWAPPED: Passing opt_shorts as long_levels, and opt_longs as short_levels
+    equity_curve, trades, total_pnl = backtest(test_data, opt_shorts, opt_longs, opt_sl)
     
-    generate_plots(test_data, trades, equity_curve, opt_longs, opt_shorts)
-    generate_html(trades, total_pnl)
+    test_sharpe = ga.calculate_sharpe(equity_curve)
+    print(f"[RESULT] Test Sharpe: {test_sharpe:.4f}")
+
+    # Pass reversed levels to plotter so the visual matches the execution
+    generate_plots(test_data, trades, equity_curve, opt_shorts, opt_longs)
+    generate_html(trades, total_pnl, test_sharpe)
     
     serve_results()
