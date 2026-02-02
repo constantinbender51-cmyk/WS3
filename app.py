@@ -44,53 +44,90 @@ def fetch_data():
     data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
     return data
 
-def get_pnl_series(prices, highs, lows, entry_price, is_long, tp_pct, sl_pct):
+def calculate_continuous_equity(data, tp_pct, sl_pct):
     """
-    Calculates PnL series for a single leg handling TP/SL exits.
-    Returns: Series of PnL values over time.
+    Simulates continuous trading for Long and Short legs independently.
+    If a leg hits TP/SL, it closes and re-opens on the next candle's Open.
     """
-    n = len(prices)
-    if n == 0:
-        return np.zeros(0)
-
-    tp_mult = (1 + tp_pct/100) if is_long else (1 - tp_pct/100)
-    sl_mult = (1 - sl_pct/100) if is_long else (1 + sl_pct/100)
+    n = len(data)
+    opens = data['open'].values
+    highs = data['high'].values
+    lows = data['low'].values
+    closes = data['close'].values
     
-    tp_price = entry_price * tp_mult
-    sl_price = entry_price * sl_mult
+    # Storage for equity curves
+    long_equity = np.zeros(n)
+    short_equity = np.zeros(n)
     
-    # Identify exit points
-    if is_long:
-        # Long: High hits TP, Low hits SL
-        hit_tp = highs >= tp_price
-        hit_sl = lows <= sl_price
-    else:
-        # Short: Low hits TP, High hits SL
-        hit_tp = lows <= tp_price
-        hit_sl = highs >= sl_price
+    # State variables
+    # Long
+    long_active = False
+    long_entry = 0.0
+    long_realized = 0.0
+    
+    # Short
+    short_active = False
+    short_entry = 0.0
+    short_realized = 0.0
+    
+    # Multipliers
+    long_tp_mult = 1 + tp_pct / 100.0
+    long_sl_mult = 1 - sl_pct / 100.0
+    short_tp_mult = 1 - tp_pct / 100.0
+    short_sl_mult = 1 + sl_pct / 100.0
+    
+    for i in range(n):
+        current_open = opens[i]
+        current_high = highs[i]
+        current_low = lows[i]
+        current_close = closes[i]
         
-    # Find first index of exit (if any)
-    first_tp_idx = np.argmax(hit_tp) if hit_tp.any() else n
-    first_sl_idx = np.argmax(hit_sl) if hit_sl.any() else n
-    
-    exit_idx = min(first_tp_idx, first_sl_idx)
-    
-    # Calculate PnL
-    current_pnl = (prices - entry_price) if is_long else (entry_price - prices)
-    
-    # Create a writable copy of the values array
-    pnl_values = current_pnl.values.copy()
-    
-    if exit_idx < n:
-        if first_sl_idx <= first_tp_idx:
-            final_pnl = (sl_price - entry_price) if is_long else (entry_price - sl_price)
-        else:
-            final_pnl = (tp_price - entry_price) if is_long else (entry_price - tp_price)
+        # --- LONG LEG ---
+        if not long_active:
+            long_entry = current_open
+            long_active = True
             
-        # Overwrite PnL after exit on the copy
-        pnl_values[exit_idx:] = final_pnl
+        # Check TP/SL
+        l_tp_price = long_entry * long_tp_mult
+        l_sl_price = long_entry * long_sl_mult
         
-    return pnl_values
+        # Determine if hit (Assuming SL hit first if both in range for safety)
+        if current_low <= l_sl_price:
+            long_realized += (l_sl_price - long_entry)
+            long_active = False # Will re-open next iteration (i+1)
+            long_val = long_realized
+        elif current_high >= l_tp_price:
+            long_realized += (l_tp_price - long_entry)
+            long_active = False
+            long_val = long_realized
+        else:
+            # Mark to Market
+            long_val = long_realized + (current_close - long_entry)
+            
+        long_equity[i] = long_val
+        
+        # --- SHORT LEG ---
+        if not short_active:
+            short_entry = current_open
+            short_active = True
+            
+        s_tp_price = short_entry * short_tp_mult
+        s_sl_price = short_entry * short_sl_mult
+        
+        if current_high >= s_sl_price:
+            short_realized += (short_entry - s_sl_price)
+            short_active = False
+            short_val = short_realized
+        elif current_low <= s_tp_price:
+            short_realized += (short_entry - s_tp_price)
+            short_active = False
+            short_val = short_realized
+        else:
+            short_val = short_realized + (short_entry - current_close)
+            
+        short_equity[i] = short_val
+        
+    return long_equity, short_equity
 
 @app.route('/')
 def index():
@@ -100,7 +137,8 @@ def index():
     html = f"""
     <html>
         <body style="font-family: monospace; background: #222; color: #ddd; text-align: center;">
-            <h2>ETH/USDT Simultaneous Long + Short Strategy</h2>
+            <h2>ETH/USDT Continuous Hedge Strategy</h2>
+            <p>Logic: Always in Long + Short. If TP/SL hit, re-open next hour.</p>
             <form action="/" method="get" style="margin-bottom: 20px; padding: 10px; background: #333; display: inline-block; border-radius: 5px;">
                 <label>Stop Loss (%): <input type="number" step="0.1" name="sl" value="{sl}" style="width: 60px;"></label>
                 <label style="margin-left: 20px;">Take Profit (%): <input type="number" step="0.1" name="tp" value="{tp}" style="width: 60px;"></label>
@@ -135,16 +173,13 @@ def plot_png():
     
     if plot_data.empty:
         return "Not enough data", 400
-
-    initial_price = plot_data['close'].iloc[0]
-    prices = plot_data['close']
-    highs = plot_data['high']
-    lows = plot_data['low']
     
-    # 2. Calculate PnL for legs
-    plot_data['long_pnl'] = get_pnl_series(prices, highs, lows, initial_price, True, tp_pct, sl_pct)
-    plot_data['short_pnl'] = get_pnl_series(prices, highs, lows, initial_price, False, tp_pct, sl_pct)
-    plot_data['net_pnl'] = plot_data['long_pnl'] + plot_data['short_pnl']
+    # 2. Calculate Continuous PnL
+    long_eq, short_eq = calculate_continuous_equity(plot_data, tp_pct, sl_pct)
+    
+    plot_data['long_pnl'] = long_eq
+    plot_data['short_pnl'] = short_eq
+    plot_data['net_pnl'] = long_eq + short_eq
     
     # Plotting
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), dpi=100, gridspec_kw={'height_ratios': [2, 1]}, sharex=True)
@@ -162,21 +197,18 @@ def plot_png():
     ax1.add_collection(lc)
     ax1.plot(plot_data['timestamp'], sma, color='white', linewidth=1.5, label='365d SMA')
     
-    # Mark entry point
-    ax1.axhline(initial_price, color='gray', linestyle='--', alpha=0.5, label='Entry Price')
-    
-    ax1.set_title(f'ETH/USDT Price vs SMA (Entry: {initial_price:.2f})')
+    ax1.set_title(f'ETH/USDT Price vs SMA')
     ax1.set_ylabel('Price (USDT)')
     ax1.legend(loc='upper left')
     ax1.grid(True, alpha=0.2)
     
     # Panel 2: PnL
-    ax2.plot(plot_data['timestamp'], plot_data['long_pnl'], color='green', alpha=0.3, label='Long PnL')
-    ax2.plot(plot_data['timestamp'], plot_data['short_pnl'], color='red', alpha=0.3, label='Short PnL')
+    ax2.plot(plot_data['timestamp'], plot_data['long_pnl'], color='green', alpha=0.3, label='Long Leg PnL')
+    ax2.plot(plot_data['timestamp'], plot_data['short_pnl'], color='red', alpha=0.3, label='Short Leg PnL')
     ax2.plot(plot_data['timestamp'], plot_data['net_pnl'], color='cyan', linewidth=2, label='Net Equity')
     
-    ax2.set_title(f'Equity (SL: {sl_pct}%, TP: {tp_pct}%)')
-    ax2.set_ylabel('PnL (USDT)')
+    ax2.set_title(f'Continuous Hedge Equity (SL: {sl_pct}%, TP: {tp_pct}%)')
+    ax2.set_ylabel('Cumulative PnL (USDT)')
     ax2.legend(loc='upper left')
     ax2.grid(True, alpha=0.2)
     
