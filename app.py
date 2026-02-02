@@ -31,10 +31,10 @@ class Config:
     SLIPPAGE = 0.0001     
     
     # Genetic Algorithm Settings
-    POPULATION_SIZE = 50
+    POPULATION_SIZE = 100
     GENERATIONS = 15
     MUTATION_RATE = 0.2
-    ELITISM_COUNT = 2
+    ELITISM_COUNT = 5
     
     # GA Constraints (Normalized Space)
     SL_MIN = 0.01           
