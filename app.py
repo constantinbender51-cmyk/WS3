@@ -18,7 +18,7 @@ class Config:
     START_TIME = "2024-01-01"
     
     # Backtest Settings
-    LEVELS_COUNT = 3        
+    LEVELS_COUNT = 5        # Increased count slightly for grid density
     TRAIN_SPLIT = 0.6       
     ANNUALIZATION_FACTOR = 365 * 6 
     
@@ -31,8 +31,8 @@ class Config:
     # GA Mutation/Bound Constraints
     SL_MIN = 0.01           
     SL_MAX = 0.10           
-    TP_MIN = 0.02           # Min Take Profit 2%
-    TP_MAX = 0.30           # Max Take Profit 30%
+    TP_MIN = 0.02           
+    TP_MAX = 0.30           
     
     SL_MUTATION_SIGMA = 0.01
     TP_MUTATION_SIGMA = 0.02
@@ -93,9 +93,9 @@ def fetch_ohlc(symbol, interval, start_str):
     return df[["open_time", "open", "high", "low", "close"]]
 
 # ==========================================
-# 2. BACKTEST ENGINE
+# 2. BACKTEST ENGINE (HEDGING ENABLED)
 # ==========================================
-def backtest(df, long_levels, short_levels, stop_loss_pct, take_profit_pct):
+def backtest(df, levels, stop_loss_pct, take_profit_pct):
     highs = df["high"].values
     lows = df["low"].values
     times = df["open_time"].values
@@ -111,9 +111,12 @@ def backtest(df, long_levels, short_levels, stop_loss_pct, take_profit_pct):
         l = lows[i]
         t = times[i]
         
-        # Entries
-        for level in long_levels:
+        # Entries: Check every level
+        for level in levels:
             if l <= level <= h:
+                # Hedge Mode: Try to open BOTH Long and Short at this level
+                
+                # Open Long if not already Long at this level
                 if not any(tr['entry_price'] == level and tr['type'] == 'long' for tr in active_trades):
                     active_trades.append({
                         'type': 'long',
@@ -124,8 +127,7 @@ def backtest(df, long_levels, short_levels, stop_loss_pct, take_profit_pct):
                         'status': 'open'
                     })
 
-        for level in short_levels:
-            if l <= level <= h:
+                # Open Short if not already Short at this level
                 if not any(tr['entry_price'] == level and tr['type'] == 'short' for tr in active_trades):
                     active_trades.append({
                         'type': 'short',
@@ -147,7 +149,7 @@ def backtest(df, long_levels, short_levels, stop_loss_pct, take_profit_pct):
                 tp_hit = h >= trade['tp_price']
                 
                 if sl_hit and tp_hit:
-                    # Conservative: Assume SL hit first in conflicting candle
+                    # Conservative: SL hit first
                     exit_p = trade['sl_price']
                     pnl = (exit_p - trade['entry_price']) / trade['entry_price']
                     closed = True
@@ -188,7 +190,7 @@ def backtest(df, long_levels, short_levels, stop_loss_pct, take_profit_pct):
 
         equity_curve.append(equity)
 
-    # Force Close at End
+    # Force Close
     last_price = closes[-1]
     last_time = times[-1]
     for trade in active_trades:
@@ -220,13 +222,12 @@ class GeneticOptimizer:
     def init_population(self):
         pop = []
         for _ in range(Config.POPULATION_SIZE):
-            # Genome: [Longs..., Shorts..., SL, TP]
-            longs = np.random.uniform(self.price_min, self.price_max, self.levels_cnt)
-            shorts = np.random.uniform(self.price_min, self.price_max, self.levels_cnt)
+            # Genome: [Level1, Level2, ..., LevelN, SL, TP]
+            levels = np.random.uniform(self.price_min, self.price_max, self.levels_cnt)
             sl = np.random.uniform(Config.SL_MIN, Config.SL_MAX)
             tp = np.random.uniform(Config.TP_MIN, Config.TP_MAX)
             
-            genome = np.concatenate([longs, shorts, [sl, tp]])
+            genome = np.concatenate([levels, [sl, tp]])
             pop.append(genome)
         return pop
 
@@ -240,36 +241,31 @@ class GeneticOptimizer:
         return sharpe
 
     def fitness(self, genome):
-        longs = genome[:self.levels_cnt]
-        shorts = genome[self.levels_cnt:2*self.levels_cnt]
+        levels = genome[:self.levels_cnt]
         sl = genome[-2]
         tp = genome[-1]
         
-        # Hard Constraints
         if sl <= 0 or tp <= 0: return -99.0
         
-        equity_curve, _, _ = backtest(self.data, longs, shorts, sl, tp)
+        equity_curve, _, _ = backtest(self.data, levels, sl, tp)
         return self.calculate_sharpe(equity_curve)
 
     def mutate(self, genome):
         idx = random.randint(0, len(genome)-1)
         
-        # Indices: 0 to 2*CNT-1 are prices. 
-        # 2*CNT is SL. 
-        # 2*CNT+1 is TP.
+        # Indices: 0 to CNT-1 are prices. 
+        # CNT is SL. 
+        # CNT+1 is TP.
         
-        price_cutoff = 2 * self.levels_cnt
+        price_cutoff = self.levels_cnt
         
         if idx < price_cutoff:
-            # Price level mutation
             shift = np.random.normal(0, (self.price_max - self.price_min) * Config.PRICE_MUTATION_PCT)
             genome[idx] += shift
         elif idx == price_cutoff:
-            # SL mutation
             genome[idx] += np.random.normal(0, Config.SL_MUTATION_SIGMA)
             genome[idx] = np.clip(genome[idx], 0.001, 0.2)
         else:
-            # TP mutation
             genome[idx] += np.random.normal(0, Config.TP_MUTATION_SIGMA)
             genome[idx] = np.clip(genome[idx], 0.001, 0.5)
             
@@ -315,35 +311,30 @@ class GeneticOptimizer:
 # ==========================================
 # 4. PLOTTING & REPORTING
 # ==========================================
-def generate_plots(df, trades, equity_curve, long_levels, short_levels):
+def generate_plots(df, trades, equity_curve, levels):
     if not os.path.exists(Config.OUTPUT_DIR):
         os.makedirs(Config.OUTPUT_DIR)
 
     # Price Plot
     plt.figure(figsize=(14, 8))
-    plt.plot(df['open_time'], df['close'], label='Price', color='black', alpha=0.6, linewidth=1)
+    plt.plot(df['open_time'], df['close'], label='Price', color='gray', alpha=0.5, linewidth=1)
     
-    for l in long_levels:
-        plt.axhline(l, color='green', linestyle='--', alpha=0.5)
-    for s in short_levels:
-        plt.axhline(s, color='red', linestyle='--', alpha=0.5)
+    # Unified Levels
+    for l in levels:
+        plt.axhline(l, color='gold', linestyle='-', alpha=0.8, linewidth=1.5, label='Trigger Level' if l==levels[0] else "")
         
     long_entries = [t for t in trades if t['type'] == 'long']
     short_entries = [t for t in trades if t['type'] == 'short']
     
     if long_entries:
         plt.scatter([t['entry_time'] for t in long_entries], [t['entry_price'] for t in long_entries], 
-                    marker='^', color='green', s=50)
-        plt.scatter([t['exit_time'] for t in long_entries], [t['exit_price'] for t in long_entries], 
-                    marker='x', color='black', s=30)
-
+                    marker='^', color='green', s=30, alpha=0.7)
     if short_entries:
         plt.scatter([t['entry_time'] for t in short_entries], [t['entry_price'] for t in short_entries], 
-                    marker='v', color='red', s=50)
-        plt.scatter([t['exit_time'] for t in short_entries], [t['exit_price'] for t in short_entries], 
-                    marker='x', color='black', s=30)
+                    marker='v', color='red', s=30, alpha=0.7)
                     
-    plt.title(f"Strategy Execution: {Config.SYMBOL}")
+    plt.title(f"Strategy Execution: {Config.SYMBOL} (Hedge/Grid Mode)")
+    plt.legend()
     plt.grid(True, alpha=0.3)
     plt.savefig(f"{Config.OUTPUT_DIR}/price_plot.png")
     plt.close()
@@ -421,25 +412,24 @@ if __name__ == "__main__":
     
     print(f"[SYSTEM] Data Split: Train={len(train_data)}, Test={len(test_data)}")
     
-    print("[SYSTEM] Starting Genetic Optimization (Target: Sharpe Ratio + TP)...")
+    print("[SYSTEM] Starting Genetic Optimization (Hedge Mode)...")
     ga = GeneticOptimizer(train_data)
     best_genome = ga.run()
     
-    opt_longs = best_genome[:Config.LEVELS_COUNT]
-    opt_shorts = best_genome[Config.LEVELS_COUNT:2*Config.LEVELS_COUNT]
+    opt_levels = best_genome[:Config.LEVELS_COUNT]
     opt_sl = best_genome[-2]
     opt_tp = best_genome[-1]
     
-    print(f"[RESULT] Optimized Params:\n Longs: {opt_longs}\n Shorts: {opt_shorts}")
+    print(f"[RESULT] Optimized Params:\n Levels: {opt_levels}")
     print(f" SL: {opt_sl:.4f} | TP: {opt_tp:.4f}")
     
     print("[SYSTEM] Running Test on Out-of-Sample Data...")
-    equity_curve, trades, total_pnl = backtest(test_data, opt_longs, opt_shorts, opt_sl, opt_tp)
+    equity_curve, trades, total_pnl = backtest(test_data, opt_levels, opt_sl, opt_tp)
     
     test_sharpe = ga.calculate_sharpe(equity_curve)
     print(f"[RESULT] Test Sharpe: {test_sharpe:.4f}")
 
-    generate_plots(test_data, trades, equity_curve, opt_longs, opt_shorts)
+    generate_plots(test_data, trades, equity_curve, opt_levels)
     generate_html(trades, total_pnl, test_sharpe)
     
     serve_results()
