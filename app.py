@@ -83,8 +83,6 @@ def optimize_regime_sharpe(opens, highs, lows, closes, smas, target_above_sma):
             sum_returns_sq = 0.0
             count = 0
             
-            # State tracking: Did we close previous hour?
-            # Start assumed closed, so we pay initial entry
             l_closed_prev = True
             s_closed_prev = True
             
@@ -95,7 +93,6 @@ def optimize_regime_sharpe(opens, highs, lows, closes, smas, target_above_sma):
                 # Check Regime
                 is_above = op > sma
                 if is_above != target_above_sma:
-                    # If we skip an hour due to regime change, we consider positions closed
                     l_closed_prev = True
                     s_closed_prev = True
                     continue
@@ -105,10 +102,7 @@ def optimize_regime_sharpe(opens, highs, lows, closes, smas, target_above_sma):
                 cl = closes[i]
                 
                 # --- LONG LEG ---
-                l_entry_fee = 0.0
-                if l_closed_prev:
-                    l_entry_fee = op * fee_rate
-                
+                l_entry_fee = op * fee_rate if l_closed_prev else 0.0
                 l_sl_price = op * l_sl_mult
                 l_tp_price = op * l_tp_mult
                 
@@ -116,28 +110,22 @@ def optimize_regime_sharpe(opens, highs, lows, closes, smas, target_above_sma):
                 l_exit_fee = 0.0
                 
                 if lo <= l_sl_price:
-                    # Hit SL
                     l_pnl = l_sl_price - op
                     l_exit_fee = l_sl_price * fee_rate
-                    l_closed_prev = True # Forced close, must re-enter next
+                    l_closed_prev = True 
                 elif hi >= l_tp_price:
-                    # Hit TP
                     l_pnl = l_tp_price - op
                     l_exit_fee = l_tp_price * fee_rate
                     l_closed_prev = True
                 else:
-                    # Time Exit (Hold)
                     l_pnl = cl - op
-                    l_exit_fee = 0.0 # No fee, just roll
-                    l_closed_prev = False # Position stays open
+                    l_exit_fee = 0.0
+                    l_closed_prev = False
                 
                 l_net = l_pnl - l_entry_fee - l_exit_fee
                 
                 # --- SHORT LEG ---
-                s_entry_fee = 0.0
-                if s_closed_prev:
-                    s_entry_fee = op * fee_rate
-                
+                s_entry_fee = op * fee_rate if s_closed_prev else 0.0
                 s_sl_price = op * s_sl_mult
                 s_tp_price = op * s_tp_mult
                 
@@ -158,15 +146,13 @@ def optimize_regime_sharpe(opens, highs, lows, closes, smas, target_above_sma):
                     s_closed_prev = False
                 
                 s_net = s_pnl - s_entry_fee - s_exit_fee
-                
-                # Total
                 net_pnl = l_net + s_net
                 
                 sum_returns += net_pnl
                 sum_returns_sq += (net_pnl * net_pnl)
                 count += 1
             
-            if count > 100:
+            if count > 50:
                 mean = sum_returns / count
                 var = (sum_returns_sq / count) - (mean * mean)
                 if var > 1e-9:
@@ -194,11 +180,9 @@ def calculate_strategy_hourly_smart_fees(data, tp_above, sl_above, tp_below, sl_
     current_cum_pnl = 0.0
     fee_rate = 0.0002
     
-    # State tracking
     l_closed_prev = True
     s_closed_prev = True
     
-    # Pre-calc multipliers
     tp_mult_above_l = 1 + tp_above / 100.0
     sl_mult_above_l = 1 - sl_above / 100.0
     tp_mult_above_s = 1 - tp_above / 100.0
@@ -219,7 +203,6 @@ def calculate_strategy_hourly_smart_fees(data, tp_above, sl_above, tp_below, sl_
         
         is_above = op > sma
         
-        # Determine Multipliers
         if is_above:
             l_tp_m, l_sl_m = tp_mult_above_l, sl_mult_above_l
             s_tp_m, s_sl_m = tp_mult_above_s, sl_mult_above_s
@@ -229,7 +212,6 @@ def calculate_strategy_hourly_smart_fees(data, tp_above, sl_above, tp_below, sl_
             
         # --- LONG ---
         l_entry_fee = op * fee_rate if l_closed_prev else 0.0
-        
         l_sl_price = op * l_sl_m
         l_tp_price = op * l_tp_m
         
@@ -257,7 +239,6 @@ def calculate_strategy_hourly_smart_fees(data, tp_above, sl_above, tp_below, sl_
         
         # --- SHORT ---
         s_entry_fee = op * fee_rate if s_closed_prev else 0.0
-        
         s_sl_price = op * s_sl_m
         s_tp_price = op * s_tp_m
         
@@ -283,12 +264,10 @@ def calculate_strategy_hourly_smart_fees(data, tp_above, sl_above, tp_below, sl_
             
         s_pnl = (op - s_exit) - s_entry_fee - s_exit_fee
         
-        # Net
         net_pnl = l_pnl + s_pnl
         current_cum_pnl += net_pnl
         net_equity[i] = current_cum_pnl
         
-        # Log trades that incurred an action
         if l_status != "TIME" or s_status != "TIME":
              trades.append({
                 'entry_time': pd.to_datetime(ts),
@@ -348,7 +327,7 @@ def index():
             </style>
             <script>
                 function runOptimization() {{
-                    document.getElementById('optimize-status').innerText = "Optimizing Smart Fee Strategy... Please wait.";
+                    document.getElementById('optimize-status').innerText = "Optimizing Training Data (<2026)...";
                     fetch('/optimize_split')
                         .then(response => response.json())
                         .then(data => {{
@@ -366,8 +345,8 @@ def index():
         </head>
         <body>
             <div class="container">
-                <h2>ETH/USDT Smart Hourly Reset (No Hold Fees)</h2>
-                <p>Positions roll over fee-free if no TP/SL triggered.</p>
+                <h2>ETH/USDT Walk-Forward Analysis</h2>
+                <p>Optimization Train: 2021-2025. Unseen Test: 2026-Present.</p>
                 
                 <form action="/" method="get">
                     <div class="params-box">
@@ -382,12 +361,12 @@ def index():
                             TP % <input type="number" step="0.1" name="tp_below" value="{tp_below}">
                         </div>
                         <div style="text-align: center; margin-top: 10px;">
-                            <input type="submit" value="Update" style="width: auto; cursor: pointer;">
+                            <input type="submit" value="Update Plots" style="width: auto; cursor: pointer;">
                         </div>
                     </div>
                 </form>
                 
-                <button onclick="runOptimization()">Run Optimization</button>
+                <button onclick="runOptimization()">Run Optimization (Train Set Only)</button>
                 <div id="optimize-status"></div>
                 
                 <br>
@@ -400,8 +379,8 @@ def index():
                             <tr>
                                 <th>Entry Time</th>
                                 <th>Regime</th>
-                                <th>Status (Long/Short)</th>
-                                <th>Net PnL (w/ Fees)</th>
+                                <th>Status</th>
+                                <th>Net PnL</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -419,25 +398,34 @@ def index():
 def optimize_split():
     global market_data, df
     
+    # CUTOFF DATE for Training
+    cutoff_ts = pd.Timestamp('2026-01-01')
+    
     if 'opens' not in market_data:
         calc_data = df.dropna(subset=['sma']).reset_index(drop=True)
+        # Store full arrays
+        market_data['timestamps'] = calc_data['timestamp'].values
         market_data['opens'] = calc_data['open'].values.astype(np.float64)
         market_data['highs'] = calc_data['high'].values.astype(np.float64)
         market_data['lows'] = calc_data['low'].values.astype(np.float64)
         market_data['closes'] = calc_data['close'].values.astype(np.float64)
         market_data['smas'] = calc_data['sma'].values.astype(np.float64)
     
-    opens = market_data['opens']
-    highs = market_data['highs']
-    lows = market_data['lows']
-    closes = market_data['closes']
-    smas = market_data['smas']
+    # Create Boolean Mask for Training Data
+    train_mask = market_data['timestamps'] < np.datetime64(cutoff_ts)
+    
+    # Slice arrays for optimizer
+    opens = market_data['opens'][train_mask]
+    highs = market_data['highs'][train_mask]
+    lows = market_data['lows'][train_mask]
+    closes = market_data['closes'][train_mask]
+    smas = market_data['smas'][train_mask]
     
     t0 = time.time()
     tp_a, sl_a, sharpe_a = optimize_regime_sharpe(opens, highs, lows, closes, smas, True)
     tp_b, sl_b, sharpe_b = optimize_regime_sharpe(opens, highs, lows, closes, smas, False)
     
-    print(f"Optimization done in {time.time() - t0:.2f}s")
+    print(f"Training Set Optimization done in {time.time() - t0:.2f}s")
     
     return jsonify({
         'tp_above': round(tp_a, 1),
@@ -466,9 +454,21 @@ def plot_png():
         return "Not enough data", 400
     
     net_equity, _ = calculate_strategy_hourly_smart_fees(plot_data, tp_a, sl_a, tp_b, sl_b)
+    plot_data['net_equity'] = net_equity
     
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), dpi=100, gridspec_kw={'height_ratios': [2, 1]}, sharex=True)
+    # Prepare Unseen Data Plot (2026+)
+    cutoff_ts = pd.Timestamp('2026-01-01')
+    unseen_data = plot_data[plot_data['timestamp'] >= cutoff_ts].copy()
     
+    # Rebase Unseen Equity to 0
+    if not unseen_data.empty:
+        base_val = unseen_data['net_equity'].iloc[0]
+        unseen_data['net_equity'] = unseen_data['net_equity'] - base_val
+    
+    # Plotting (3 Subplots)
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 12), dpi=100, gridspec_kw={'height_ratios': [2, 1, 1]}, sharex=False)
+    
+    # 1. Price
     x = matplotlib.dates.date2num(plot_data['timestamp'])
     y = plot_data['close'].values
     sma = plot_data['sma'].values
@@ -481,22 +481,39 @@ def plot_png():
     ax1.add_collection(lc)
     ax1.plot(plot_data['timestamp'], sma, color='white', linewidth=1.5, label='365d SMA')
     ax1.set_title('ETH/USDT Price vs SMA')
-    ax1.set_ylabel('Price (USDT)')
+    ax1.set_ylabel('Price')
     ax1.legend(loc='upper left')
     ax1.grid(True, alpha=0.2)
+    # Cutoff Line
+    ax1.axvline(cutoff_ts, color='yellow', linestyle='--', linewidth=2, label='Training Cutoff')
+    ax1.set_xlim(plot_data['timestamp'].min(), plot_data['timestamp'].max())
     
-    ax2.plot(plot_data['timestamp'], net_equity, color='cyan', linewidth=2, label='Net Equity')
-    ax2.set_title(f'Smart Hourly Reset (Fee on Trigger Only)')
+    # 2. Full Equity
+    ax2.plot(plot_data['timestamp'], plot_data['net_equity'], color='cyan', linewidth=1.5, label='Full History Equity')
+    ax2.set_title('Full History PnL (Training + Unseen)')
     ax2.set_ylabel('PnL (USDT)')
-    ax2.legend(loc='upper left')
+    ax2.axvline(cutoff_ts, color='yellow', linestyle='--', linewidth=2)
     ax2.grid(True, alpha=0.2)
+    ax2.set_xlim(plot_data['timestamp'].min(), plot_data['timestamp'].max())
     
-    for ax in [ax1, ax2]:
+    # 3. Unseen Data Zoom
+    if not unseen_data.empty:
+        ax3.plot(unseen_data['timestamp'], unseen_data['net_equity'], color='magenta', linewidth=1.5, label='Unseen Data PnL')
+        ax3.set_title('Unseen Data PnL (2026-Present) - Rebased to 0')
+        ax3.set_ylabel('PnL (USDT)')
+        ax3.grid(True, alpha=0.2)
+        ax3.axhline(0, color='white', alpha=0.3)
+    else:
+        ax3.text(0.5, 0.5, "No Unseen Data Available (>2026)", ha='center', va='center', color='white')
+    
+    for ax in [ax1, ax2, ax3]:
         ax.set_facecolor('black')
-        ax.autoscale_view()
     
     fig.patch.set_facecolor('white')
+    ax1.xaxis.set_major_formatter(matplotlib.dates.DateFormatter('%Y-%m'))
     ax2.xaxis.set_major_formatter(matplotlib.dates.DateFormatter('%Y-%m'))
+    ax3.xaxis.set_major_formatter(matplotlib.dates.DateFormatter('%Y-%m-%d'))
+    
     plt.tight_layout()
     
     img = io.BytesIO()
