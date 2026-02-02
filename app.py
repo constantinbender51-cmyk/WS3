@@ -56,28 +56,21 @@ def fetch_data():
     data = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
     
-    # Pre-calculate ALL SMA candidates (40, 50 ... 200)
-    # 200 hours is small, user likely meant 200 DAYS given context of 365?
-    # "Include SMA in grid search 40 50 ... 200"
-    # Previously used 365 DAYS (8760 hours). 
-    # If user types "200", they usually mean Days in crypto daily context, but we are on 1H chart.
-    # Standard 1H SMAs are 50, 200 hours. Standard Daily are 50, 200 days.
-    # Given the previous context was "365 day SMA" (8760 hours), searching 40-200 HOURS would be a huge regime shift (short term trend).
-    # Searching 40-200 DAYS (960-4800 hours) is more comparable.
-    # However, "40 50 ... 200" usually implies the raw number.
-    # I will stick to **DAYS** (x24 hours) to keep it consistent with the "365" logic previously used.
-    
+    # Pre-calculate ALL SMA candidates (40-200 days)
     for d in range(40, 210, 10):
         data[f'sma_{d}d'] = data['close'].rolling(window=d*24).mean()
         
     return data
 
 @njit(fastmath=True)
-def optimize_regime_sharpe(opens, highs, lows, closes, smas, target_above_sma):
+def optimize_regime_pnl(opens, highs, lows, closes, smas, target_above_sma):
+    """
+    Optimizes for Total Net PnL (Profit).
+    """
     n = len(opens)
     fee_rate = 0.0002
     
-    best_sharpe = -np.inf
+    best_pnl = -np.inf
     best_tp = 5.0
     best_sl = 2.0
     
@@ -92,9 +85,7 @@ def optimize_regime_sharpe(opens, highs, lows, closes, smas, target_above_sma):
             s_tp_mult = 1.0 - tp_pct / 100.0
             s_sl_mult = 1.0 + sl_pct / 100.0
             
-            sum_returns = 0.0
-            sum_returns_sq = 0.0
-            count = 0
+            total_pnl = 0.0
             
             l_closed_prev = True
             s_closed_prev = True
@@ -118,72 +109,55 @@ def optimize_regime_sharpe(opens, highs, lows, closes, smas, target_above_sma):
                 l_sl_price = op * l_sl_mult
                 l_tp_price = op * l_tp_mult
                 
-                l_pnl = 0.0
                 l_exit_fee = 0.0
+                l_trade_pnl = 0.0
                 
                 if lo <= l_sl_price:
-                    l_pnl = l_sl_price - op
+                    l_trade_pnl = l_sl_price - op
                     l_exit_fee = l_sl_price * fee_rate
                     l_closed_prev = True 
                 elif hi >= l_tp_price:
-                    l_pnl = l_tp_price - op
+                    l_trade_pnl = l_tp_price - op
                     l_exit_fee = l_tp_price * fee_rate
                     l_closed_prev = True
                 else:
-                    l_pnl = cl - op
+                    l_trade_pnl = cl - op
                     l_exit_fee = 0.0
                     l_closed_prev = False
                 
-                l_net = l_pnl - l_entry_fee - l_exit_fee
+                l_net = l_trade_pnl - l_entry_fee - l_exit_fee
                 
                 # SHORT
                 s_entry_fee = op * fee_rate if s_closed_prev else 0.0
                 s_sl_price = op * s_sl_mult
                 s_tp_price = op * s_tp_mult
                 
-                s_pnl = 0.0
                 s_exit_fee = 0.0
+                s_trade_pnl = 0.0
                 
                 if hi >= s_sl_price:
-                    s_pnl = op - s_sl_price
+                    s_trade_pnl = op - s_sl_price
                     s_exit_fee = s_sl_price * fee_rate
                     s_closed_prev = True
                 elif lo <= s_tp_price:
-                    s_pnl = op - s_tp_price
+                    s_trade_pnl = op - s_tp_price
                     s_exit_fee = s_tp_price * fee_rate
                     s_closed_prev = True
                 else:
-                    s_pnl = op - cl
+                    s_trade_pnl = op - cl
                     s_exit_fee = 0.0
                     s_closed_prev = False
                 
-                s_net = s_pnl - s_entry_fee - s_exit_fee
-                net_pnl = l_net + s_net
+                s_net = s_trade_pnl - s_entry_fee - s_exit_fee
                 
-                sum_returns += net_pnl
-                sum_returns_sq += (net_pnl * net_pnl)
-                count += 1
+                total_pnl += (l_net + s_net)
             
-            if count > 50:
-                mean = sum_returns / count
-                var = (sum_returns_sq / count) - (mean * mean)
-                if var > 1e-9:
-                    std = np.sqrt(var)
-                    # We return statistics to combine them later
-                    sharpe = (mean / std) * 93.59
-                    
-                    if sharpe > best_sharpe:
-                        best_sharpe = sharpe
-                        best_tp = tp_pct
-                        best_sl = sl_pct
-                        best_mean = mean
-                        best_var = var
-                        best_count = count
+            if total_pnl > best_pnl:
+                best_pnl = total_pnl
+                best_tp = tp_pct
+                best_sl = sl_pct
                         
-    if best_sharpe == -np.inf:
-        return 5.0, 2.0, 0.0, 0.0, 0.0, 0
-        
-    return best_tp, best_sl, best_sharpe, best_mean, best_var, best_count
+    return best_tp, best_sl, best_pnl
 
 def calculate_strategy_final(data, sma_days, tp_above, sl_above, tp_below, sl_below):
     n = len(data)
@@ -193,7 +167,6 @@ def calculate_strategy_final(data, sma_days, tp_above, sl_above, tp_below, sl_be
     lows = data['low'].values
     closes = data['close'].values
     
-    # Dynamic SMA calculation if not pre-calc (for plotting unseen)
     col_name = f'sma_{int(sma_days)}d'
     if col_name in data.columns:
         smas = data[col_name].values
@@ -227,7 +200,6 @@ def calculate_strategy_final(data, sma_days, tp_above, sl_above, tp_below, sl_be
         sma = smas[i]
         
         if sma == 0 or np.isnan(sma):
-            # Skip until SMA is ready
             l_closed_prev = True
             s_closed_prev = True
             continue
@@ -241,7 +213,7 @@ def calculate_strategy_final(data, sma_days, tp_above, sl_above, tp_below, sl_be
             l_tp_m, l_sl_m = tp_mult_below_l, sl_mult_below_l
             s_tp_m, s_sl_m = tp_mult_below_s, sl_mult_below_s
             
-        # --- LONG ---
+        # LONG
         l_entry_fee = op * fee_rate if l_closed_prev else 0.0
         l_sl_price = op * l_sl_m
         l_tp_price = op * l_tp_m
@@ -268,7 +240,7 @@ def calculate_strategy_final(data, sma_days, tp_above, sl_above, tp_below, sl_be
             
         l_pnl = (l_exit - op) - l_entry_fee - l_exit_fee
         
-        # --- SHORT ---
+        # SHORT
         s_entry_fee = op * fee_rate if s_closed_prev else 0.0
         s_sl_price = op * s_sl_m
         s_tp_price = op * s_tp_m
@@ -327,7 +299,7 @@ def index():
     if df is None:
         return "Data not loaded", 500
 
-    calc_data = df.dropna(subset=['close']).reset_index(drop=True) # Don't dropNA on SMA yet, handled in loop
+    calc_data = df.dropna(subset=['close']).reset_index(drop=True)
     net_equity, trades, _ = calculate_strategy_final(calc_data, sma_days, tp_above, sl_above, tp_below, sl_below)
     
     rows = ""
@@ -360,11 +332,11 @@ def index():
             </style>
             <script>
                 function runOptimization() {{
-                    document.getElementById('optimize-status').innerText = "Optimizing SMA (40-200) & Params... Please wait.";
+                    document.getElementById('optimize-status').innerText = "Optimizing PnL (SMA 40-200)... Please wait.";
                     fetch('/optimize_all')
                         .then(response => response.json())
                         .then(data => {{
-                            document.getElementById('optimize-status').innerText = "Found Best SMA: " + data.best_sma + " days (Sharpe: " + data.total_sharpe.toFixed(2) + ")";
+                            document.getElementById('optimize-status').innerText = "Best SMA: " + data.best_sma + "d (PnL: " + data.total_pnl.toFixed(2) + ")";
                             document.querySelector('input[name="sma_days"]').value = data.best_sma;
                             document.querySelector('input[name="tp_above"]').value = data.tp_above;
                             document.querySelector('input[name="sl_above"]').value = data.sl_above;
@@ -379,7 +351,7 @@ def index():
         </head>
         <body>
             <div class="container">
-                <h2>ETH/USDT Full Optimization</h2>
+                <h2>ETH/USDT Full PnL Optimization</h2>
                 <p>Grid Search: SMA (40-200d) + TP/SL (0.2-10%). Train < 2026.</p>
                 
                 <form action="/" method="get">
@@ -403,7 +375,7 @@ def index():
                     </div>
                 </form>
                 
-                <button onclick="runOptimization()">Run Full Grid Search</button>
+                <button onclick="runOptimization()">Run Full PnL Search</button>
                 <div id="optimize-status"></div>
                 
                 <br>
@@ -438,14 +410,12 @@ def optimize_all():
     cutoff_ts = pd.Timestamp('2026-01-01')
     
     if 'opens' not in market_data:
-        # Load logic similar to before, but we need dynamic SMAs
         calc_data = df.dropna(subset=['close']).reset_index(drop=True)
         market_data['timestamps'] = calc_data['timestamp'].values
         market_data['opens'] = calc_data['open'].values.astype(np.float64)
         market_data['highs'] = calc_data['high'].values.astype(np.float64)
         market_data['lows'] = calc_data['low'].values.astype(np.float64)
         market_data['closes'] = calc_data['close'].values.astype(np.float64)
-        # We also need the SMA columns cached in numpy
         for d in range(40, 210, 10):
             col = f'sma_{d}d'
             market_data[col] = calc_data[col].fillna(0).values.astype(np.float64)
@@ -457,7 +427,7 @@ def optimize_all():
     lows = market_data['lows'][train_mask]
     closes = market_data['closes'][train_mask]
     
-    best_global_sharpe = -np.inf
+    best_global_pnl = -np.inf
     best_config = {}
     
     t0 = time.time()
@@ -467,40 +437,24 @@ def optimize_all():
         col = f'sma_{d}d'
         smas = market_data[col][train_mask]
         
-        # Optimize Above
-        tp_a, sl_a, _, mean_a, var_a, count_a = optimize_regime_sharpe(opens, highs, lows, closes, smas, True)
+        # Optimize Above for PnL
+        tp_a, sl_a, pnl_a = optimize_regime_pnl(opens, highs, lows, closes, smas, True)
         
-        # Optimize Below
-        tp_b, sl_b, _, mean_b, var_b, count_b = optimize_regime_sharpe(opens, highs, lows, closes, smas, False)
+        # Optimize Below for PnL
+        tp_b, sl_b, pnl_b = optimize_regime_pnl(opens, highs, lows, closes, smas, False)
         
-        # Combine Stats for Total Sharpe
-        total_mean = (mean_a * count_a + mean_b * count_b) / (count_a + count_b)
+        total_pnl = pnl_a + pnl_b
         
-        # Variance combination (approximate for disjoint sets)
-        # Total SumSq = SumSq_A + SumSq_B
-        # This is strictly true since they never overlap.
-        # Recalculate SumSq from Mean/Var
-        sumsq_a = (var_a + mean_a**2) * count_a
-        sumsq_b = (var_b + mean_b**2) * count_b
-        
-        total_count = count_a + count_b
-        if total_count > 0:
-            total_sumsq = sumsq_a + sumsq_b
-            total_var = (total_sumsq / total_count) - (total_mean**2)
-            if total_var > 0:
-                total_std = np.sqrt(total_var)
-                total_sharpe = (total_mean / total_std) * 93.59
-                
-                if total_sharpe > best_global_sharpe:
-                    best_global_sharpe = total_sharpe
-                    best_config = {
-                        'best_sma': d,
-                        'tp_above': round(tp_a, 1),
-                        'sl_above': round(sl_a, 1),
-                        'tp_below': round(tp_b, 1),
-                        'sl_below': round(sl_b, 1),
-                        'total_sharpe': total_sharpe
-                    }
+        if total_pnl > best_global_pnl:
+            best_global_pnl = total_pnl
+            best_config = {
+                'best_sma': d,
+                'tp_above': round(tp_a, 1),
+                'sl_above': round(sl_a, 1),
+                'tp_below': round(tp_b, 1),
+                'sl_below': round(sl_b, 1),
+                'total_pnl': total_pnl
+            }
 
     print(f"Global Optimization done in {time.time() - t0:.2f}s")
     return jsonify(best_config)
@@ -520,12 +474,10 @@ def plot_png():
 
     plot_data = df.dropna(subset=['close']).reset_index(drop=True).copy()
     
-    # Calculate strategy with specific SMA
     net_equity, _, smas = calculate_strategy_final(plot_data, sma_days, tp_a, sl_a, tp_b, sl_b)
     plot_data['net_equity'] = net_equity
-    plot_data['sma_plot'] = smas # Assign for plotting
+    plot_data['sma_plot'] = smas
     
-    # 2026 Split
     cutoff_ts = pd.Timestamp('2026-01-01')
     unseen_data = plot_data[plot_data['timestamp'] >= cutoff_ts].copy()
     if not unseen_data.empty:
@@ -533,7 +485,6 @@ def plot_png():
     
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 12), dpi=100, gridspec_kw={'height_ratios': [2, 1, 1]})
     
-    # 1. Price
     x = matplotlib.dates.date2num(plot_data['timestamp'])
     y = plot_data['close'].values
     sma_vals = plot_data['sma_plot'].values
@@ -552,14 +503,12 @@ def plot_png():
     ax1.legend()
     ax1.grid(True, alpha=0.2)
     
-    # 2. Full Equity
     ax2.plot(plot_data['timestamp'], plot_data['net_equity'], color='cyan')
     ax2.set_title('Full History PnL')
     ax2.axvline(cutoff_ts, color='yellow', linestyle='--')
     ax2.set_xlim(plot_data['timestamp'].min(), plot_data['timestamp'].max())
     ax2.grid(True, alpha=0.2)
     
-    # 3. Unseen
     if not unseen_data.empty:
         ax3.plot(unseen_data['timestamp'], unseen_data['net_equity'], color='magenta')
         ax3.set_title('Unseen Data PnL (2026+)')
