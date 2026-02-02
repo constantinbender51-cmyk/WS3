@@ -1,454 +1,433 @@
-import ccxt
+import requests
 import pandas as pd
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from flask import Flask, send_file, request, render_template_string
-import io
 import numpy as np
-import time
+import matplotlib.pyplot as plt
+import http.server
+import socketserver
 import threading
+import os
+import random
+from datetime import datetime
 
-# Try importing Numba
-try:
-    from numba import njit
-    HAS_NUMBA = True
-except ImportError:
-    HAS_NUMBA = False
-    print("Warning: Numba not installed. This will be extremely slow.")
-    def njit(*args, **kwargs):
-        def decorator(func):
-            return func
-        return decorator
+# ==========================================
+# CONFIGURATION
+# ==========================================
+SYMBOL = "BTCUSDT"
+INTERVAL = "4h"  # Granularity
+START_TIME = "2022-01-01"
+PORT = 8080
+LEVELS_COUNT = 3  # x levels for long, x for short
+POPULATION_SIZE = 50
+GENERATIONS = 15
+MUTATION_RATE = 0.2
 
-app = Flask(__name__)
-
-# --- CONFIG ---
-ASSETS = [
-    'BTC/USDT', 'ETH/USDT', 'XRP/USDT', 'SOL/USDT', 'DOGE/USDT',
-    'ADA/USDT', 'BCH/USDT', 'LINK/USDT', 'XLM/USDT', 'SUI/USDT',
-    'AVAX/USDT', 'LTC/USDT', 'HBAR/USDT', 'SHIB/USDT', 'TON/USDT'
-]
-TIMEFRAMES = ['30m', '1h', '4h', '1d']
-SPLIT_RATIO = 0.70  # 70% Train, 30% Test
-
-# Global Stores
-RAW_DATA_30M = {}   # Holds the raw 30m DF for each asset
-TOP_5_RESULTS = []  # Stores the best optimized configs
-IS_LOADING = True
-LOADING_STATUS = "Initializing..."
-
-# --- DATA FETCHING ---
-def fetch_30m_history(symbol):
-    """Fetches ~5 years of 30m data for a single symbol."""
-    exchange = ccxt.binance({'enableRateLimit': True})
-    limit = 1000
-    now = exchange.milliseconds()
-    since = now - (5 * 365 * 24 * 60 * 60 * 1000)
-    all_ohlcv = []
+# ==========================================
+# 1. DATA FETCHING (Binance)
+# ==========================================
+def fetch_ohlc(symbol, interval, start_str):
+    """
+    Fetches OHLC data from Binance public API.
+    Does not use third-party wrappers, utilizes direct requests.
+    """
+    base_url = "https://api.binance.com/api/v3/klines"
+    dt_obj = datetime.strptime(start_str, "%Y-%m-%d")
+    start_ts = int(dt_obj.timestamp() * 1000)
     
-    while since < now:
+    data = []
+    current_ts = start_ts
+    
+    print(f"[SYSTEM] Fetching data for {symbol} from {start_str}...")
+    
+    while True:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": current_ts,
+            "limit": 1000
+        }
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, '30m', since, limit)
-            if not ohlcv:
-                break
-            all_ohlcv.extend(ohlcv)
-            # Move pointer forward (30m * 1000 candles)
-            last_ts = ohlcv[-1][0]
-            since = last_ts + 1800000 
+            r = requests.get(base_url, params=params)
+            r.raise_for_status()
+            chunk = r.json()
         except Exception as e:
-            print(f"Error {symbol}: {e}")
+            print(f"[ERROR] Connection failed: {e}")
+            break
+
+        if not chunk:
             break
             
-    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    return df
-
-def resample_data(df_30m, target_tf):
-    """Resamples 30m data to 1h, 4h, or 1d."""
-    if target_tf == '30m':
-        return df_30m.copy()
-    
-    # Map timeframe strings to pandas offsets
-    tf_map = {'1h': '1h', '4h': '4h', '1d': '1D'}
-    rule = tf_map.get(target_tf)
-    
-    if not rule:
-        return df_30m
+        data.extend(chunk)
+        last_ts = chunk[-1][0]
+        current_ts = last_ts + 1
         
-    df_res = df_30m.set_index('timestamp').resample(rule).agg({
-        'open': 'first',
-        'high': 'max',
-        'low': 'min',
-        'close': 'last',
-        'volume': 'sum'
-    }).dropna().reset_index()
+        # Break if we catch up to now
+        if len(chunk) < 1000:
+            break
+            
+    df = pd.DataFrame(data, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "qav", "num_trades", "taker_buy_base", "taker_buy_quote", "ignore"
+    ])
     
-    return df_res
+    # Type conversion
+    numeric_cols = ["open", "high", "low", "close"]
+    df[numeric_cols] = df[numeric_cols].astype(float)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    
+    print(f"[SYSTEM] Fetched {len(df)} candles.")
+    return df[["open_time", "open", "high", "low", "close"]]
 
-# --- OPTIMIZER ENGINE ---
-@njit(fastmath=True)
-def run_grid_search(opens, highs, lows, closes):
+# ==========================================
+# 2. BACKTEST ENGINE
+# ==========================================
+def backtest(df, long_levels, short_levels, stop_loss_pct):
     """
-    Optimizes Single Strategy (Sharpe) on provided arrays.
-    Returns: (best_tp, best_sl, best_sharpe)
+    Event-driven simulation (vectorization is difficult with stateful SL).
+    Assumes Limit Orders resting at levels.
+    
+    :param long_levels: list of prices to buy
+    :param short_levels: list of prices to sell
+    :param stop_loss_pct: float (e.g., 0.02 for 2%)
+    :return: equity_curve (list), trade_log (list of dicts), total_pnl
     """
-    n = len(opens)
-    fee_rate = 0.0002
+    # Pre-compute numpy arrays for speed
+    highs = df["high"].values
+    lows = df["low"].values
+    times = df["open_time"].values
+    closes = df["close"].values
     
-    best_sharpe = -np.inf
-    best_tp = 5.0
-    best_sl = 2.0
+    trades = [] # {type, entry_price, entry_time, exit_price, exit_time, pnl, status}
+    active_trades = [] 
     
-    # Grid 0.2% to 10.0%
-    for tp_int in range(2, 101, 2):
-        for sl_int in range(2, 101, 2):
-            tp_pct = tp_int / 10.0
-            sl_pct = sl_int / 10.0
-            
-            l_tp_mult = 1.0 + tp_pct/100.0
-            l_sl_mult = 1.0 - sl_pct/100.0
-            s_tp_mult = 1.0 - tp_pct/100.0
-            s_sl_mult = 1.0 + sl_pct/100.0
-            
-            sum_ret = 0.0
-            sum_ret_sq = 0.0
-            
-            l_closed = True
-            s_closed = True
-            
-            for i in range(n):
-                op = opens[i]
-                hi = highs[i]
-                lo = lows[i]
-                cl = closes[i]
-                
-                # LONG
-                l_entry_fee = op * fee_rate if l_closed else 0.0
-                l_sl_price = op * l_sl_mult
-                l_tp_price = op * l_tp_mult
-                l_pnl = 0.0
-                l_exit_fee = 0.0
-                
-                if lo <= l_sl_price:
-                    l_pnl = l_sl_price - op
-                    l_exit_fee = l_sl_price * fee_rate
-                    l_closed = True
-                elif hi >= l_tp_price:
-                    l_pnl = l_tp_price - op
-                    l_exit_fee = l_tp_price * fee_rate
-                    l_closed = True
-                else:
-                    l_pnl = cl - op
-                    l_exit_fee = 0.0
-                    l_closed = False
-                    
-                # SHORT
-                s_entry_fee = op * fee_rate if s_closed else 0.0
-                s_sl_price = op * s_sl_mult
-                s_tp_price = op * s_tp_mult
-                s_pnl = 0.0
-                s_exit_fee = 0.0
-                
-                if hi >= s_sl_price:
-                    s_pnl = op - s_sl_price
-                    s_exit_fee = s_sl_price * fee_rate
-                    s_closed = True
-                elif lo <= s_tp_price:
-                    s_pnl = op - s_tp_price
-                    s_exit_fee = s_tp_price * fee_rate
-                    s_closed = True
-                else:
-                    s_pnl = op - cl
-                    s_exit_fee = 0.0
-                    s_closed = False
-                    
-                net = (l_pnl - l_entry_fee - l_exit_fee) + (s_pnl - s_entry_fee - s_exit_fee)
-                sum_ret += net
-                sum_ret_sq += net*net
-                
-            # Calc Sharpe
-            if n > 50:
-                mean = sum_ret / n
-                var = (sum_ret_sq / n) - (mean*mean)
-                if var > 1e-9:
-                    std = np.sqrt(var)
-                    sharpe = mean / std # Raw Sharpe per candle
-                    # Store Raw Sharpe for ranking (Timeframe agnostic for raw comparison or annualize later)
-                    # To be fair across timeframes, we should Annualize.
-                    # However, numba function doesn't know timeframe.
-                    # We will return raw sharpe * sqrt(candles_per_year) outside.
-                    
-                    if (mean / std) > best_sharpe:
-                        best_sharpe = (mean / std)
-                        best_tp = tp_pct
-                        best_sl = sl_pct
-                        
-    return best_tp, best_sl, best_sharpe
-
-# --- WORKER THREAD ---
-def background_worker():
-    global RAW_DATA_30M, TOP_5_RESULTS, IS_LOADING, LOADING_STATUS
+    equity = 0.0
+    equity_curve = [0.0]
     
-    print("--- WORKER STARTED ---")
-    
-    # 1. Fetch Data
-    for i, asset in enumerate(ASSETS):
-        LOADING_STATUS = f"Fetching {asset} ({i+1}/{len(ASSETS)})..."
-        print(LOADING_STATUS)
-        df = fetch_30m_history(asset)
-        RAW_DATA_30M[asset] = df
+    # Iterate through candles
+    for i in range(len(df)):
+        h = highs[i]
+        l = lows[i]
+        t = times[i]
         
-    LOADING_STATUS = "Data Fetched. Resampling & Optimizing..."
-    print(LOADING_STATUS)
-    
-    results_list = []
-    
-    # 2. Resample & Optimize
-    total_tasks = len(ASSETS) * len(TIMEFRAMES)
-    completed = 0
-    
-    for asset in ASSETS:
-        df_30m = RAW_DATA_30M.get(asset)
-        if df_30m is None or df_30m.empty:
-            continue
-            
-        for tf in TIMEFRAMES:
-            # Resample
-            df_tf = resample_data(df_30m, tf)
-            if df_tf.empty:
-                continue
-            
-            # Split Data (70% Train)
-            cutoff_idx = int(len(df_tf) * SPLIT_RATIO)
-            train_df = df_tf.iloc[:cutoff_idx]
-            
-            if len(train_df) < 100: 
-                continue
-                
-            # Prepare Arrays
-            opens = train_df['open'].values.astype(np.float64)
-            highs = train_df['high'].values.astype(np.float64)
-            lows = train_df['low'].values.astype(np.float64)
-            closes = train_df['close'].values.astype(np.float64)
-            
-            # Run Grid Search
-            best_tp, best_sl, raw_sharpe = run_grid_search(opens, highs, lows, closes)
-            
-            # Annualize Sharpe
-            tf_annualizer = {
-                '30m': np.sqrt(365*48),
-                '1h': np.sqrt(365*24),
-                '4h': np.sqrt(365*6),
-                '1d': np.sqrt(365)
-            }
-            ann_sharpe = raw_sharpe * tf_annualizer.get(tf, 1.0)
-            
-            results_list.append({
-                'asset': asset,
-                'timeframe': tf,
-                'tp': best_tp,
-                'sl': best_sl,
-                'sharpe': ann_sharpe,
-                'cutoff_ts': df_tf.iloc[cutoff_idx]['timestamp'] # Save cutoff timestamp for plotting later
-            })
-            
-            completed += 1
-            if completed % 5 == 0:
-                print(f"Optimized {completed}/{total_tasks} combinations...")
+        # 1. Check Entry Triggers
+        # Long entries (Limit Buy)
+        for level in long_levels:
+            if l <= level <= h:
+                # Check if we already have a position at this level? 
+                # Strategy implies 'define levels', usually static grids. 
+                # We allow multiple entries if price revisits? 
+                # To prevent spam, we only enter if no active trade exists at this exact level.
+                if not any(tr['entry_price'] == level and tr['type'] == 'long' for tr in active_trades):
+                    active_trades.append({
+                        'type': 'long',
+                        'entry_price': level,
+                        'entry_time': t,
+                        'sl_price': level * (1 - stop_loss_pct),
+                        'status': 'open'
+                    })
 
-    # 3. Rank
-    results_list.sort(key=lambda x: x['sharpe'], reverse=True)
-    TOP_5_RESULTS = results_list[:5]
-    
-    IS_LOADING = False
-    LOADING_STATUS = "Done"
-    print("--- WORKER FINISHED ---")
-    print("Top 5 Configs:")
-    for r in TOP_5_RESULTS:
-        print(r)
-
-# Start Worker
-t = threading.Thread(target=background_worker)
-t.start()
-
-# --- WEB SERVER ---
-def calculate_equity_curve(df, tp, sl):
-    """Calculates equity curve for plotting (Python logic, similar to Numba but returns array)"""
-    n = len(df)
-    opens = df['open'].values
-    highs = df['high'].values
-    lows = df['low'].values
-    closes = df['close'].values
-    timestamps = df['timestamp'].values
-    
-    equity = np.zeros(n)
-    cum_pnl = 0.0
-    fee_rate = 0.0002
-    
-    l_closed = True
-    s_closed = True
-    
-    tp_mult_l = 1 + tp/100.0
-    sl_mult_l = 1 - sl/100.0
-    tp_mult_s = 1 - tp/100.0
-    sl_mult_s = 1 + sl/100.0
-    
-    for i in range(n):
-        op = opens[i]
-        hi = highs[i]
-        lo = lows[i]
-        cl = closes[i]
+        # Short entries (Limit Sell)
+        for level in short_levels:
+            if l <= level <= h:
+                if not any(tr['entry_price'] == level and tr['type'] == 'short' for tr in active_trades):
+                    active_trades.append({
+                        'type': 'short',
+                        'entry_price': level,
+                        'entry_time': t,
+                        'sl_price': level * (1 + stop_loss_pct),
+                        'status': 'open'
+                    })
         
-        # Long
-        l_entry_fee = op * fee_rate if l_closed else 0.0
-        l_pnl = 0.0
-        l_exit_fee = 0.0
-        if lo <= op*sl_mult_l:
-            l_pnl = (op*sl_mult_l) - op
-            l_exit_fee = (op*sl_mult_l) * fee_rate
-            l_closed = True
-        elif hi >= op*tp_mult_l:
-            l_pnl = (op*tp_mult_l) - op
-            l_exit_fee = (op*tp_mult_l) * fee_rate
-            l_closed = True
+        # 2. Check Exits (Stop Loss)
+        # We iterate a copy to modify the list
+        for trade in active_trades[:]:
+            pnl = 0.0
+            closed = False
+            
+            if trade['type'] == 'long':
+                # If Low hit SL
+                if l <= trade['sl_price']:
+                    exit_p = trade['sl_price']
+                    # Slippage assumption: filled at SL price
+                    pnl = (exit_p - trade['entry_price']) / trade['entry_price']
+                    closed = True
+            
+            elif trade['type'] == 'short':
+                # If High hit SL
+                if h >= trade['sl_price']:
+                    exit_p = trade['sl_price']
+                    pnl = (trade['entry_price'] - exit_p) / trade['entry_price']
+                    closed = True
+            
+            if closed:
+                trade['exit_price'] = exit_p
+                trade['exit_time'] = t
+                trade['pnl'] = pnl
+                trade['status'] = 'closed'
+                trades.append(trade)
+                active_trades.remove(trade)
+                equity += pnl
+
+        equity_curve.append(equity)
+
+    # Close remaining at last price for reporting
+    last_price = closes[-1]
+    last_time = times[-1]
+    for trade in active_trades:
+        pnl = 0.0
+        if trade['type'] == 'long':
+            pnl = (last_price - trade['entry_price']) / trade['entry_price']
         else:
-            l_pnl = cl - op
-            l_closed = False
-            
-        # Short
-        s_entry_fee = op * fee_rate if s_closed else 0.0
-        s_pnl = 0.0
-        s_exit_fee = 0.0
-        if hi >= op*sl_mult_s:
-            s_pnl = op - (op*sl_mult_s)
-            s_exit_fee = (op*sl_mult_s) * fee_rate
-            s_closed = True
-        elif lo <= op*tp_mult_s:
-            s_pnl = op - (op*tp_mult_s)
-            s_exit_fee = (op*tp_mult_s) * fee_rate
-            s_closed = True
-        else:
-            s_pnl = op - cl
-            s_closed = False
-            
-        net = (l_pnl - l_entry_fee - l_exit_fee) + (s_pnl - s_entry_fee - s_exit_fee)
-        cum_pnl += net
-        equity[i] = cum_pnl
+            pnl = (trade['entry_price'] - last_price) / trade['entry_price']
         
-    return timestamps, equity
+        trade['exit_price'] = last_price
+        trade['exit_time'] = last_time
+        trade['pnl'] = pnl
+        trade['status'] = 'force_closed'
+        trades.append(trade)
+        equity += pnl
+        
+    return np.array(equity_curve), trades, equity
 
-@app.route('/')
-def dashboard():
-    if IS_LOADING:
-        return f"""
-        <html>
-        <head><meta http-equiv="refresh" content="5"></head>
-        <body style='background:#222; color:#0f0; font-family:monospace; text-align:center; padding-top:100px;'>
-            <h1>System Initializing...</h1>
-            <p>{LOADING_STATUS}</p>
-            <p>Please wait. Page will reload automatically.</p>
-        </body>
-        </html>
-        """
+# ==========================================
+# 3. GENETIC ALGORITHM
+# ==========================================
+class GeneticOptimizer:
+    def __init__(self, data, pop_size, generations, levels_cnt):
+        self.data = data
+        self.pop_size = pop_size
+        self.generations = generations
+        self.levels_cnt = levels_cnt
         
-    # Generate Table HTML
-    rows = ""
-    for idx, res in enumerate(TOP_5_RESULTS):
-        rows += f"""
-        <tr style="background: #333;">
-            <td>#{idx+1}</td>
-            <td style="color:cyan; font-weight:bold;">{res['asset']}</td>
-            <td>{res['timeframe']}</td>
-            <td>{res['tp']}%</td>
-            <td>{res['sl']}%</td>
-            <td style="color:gold;">{res['sharpe']:.2f}</td>
-            <td>
-                <a href="/plot?rank={idx}">
-                    <button style="cursor:pointer; background:#554400; color:white; border:1px solid #776600;">View Chart</button>
-                </a>
-            </td>
-        </tr>
-        """
+        # Bounds for initialization
+        self.price_min = data['low'].min()
+        self.price_max = data['high'].max()
         
+    def init_population(self):
+        pop = []
+        for _ in range(self.pop_size):
+            # Genome: [L1, L2, ..., S1, S2, ..., SL_PCT]
+            longs = np.random.uniform(self.price_min, self.price_max, self.levels_cnt)
+            shorts = np.random.uniform(self.price_min, self.price_max, self.levels_cnt)
+            sl = np.random.uniform(0.01, 0.10) # 1% to 10% SL
+            genome = np.concatenate([longs, shorts, [sl]])
+            pop.append(genome)
+        return pop
+
+    def fitness(self, genome):
+        longs = genome[:self.levels_cnt]
+        shorts = genome[self.levels_cnt:2*self.levels_cnt]
+        sl = genome[-1]
+        
+        # Constraint: SL must be positive
+        if sl <= 0: return -9999.0
+        
+        _, _, total_pnl = backtest(self.data, longs, shorts, sl)
+        return total_pnl
+
+    def mutate(self, genome):
+        # Gaussian mutation
+        idx = random.randint(0, len(genome)-1)
+        if idx < 2 * self.levels_cnt:
+            # Price level mutation: shift by std of prices
+            shift = np.random.normal(0, (self.price_max - self.price_min) * 0.05)
+            genome[idx] += shift
+        else:
+            # SL mutation
+            genome[idx] += np.random.normal(0, 0.01)
+            genome[idx] = np.clip(genome[idx], 0.001, 0.2)
+        return genome
+
+    def crossover(self, p1, p2):
+        pt = random.randint(1, len(p1)-1)
+        c1 = np.concatenate([p1[:pt], p2[pt:]])
+        c2 = np.concatenate([p2[:pt], p1[pt:]])
+        return c1, c2
+
+    def run(self):
+        pop = self.init_population()
+        best_genome = None
+        best_score = -np.inf
+        
+        for g in range(self.generations):
+            scores = [self.fitness(ind) for ind in pop]
+            
+            # Tracking
+            max_s = np.max(scores)
+            if max_s > best_score:
+                best_score = max_s
+                best_genome = pop[np.argmax(scores)]
+            
+            print(f"[GA] Gen {g+1}/{self.generations} | Max PnL: {max_s:.4f}")
+            
+            # Selection (Tournament)
+            new_pop = []
+            while len(new_pop) < self.pop_size:
+                p1 = pop[np.argmax([scores[random.randint(0, len(pop)-1)] for _ in range(3)])]
+                p2 = pop[np.argmax([scores[random.randint(0, len(pop)-1)] for _ in range(3)])]
+                
+                # Crossover
+                c1, c2 = self.crossover(p1, p2)
+                
+                # Mutation
+                if random.random() < MUTATION_RATE: c1 = self.mutate(c1)
+                if random.random() < MUTATION_RATE: c2 = self.mutate(c2)
+                
+                new_pop.extend([c1, c2])
+            
+            pop = new_pop[:self.pop_size]
+            
+        return best_genome
+
+# ==========================================
+# 4. PLOTTING & REPORTING
+# ==========================================
+def generate_plots(df, trades, equity_curve, long_levels, short_levels, output_dir):
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # 1. Price Plot
+    plt.figure(figsize=(14, 8))
+    plt.plot(df['open_time'], df['close'], label='Price', color='black', alpha=0.6, linewidth=1)
+    
+    # Levels
+    for l in long_levels:
+        plt.axhline(l, color='green', linestyle='--', alpha=0.5, label='Long Level' if l==long_levels[0] else "")
+    for s in short_levels:
+        plt.axhline(s, color='red', linestyle='--', alpha=0.5, label='Short Level' if s==short_levels[0] else "")
+        
+    # Markers
+    long_entries = [t for t in trades if t['type'] == 'long']
+    short_entries = [t for t in trades if t['type'] == 'short']
+    
+    if long_entries:
+        plt.scatter([t['entry_time'] for t in long_entries], [t['entry_price'] for t in long_entries], 
+                    marker='^', color='green', s=50, label='Long Entry')
+        plt.scatter([t['exit_time'] for t in long_entries], [t['exit_price'] for t in long_entries], 
+                    marker='x', color='black', s=30)
+
+    if short_entries:
+        plt.scatter([t['entry_time'] for t in short_entries], [t['entry_price'] for t in short_entries], 
+                    marker='v', color='red', s=50, label='Short Entry')
+        plt.scatter([t['exit_time'] for t in short_entries], [t['exit_price'] for t in short_entries], 
+                    marker='x', color='black', s=30)
+                    
+    plt.title(f"Strategy Execution: {SYMBOL}")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig(f"{output_dir}/price_plot.png")
+    plt.close()
+
+    # 2. PnL Plot
+    plt.figure(figsize=(14, 6))
+    plt.plot(equity_curve, color='blue', label='Cumulative PnL (Units)')
+    plt.title("Equity Curve")
+    plt.grid(True)
+    plt.legend()
+    plt.savefig(f"{output_dir}/pnl_plot.png")
+    plt.close()
+
+def generate_html(trades, pnl, output_dir):
     html = f"""
     <html>
     <head>
-        <title>Top 5 Strategies</title>
+        <title>Backtest Report</title>
         <style>
-            body {{ font-family: monospace; background: #111; color: #ddd; padding: 20px; }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-            th {{ background: #444; padding: 10px; text-align: left; }}
-            td {{ padding: 10px; border-bottom: 1px solid #222; }}
-            h2 {{ color: #0f0; }}
+            body {{ font-family: monospace; background: #f4f4f4; padding: 20px; }}
+            .container {{ max-width: 1000px; margin: auto; background: white; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
+            h1, h2 {{ border-bottom: 2px solid #333; padding-bottom: 10px; }}
+            img {{ max-width: 100%; margin-bottom: 20px; border: 1px solid #ddd; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 12px; }}
+            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+            th {{ background-color: #333; color: white; }}
+            tr:nth-child(even) {{ background-color: #f9f9f9; }}
+            .profit {{ color: green; font-weight: bold; }}
+            .loss {{ color: red; font-weight: bold; }}
         </style>
     </head>
     <body>
-        <h2>Top 5 Optimized Strategies (70/30 Split)</h2>
-        <table>
-            <thead>
+        <div class="container">
+            <h1>Strategy Report: {SYMBOL}</h1>
+            <h2>Total PnL: <span class="{ 'profit' if pnl > 0 else 'loss' }">{pnl:.4f} R</span></h2>
+            
+            <h3>Price Action & Entries</h3>
+            <img src="price_plot.png" alt="Price Plot">
+            
+            <h3>Equity Curve</h3>
+            <img src="pnl_plot.png" alt="PnL Plot">
+            
+            <h3>Trade Log</h3>
+            <table>
                 <tr>
-                    <th>Rank</th>
-                    <th>Asset</th>
-                    <th>Timeframe</th>
-                    <th>TP</th>
-                    <th>SL</th>
-                    <th>Train Sharpe</th>
-                    <th>Action</th>
+                    <th>Type</th><th>Entry Time</th><th>Entry Price</th><th>Exit Time</th><th>Exit Price</th><th>PnL</th><th>Status</th>
                 </tr>
-            </thead>
-            <tbody>
-                {rows}
-            </tbody>
-        </table>
-        <p style="margin-top:20px; color:#888;">*Optimization performed on first 70% of data (Training Set).</p>
+    """
+    
+    for t in trades:
+        color_class = "profit" if t['pnl'] > 0 else "loss"
+        html += f"""
+                <tr>
+                    <td>{t['type'].upper()}</td>
+                    <td>{t['entry_time']}</td>
+                    <td>{t['entry_price']:.2f}</td>
+                    <td>{t['exit_time']}</td>
+                    <td>{t['exit_price']:.2f}</td>
+                    <td class="{color_class}">{t['pnl']:.4f}</td>
+                    <td>{t['status']}</td>
+                </tr>
+        """
+        
+    html += """
+            </table>
+        </div>
     </body>
     </html>
     """
-    return html
+    
+    with open(f"{output_dir}/index.html", "w") as f:
+        f.write(html)
 
-@app.route('/plot')
-def plot_chart():
-    try:
-        rank = int(request.args.get('rank', 0))
-        config = TOP_5_RESULTS[rank]
-    except:
-        return "Invalid Rank"
-    
-    # Reconstruct Data
-    df_30m = RAW_DATA_30M[config['asset']]
-    df_tf = resample_data(df_30m, config['timeframe'])
-    
-    # Calculate Full Equity
-    ts, equity = calculate_equity_curve(df_tf, config['tp'], config['sl'])
-    
-    # Plot
-    fig, ax = plt.subplots(figsize=(15, 8))
-    ax.plot(ts, equity, color='cyan', label='Total Equity')
-    
-    # Draw Split Line
-    cutoff_ts = config['cutoff_ts']
-    ax.axvline(cutoff_ts, color='yellow', linestyle='--', linewidth=2, label='Train/Test Split (70/30)')
-    
-    # Highlight Test Area
-    ylim = ax.get_ylim()
-    ax.fill_betweenx(ylim, cutoff_ts, ts[-1], color='white', alpha=0.1, label='Unseen Test Data')
-    
-    ax.set_title(f"#{rank+1} {config['asset']} {config['timeframe']} | TP:{config['tp']}% SL:{config['sl']}% | Train Sharpe: {config['sharpe']:.2f}")
-    ax.legend(loc='upper left')
-    ax.set_facecolor('black')
-    fig.patch.set_facecolor('#222')
-    ax.tick_params(colors='white')
-    ax.xaxis.label.set_color('white')
-    ax.yaxis.label.set_color('white')
-    ax.title.set_color('white')
-    
-    img = io.BytesIO()
-    plt.savefig(img, format='png', bbox_inches='tight')
-    img.seek(0)
-    plt.close(fig)
-    return send_file(img, mimetype='image/png')
+# ==========================================
+# 5. SERVER
+# ==========================================
+def serve_results(directory):
+    os.chdir(directory)
+    handler = http.server.SimpleHTTPRequestHandler
+    with socketserver.TCPServer(("", PORT), handler) as httpd:
+        print(f"[SERVER] Serving at http://localhost:{PORT}")
+        httpd.serve_forever()
 
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
 if __name__ == "__main__":
-    print("Server starting on 8080...")
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    # 1. Fetch
+    df = fetch_ohlc(SYMBOL, INTERVAL, START_TIME)
+    
+    # 2. Split
+    split_idx = int(len(df) * 0.6)
+    train_data = df.iloc[:split_idx].reset_index(drop=True)
+    test_data = df.iloc[split_idx:].reset_index(drop=True)
+    
+    print(f"[SYSTEM] Data Split: Train={len(train_data)}, Test={len(test_data)}")
+    
+    # 3. Optimize (GA)
+    print("[SYSTEM] Starting Genetic Optimization...")
+    ga = GeneticOptimizer(train_data, POPULATION_SIZE, GENERATIONS, LEVELS_COUNT)
+    best_genome = ga.run()
+    
+    opt_longs = best_genome[:LEVELS_COUNT]
+    opt_shorts = best_genome[LEVELS_COUNT:2*LEVELS_COUNT]
+    opt_sl = best_genome[-1]
+    
+    print(f"[RESULT] Optimized Params:\n Longs: {opt_longs}\n Shorts: {opt_shorts}\n SL: {opt_sl:.4f}")
+    
+    # 4. Test
+    print("[SYSTEM] Running Test on Out-of-Sample Data...")
+    equity_curve, trades, total_pnl = backtest(test_data, opt_longs, opt_shorts, opt_sl)
+    
+    # 5. Serve
+    output_dir = "server_root"
+    generate_plots(test_data, trades, equity_curve, opt_longs, opt_shorts, output_dir)
+    generate_html(trades, total_pnl, output_dir)
+    
+    serve_results(output_dir)
