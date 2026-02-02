@@ -4,7 +4,6 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
-from matplotlib.colors import ListedColormap, BoundaryNorm
 from flask import Flask, send_file
 import io
 import numpy as np
@@ -32,9 +31,11 @@ def fetch_data():
             all_ohlcv.extend(ohlcv)
             last_timestamp = ohlcv[-1][0]
             since = last_timestamp + 3600000
-            print(f"Fetched up to {pd.to_datetime(last_timestamp, unit='ms')}")
+            # Reduced print frequency for density
+            if len(all_ohlcv) % 10000 == 0:
+                print(f"Fetched {len(all_ohlcv)} candles...")
         except Exception as e:
-            print(f"Error fetching data: {e}")
+            print(f"Error: {e}")
             break
             
     df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -45,47 +46,68 @@ def fetch_data():
 def plot_png():
     global df
     
-    # Calculate 365-day SMA (24 hours * 365 days)
-    sma_window = 365 * 24
-    df['sma'] = df['close'].rolling(window=sma_window).mean()
+    # 1. Calculate 200-period SMA (200 Hours)
+    df['sma'] = df['close'].rolling(window=200).mean()
     
-    # Filter out NaN values from SMA calculation for clean plotting
+    # 2. Strategy Logic: Stop and Reverse
+    # Signal: 1 (Long) if Close > SMA, -1 (Short) if Close < SMA
+    # "Open a long and short simultaneously" -> Interpreted as switching bias instant execution (Reversal)
+    df['signal'] = np.where(df['close'] > df['sma'], 1, -1)
+    
+    # Calculate Returns
+    # Shift signal by 1 because we trade at the Open of the NEXT candle based on Close of CURRENT
+    df['market_return'] = df['close'].pct_change()
+    df['strategy_return'] = df['market_return'] * df['signal'].shift(1)
+    
+    # 3. Equity Plot
+    # Fill NaN from SMA window with 0 return
+    df['strategy_return'] = df['strategy_return'].fillna(0)
+    df['equity'] = (1 + df['strategy_return']).cumprod()
+    
+    # Filter for plotting
     plot_data = df.dropna(subset=['sma']).copy()
     
-    fig, ax = plt.subplots(figsize=(15, 8), dpi=100)
+    # Plot Setup
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), dpi=100, gridspec_kw={'height_ratios': [2, 1]}, sharex=True)
     
-    # Data conversion for matplotlib
+    # --- Top Panel: Price vs SMA ---
     x = matplotlib.dates.date2num(plot_data['timestamp'])
     y = plot_data['close'].values
     sma = plot_data['sma'].values
     
-    # Create segments for LineCollection
     points = np.array([x, y]).T.reshape(-1, 1, 2)
     segments = np.concatenate([points[:-1], points[1:]], axis=1)
     
-    # Determine colors based on Price vs SMA relationship
-    # We compare the start of the segment to the SMA
-    # Logic: Green if Price > SMA, Red if Price <= SMA
-    # Using the first point of the segment for color determination
-    # Note: This is an approximation at the exact crossover point but sufficient for high density
+    # Color logic: Green if Price > SMA, Red if Price < SMA
     colors = ['green' if p > s else 'red' for p, s in zip(y[:-1], sma[:-1])]
     
     lc = LineCollection(segments, colors=colors, linewidth=1)
-    ax.add_collection(lc)
+    ax1.add_collection(lc)
+    ax1.plot(plot_data['timestamp'], sma, color='white', linewidth=1.5, label='200 SMA')
     
-    # Plot SMA
-    ax.plot(plot_data['timestamp'], sma, color='white', linewidth=1, label='365d SMA')
+    ax1.set_title('ETH/USDT 1H - Price vs 200 SMA')
+    ax1.set_ylabel('Price (USDT)')
+    ax1.grid(True, alpha=0.2)
+    ax1.legend(loc='upper left')
     
-    ax.autoscale_view()
-    ax.set_title('ETH/USDT - 5 Year 1H Close Price vs 365d SMA')
-    ax.set_ylabel('Price (USDT)')
-    ax.legend(loc='upper left')
-    ax.grid(True, alpha=0.2)
-    ax.set_facecolor('black')
+    # --- Bottom Panel: Equity Curve ---
+    ax2.plot(plot_data['timestamp'], plot_data['equity'], color='cyan', linewidth=1.5)
+    ax2.fill_between(plot_data['timestamp'], plot_data['equity'], 1, alpha=0.1, color='cyan')
+    
+    ax2.set_title('Strategy Equity (Reversal: Long > SMA, Short < SMA)')
+    ax2.set_ylabel('Normalized Equity (Start=1.0)')
+    ax2.grid(True, alpha=0.2)
+    ax2.axhline(1, color='gray', linestyle='--', alpha=0.5)
+    
+    # Styling
+    for ax in [ax1, ax2]:
+        ax.set_facecolor('black')
     fig.patch.set_facecolor('white')
     
     # Format Date Axis
-    ax.xaxis.set_major_formatter(matplotlib.dates.DateFormatter('%Y-%m'))
+    ax2.xaxis.set_major_formatter(matplotlib.dates.DateFormatter('%Y-%m'))
+    
+    plt.tight_layout()
     
     img = io.BytesIO()
     plt.savefig(img, format='png', bbox_inches='tight')
