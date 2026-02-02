@@ -1,3 +1,4 @@
+numba
 plotly 
 dash
 flask
