@@ -6,186 +6,223 @@ import numpy as np
 import matplotlib.pyplot as plt
 import io
 import base64
-from datetime import datetime, timedelta
+from datetime import datetime
 
-# Global Storage for Pre-computed HTML
-CACHED_HTML = b"<h3>Initializing... check back in 10 seconds.</h3>"
+# Global Cache
+CACHED_REPORT = b"<h3>Processing... Refresh in 30 seconds.</h3>"
 
 # ==========================================
-# 1. Data & Processing Core
+# 1. Data Engine
 # ==========================================
-def fetch_1yr_data():
-    print("--- Fetching 1 Year of Data ---")
+def fetch_deep_data():
+    print("--- Fetching Deep History (Starting 2021 for SMA Warmup) ---")
     base_url = "https://api.binance.com/api/v3/klines"
     limit = 1000
-    end_time = int(datetime.now().timestamp() * 1000)
-    start_time = int((datetime.now() - timedelta(days=365)).timestamp() * 1000)
+    
+    # Start: Jan 1, 2021 (Provides 1 year warmup for 2022 analysis)
+    start_ts = int(datetime(2021, 1, 1).timestamp() * 1000)
+    end_ts = int(datetime.now().timestamp() * 1000)
     
     all_data = []
-    current_start = start_time
+    current = start_ts
     
     while True:
-        params = {'symbol': 'ETHUSDT', 'interval': '1h', 'limit': limit, 'startTime': current_start, 'endTime': end_time}
+        params = {
+            'symbol': 'ETHUSDT', 'interval': '1h', 'limit': limit,
+            'startTime': current, 'endTime': end_ts
+        }
         try:
             resp = requests.get(base_url, params=params).json()
             if not resp or isinstance(resp, dict): break
             all_data.extend(resp)
-            current_start = resp[-1][0] + 1
-            if len(resp) < limit or current_start >= end_time: break
+            current = resp[-1][0] + 1
+            if len(resp) < limit or current >= end_ts: break
         except Exception as e:
             print(f"Fetch Error: {e}")
             break
-            
-    df = pd.DataFrame(all_data, columns=['op_t', 'open', 'high', 'low', 'close', 'vol', 'cl_t', 'qv', 'nt', 'tb', 'tq', 'ig'])
+    
+    df = pd.DataFrame(all_data, columns=[
+        'op_t', 'open', 'high', 'low', 'close', 'vol', 
+        'cl_t', 'qv', 'nt', 'tb', 'tq', 'ig'
+    ])
+    
     cols = ['open', 'high', 'low', 'close']
     df[cols] = df[cols].astype(float)
     df['timestamp'] = pd.to_datetime(df['op_t'], unit='ms')
-    print(f"Loaded {len(df)} candles.")
+    
+    print(f"Total Candles: {len(df)}")
     return df
+
+# ==========================================
+# 2. Indicator & Vectorized Logic
+# ==========================================
+def apply_indicators(df):
+    # 365 Days * 24 Hours = 8760 periods
+    df['sma_365d'] = df['close'].rolling(window=8760).mean()
+    
+    # Filter: Start Analysis from 2022 (Drop 2021 warmup)
+    mask_2022 = df['timestamp'] >= datetime(2022, 1, 1)
+    return df[mask_2022].copy()
 
 def get_pnl(df, sl, tp):
     if df.empty: return np.array([])
-    # Vectorized PnL Calculation
-    o, h, l, c = df['open'].values, df['high'].values, df['low'].values, df['close'].values
     
-    # Long
-    l_win = (h >= o * (1 + tp)) & ~(l <= o * (1 - sl))
-    l_loss = l <= o * (1 - sl)
-    l_ret = np.where(l_loss, -sl, np.where(l_win, tp, (c - o)/o))
+    o = df['open'].values
+    h = df['high'].values
+    l = df['low'].values
+    c = df['close'].values
     
-    # Short
-    s_win = (l <= o * (1 - tp)) & ~(h >= o * (1 + sl))
-    s_loss = h >= o * (1 + sl)
-    s_ret = np.where(s_loss, -sl, np.where(s_win, tp, (o - c)/o))
+    # Long Logic
+    l_tp_price = o * (1 + tp)
+    l_sl_price = o * (1 - sl)
     
-    return l_ret + s_ret
+    # Check Long Hits
+    l_hit_sl = l <= l_sl_price
+    # Conservative: SL hit checks low. TP hit checks high AND assumes SL not hit first.
+    l_hit_tp = (h >= l_tp_price) & (~l_hit_sl) 
+    
+    l_pnl = np.where(l_hit_sl, -sl, np.where(l_hit_tp, tp, (c - o)/o))
+    
+    # Short Logic
+    s_tp_price = o * (1 - tp)
+    s_sl_price = o * (1 + sl)
+    
+    # Check Short Hits
+    s_hit_sl = h >= s_sl_price
+    s_hit_tp = (l <= s_tp_price) & (~s_hit_sl)
+    
+    s_pnl = np.where(s_hit_sl, -sl, np.where(s_hit_tp, tp, (o - c)/o))
+    
+    return l_pnl + s_pnl
 
-def optimize_grid(df):
+# ==========================================
+# 3. Regime Optimization
+# ==========================================
+def optimize_regime(df, name):
+    print(f"Optimizing {name} Regime ({len(df)} candles)...")
     best_sharpe = -999
-    best_params = (0.01, 0.01)
-    # Grid: 0.5% to 5.0%
-    search_space = np.linspace(0.005, 0.05, 15)
+    best_params = (0, 0)
+    best_curve = []
     
-    for sl in search_space:
-        for tp in search_space:
+    # Grid: 0.5% to 5.0%
+    grid = np.linspace(0.005, 0.05, 20)
+    
+    for sl in grid:
+        for tp in grid:
             returns = get_pnl(df, sl, tp)
-            if np.std(returns) == 0: continue
-            # Annualized Sharpe
+            if len(returns) == 0 or np.std(returns) == 0: continue
+            
+            # Annualized Sharpe (Hourly)
             sharpe = (np.mean(returns) / np.std(returns)) * np.sqrt(24*365)
+            
             if sharpe > best_sharpe:
                 best_sharpe = sharpe
                 best_params = (sl, tp)
-    return best_params
-
-def run_analysis():
-    print("--- Starting Walk-Forward Analysis ---")
-    df = fetch_1yr_data()
-    df['month'] = df['timestamp'].dt.to_period('M')
-    months = df['month'].unique()
-    
-    equity = []
-    results_table = []
-    trade_log = []
-    
-    # Need at least 2 months
-    for i in range(len(months) - 1):
-        train_m, test_m = months[i], months[i+1]
-        print(f"Optimizing on {train_m} -> Testing on {test_m}")
-        
-        # 1. Train
-        train_data = df[df['month'] == train_m]
-        best_sl, best_tp = optimize_grid(train_data)
-        
-        # 2. Test
-        test_data = df[df['month'] == test_m]
-        returns = get_pnl(test_data, best_sl, best_tp)
-        
-        # 3. Log
-        monthly_sum = np.sum(returns)
-        results_table.append({
-            'period': str(test_m),
-            'sl': f"{best_sl*100:.1f}%", 
-            'tp': f"{best_tp*100:.1f}%", 
-            'net': monthly_sum
-        })
-        equity.extend(returns)
-        
-        # 4. Dense Logging (Vol Events > 0.5% movement)
-        mask = np.abs(returns) > 0.005
-        idxs = np.where(mask)[0]
-        for idx in idxs:
-            trade_log.append({
-                'time': test_data.iloc[idx]['timestamp'],
-                'price': test_data.iloc[idx]['close'],
-                'pnl': returns[idx],
-                'params': f"{best_sl*100:.1f}/{best_tp*100:.1f}"
-            })
-            
-    return equity, results_table, trade_log
+                best_curve = np.cumsum(returns)
+                
+    return best_params, best_sharpe, best_curve
 
 # ==========================================
-# 2. HTML Generation
+# 4. Execution & Report
 # ==========================================
-def generate_report():
-    equity, table_data, trades = run_analysis()
+def run_full_analysis():
+    # 1. Prepare Data
+    raw_df = fetch_deep_data()
+    df = apply_indicators(raw_df)
     
-    # Chart
-    plt.figure(figsize=(10, 5))
-    plt.plot(np.cumsum(equity), color='#2980b9', linewidth=2)
-    plt.title('Walk-Forward Equity Curve (1 Year)', fontsize=14)
+    # 2. Split Regimes
+    # Above SMA (Bullish Bias)
+    df_above = df[df['close'] > df['sma_365d']].copy()
+    
+    # Below SMA (Bearish Bias)
+    df_below = df[df['close'] < df['sma_365d']].copy()
+    
+    # 3. Optimize Independently
+    (ab_sl, ab_tp), ab_sharpe, ab_curve = optimize_regime(df_above, "Above SMA")
+    (be_sl, be_tp), be_sharpe, be_curve = optimize_regime(df_below, "Below SMA")
+    
+    # 4. Generate Visualization
+    plt.figure(figsize=(12, 10))
+    
+    # Plot 1: Price vs SMA
+    plt.subplot(3, 1, 1)
+    plt.plot(df['timestamp'], df['close'], label='Price', color='black', alpha=0.6, linewidth=0.8)
+    plt.plot(df['timestamp'], df['sma_365d'], label='365-Day SMA', color='orange', linewidth=1.5)
+    plt.title('Regime Split: Price vs 365-Day SMA (2022-Present)')
+    plt.legend()
     plt.grid(True, alpha=0.3)
+    
+    # Plot 2: Above SMA Equity
+    plt.subplot(3, 1, 2)
+    if len(ab_curve) > 0:
+        plt.plot(ab_curve, color='green', label=f'Above SMA (SL={ab_sl*100:.1f}% TP={ab_tp*100:.1f}%)')
+    plt.title(f'Performance: Above SMA (Sharpe: {ab_sharpe:.2f})')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Plot 3: Below SMA Equity
+    plt.subplot(3, 1, 3)
+    if len(be_curve) > 0:
+        plt.plot(be_curve, color='red', label=f'Below SMA (SL={be_sl*100:.1f}% TP={be_tp*100:.1f}%)')
+    plt.title(f'Performance: Below SMA (Sharpe: {be_sharpe:.2f})')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
     plt.tight_layout()
+    
     buf = io.BytesIO()
     plt.savefig(buf, format='png')
     buf.seek(0)
     img = base64.b64encode(buf.read()).decode('utf-8')
     plt.close()
     
-    # HTML Construction
-    rows = ""
-    for r in table_data:
-        color = "green" if r['net'] > 0 else "red"
-        rows += f"<tr><td>{r['period']}</td><td>SL {r['sl']} / TP {r['tp']}</td><td style='color:{color}'><b>{r['net']*100:.2f}%</b></td></tr>"
-        
-    log_rows = ""
-    for t in trades[-20:]: # Last 20 major events
-        c = "green" if t['pnl'] > 0 else "red"
-        log_rows += f"<tr><td>{t['time']}</td><td>{t['price']:.2f}</td><td>{t['params']}</td><td style='color:{c}'>{t['pnl']*100:.2f}%</td></tr>"
-
+    # 5. Generate HTML
     html = f"""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Walk-Forward Report</title>
         <style>
-            body {{ font-family: 'Segoe UI', monospace; background: #f0f2f5; padding: 20px; max-width: 900px; margin: auto; }}
-            .card {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }}
-            table {{ width: 100%; border-collapse: collapse; }}
-            th {{ text-align: left; background: #eee; padding: 10px; }}
-            td {{ padding: 10px; border-bottom: 1px solid #eee; }}
-            h2 {{ margin-top: 0; }}
+            body {{ font-family: monospace; background: #222; color: #eee; padding: 20px; }}
+            .card {{ background: #333; padding: 20px; border-radius: 8px; margin-bottom: 20px; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+            th {{ background: #444; text-align: left; padding: 8px; }}
+            td {{ border-bottom: 1px solid #555; padding: 8px; }}
+            .highlight {{ color: #00ff00; font-weight: bold; }}
         </style>
     </head>
     <body>
-        <div class="card">
-            <h2>Strategy Performance</h2>
-            <img src="data:image/png;base64,{img}" style="width:100%">
-        </div>
+        <h1>Trend Regime Optimization (2022 - Present)</h1>
         
         <div class="card">
-            <h2>Monthly Walk-Forward Results</h2>
+            <h2>Optimal Parameters</h2>
             <table>
-                <tr><th>Month</th><th>Optimized Params (Prev Month)</th><th>Net Return</th></tr>
-                {rows}
+                <tr>
+                    <th>Regime</th>
+                    <th>Condition</th>
+                    <th>Optimal SL</th>
+                    <th>Optimal TP</th>
+                    <th>Sharpe Ratio</th>
+                </tr>
+                <tr>
+                    <td><b>Bull Market</b></td>
+                    <td>Price > 365 SMA</td>
+                    <td class="highlight">{ab_sl*100:.2f}%</td>
+                    <td class="highlight">{ab_tp*100:.2f}%</td>
+                    <td>{ab_sharpe:.4f}</td>
+                </tr>
+                <tr>
+                    <td><b>Bear Market</b></td>
+                    <td>Price < 365 SMA</td>
+                    <td class="highlight">{be_sl*100:.2f}%</td>
+                    <td class="highlight">{be_tp*100:.2f}%</td>
+                    <td>{be_sharpe:.4f}</td>
+                </tr>
             </table>
         </div>
-        
+
         <div class="card">
-            <h2>Recent High-Volatility Events</h2>
-            <table>
-                <tr><th>Time</th><th>Price</th><th>Active Params</th><th>PnL</th></tr>
-                {log_rows}
-            </table>
+            <h2>Visual Analysis</h2>
+            <img src="data:image/png;base64,{img}" style="width: 100%; border: 1px solid #555;">
         </div>
     </body>
     </html>
@@ -193,25 +230,24 @@ def generate_report():
     return html.encode('utf-8')
 
 # ==========================================
-# 3. Server
+# 5. Server Handler
 # ==========================================
-class FastHandler(http.server.BaseHTTPRequestHandler):
+class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/html")
         self.end_headers()
-        self.wfile.write(CACHED_HTML)
+        self.wfile.write(CACHED_REPORT)
 
 if __name__ == "__main__":
-    # PRE-COMPUTE ON STARTUP
     try:
-        CACHED_HTML = generate_report()
-        print("--- Report Generated. Server Ready. ---")
+        CACHED_REPORT = run_full_analysis()
+        print("--- Analysis Complete. Server Ready. ---")
     except Exception as e:
-        print(f"Startup Failed: {e}")
-        CACHED_HTML = f"<h1>Error: {e}</h1>".encode('utf-8')
-
+        print(f"Error: {e}")
+        CACHED_REPORT = f"<h1>Error: {e}</h1>".encode('utf-8')
+        
     PORT = 8080
     print(f"Serving on http://localhost:{PORT}")
-    with socketserver.TCPServer(("", PORT), FastHandler) as httpd:
+    with socketserver.TCPServer(("", PORT), Handler) as httpd:
         httpd.serve_forever()
