@@ -55,8 +55,21 @@ def fetch_data():
             
     data = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
-    data['sma'] = data['close'].rolling(window=365*24).mean()
     
+    # Pre-calculate ALL SMA candidates (40, 50 ... 200)
+    # 200 hours is small, user likely meant 200 DAYS given context of 365?
+    # "Include SMA in grid search 40 50 ... 200"
+    # Previously used 365 DAYS (8760 hours). 
+    # If user types "200", they usually mean Days in crypto daily context, but we are on 1H chart.
+    # Standard 1H SMAs are 50, 200 hours. Standard Daily are 50, 200 days.
+    # Given the previous context was "365 day SMA" (8760 hours), searching 40-200 HOURS would be a huge regime shift (short term trend).
+    # Searching 40-200 DAYS (960-4800 hours) is more comparable.
+    # However, "40 50 ... 200" usually implies the raw number.
+    # I will stick to **DAYS** (x24 hours) to keep it consistent with the "365" logic previously used.
+    
+    for d in range(40, 210, 10):
+        data[f'sma_{d}d'] = data['close'].rolling(window=d*24).mean()
+        
     return data
 
 @njit(fastmath=True)
@@ -90,7 +103,6 @@ def optimize_regime_sharpe(opens, highs, lows, closes, smas, target_above_sma):
                 op = opens[i]
                 sma = smas[i]
                 
-                # Check Regime
                 is_above = op > sma
                 if is_above != target_above_sma:
                     l_closed_prev = True
@@ -101,7 +113,7 @@ def optimize_regime_sharpe(opens, highs, lows, closes, smas, target_above_sma):
                 lo = lows[i]
                 cl = closes[i]
                 
-                # --- LONG LEG ---
+                # LONG
                 l_entry_fee = op * fee_rate if l_closed_prev else 0.0
                 l_sl_price = op * l_sl_mult
                 l_tp_price = op * l_tp_mult
@@ -124,7 +136,7 @@ def optimize_regime_sharpe(opens, highs, lows, closes, smas, target_above_sma):
                 
                 l_net = l_pnl - l_entry_fee - l_exit_fee
                 
-                # --- SHORT LEG ---
+                # SHORT
                 s_entry_fee = op * fee_rate if s_closed_prev else 0.0
                 s_sl_price = op * s_sl_mult
                 s_tp_price = op * s_tp_mult
@@ -157,24 +169,37 @@ def optimize_regime_sharpe(opens, highs, lows, closes, smas, target_above_sma):
                 var = (sum_returns_sq / count) - (mean * mean)
                 if var > 1e-9:
                     std = np.sqrt(var)
+                    # We return statistics to combine them later
                     sharpe = (mean / std) * 93.59
                     
                     if sharpe > best_sharpe:
                         best_sharpe = sharpe
                         best_tp = tp_pct
                         best_sl = sl_pct
+                        best_mean = mean
+                        best_var = var
+                        best_count = count
                         
-    return best_tp, best_sl, best_sharpe
+    if best_sharpe == -np.inf:
+        return 5.0, 2.0, 0.0, 0.0, 0.0, 0
+        
+    return best_tp, best_sl, best_sharpe, best_mean, best_var, best_count
 
-def calculate_strategy_hourly_smart_fees(data, tp_above, sl_above, tp_below, sl_below):
+def calculate_strategy_final(data, sma_days, tp_above, sl_above, tp_below, sl_below):
     n = len(data)
     timestamps = data['timestamp'].values
     opens = data['open'].values
     highs = data['high'].values
     lows = data['low'].values
     closes = data['close'].values
-    smas = data['sma'].values
     
+    # Dynamic SMA calculation if not pre-calc (for plotting unseen)
+    col_name = f'sma_{int(sma_days)}d'
+    if col_name in data.columns:
+        smas = data[col_name].values
+    else:
+        smas = data['close'].rolling(window=int(sma_days)*24).mean().fillna(0).values
+
     net_equity = np.zeros(n)
     trades = []
     current_cum_pnl = 0.0
@@ -201,6 +226,12 @@ def calculate_strategy_hourly_smart_fees(data, tp_above, sl_above, tp_below, sl_
         cl = closes[i]
         sma = smas[i]
         
+        if sma == 0 or np.isnan(sma):
+            # Skip until SMA is ready
+            l_closed_prev = True
+            s_closed_prev = True
+            continue
+            
         is_above = op > sma
         
         if is_above:
@@ -277,25 +308,27 @@ def calculate_strategy_hourly_smart_fees(data, tp_above, sl_above, tp_below, sl_
                 'pnl': net_pnl
             })
             
-    return net_equity, trades
+    return net_equity, trades, smas
 
 @app.route('/')
 def index():
     global df
     try:
+        sma_days = int(request.args.get('sma_days', 365))
         sl_above = float(request.args.get('sl_above', 2.0))
         tp_above = float(request.args.get('tp_above', 5.0))
         sl_below = float(request.args.get('sl_below', 2.0))
         tp_below = float(request.args.get('tp_below', 5.0))
     except:
+        sma_days = 365
         sl_above, tp_above = 2.0, 5.0
         sl_below, tp_below = 2.0, 5.0
         
     if df is None:
         return "Data not loaded", 500
 
-    calc_data = df.dropna(subset=['sma']).reset_index(drop=True)
-    net_equity, trades = calculate_strategy_hourly_smart_fees(calc_data, tp_above, sl_above, tp_below, sl_below)
+    calc_data = df.dropna(subset=['close']).reset_index(drop=True) # Don't dropNA on SMA yet, handled in loop
+    net_equity, trades, _ = calculate_strategy_final(calc_data, sma_days, tp_above, sl_above, tp_below, sl_below)
     
     rows = ""
     for t in reversed(trades[-50:]):
@@ -327,11 +360,12 @@ def index():
             </style>
             <script>
                 function runOptimization() {{
-                    document.getElementById('optimize-status').innerText = "Optimizing Training Data (<2026)...";
-                    fetch('/optimize_split')
+                    document.getElementById('optimize-status').innerText = "Optimizing SMA (40-200) & Params... Please wait.";
+                    fetch('/optimize_all')
                         .then(response => response.json())
                         .then(data => {{
-                            document.getElementById('optimize-status').innerText = "Done! Above: " + data.tp_above + "/" + data.sl_above + " | Below: " + data.tp_below + "/" + data.sl_below;
+                            document.getElementById('optimize-status').innerText = "Found Best SMA: " + data.best_sma + " days (Sharpe: " + data.total_sharpe.toFixed(2) + ")";
+                            document.querySelector('input[name="sma_days"]').value = data.best_sma;
                             document.querySelector('input[name="tp_above"]').value = data.tp_above;
                             document.querySelector('input[name="sl_above"]').value = data.sl_above;
                             document.querySelector('input[name="tp_below"]').value = data.tp_below;
@@ -345,18 +379,21 @@ def index():
         </head>
         <body>
             <div class="container">
-                <h2>ETH/USDT Walk-Forward Analysis</h2>
-                <p>Optimization Train: 2021-2025. Unseen Test: 2026-Present.</p>
+                <h2>ETH/USDT Full Optimization</h2>
+                <p>Grid Search: SMA (40-200d) + TP/SL (0.2-10%). Train < 2026.</p>
                 
                 <form action="/" method="get">
                     <div class="params-box">
                         <div class="params-row">
-                            <strong>Above SMA (>365):</strong>
+                             <strong>Trend Filter:</strong> SMA Days <input type="number" name="sma_days" value="{sma_days}">
+                        </div>
+                        <div class="params-row">
+                            <strong>Above SMA:</strong>
                             SL % <input type="number" step="0.1" name="sl_above" value="{sl_above}">
                             TP % <input type="number" step="0.1" name="tp_above" value="{tp_above}">
                         </div>
                         <div class="params-row">
-                            <strong>Below SMA (<365):</strong>
+                            <strong>Below SMA:</strong>
                             SL % <input type="number" step="0.1" name="sl_below" value="{sl_below}">
                             TP % <input type="number" step="0.1" name="tp_below" value="{tp_below}">
                         </div>
@@ -366,13 +403,13 @@ def index():
                     </div>
                 </form>
                 
-                <button onclick="runOptimization()">Run Optimization (Train Set Only)</button>
+                <button onclick="runOptimization()">Run Full Grid Search</button>
                 <div id="optimize-status"></div>
                 
                 <br>
-                <img src="/plot.png?sl_above={sl_above}&tp_above={tp_above}&sl_below={sl_below}&tp_below={tp_below}" style="border: 1px solid #555; max-width: 100%; margin-top: 20px;">
+                <img src="/plot.png?sma_days={sma_days}&sl_above={sl_above}&tp_above={tp_above}&sl_below={sl_below}&tp_below={tp_below}" style="border: 1px solid #555; max-width: 100%; margin-top: 20px;">
                 
-                <h3>Triggered Trade Events</h3>
+                <h3>Recent Events</h3>
                 <div class="scroll-table">
                     <table>
                         <thead>
@@ -394,133 +431,155 @@ def index():
     """
     return html
 
-@app.route('/optimize_split')
-def optimize_split():
+@app.route('/optimize_all')
+def optimize_all():
     global market_data, df
     
-    # CUTOFF DATE for Training
     cutoff_ts = pd.Timestamp('2026-01-01')
     
     if 'opens' not in market_data:
-        calc_data = df.dropna(subset=['sma']).reset_index(drop=True)
-        # Store full arrays
+        # Load logic similar to before, but we need dynamic SMAs
+        calc_data = df.dropna(subset=['close']).reset_index(drop=True)
         market_data['timestamps'] = calc_data['timestamp'].values
         market_data['opens'] = calc_data['open'].values.astype(np.float64)
         market_data['highs'] = calc_data['high'].values.astype(np.float64)
         market_data['lows'] = calc_data['low'].values.astype(np.float64)
         market_data['closes'] = calc_data['close'].values.astype(np.float64)
-        market_data['smas'] = calc_data['sma'].values.astype(np.float64)
-    
-    # Create Boolean Mask for Training Data
+        # We also need the SMA columns cached in numpy
+        for d in range(40, 210, 10):
+            col = f'sma_{d}d'
+            market_data[col] = calc_data[col].fillna(0).values.astype(np.float64)
+
     train_mask = market_data['timestamps'] < np.datetime64(cutoff_ts)
     
-    # Slice arrays for optimizer
     opens = market_data['opens'][train_mask]
     highs = market_data['highs'][train_mask]
     lows = market_data['lows'][train_mask]
     closes = market_data['closes'][train_mask]
-    smas = market_data['smas'][train_mask]
+    
+    best_global_sharpe = -np.inf
+    best_config = {}
     
     t0 = time.time()
-    tp_a, sl_a, sharpe_a = optimize_regime_sharpe(opens, highs, lows, closes, smas, True)
-    tp_b, sl_b, sharpe_b = optimize_regime_sharpe(opens, highs, lows, closes, smas, False)
     
-    print(f"Training Set Optimization done in {time.time() - t0:.2f}s")
-    
-    return jsonify({
-        'tp_above': round(tp_a, 1),
-        'sl_above': round(sl_a, 1),
-        'sharpe_above': sharpe_a,
-        'tp_below': round(tp_b, 1),
-        'sl_below': round(sl_b, 1),
-        'sharpe_below': sharpe_b
-    })
+    # Loop SMAs 40 to 200
+    for d in range(40, 210, 10):
+        col = f'sma_{d}d'
+        smas = market_data[col][train_mask]
+        
+        # Optimize Above
+        tp_a, sl_a, _, mean_a, var_a, count_a = optimize_regime_sharpe(opens, highs, lows, closes, smas, True)
+        
+        # Optimize Below
+        tp_b, sl_b, _, mean_b, var_b, count_b = optimize_regime_sharpe(opens, highs, lows, closes, smas, False)
+        
+        # Combine Stats for Total Sharpe
+        total_mean = (mean_a * count_a + mean_b * count_b) / (count_a + count_b)
+        
+        # Variance combination (approximate for disjoint sets)
+        # Total SumSq = SumSq_A + SumSq_B
+        # This is strictly true since they never overlap.
+        # Recalculate SumSq from Mean/Var
+        sumsq_a = (var_a + mean_a**2) * count_a
+        sumsq_b = (var_b + mean_b**2) * count_b
+        
+        total_count = count_a + count_b
+        if total_count > 0:
+            total_sumsq = sumsq_a + sumsq_b
+            total_var = (total_sumsq / total_count) - (total_mean**2)
+            if total_var > 0:
+                total_std = np.sqrt(total_var)
+                total_sharpe = (total_mean / total_std) * 93.59
+                
+                if total_sharpe > best_global_sharpe:
+                    best_global_sharpe = total_sharpe
+                    best_config = {
+                        'best_sma': d,
+                        'tp_above': round(tp_a, 1),
+                        'sl_above': round(sl_a, 1),
+                        'tp_below': round(tp_b, 1),
+                        'sl_below': round(sl_b, 1),
+                        'total_sharpe': total_sharpe
+                    }
+
+    print(f"Global Optimization done in {time.time() - t0:.2f}s")
+    return jsonify(best_config)
 
 @app.route('/plot.png')
 def plot_png():
     global df
     try:
+        sma_days = int(request.args.get('sma_days', 365))
         sl_a = float(request.args.get('sl_above', 2.0))
         tp_a = float(request.args.get('tp_above', 5.0))
         sl_b = float(request.args.get('sl_below', 2.0))
         tp_b = float(request.args.get('tp_below', 5.0))
     except:
+        sma_days = 365
         sl_a, tp_a, sl_b, tp_b = 2.0, 5.0, 2.0, 5.0
 
-    plot_data = df.dropna(subset=['sma']).copy()
-    plot_data = plot_data.reset_index(drop=True)
+    plot_data = df.dropna(subset=['close']).reset_index(drop=True).copy()
     
-    if plot_data.empty:
-        return "Not enough data", 400
-    
-    net_equity, _ = calculate_strategy_hourly_smart_fees(plot_data, tp_a, sl_a, tp_b, sl_b)
+    # Calculate strategy with specific SMA
+    net_equity, _, smas = calculate_strategy_final(plot_data, sma_days, tp_a, sl_a, tp_b, sl_b)
     plot_data['net_equity'] = net_equity
+    plot_data['sma_plot'] = smas # Assign for plotting
     
-    # Prepare Unseen Data Plot (2026+)
+    # 2026 Split
     cutoff_ts = pd.Timestamp('2026-01-01')
     unseen_data = plot_data[plot_data['timestamp'] >= cutoff_ts].copy()
-    
-    # Rebase Unseen Equity to 0
     if not unseen_data.empty:
-        base_val = unseen_data['net_equity'].iloc[0]
-        unseen_data['net_equity'] = unseen_data['net_equity'] - base_val
+        unseen_data['net_equity'] -= unseen_data['net_equity'].iloc[0]
     
-    # Plotting (3 Subplots)
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 12), dpi=100, gridspec_kw={'height_ratios': [2, 1, 1]}, sharex=False)
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 12), dpi=100, gridspec_kw={'height_ratios': [2, 1, 1]})
     
     # 1. Price
     x = matplotlib.dates.date2num(plot_data['timestamp'])
     y = plot_data['close'].values
-    sma = plot_data['sma'].values
+    sma_vals = plot_data['sma_plot'].values
     
     points = np.array([x, y]).T.reshape(-1, 1, 2)
     segments = np.concatenate([points[:-1], points[1:]], axis=1)
-    colors = ['green' if p > s else 'red' for p, s in zip(y[:-1], sma[:-1])]
+    colors = ['green' if p > s else 'red' for p, s in zip(y[:-1], sma_vals[:-1])]
     
     lc = LineCollection(segments, colors=colors, linewidth=1)
     ax1.add_collection(lc)
-    ax1.plot(plot_data['timestamp'], sma, color='white', linewidth=1.5, label='365d SMA')
-    ax1.set_title('ETH/USDT Price vs SMA')
-    ax1.set_ylabel('Price')
-    ax1.legend(loc='upper left')
-    ax1.grid(True, alpha=0.2)
-    # Cutoff Line
-    ax1.axvline(cutoff_ts, color='yellow', linestyle='--', linewidth=2, label='Training Cutoff')
+    ax1.plot(plot_data['timestamp'], sma_vals, color='white', linewidth=1.5, label=f'{sma_days}d SMA')
+    ax1.set_title(f'ETH/USDT Price vs {sma_days}d SMA')
+    ax1.axvline(cutoff_ts, color='yellow', linestyle='--')
     ax1.set_xlim(plot_data['timestamp'].min(), plot_data['timestamp'].max())
+    ax1.set_ylim(plot_data['close'].min() * 0.9, plot_data['close'].max() * 1.1)
+    ax1.legend()
+    ax1.grid(True, alpha=0.2)
     
     # 2. Full Equity
-    ax2.plot(plot_data['timestamp'], plot_data['net_equity'], color='cyan', linewidth=1.5, label='Full History Equity')
-    ax2.set_title('Full History PnL (Training + Unseen)')
-    ax2.set_ylabel('PnL (USDT)')
-    ax2.axvline(cutoff_ts, color='yellow', linestyle='--', linewidth=2)
-    ax2.grid(True, alpha=0.2)
+    ax2.plot(plot_data['timestamp'], plot_data['net_equity'], color='cyan')
+    ax2.set_title('Full History PnL')
+    ax2.axvline(cutoff_ts, color='yellow', linestyle='--')
     ax2.set_xlim(plot_data['timestamp'].min(), plot_data['timestamp'].max())
+    ax2.grid(True, alpha=0.2)
     
-    # 3. Unseen Data Zoom
+    # 3. Unseen
     if not unseen_data.empty:
-        ax3.plot(unseen_data['timestamp'], unseen_data['net_equity'], color='magenta', linewidth=1.5, label='Unseen Data PnL')
-        ax3.set_title('Unseen Data PnL (2026-Present) - Rebased to 0')
-        ax3.set_ylabel('PnL (USDT)')
-        ax3.grid(True, alpha=0.2)
+        ax3.plot(unseen_data['timestamp'], unseen_data['net_equity'], color='magenta')
+        ax3.set_title('Unseen Data PnL (2026+)')
         ax3.axhline(0, color='white', alpha=0.3)
     else:
-        ax3.text(0.5, 0.5, "No Unseen Data Available (>2026)", ha='center', va='center', color='white')
+        ax3.text(0.5, 0.5, "No Unseen Data", color='white')
+    ax3.grid(True, alpha=0.2)
     
     for ax in [ax1, ax2, ax3]:
         ax.set_facecolor('black')
-    
     fig.patch.set_facecolor('white')
     ax1.xaxis.set_major_formatter(matplotlib.dates.DateFormatter('%Y-%m'))
     ax2.xaxis.set_major_formatter(matplotlib.dates.DateFormatter('%Y-%m'))
     ax3.xaxis.set_major_formatter(matplotlib.dates.DateFormatter('%Y-%m-%d'))
     
     plt.tight_layout()
-    
     img = io.BytesIO()
     plt.savefig(img, format='png', bbox_inches='tight')
     img.seek(0)
     plt.close(fig)
-    
     return send_file(img, mimetype='image/png')
 
 if __name__ == "__main__":
