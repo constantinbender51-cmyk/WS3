@@ -23,8 +23,8 @@ class Config:
     ANNUALIZATION_FACTOR = 365 * 6 
     
     # Genetic Algorithm Settings
-    POPULATION_SIZE = 50
-    GENERATIONS = 15
+    POPULATION_SIZE = 100
+    GENERATIONS = 30
     MUTATION_RATE = 0.2
     ELITISM_COUNT = 2
     
