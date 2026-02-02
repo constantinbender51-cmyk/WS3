@@ -15,7 +15,7 @@ class Config:
     # Exchange Settings
     SYMBOL = "BTCUSDT"
     INTERVAL = "4h"
-    START_TIME = "2025-01-01"
+    START_TIME = "2024-01-01"
     
     # Backtest Settings
     LEVELS_COUNT = 3        # Number of Long and Short levels (each)
