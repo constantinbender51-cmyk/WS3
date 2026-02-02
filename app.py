@@ -23,9 +23,9 @@ app = Flask(__name__)
 
 # Global Storage
 current_df = None
-market_data_cache = {} # Cache optimized arrays for the current asset
+market_data_cache = {} 
 current_config = {
-    'symbol': 'ETH/USDT',
+    'symbol': 'BTC/USDT',
     'timeframe': '1h'
 }
 
@@ -40,8 +40,6 @@ TIMEFRAMES = ['30m', '1h', '4h', '1d']
 def fetch_data(symbol, timeframe):
     exchange = ccxt.binance({'enableRateLimit': True})
     limit = 1000
-    
-    # Calculate start time: 5 years ago
     now = exchange.milliseconds()
     since = now - (5 * 365 * 24 * 60 * 60 * 1000)
     
@@ -54,20 +52,10 @@ def fetch_data(symbol, timeframe):
             if not ohlcv:
                 break
             all_ohlcv.extend(ohlcv)
-            
-            # Update 'since' based on timeframe duration in ms
             last_timestamp = ohlcv[-1][0]
-            
-            # Duration map
-            tf_ms = {
-                '30m': 1800000,
-                '1h': 3600000,
-                '4h': 14400000,
-                '1d': 86400000
-            }
+            tf_ms = {'30m': 1800000, '1h': 3600000, '4h': 14400000, '1d': 86400000}
             duration = tf_ms.get(timeframe, 3600000)
             since = last_timestamp + duration
-            
         except Exception as e:
             print(f"Error fetching: {e}")
             break
@@ -77,11 +65,14 @@ def fetch_data(symbol, timeframe):
     return df
 
 @njit(fastmath=True)
-def optimize_single_pnl(opens, highs, lows, closes):
+def optimize_single_sharpe(opens, highs, lows, closes):
+    """
+    Optimizes for Sharpe Ratio (Risk-Adjusted Return).
+    """
     n = len(opens)
     fee_rate = 0.0002
     
-    best_pnl = -np.inf
+    best_sharpe = -np.inf
     best_tp = 5.0
     best_sl = 2.0
     
@@ -96,7 +87,9 @@ def optimize_single_pnl(opens, highs, lows, closes):
             s_tp_mult = 1.0 - tp_pct / 100.0
             s_sl_mult = 1.0 + sl_pct / 100.0
             
-            total_pnl = 0.0
+            # Welford's or SumSq for variance
+            sum_returns = 0.0
+            sum_returns_sq = 0.0
             
             l_closed_prev = True
             s_closed_prev = True
@@ -112,53 +105,67 @@ def optimize_single_pnl(opens, highs, lows, closes):
                 l_sl_price = op * l_sl_mult
                 l_tp_price = op * l_tp_mult
                 l_exit_fee = 0.0
-                l_trade_pnl = 0.0
+                l_pnl = 0.0
                 
                 if lo <= l_sl_price:
-                    l_trade_pnl = l_sl_price - op
+                    l_pnl = l_sl_price - op
                     l_exit_fee = l_sl_price * fee_rate
                     l_closed_prev = True 
                 elif hi >= l_tp_price:
-                    l_trade_pnl = l_tp_price - op
+                    l_pnl = l_tp_price - op
                     l_exit_fee = l_tp_price * fee_rate
                     l_closed_prev = True
                 else:
-                    l_trade_pnl = cl - op
+                    l_pnl = cl - op
                     l_exit_fee = 0.0
                     l_closed_prev = False
                 
-                l_net = l_trade_pnl - l_entry_fee - l_exit_fee
+                l_net = l_pnl - l_entry_fee - l_exit_fee
                 
                 # SHORT
                 s_entry_fee = op * fee_rate if s_closed_prev else 0.0
                 s_sl_price = op * s_sl_mult
                 s_tp_price = op * s_tp_mult
                 s_exit_fee = 0.0
-                s_trade_pnl = 0.0
+                s_pnl = 0.0
                 
                 if hi >= s_sl_price:
-                    s_trade_pnl = op - s_sl_price
+                    s_pnl = op - s_sl_price
                     s_exit_fee = s_sl_price * fee_rate
                     s_closed_prev = True
                 elif lo <= s_tp_price:
-                    s_trade_pnl = op - s_tp_price
+                    s_pnl = op - s_tp_price
                     s_exit_fee = s_tp_price * fee_rate
                     s_closed_prev = True
                 else:
-                    s_trade_pnl = op - cl
+                    s_pnl = op - cl
                     s_exit_fee = 0.0
                     s_closed_prev = False
                 
-                s_net = s_trade_pnl - s_entry_fee - s_exit_fee
+                s_net = s_pnl - s_entry_fee - s_exit_fee
                 
-                total_pnl += (l_net + s_net)
+                net_pnl = l_net + s_net
+                
+                # Accumulate Stats
+                sum_returns += net_pnl
+                sum_returns_sq += (net_pnl * net_pnl)
             
-            if total_pnl > best_pnl:
-                best_pnl = total_pnl
-                best_tp = tp_pct
-                best_sl = sl_pct
+            # Calculate Sharpe
+            if n > 100:
+                mean = sum_returns / n
+                var = (sum_returns_sq / n) - (mean * mean)
+                if var > 1e-9:
+                    std = np.sqrt(var)
+                    # Annualize Sharpe (approx 8760 hours in year)
+                    # If timeframe is different, this constant is just a scaler, doesn't change optimization rank
+                    sharpe = (mean / std) * 93.59
+                    
+                    if sharpe > best_sharpe:
+                        best_sharpe = sharpe
+                        best_tp = tp_pct
+                        best_sl = sl_pct
                         
-    return best_tp, best_sl, best_pnl
+    return best_tp, best_sl, best_sharpe
 
 def calculate_strategy_single(data, tp_pct, sl_pct):
     n = len(data)
@@ -192,10 +199,8 @@ def calculate_strategy_single(data, tp_pct, sl_pct):
         l_entry_fee = op * fee_rate if l_closed_prev else 0.0
         l_sl_price = op * sl_mult_l
         l_tp_price = op * tp_mult_l
-        
-        l_exit = 0.0
-        l_status = ""
         l_exit_fee = 0.0
+        l_status = ""
         
         if lo <= l_sl_price:
             l_exit = l_sl_price
@@ -219,10 +224,8 @@ def calculate_strategy_single(data, tp_pct, sl_pct):
         s_entry_fee = op * fee_rate if s_closed_prev else 0.0
         s_sl_price = op * sl_mult_s
         s_tp_price = op * tp_mult_s
-        
-        s_exit = 0.0
-        s_status = ""
         s_exit_fee = 0.0
+        s_status = ""
         
         if hi >= s_sl_price:
             s_exit = s_sl_price
@@ -261,7 +264,7 @@ def load_data():
     global current_df, market_data_cache, current_config
     
     req = request.json
-    symbol = req.get('symbol', 'ETH/USDT')
+    symbol = req.get('symbol', 'BTC/USDT')
     timeframe = req.get('timeframe', '1h')
     
     current_df = fetch_data(symbol, timeframe)
@@ -281,7 +284,6 @@ def index():
     asset_options = "".join([f"<option value='{a}'>{a}</option>" for a in ASSETS])
     tf_options = "".join([f"<option value='{t}'>{t}</option>" for t in TIMEFRAMES])
     
-    # Load defaults if no data
     status_text = "No data loaded."
     if current_df is not None:
         status_text = f"Loaded: {current_config['symbol']} ({current_config['timeframe']})"
@@ -323,14 +325,13 @@ def index():
                 }}
 
                 function runOptimizer() {{
-                    document.getElementById('status-bar').innerText = "Optimizing... Please wait.";
+                    document.getElementById('status-bar').innerText = "Optimizing Sharpe (Train <2026)... Please wait.";
                     fetch('/optimize')
                         .then(res => res.json())
                         .then(data => {{
-                            document.getElementById('status-bar').innerText = "Optimized! SL: " + data.sl + " TP: " + data.tp + " PnL: " + data.pnl.toFixed(2);
+                            document.getElementById('status-bar').innerText = "Optimized! SL: " + data.sl + " TP: " + data.tp + " Sharpe: " + data.sharpe.toFixed(2);
                             document.querySelector('input[name="sl"]').value = data.sl;
                             document.querySelector('input[name="tp"]').value = data.tp;
-                            // Trigger plot update
                             document.getElementById('plot-form').submit();
                         }});
                 }}
@@ -338,7 +339,7 @@ def index():
         </head>
         <body>
             <div class="container">
-                <h2>Multi-Asset PnL Optimizer</h2>
+                <h2>Multi-Asset Strategy (Sharpe)</h2>
                 
                 <div class="controls">
                     <label>Asset: <select id="symbol">{asset_options}</select></label>
@@ -354,7 +355,7 @@ def index():
                         <label>TP % <input type="number" step="0.1" name="tp" value="{tp}"></label>
                         <input type="submit" value="Update Chart" style="background:#444;">
                     </form>
-                    <button onclick="runOptimizer()">Run Auto-Optimize</button>
+                    <button onclick="runOptimizer()">Optimize Sharpe</button>
                 </div>
 
                 <img src="/plot.png?sl={sl}&tp={tp}" style="border: 1px solid #555; max-width: 100%; width: 100%; height: auto;">
@@ -397,7 +398,6 @@ def optimize():
         
     cutoff_ts = pd.Timestamp('2026-01-01')
     
-    # Cache preparation
     if 'opens' not in market_data_cache:
         calc_data = current_df.dropna(subset=['close']).reset_index(drop=True)
         market_data_cache['timestamps'] = calc_data['timestamp'].values
@@ -413,12 +413,12 @@ def optimize():
     lows = market_data_cache['lows'][train_mask]
     closes = market_data_cache['closes'][train_mask]
     
-    best_tp, best_sl, best_pnl = optimize_single_pnl(opens, highs, lows, closes)
+    best_tp, best_sl, best_sharpe = optimize_single_sharpe(opens, highs, lows, closes)
     
     return jsonify({
         'tp': round(best_tp, 1),
         'sl': round(best_sl, 1),
-        'pnl': best_pnl
+        'sharpe': best_sharpe
     })
 
 @app.route('/plot.png')
@@ -432,7 +432,6 @@ def plot_png():
         sl, tp = 2.0, 5.0
 
     if current_df is None:
-        # Return empty placeholder
         fig, ax = plt.subplots(figsize=(10, 2))
         ax.text(0.5, 0.5, "Please Load Data First", ha='center', va='center')
         img = io.BytesIO()
@@ -491,6 +490,5 @@ def plot_png():
 
 if __name__ == "__main__":
     print("Starting server on 8080...")
-    # Initialize with default to allow instant plotting
     current_df = fetch_data('BTC/USDT', '1h')
     app.run(host='0.0.0.0', port=8080, debug=False)
