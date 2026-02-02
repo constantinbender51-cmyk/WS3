@@ -4,14 +4,32 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
-from flask import Flask, send_file, request
+from flask import Flask, send_file, request, jsonify
 import io
 import numpy as np
+import time
+
+# Try to import Numba for performance
+try:
+    from numba import njit, prange
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+    print("Warning: Numba not installed. Grid search will be slow.")
+    # Dummy decorator
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    def prange(n):
+        return range(n)
 
 app = Flask(__name__)
 
-# Global dataframe storage
+# Global storage
 df = None
+# Cache numpy arrays for the optimizer
+market_data = {}
 
 def fetch_data():
     exchange = ccxt.binance({'enableRateLimit': True})
@@ -42,11 +60,82 @@ def fetch_data():
             
     data = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
+    
+    # Pre-calculate 365 SMA here to ensure consistency
+    data['sma'] = data['close'].rolling(window=365*24).mean()
+    
     return data
 
-def calculate_strategy(data, tp_pct, sl_pct):
+@njit(fastmath=True)
+def fast_backtest(opens, highs, lows, closes, tp_pct, sl_pct):
     """
-    Simulates continuous trading. Returns equity curves and trade log.
+    Optimized core logic for Grid Search.
+    Returns: Net PnL (float)
+    """
+    n = len(opens)
+    
+    # Multipliers
+    l_tp_mult = 1.0 + tp_pct / 100.0
+    l_sl_mult = 1.0 - sl_pct / 100.0
+    s_tp_mult = 1.0 - tp_pct / 100.0
+    s_sl_mult = 1.0 + sl_pct / 100.0
+    
+    # State
+    l_active = False
+    l_entry = 0.0
+    l_realized = 0.0
+    
+    s_active = False
+    s_entry = 0.0
+    s_realized = 0.0
+    
+    for i in range(n):
+        op = opens[i]
+        hi = highs[i]
+        lo = lows[i]
+        cl = closes[i]
+        
+        # --- LONG ---
+        if not l_active:
+            l_entry = op
+            l_active = True
+            
+        l_tp = l_entry * l_tp_mult
+        l_sl = l_entry * l_sl_mult
+        
+        if lo <= l_sl:
+            l_realized += (l_sl - l_entry)
+            l_active = False
+        elif hi >= l_tp:
+            l_realized += (l_tp - l_entry)
+            l_active = False
+            
+        # --- SHORT ---
+        if not s_active:
+            s_entry = op
+            s_active = True
+            
+        s_tp = s_entry * s_tp_mult
+        s_sl = s_entry * s_sl_mult
+        
+        if hi >= s_sl:
+            s_realized += (s_entry - s_sl)
+            s_active = False
+        elif lo <= s_tp:
+            s_realized += (s_entry - s_tp)
+            s_active = False
+            
+    # Add unrealized PnL at the end
+    if l_active:
+        l_realized += (closes[n-1] - l_entry)
+    if s_active:
+        s_realized += (s_entry - closes[n-1])
+        
+    return l_realized + s_realized
+
+def calculate_strategy_details(data, tp_pct, sl_pct):
+    """
+    Detailed Python calculation for plotting/table (slower, stores history).
     """
     n = len(data)
     timestamps = data['timestamp'].values
@@ -59,7 +148,6 @@ def calculate_strategy(data, tp_pct, sl_pct):
     short_equity = np.zeros(n)
     trades = []
     
-    # State
     l_active = False
     l_entry_price = 0.0
     l_entry_idx = 0
@@ -82,7 +170,7 @@ def calculate_strategy(data, tp_pct, sl_pct):
         lo = lows[i]
         cl = closes[i]
         
-        # --- LONG ---
+        # LONG
         if not l_active:
             l_entry_price = op
             l_entry_idx = i
@@ -122,7 +210,7 @@ def calculate_strategy(data, tp_pct, sl_pct):
         else:
             long_equity[i] = l_realized + (cl - l_entry_price)
 
-        # --- SHORT ---
+        # SHORT
         if not s_active:
             s_entry_price = op
             s_entry_idx = i
@@ -173,20 +261,16 @@ def index():
     except ValueError:
         sl = 20.0
         tp = 50.0
-
-    # Ensure data availability
-    sma_window = 365 * 24
-    if 'sma' not in df.columns:
-        df['sma'] = df['close'].rolling(window=sma_window).mean()
         
+    # Ensure data available
+    if df is None:
+        return "Data not loaded.", 500
+
     calc_data = df.dropna(subset=['sma']).reset_index(drop=True)
+    _, _, trades = calculate_strategy_details(calc_data, tp, sl)
     
-    # Calculate strategy to get trades
-    _, _, trades = calculate_strategy(calc_data, tp, sl)
-    
-    # Generate Table Rows (Reverse order: newest first)
     rows = ""
-    for t in reversed(trades):
+    for t in reversed(trades[-50:]): # Show last 50 for brevity in list
         color = "#00ff00" if t['pnl'] > 0 else "#ff0000"
         rows += f"""
         <tr>
@@ -206,25 +290,48 @@ def index():
             <style>
                 body {{ font-family: monospace; background: #222; color: #ddd; margin: 0; padding: 20px; }}
                 .container {{ max_width: 1200px; margin: 0 auto; text-align: center; }}
-                input {{ background: #333; color: white; border: 1px solid #555; padding: 5px; }}
+                input, button {{ background: #333; color: white; border: 1px solid #555; padding: 5px; }}
+                button {{ cursor: pointer; }}
                 table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 12px; }}
                 th {{ background: #444; padding: 10px; text-align: left; position: sticky; top: 0; }}
                 td {{ border-bottom: 1px solid #333; padding: 5px; text-align: left; }}
                 .scroll-table {{ max_height: 500px; overflow-y: auto; border: 1px solid #444; margin-top: 20px; }}
+                #optimize-status {{ margin-top: 10px; color: yellow; }}
             </style>
+            <script>
+                function runOptimization() {{
+                    document.getElementById('optimize-status').innerText = "Running Grid Search (0-10%)... Please wait.";
+                    fetch('/optimize_grid')
+                        .then(response => response.json())
+                        .then(data => {{
+                            document.getElementById('optimize-status').innerText = 
+                                "Optimization Complete! Best TP: " + data.best_tp + "%, SL: " + data.best_sl + "% (PnL: " + data.max_pnl.toFixed(2) + ")";
+                            document.querySelector('input[name="tp"]').value = data.best_tp;
+                            document.querySelector('input[name="sl"]').value = data.best_sl;
+                        }})
+                        .catch(err => {{
+                            document.getElementById('optimize-status').innerText = "Error: " + err;
+                        }});
+                }}
+            </script>
         </head>
         <body>
             <div class="container">
                 <h2>ETH/USDT Continuous Hedge Strategy</h2>
-                <form action="/" method="get">
-                    <label>Stop Loss (%): <input type="number" step="0.1" name="sl" value="{sl}"></label>
-                    <label style="margin-left: 20px;">Take Profit (%): <input type="number" step="0.1" name="tp" value="{tp}"></label>
-                    <input type="submit" value="Update" style="margin-left: 20px; cursor: pointer;">
-                </form>
-                <br>
-                <img src="/plot.png?sl={sl}&tp={tp}" style="border: 1px solid #555; max-width: 100%;">
+                <div style="background: #333; padding: 15px; border-radius: 5px; display: inline-block;">
+                    <form action="/" method="get" style="display: inline;">
+                        <label>Stop Loss (%): <input type="number" step="0.1" name="sl" value="{sl}"></label>
+                        <label style="margin-left: 20px;">Take Profit (%): <input type="number" step="0.1" name="tp" value="{tp}"></label>
+                        <input type="submit" value="Update Chart" style="margin-left: 10px;">
+                    </form>
+                    <button onclick="runOptimization()" style="margin-left: 20px; background: #554400;">Run Grid Search (Auto-Find)</button>
+                </div>
+                <div id="optimize-status"></div>
                 
-                <h3>Trade History ({len(trades)} Trades)</h3>
+                <br>
+                <img src="/plot.png?sl={sl}&tp={tp}" style="border: 1px solid #555; max-width: 100%; margin-top: 20px;">
+                
+                <h3>Recent Trade History</h3>
                 <div class="scroll-table">
                     <table>
                         <thead>
@@ -249,6 +356,52 @@ def index():
     """
     return html
 
+@app.route('/optimize_grid')
+def optimize_grid():
+    global market_data, df
+    
+    # Ensure numpy arrays are ready
+    if 'opens' not in market_data:
+        calc_data = df.dropna(subset=['sma']).reset_index(drop=True)
+        market_data['opens'] = calc_data['open'].values.astype(np.float64)
+        market_data['highs'] = calc_data['high'].values.astype(np.float64)
+        market_data['lows'] = calc_data['low'].values.astype(np.float64)
+        market_data['closes'] = calc_data['close'].values.astype(np.float64)
+    
+    opens = market_data['opens']
+    highs = market_data['highs']
+    lows = market_data['lows']
+    closes = market_data['closes']
+    
+    best_pnl = -np.inf
+    best_tp = 0.0
+    best_sl = 0.0
+    
+    # Grid Search: 0.1 to 10.0 (Step 0.1)
+    # 100 x 100 = 10,000 iterations
+    # Using python loop for grid, but JIT for core calculation.
+    
+    t0 = time.time()
+    
+    tp_range = np.arange(0.1, 10.1, 0.1)
+    sl_range = np.arange(0.1, 10.1, 0.1)
+    
+    for tp in tp_range:
+        for sl in sl_range:
+            pnl = fast_backtest(opens, highs, lows, closes, tp, sl)
+            if pnl > best_pnl:
+                best_pnl = pnl
+                best_tp = tp
+                best_sl = sl
+                
+    print(f"Optimization finished in {time.time() - t0:.2f}s. Best: TP {best_tp:.1f}, SL {best_sl:.1f}, PnL {best_pnl:.2f}")
+    
+    return jsonify({
+        'best_tp': round(best_tp, 1),
+        'best_sl': round(best_sl, 1),
+        'max_pnl': best_pnl
+    })
+
 @app.route('/plot.png')
 def plot_png():
     global df
@@ -259,18 +412,13 @@ def plot_png():
         sl_pct = 20
         tp_pct = 50
 
-    sma_window = 365 * 24
-    if 'sma' not in df.columns:
-        df['sma'] = df['close'].rolling(window=sma_window).mean()
-    
     plot_data = df.dropna(subset=['sma']).copy()
     plot_data = plot_data.reset_index(drop=True)
     
     if plot_data.empty:
         return "Not enough data", 400
     
-    # Calculate Equity
-    long_eq, short_eq, _ = calculate_strategy(plot_data, tp_pct, sl_pct)
+    long_eq, short_eq, _ = calculate_strategy_details(plot_data, tp_pct, sl_pct)
     
     plot_data['long_pnl'] = long_eq
     plot_data['short_pnl'] = short_eq
@@ -278,7 +426,6 @@ def plot_png():
     
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), dpi=100, gridspec_kw={'height_ratios': [2, 1]}, sharex=True)
     
-    # Panel 1
     x = matplotlib.dates.date2num(plot_data['timestamp'])
     y = plot_data['close'].values
     sma = plot_data['sma'].values
@@ -295,7 +442,6 @@ def plot_png():
     ax1.legend(loc='upper left')
     ax1.grid(True, alpha=0.2)
     
-    # Panel 2
     ax2.plot(plot_data['timestamp'], plot_data['long_pnl'], color='green', alpha=0.3, label='Long Leg PnL')
     ax2.plot(plot_data['timestamp'], plot_data['short_pnl'], color='red', alpha=0.3, label='Short Leg PnL')
     ax2.plot(plot_data['timestamp'], plot_data['net_pnl'], color='cyan', linewidth=2, label='Net Equity')
