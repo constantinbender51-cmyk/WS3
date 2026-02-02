@@ -26,7 +26,7 @@ class Config:
     POPULATION_SIZE = 100
     GENERATIONS = 30
     MUTATION_RATE = 0.2
-    ELITISM_COUNT = 2
+    ELITISM_COUNT = 0
     
     # GA Mutation/Bound Constraints
     SL_MIN = 0.01           
