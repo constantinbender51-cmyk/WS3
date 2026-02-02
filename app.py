@@ -31,7 +31,6 @@ def fetch_data():
             all_ohlcv.extend(ohlcv)
             last_timestamp = ohlcv[-1][0]
             since = last_timestamp + 3600000
-            # Reduced print frequency for density
             if len(all_ohlcv) % 10000 == 0:
                 print(f"Fetched {len(all_ohlcv)} candles...")
         except Exception as e:
@@ -46,31 +45,32 @@ def fetch_data():
 def plot_png():
     global df
     
-    # 1. Calculate 200-period SMA (200 Hours)
-    df['sma'] = df['close'].rolling(window=200).mean()
+    # 1. Calculate 365-Day SMA (365 days * 24 hours)
+    # 5 years is ~43,800 hours. 365 days is 8,760 hours.
+    sma_window = 365 * 24
+    df['sma'] = df['close'].rolling(window=sma_window).mean()
     
-    # 2. Strategy Logic: Stop and Reverse
-    # Signal: 1 (Long) if Close > SMA, -1 (Short) if Close < SMA
-    # "Open a long and short simultaneously" -> Interpreted as switching bias instant execution (Reversal)
-    df['signal'] = np.where(df['close'] > df['sma'], 1, -1)
-    
-    # Calculate Returns
-    # Shift signal by 1 because we trade at the Open of the NEXT candle based on Close of CURRENT
-    df['market_return'] = df['close'].pct_change()
-    df['strategy_return'] = df['market_return'] * df['signal'].shift(1)
-    
-    # 3. Equity Plot
-    # Fill NaN from SMA window with 0 return
-    df['strategy_return'] = df['strategy_return'].fillna(0)
-    df['equity'] = (1 + df['strategy_return']).cumprod()
-    
-    # Filter for plotting
+    # 2. Simultaneous Long and Short Logic
+    # Assumption: Hold 1 unit Long and 1 unit Short from the start of the plotting period.
+    # Start analysis from when SMA is available
     plot_data = df.dropna(subset=['sma']).copy()
+    plot_data = plot_data.reset_index(drop=True)
+    
+    initial_price = plot_data['close'].iloc[0]
+    
+    # Long PnL: Price - Initial
+    plot_data['long_pnl'] = plot_data['close'] - initial_price
+    
+    # Short PnL: Initial - Price
+    plot_data['short_pnl'] = initial_price - plot_data['close']
+    
+    # Net Equity (PnL)
+    plot_data['net_pnl'] = plot_data['long_pnl'] + plot_data['short_pnl']
     
     # Plot Setup
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), dpi=100, gridspec_kw={'height_ratios': [2, 1]}, sharex=True)
     
-    # --- Top Panel: Price vs SMA ---
+    # --- Top Panel: Price vs 365-Day SMA ---
     x = matplotlib.dates.date2num(plot_data['timestamp'])
     y = plot_data['close'].values
     sma = plot_data['sma'].values
@@ -78,33 +78,35 @@ def plot_png():
     points = np.array([x, y]).T.reshape(-1, 1, 2)
     segments = np.concatenate([points[:-1], points[1:]], axis=1)
     
-    # Color logic: Green if Price > SMA, Red if Price < SMA
+    # Color logic: Green if Price > SMA, Red if Price <= SMA
     colors = ['green' if p > s else 'red' for p, s in zip(y[:-1], sma[:-1])]
     
     lc = LineCollection(segments, colors=colors, linewidth=1)
     ax1.add_collection(lc)
-    ax1.plot(plot_data['timestamp'], sma, color='white', linewidth=1.5, label='200 SMA')
+    ax1.plot(plot_data['timestamp'], sma, color='white', linewidth=1.5, label='365d SMA')
     
-    ax1.set_title('ETH/USDT 1H - Price vs 200 SMA')
+    ax1.set_title('ETH/USDT 1H - Price vs 365 Day SMA')
     ax1.set_ylabel('Price (USDT)')
     ax1.grid(True, alpha=0.2)
     ax1.legend(loc='upper left')
     
     # --- Bottom Panel: Equity Curve ---
-    ax2.plot(plot_data['timestamp'], plot_data['equity'], color='cyan', linewidth=1.5)
-    ax2.fill_between(plot_data['timestamp'], plot_data['equity'], 1, alpha=0.1, color='cyan')
+    # Plotting Long, Short, and Net to demonstrate the hedge
+    ax2.plot(plot_data['timestamp'], plot_data['long_pnl'], color='green', alpha=0.3, linewidth=1, label='Long Only PnL')
+    ax2.plot(plot_data['timestamp'], plot_data['short_pnl'], color='red', alpha=0.3, linewidth=1, label='Short Only PnL')
+    ax2.plot(plot_data['timestamp'], plot_data['net_pnl'], color='cyan', linewidth=2, label='Net Equity (Simultaneous)')
     
-    ax2.set_title('Strategy Equity (Reversal: Long > SMA, Short < SMA)')
-    ax2.set_ylabel('Normalized Equity (Start=1.0)')
+    ax2.set_title('Simultaneous Long + Short Equity (PnL)')
+    ax2.set_ylabel('PnL (USDT)')
     ax2.grid(True, alpha=0.2)
-    ax2.axhline(1, color='gray', linestyle='--', alpha=0.5)
+    ax2.legend(loc='upper left')
     
     # Styling
     for ax in [ax1, ax2]:
         ax.set_facecolor('black')
-    fig.patch.set_facecolor('white')
+        ax.autoscale_view()
     
-    # Format Date Axis
+    fig.patch.set_facecolor('white')
     ax2.xaxis.set_major_formatter(matplotlib.dates.DateFormatter('%Y-%m'))
     
     plt.tight_layout()
