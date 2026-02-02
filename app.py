@@ -18,7 +18,7 @@ class Config:
     START_TIME = "2024-01-01"
     
     # Backtest Settings
-    LEVELS_COUNT = 10      # Increased count slightly for grid density
+    LEVELS_COUNT = 5      # Increased count slightly for grid density
     TRAIN_SPLIT = 0.8 
     ANNUALIZATION_FACTOR = 365 * 6 
     
@@ -26,7 +26,7 @@ class Config:
     POPULATION_SIZE = 100
     GENERATIONS = 30
     MUTATION_RATE = 0.2
-    ELITISM_COUNT = 0
+    ELITISM_COUNT = 5
     
     # GA Mutation/Bound Constraints
     SL_MIN = 0.01           
