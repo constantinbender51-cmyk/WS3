@@ -3,7 +3,6 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.collections import LineCollection
 from flask import Flask, send_file, request, jsonify
 import io
 import numpy as np
@@ -22,22 +21,32 @@ except ImportError:
 
 app = Flask(__name__)
 
-# Global storage
-df = None
-market_data = {}
+# Global Storage
+current_df = None
+market_data_cache = {} # Cache optimized arrays for the current asset
+current_config = {
+    'symbol': 'ETH/USDT',
+    'timeframe': '1h'
+}
 
-def fetch_data():
+ASSETS = [
+    'BTC/USDT', 'ETH/USDT', 'XRP/USDT', 'SOL/USDT', 'DOGE/USDT',
+    'ADA/USDT', 'BCH/USDT', 'LINK/USDT', 'XLM/USDT', 'SUI/USDT',
+    'AVAX/USDT', 'LTC/USDT', 'HBAR/USDT', 'SHIB/USDT', 'TON/USDT'
+]
+
+TIMEFRAMES = ['30m', '1h', '4h', '1d']
+
+def fetch_data(symbol, timeframe):
     exchange = ccxt.binance({'enableRateLimit': True})
-    symbol = 'ETH/USDT'
-    timeframe = '1h'
     limit = 1000
     
+    # Calculate start time: 5 years ago
     now = exchange.milliseconds()
     since = now - (5 * 365 * 24 * 60 * 60 * 1000)
     
     all_ohlcv = []
-    
-    print(f"Fetching 5 years of {timeframe} data for {symbol}...")
+    print(f"Fetching data for {symbol} {timeframe}...")
     
     while since < now:
         try:
@@ -45,24 +54,30 @@ def fetch_data():
             if not ohlcv:
                 break
             all_ohlcv.extend(ohlcv)
+            
+            # Update 'since' based on timeframe duration in ms
             last_timestamp = ohlcv[-1][0]
-            since = last_timestamp + 3600000
-            if len(all_ohlcv) % 10000 == 0:
-                print(f"Fetched {len(all_ohlcv)} candles...")
+            
+            # Duration map
+            tf_ms = {
+                '30m': 1800000,
+                '1h': 3600000,
+                '4h': 14400000,
+                '1d': 86400000
+            }
+            duration = tf_ms.get(timeframe, 3600000)
+            since = last_timestamp + duration
+            
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Error fetching: {e}")
             break
             
-    data = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
-    
-    return data
+    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    return df
 
 @njit(fastmath=True)
 def optimize_single_pnl(opens, highs, lows, closes):
-    """
-    Optimizes for Total Net PnL (Profit) using a single SL/TP pair.
-    """
     n = len(opens)
     fee_rate = 0.0002
     
@@ -96,7 +111,6 @@ def optimize_single_pnl(opens, highs, lows, closes):
                 l_entry_fee = op * fee_rate if l_closed_prev else 0.0
                 l_sl_price = op * l_sl_mult
                 l_tp_price = op * l_tp_mult
-                
                 l_exit_fee = 0.0
                 l_trade_pnl = 0.0
                 
@@ -119,7 +133,6 @@ def optimize_single_pnl(opens, highs, lows, closes):
                 s_entry_fee = op * fee_rate if s_closed_prev else 0.0
                 s_sl_price = op * s_sl_mult
                 s_tp_price = op * s_tp_mult
-                
                 s_exit_fee = 0.0
                 s_trade_pnl = 0.0
                 
@@ -243,20 +256,125 @@ def calculate_strategy_single(data, tp_pct, sl_pct):
             
     return net_equity, trades
 
+@app.route('/load_data', methods=['POST'])
+def load_data():
+    global current_df, market_data_cache, current_config
+    
+    req = request.json
+    symbol = req.get('symbol', 'ETH/USDT')
+    timeframe = req.get('timeframe', '1h')
+    
+    current_df = fetch_data(symbol, timeframe)
+    current_config['symbol'] = symbol
+    current_config['timeframe'] = timeframe
+    
+    # Invalidate cache
+    market_data_cache = {}
+    
+    return jsonify({'status': 'success', 'rows': len(current_df)})
+
 @app.route('/')
 def index():
-    global df
-    try:
-        sl = float(request.args.get('sl', 2.0))
-        tp = float(request.args.get('tp', 5.0))
-    except:
-        sl, tp = 2.0, 5.0
-        
-    if df is None:
-        return "Data not loaded", 500
+    sl = request.args.get('sl', '2.0')
+    tp = request.args.get('tp', '5.0')
+    
+    asset_options = "".join([f"<option value='{a}'>{a}</option>" for a in ASSETS])
+    tf_options = "".join([f"<option value='{t}'>{t}</option>" for t in TIMEFRAMES])
+    
+    # Load defaults if no data
+    status_text = "No data loaded."
+    if current_df is not None:
+        status_text = f"Loaded: {current_config['symbol']} ({current_config['timeframe']})"
 
-    calc_data = df.dropna(subset=['close']).reset_index(drop=True)
-    net_equity, trades = calculate_strategy_single(calc_data, tp, sl)
+    html = f"""
+    <html>
+        <head>
+            <title>Multi-Asset Optimization</title>
+            <style>
+                body {{ font-family: monospace; background: #222; color: #ddd; margin: 0; padding: 20px; }}
+                .container {{ max_width: 1200px; margin: 0 auto; text-align: center; }}
+                .controls {{ background: #333; padding: 15px; border-radius: 5px; margin-bottom: 20px; display: flex; justify-content: center; gap: 20px; align-items: center; }}
+                select, input, button {{ background: #444; color: white; border: 1px solid #555; padding: 8px; border-radius: 4px; }}
+                button {{ cursor: pointer; background: #554400; font-weight: bold; }}
+                button:hover {{ background: #776600; }}
+                #load-btn {{ background: #004400; }}
+                .scroll-table {{ max_height: 500px; overflow-y: auto; border: 1px solid #444; margin-top: 20px; }}
+                table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+                th {{ background: #444; padding: 10px; position: sticky; top: 0; }}
+                td {{ border-bottom: 1px solid #333; padding: 5px; text-align: left; }}
+                #status-bar {{ margin-bottom: 10px; color: cyan; }}
+            </style>
+            <script>
+                function loadData() {{
+                    const sym = document.getElementById('symbol').value;
+                    const tf = document.getElementById('timeframe').value;
+                    document.getElementById('status-bar').innerText = "Fetching data (this may take a few seconds)...";
+                    
+                    fetch('/load_data', {{
+                        method: 'POST',
+                        headers: {{'Content-Type': 'application/json'}},
+                        body: JSON.stringify({{symbol: sym, timeframe: tf}})
+                    }})
+                    .then(res => res.json())
+                    .then(data => {{
+                        document.getElementById('status-bar').innerText = "Loaded " + sym + " " + tf + " (" + data.rows + " candles)";
+                        location.reload(); 
+                    }});
+                }}
+
+                function runOptimizer() {{
+                    document.getElementById('status-bar').innerText = "Optimizing... Please wait.";
+                    fetch('/optimize')
+                        .then(res => res.json())
+                        .then(data => {{
+                            document.getElementById('status-bar').innerText = "Optimized! SL: " + data.sl + " TP: " + data.tp + " PnL: " + data.pnl.toFixed(2);
+                            document.querySelector('input[name="sl"]').value = data.sl;
+                            document.querySelector('input[name="tp"]').value = data.tp;
+                            // Trigger plot update
+                            document.getElementById('plot-form').submit();
+                        }});
+                }}
+            </script>
+        </head>
+        <body>
+            <div class="container">
+                <h2>Multi-Asset PnL Optimizer</h2>
+                
+                <div class="controls">
+                    <label>Asset: <select id="symbol">{asset_options}</select></label>
+                    <label>Timeframe: <select id="timeframe">{tf_options}</select></label>
+                    <button id="load-btn" onclick="loadData()">Load Data</button>
+                </div>
+                
+                <div id="status-bar">{status_text}</div>
+                
+                <div class="controls">
+                    <form id="plot-form" action="/" method="get" style="display:flex; gap:10px; align-items:center; margin:0;">
+                        <label>SL % <input type="number" step="0.1" name="sl" value="{sl}"></label>
+                        <label>TP % <input type="number" step="0.1" name="tp" value="{tp}"></label>
+                        <input type="submit" value="Update Chart" style="background:#444;">
+                    </form>
+                    <button onclick="runOptimizer()">Run Auto-Optimize</button>
+                </div>
+
+                <img src="/plot.png?sl={sl}&tp={tp}" style="border: 1px solid #555; max-width: 100%; width: 100%; height: auto;">
+                
+                <h3>Recent Trades</h3>
+                <div class="scroll-table" id="trade-list">
+                    {get_trade_table_html(float(tp), float(sl))}
+                </div>
+            </div>
+        </body>
+    </html>
+    """
+    return html
+
+def get_trade_table_html(tp, sl):
+    if current_df is None:
+        return "<table><tr><td>No Data</td></tr></table>"
+        
+    calc_data = current_df.dropna(subset=['close']).reset_index(drop=True)
+    _, trades = calculate_strategy_single(calc_data, tp, sl)
     
     rows = ""
     for t in reversed(trades[-50:]):
@@ -268,110 +386,34 @@ def index():
             <td style="color: {color}">{t['pnl']:.2f}</td>
         </tr>
         """
-    
-    html = f"""
-    <html>
-        <head>
-            <style>
-                body {{ font-family: monospace; background: #222; color: #ddd; margin: 0; padding: 20px; }}
-                .container {{ max_width: 1200px; margin: 0 auto; text-align: center; }}
-                input, button {{ background: #333; color: white; border: 1px solid #555; padding: 5px; width: 80px; }}
-                button {{ cursor: pointer; width: auto; background: #554400; }}
-                .params-box {{ background: #333; padding: 15px; border-radius: 5px; display: inline-block; text-align: left; }}
-                .params-row {{ margin-bottom: 10px; }}
-                table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 12px; }}
-                th {{ background: #444; padding: 10px; text-align: left; }}
-                td {{ border-bottom: 1px solid #333; padding: 5px; text-align: left; }}
-                .scroll-table {{ max_height: 500px; overflow-y: auto; border: 1px solid #444; }}
-                #optimize-status {{ margin-top: 10px; color: yellow; }}
-            </style>
-            <script>
-                function runOptimization() {{
-                    document.getElementById('optimize-status').innerText = "Optimizing Single SL/TP (Train PnL)... Please wait.";
-                    fetch('/optimize')
-                        .then(response => response.json())
-                        .then(data => {{
-                            document.getElementById('optimize-status').innerText = "Done! SL: " + data.sl + "% | TP: " + data.tp + "% (PnL: " + data.pnl.toFixed(2) + ")";
-                            document.querySelector('input[name="tp"]').value = data.tp;
-                            document.querySelector('input[name="sl"]').value = data.sl;
-                        }})
-                        .catch(err => {{
-                            document.getElementById('optimize-status').innerText = "Error: " + err;
-                        }});
-                }}
-            </script>
-        </head>
-        <body>
-            <div class="container">
-                <h2>ETH/USDT Single Strategy Optimization</h2>
-                <p>Grid Search: Single TP/SL (0.2-10%). Train < 2026. Metric: PnL.</p>
-                
-                <form action="/" method="get">
-                    <div class="params-box">
-                        <div class="params-row">
-                            <strong>Global Params:</strong>
-                            SL % <input type="number" step="0.1" name="sl" value="{sl}">
-                            TP % <input type="number" step="0.1" name="tp" value="{tp}">
-                        </div>
-                        <div style="text-align: center; margin-top: 10px;">
-                            <input type="submit" value="Update Plots" style="width: auto; cursor: pointer;">
-                        </div>
-                    </div>
-                </form>
-                
-                <button onclick="runOptimization()">Run Optimization</button>
-                <div id="optimize-status"></div>
-                
-                <br>
-                <img src="/plot.png?sl={sl}&tp={tp}" style="border: 1px solid #555; max-width: 100%; margin-top: 20px;">
-                
-                <h3>Recent Events</h3>
-                <div class="scroll-table">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Entry Time</th>
-                                <th>Status</th>
-                                <th>Net PnL</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {rows}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </body>
-    </html>
-    """
-    return html
+    return f"<table><thead><tr><th>Time</th><th>Status</th><th>PnL</th></tr></thead><tbody>{rows}</tbody></table>"
 
 @app.route('/optimize')
 def optimize():
-    global market_data, df
+    global market_data_cache, current_df
     
+    if current_df is None:
+        return jsonify({'error': 'No data'}), 400
+        
     cutoff_ts = pd.Timestamp('2026-01-01')
     
-    if 'opens' not in market_data:
-        calc_data = df.dropna(subset=['close']).reset_index(drop=True)
-        market_data['timestamps'] = calc_data['timestamp'].values
-        market_data['opens'] = calc_data['open'].values.astype(np.float64)
-        market_data['highs'] = calc_data['high'].values.astype(np.float64)
-        market_data['lows'] = calc_data['low'].values.astype(np.float64)
-        market_data['closes'] = calc_data['close'].values.astype(np.float64)
+    # Cache preparation
+    if 'opens' not in market_data_cache:
+        calc_data = current_df.dropna(subset=['close']).reset_index(drop=True)
+        market_data_cache['timestamps'] = calc_data['timestamp'].values
+        market_data_cache['opens'] = calc_data['open'].values.astype(np.float64)
+        market_data_cache['highs'] = calc_data['high'].values.astype(np.float64)
+        market_data_cache['lows'] = calc_data['low'].values.astype(np.float64)
+        market_data_cache['closes'] = calc_data['close'].values.astype(np.float64)
 
-    train_mask = market_data['timestamps'] < np.datetime64(cutoff_ts)
+    train_mask = market_data_cache['timestamps'] < np.datetime64(cutoff_ts)
     
-    opens = market_data['opens'][train_mask]
-    highs = market_data['highs'][train_mask]
-    lows = market_data['lows'][train_mask]
-    closes = market_data['closes'][train_mask]
-    
-    t0 = time.time()
+    opens = market_data_cache['opens'][train_mask]
+    highs = market_data_cache['highs'][train_mask]
+    lows = market_data_cache['lows'][train_mask]
+    closes = market_data_cache['closes'][train_mask]
     
     best_tp, best_sl, best_pnl = optimize_single_pnl(opens, highs, lows, closes)
-    
-    print(f"Optimization done in {time.time() - t0:.2f}s")
     
     return jsonify({
         'tp': round(best_tp, 1),
@@ -381,15 +423,25 @@ def optimize():
 
 @app.route('/plot.png')
 def plot_png():
-    global df
+    global current_df, current_config
+    
     try:
         sl = float(request.args.get('sl', 2.0))
         tp = float(request.args.get('tp', 5.0))
     except:
         sl, tp = 2.0, 5.0
 
-    plot_data = df.dropna(subset=['close']).reset_index(drop=True).copy()
-    
+    if current_df is None:
+        # Return empty placeholder
+        fig, ax = plt.subplots(figsize=(10, 2))
+        ax.text(0.5, 0.5, "Please Load Data First", ha='center', va='center')
+        img = io.BytesIO()
+        plt.savefig(img, format='png')
+        img.seek(0)
+        plt.close(fig)
+        return send_file(img, mimetype='image/png')
+
+    plot_data = current_df.dropna(subset=['close']).reset_index(drop=True).copy()
     net_equity, _ = calculate_strategy_single(plot_data, tp, sl)
     plot_data['net_equity'] = net_equity
     
@@ -403,9 +455,8 @@ def plot_png():
     x = matplotlib.dates.date2num(plot_data['timestamp'])
     y = plot_data['close'].values
     
-    # Simple price plot, no color segments needed since no SMA
     ax1.plot(plot_data['timestamp'], y, color='white', linewidth=1)
-    ax1.set_title('ETH/USDT Price')
+    ax1.set_title(f"{current_config['symbol']} ({current_config['timeframe']}) Price")
     ax1.axvline(cutoff_ts, color='yellow', linestyle='--')
     ax1.set_xlim(plot_data['timestamp'].min(), plot_data['timestamp'].max())
     ax1.grid(True, alpha=0.2)
@@ -439,6 +490,7 @@ def plot_png():
     return send_file(img, mimetype='image/png')
 
 if __name__ == "__main__":
-    df = fetch_data()
-    print("Serving on port 8080...")
+    print("Starting server on 8080...")
+    # Initialize with default to allow instant plotting
+    current_df = fetch_data('BTC/USDT', '1h')
     app.run(host='0.0.0.0', port=8080, debug=False)
