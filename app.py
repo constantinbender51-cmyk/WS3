@@ -44,108 +44,206 @@ def fetch_data():
     data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
     return data
 
-def calculate_continuous_equity(data, tp_pct, sl_pct):
+def calculate_strategy(data, tp_pct, sl_pct):
     """
-    Simulates continuous trading for Long and Short legs independently.
-    If a leg hits TP/SL, it closes and re-opens on the next candle's Open.
+    Simulates continuous trading. Returns equity curves and trade log.
     """
     n = len(data)
+    timestamps = data['timestamp'].values
     opens = data['open'].values
     highs = data['high'].values
     lows = data['low'].values
     closes = data['close'].values
     
-    # Storage for equity curves
     long_equity = np.zeros(n)
     short_equity = np.zeros(n)
+    trades = []
     
-    # State variables
-    # Long
-    long_active = False
-    long_entry = 0.0
-    long_realized = 0.0
+    # State
+    l_active = False
+    l_entry_price = 0.0
+    l_entry_idx = 0
+    l_realized = 0.0
     
-    # Short
-    short_active = False
-    short_entry = 0.0
-    short_realized = 0.0
+    s_active = False
+    s_entry_price = 0.0
+    s_entry_idx = 0
+    s_realized = 0.0
     
-    # Multipliers
-    long_tp_mult = 1 + tp_pct / 100.0
-    long_sl_mult = 1 - sl_pct / 100.0
-    short_tp_mult = 1 - tp_pct / 100.0
-    short_sl_mult = 1 + sl_pct / 100.0
+    l_tp_mult = 1 + tp_pct / 100.0
+    l_sl_mult = 1 - sl_pct / 100.0
+    s_tp_mult = 1 - tp_pct / 100.0
+    s_sl_mult = 1 + sl_pct / 100.0
     
     for i in range(n):
-        current_open = opens[i]
-        current_high = highs[i]
-        current_low = lows[i]
-        current_close = closes[i]
+        ts = timestamps[i]
+        op = opens[i]
+        hi = highs[i]
+        lo = lows[i]
+        cl = closes[i]
         
-        # --- LONG LEG ---
-        if not long_active:
-            long_entry = current_open
-            long_active = True
+        # --- LONG ---
+        if not l_active:
+            l_entry_price = op
+            l_entry_idx = i
+            l_active = True
             
-        # Check TP/SL
-        l_tp_price = long_entry * long_tp_mult
-        l_sl_price = long_entry * long_sl_mult
+        l_tp = l_entry_price * l_tp_mult
+        l_sl = l_entry_price * l_sl_mult
         
-        # Determine if hit (Assuming SL hit first if both in range for safety)
-        if current_low <= l_sl_price:
-            long_realized += (l_sl_price - long_entry)
-            long_active = False # Will re-open next iteration (i+1)
-            long_val = long_realized
-        elif current_high >= l_tp_price:
-            long_realized += (l_tp_price - long_entry)
-            long_active = False
-            long_val = long_realized
+        l_pnl = 0.0
+        l_status = ""
+        l_exit_price = 0.0
+        
+        if lo <= l_sl:
+            l_pnl = l_sl - l_entry_price
+            l_realized += l_pnl
+            l_active = False
+            l_status = "SL"
+            l_exit_price = l_sl
+        elif hi >= l_tp:
+            l_pnl = l_tp - l_entry_price
+            l_realized += l_pnl
+            l_active = False
+            l_status = "TP"
+            l_exit_price = l_tp
+        
+        if not l_active:
+            trades.append({
+                'entry_time': pd.to_datetime(timestamps[l_entry_idx]),
+                'exit_time': pd.to_datetime(ts),
+                'type': 'LONG',
+                'entry_price': l_entry_price,
+                'exit_price': l_exit_price,
+                'pnl': l_pnl,
+                'status': l_status
+            })
+            long_equity[i] = l_realized
         else:
-            # Mark to Market
-            long_val = long_realized + (current_close - long_entry)
+            long_equity[i] = l_realized + (cl - l_entry_price)
+
+        # --- SHORT ---
+        if not s_active:
+            s_entry_price = op
+            s_entry_idx = i
+            s_active = True
             
-        long_equity[i] = long_val
+        s_tp = s_entry_price * s_tp_mult
+        s_sl = s_entry_price * s_sl_mult
         
-        # --- SHORT LEG ---
-        if not short_active:
-            short_entry = current_open
-            short_active = True
+        s_pnl = 0.0
+        s_status = ""
+        s_exit_price = 0.0
+        
+        if hi >= s_sl:
+            s_pnl = s_entry_price - s_sl
+            s_realized += s_pnl
+            s_active = False
+            s_status = "SL"
+            s_exit_price = s_sl
+        elif lo <= s_tp:
+            s_pnl = s_entry_price - s_tp
+            s_realized += s_pnl
+            s_active = False
+            s_status = "TP"
+            s_exit_price = s_tp
             
-        s_tp_price = short_entry * short_tp_mult
-        s_sl_price = short_entry * short_sl_mult
-        
-        if current_high >= s_sl_price:
-            short_realized += (short_entry - s_sl_price)
-            short_active = False
-            short_val = short_realized
-        elif current_low <= s_tp_price:
-            short_realized += (short_entry - s_tp_price)
-            short_active = False
-            short_val = short_realized
+        if not s_active:
+            trades.append({
+                'entry_time': pd.to_datetime(timestamps[s_entry_idx]),
+                'exit_time': pd.to_datetime(ts),
+                'type': 'SHORT',
+                'entry_price': s_entry_price,
+                'exit_price': s_exit_price,
+                'pnl': s_pnl,
+                'status': s_status
+            })
+            short_equity[i] = s_realized
         else:
-            short_val = short_realized + (short_entry - current_close)
+            short_equity[i] = s_realized + (s_entry_price - cl)
             
-        short_equity[i] = short_val
-        
-    return long_equity, short_equity
+    return long_equity, short_equity, trades
 
 @app.route('/')
 def index():
-    sl = request.args.get('sl', '20')
-    tp = request.args.get('tp', '50')
+    global df
+    try:
+        sl = float(request.args.get('sl', 20))
+        tp = float(request.args.get('tp', 50))
+    except ValueError:
+        sl = 20.0
+        tp = 50.0
+
+    # Ensure data availability
+    sma_window = 365 * 24
+    if 'sma' not in df.columns:
+        df['sma'] = df['close'].rolling(window=sma_window).mean()
+        
+    calc_data = df.dropna(subset=['sma']).reset_index(drop=True)
+    
+    # Calculate strategy to get trades
+    _, _, trades = calculate_strategy(calc_data, tp, sl)
+    
+    # Generate Table Rows (Reverse order: newest first)
+    rows = ""
+    for t in reversed(trades):
+        color = "#00ff00" if t['pnl'] > 0 else "#ff0000"
+        rows += f"""
+        <tr>
+            <td>{t['entry_time']}</td>
+            <td>{t['exit_time']}</td>
+            <td style="color: {'cyan' if t['type']=='LONG' else 'orange'}">{t['type']}</td>
+            <td>{t['entry_price']:.2f}</td>
+            <td>{t['exit_price']:.2f}</td>
+            <td>{t['status']}</td>
+            <td style="color: {color}">{t['pnl']:.2f}</td>
+        </tr>
+        """
     
     html = f"""
     <html>
-        <body style="font-family: monospace; background: #222; color: #ddd; text-align: center;">
-            <h2>ETH/USDT Continuous Hedge Strategy</h2>
-            <p>Logic: Always in Long + Short. If TP/SL hit, re-open next hour.</p>
-            <form action="/" method="get" style="margin-bottom: 20px; padding: 10px; background: #333; display: inline-block; border-radius: 5px;">
-                <label>Stop Loss (%): <input type="number" step="0.1" name="sl" value="{sl}" style="width: 60px;"></label>
-                <label style="margin-left: 20px;">Take Profit (%): <input type="number" step="0.1" name="tp" value="{tp}" style="width: 60px;"></label>
-                <input type="submit" value="Update" style="margin-left: 20px;">
-            </form>
-            <br>
-            <img src="/plot.png?sl={sl}&tp={tp}" style="border: 1px solid #555;">
+        <head>
+            <style>
+                body {{ font-family: monospace; background: #222; color: #ddd; margin: 0; padding: 20px; }}
+                .container {{ max_width: 1200px; margin: 0 auto; text-align: center; }}
+                input {{ background: #333; color: white; border: 1px solid #555; padding: 5px; }}
+                table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 12px; }}
+                th {{ background: #444; padding: 10px; text-align: left; position: sticky; top: 0; }}
+                td {{ border-bottom: 1px solid #333; padding: 5px; text-align: left; }}
+                .scroll-table {{ max_height: 500px; overflow-y: auto; border: 1px solid #444; margin-top: 20px; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h2>ETH/USDT Continuous Hedge Strategy</h2>
+                <form action="/" method="get">
+                    <label>Stop Loss (%): <input type="number" step="0.1" name="sl" value="{sl}"></label>
+                    <label style="margin-left: 20px;">Take Profit (%): <input type="number" step="0.1" name="tp" value="{tp}"></label>
+                    <input type="submit" value="Update" style="margin-left: 20px; cursor: pointer;">
+                </form>
+                <br>
+                <img src="/plot.png?sl={sl}&tp={tp}" style="border: 1px solid #555; max-width: 100%;">
+                
+                <h3>Trade History ({len(trades)} Trades)</h3>
+                <div class="scroll-table">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Entry Time</th>
+                                <th>Exit Time</th>
+                                <th>Type</th>
+                                <th>Entry Price</th>
+                                <th>Exit Price</th>
+                                <th>Status</th>
+                                <th>PnL</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {rows}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
         </body>
     </html>
     """
@@ -154,7 +252,6 @@ def index():
 @app.route('/plot.png')
 def plot_png():
     global df
-    
     try:
         sl_pct = float(request.args.get('sl', 20))
         tp_pct = float(request.args.get('tp', 50))
@@ -162,64 +259,57 @@ def plot_png():
         sl_pct = 20
         tp_pct = 50
 
-    # 1. 365-Day SMA
     sma_window = 365 * 24
     if 'sma' not in df.columns:
         df['sma'] = df['close'].rolling(window=sma_window).mean()
     
-    # Prepare data starting from valid SMA
     plot_data = df.dropna(subset=['sma']).copy()
     plot_data = plot_data.reset_index(drop=True)
     
     if plot_data.empty:
         return "Not enough data", 400
     
-    # 2. Calculate Continuous PnL
-    long_eq, short_eq = calculate_continuous_equity(plot_data, tp_pct, sl_pct)
+    # Calculate Equity
+    long_eq, short_eq, _ = calculate_strategy(plot_data, tp_pct, sl_pct)
     
     plot_data['long_pnl'] = long_eq
     plot_data['short_pnl'] = short_eq
     plot_data['net_pnl'] = long_eq + short_eq
     
-    # Plotting
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), dpi=100, gridspec_kw={'height_ratios': [2, 1]}, sharex=True)
     
-    # Panel 1: Price & SMA
+    # Panel 1
     x = matplotlib.dates.date2num(plot_data['timestamp'])
     y = plot_data['close'].values
     sma = plot_data['sma'].values
     
     points = np.array([x, y]).T.reshape(-1, 1, 2)
     segments = np.concatenate([points[:-1], points[1:]], axis=1)
-    
     colors = ['green' if p > s else 'red' for p, s in zip(y[:-1], sma[:-1])]
+    
     lc = LineCollection(segments, colors=colors, linewidth=1)
     ax1.add_collection(lc)
     ax1.plot(plot_data['timestamp'], sma, color='white', linewidth=1.5, label='365d SMA')
-    
-    ax1.set_title(f'ETH/USDT Price vs SMA')
+    ax1.set_title('ETH/USDT Price vs SMA')
     ax1.set_ylabel('Price (USDT)')
     ax1.legend(loc='upper left')
     ax1.grid(True, alpha=0.2)
     
-    # Panel 2: PnL
+    # Panel 2
     ax2.plot(plot_data['timestamp'], plot_data['long_pnl'], color='green', alpha=0.3, label='Long Leg PnL')
     ax2.plot(plot_data['timestamp'], plot_data['short_pnl'], color='red', alpha=0.3, label='Short Leg PnL')
     ax2.plot(plot_data['timestamp'], plot_data['net_pnl'], color='cyan', linewidth=2, label='Net Equity')
-    
-    ax2.set_title(f'Continuous Hedge Equity (SL: {sl_pct}%, TP: {tp_pct}%)')
-    ax2.set_ylabel('Cumulative PnL (USDT)')
+    ax2.set_title(f'Equity Curve (SL: {sl_pct}%, TP: {tp_pct}%)')
+    ax2.set_ylabel('PnL (USDT)')
     ax2.legend(loc='upper left')
     ax2.grid(True, alpha=0.2)
     
-    # Styling
     for ax in [ax1, ax2]:
         ax.set_facecolor('black')
         ax.autoscale_view()
     
     fig.patch.set_facecolor('white')
     ax2.xaxis.set_major_formatter(matplotlib.dates.DateFormatter('%Y-%m'))
-    
     plt.tight_layout()
     
     img = io.BytesIO()
