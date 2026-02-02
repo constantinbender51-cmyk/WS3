@@ -65,25 +65,20 @@ def fetch_data():
 @njit(fastmath=True)
 def optimize_regime_sharpe(opens, highs, lows, closes, smas, target_above_sma):
     """
-    Optimizes TP/SL for a specific regime (Above or Below SMA).
-    Returns: Best TP, Best SL, Best Sharpe for that regime.
+    Optimizes for the new strategy:
+    1. Open Long + Short every hour at Open.
+    2. Close at SL, TP, or Hourly Close (whichever comes first).
     """
     n = len(opens)
     fee_rate = 0.0002
     
     best_sharpe = -np.inf
-    best_tp = 20.0
-    best_sl = 20.0
+    best_tp = 5.0
+    best_sl = 2.0
     
-    # Grid Search Range
-    # Using slightly coarser steps or limited range if speed is an issue, 
-    # but 0.1-10.0 is requested.
-    
-    # We loop manually through the grid
-    # 0.1 to 10.0 = 100 steps. 100x100 = 10,000 iters.
-    
-    for tp_int in range(1, 101):
-        for sl_int in range(1, 101):
+    # Search Range: 0.2% to 10.0%
+    for tp_int in range(2, 101, 2): 
+        for sl_int in range(2, 101, 2):
             tp_pct = tp_int / 10.0
             sl_pct = sl_int / 10.0
             
@@ -92,112 +87,74 @@ def optimize_regime_sharpe(opens, highs, lows, closes, smas, target_above_sma):
             s_tp_mult = 1.0 - tp_pct / 100.0
             s_sl_mult = 1.0 + sl_pct / 100.0
             
-            # Simulation State
-            l_active = False
-            l_entry = 0.0
-            
-            s_active = False
-            s_entry = 0.0
-            
-            # Return Stats
             sum_returns = 0.0
             sum_returns_sq = 0.0
             count = 0
             
-            # Running Equity for Delta Calc
-            l_cash = 0.0
-            s_cash = 0.0
-            prev_equity = 0.0
-            
+            # Loop strictly for stats calculation
             for i in range(n):
                 op = opens[i]
+                sma = smas[i]
+                
+                # Check Regime
+                is_above = op > sma
+                if is_above != target_above_sma:
+                    continue
+                
                 hi = highs[i]
                 lo = lows[i]
                 cl = closes[i]
-                sma = smas[i]
                 
-                # Determine Regime of the current moment (using Open vs SMA or strict logic)
-                # We only count stats for the regime we are optimizing.
-                # However, we must SIMULATE the whole path to keep equity consistent, 
-                # but only accumulate Sharpe stats if the trade *started* in the regime?
-                # Or if the current candle is in the regime?
-                # "Optimize Above and Below Separately" implies finding parameters that perform best
-                # when the condition is met.
+                # --- Hourly Reset Logic ---
                 
-                # Logic: We simulate the strategy using these params ONLY when the condition is met.
-                # If condition not met, we assume flat (0 return) for the optimization metric of this specific regime.
+                # LONG Leg
+                l_entry = op
+                l_pnl = 0.0
+                # Calc Exits
+                l_sl_price = l_entry * l_sl_mult
+                l_tp_price = l_entry * l_tp_mult
                 
-                is_above = op > sma
-                
-                # Check if this candle belongs to the target regime
-                in_regime = (is_above == target_above_sma)
-                
-                # Trade Logic (Simplified for speed: Always in market if in regime?)
-                # The strategy is "Continuous Hedge".
-                # If we are optimizing "Above", we assume we are using these params when Above.
-                # We ignore what happens when Below (assume 0 returns for Sharpe calc of this component).
-                
-                # --- LONG ---
-                if not l_active:
-                    l_entry = op
-                    l_cash -= (l_entry * fee_rate)
-                    l_active = True
-                    
-                l_tp = l_entry * l_tp_mult
-                l_sl = l_entry * l_sl_mult
-                
-                l_float = 0.0
-                if lo <= l_sl:
-                    l_cash += (l_sl - l_entry) - (l_sl * fee_rate)
-                    l_active = False
-                elif hi >= l_tp:
-                    l_cash += (l_tp - l_entry) - (l_tp * fee_rate)
-                    l_active = False
+                # Logic: Did we hit SL or TP?
+                # Assumption: If Low <= SL, we hit SL. If High >= TP, we hit TP.
+                # Conflict: If both hit? Standard conservative: SL hit first.
+                if lo <= l_sl_price:
+                    l_exit = l_sl_price
+                    l_pnl = (l_exit - l_entry) - (l_entry * fee_rate) - (l_exit * fee_rate)
+                elif hi >= l_tp_price:
+                    l_exit = l_tp_price
+                    l_pnl = (l_exit - l_entry) - (l_entry * fee_rate) - (l_exit * fee_rate)
                 else:
-                    l_float = cl - l_entry
+                    l_exit = cl
+                    l_pnl = (l_exit - l_entry) - (l_entry * fee_rate) - (l_exit * fee_rate)
                     
-                # --- SHORT ---
-                if not s_active:
-                    s_entry = op
-                    s_cash -= (s_entry * fee_rate)
-                    s_active = True
+                # SHORT Leg
+                s_entry = op
+                s_pnl = 0.0
+                s_sl_price = s_entry * s_sl_mult
+                s_tp_price = s_entry * s_tp_mult
                 
-                s_tp = s_entry * s_tp_mult
-                s_sl = s_entry * s_sl_mult
-                
-                s_float = 0.0
-                if hi >= s_sl:
-                    s_cash += (s_entry - s_sl) - (s_sl * fee_rate)
-                    s_active = False
-                elif lo <= s_tp:
-                    s_cash += (s_entry - s_tp) - (s_tp * fee_rate)
-                    s_active = False
+                if hi >= s_sl_price:
+                    s_exit = s_sl_price
+                    s_pnl = (s_entry - s_exit) - (s_entry * fee_rate) - (s_exit * fee_rate)
+                elif lo <= s_tp_price:
+                    s_exit = s_tp_price
+                    s_pnl = (s_entry - s_exit) - (s_entry * fee_rate) - (s_exit * fee_rate)
                 else:
-                    s_float = s_entry - cl
+                    s_exit = cl
+                    s_pnl = (s_entry - s_exit) - (s_entry * fee_rate) - (s_exit * fee_rate)
                     
-                # --- Stats Accumulation ---
-                current_equity = l_cash + l_float + s_cash + s_float
+                # Net PnL for this hour
+                net_pnl = l_pnl + s_pnl
                 
-                if i == 0:
-                    delta = current_equity
-                else:
-                    delta = current_equity - prev_equity
-                
-                prev_equity = current_equity
-                
-                # Only accumulate Sharpe stats if we are in the target regime
-                if in_regime:
-                    sum_returns += delta
-                    sum_returns_sq += (delta * delta)
-                    count += 1
+                sum_returns += net_pnl
+                sum_returns_sq += (net_pnl * net_pnl)
+                count += 1
             
-            # Calculate Sharpe for this regime
-            if count > 100: # Min samples
+            if count > 100:
                 mean = sum_returns / count
                 var = (sum_returns_sq / count) - (mean * mean)
-                if var > 0:
+                if var > 1e-9:
                     std = np.sqrt(var)
-                    # Annualize roughly
                     sharpe = (mean / std) * 93.59
                     
                     if sharpe > best_sharpe:
@@ -207,7 +164,7 @@ def optimize_regime_sharpe(opens, highs, lows, closes, smas, target_above_sma):
                         
     return best_tp, best_sl, best_sharpe
 
-def calculate_strategy_split(data, tp_above, sl_above, tp_below, sl_below):
+def calculate_strategy_hourly(data, tp_above, sl_above, tp_below, sl_below):
     n = len(data)
     timestamps = data['timestamp'].values
     opens = data['open'].values
@@ -216,26 +173,12 @@ def calculate_strategy_split(data, tp_above, sl_above, tp_below, sl_below):
     closes = data['close'].values
     smas = data['sma'].values
     
-    long_equity = np.zeros(n)
-    short_equity = np.zeros(n)
+    # Cumulative PnL arrays for plotting
+    net_equity = np.zeros(n)
+    
     trades = []
-    
+    current_cum_pnl = 0.0
     fee_rate = 0.0002
-    
-    l_active = False
-    l_entry_price = 0.0
-    l_entry_idx = 0
-    l_realized = 0.0
-    # Track which params were used for the active trade
-    l_current_tp_mult = 0.0
-    l_current_sl_mult = 0.0
-    
-    s_active = False
-    s_entry_price = 0.0
-    s_entry_idx = 0
-    s_realized = 0.0
-    s_current_tp_mult = 0.0
-    s_current_sl_mult = 0.0
     
     # Pre-calc multipliers
     tp_mult_above_l = 1 + tp_above / 100.0
@@ -258,116 +201,70 @@ def calculate_strategy_split(data, tp_above, sl_above, tp_below, sl_below):
         
         is_above = op > sma
         
-        # Determine params for NEW trades
+        # Select Multipliers
         if is_above:
-            cur_l_tp_m = tp_mult_above_l
-            cur_l_sl_m = sl_mult_above_l
-            cur_s_tp_m = tp_mult_above_s
-            cur_s_sl_m = sl_mult_above_s
+            l_tp_m, l_sl_m = tp_mult_above_l, sl_mult_above_l
+            s_tp_m, s_sl_m = tp_mult_above_s, sl_mult_above_s
         else:
-            cur_l_tp_m = tp_mult_below_l
-            cur_l_sl_m = sl_mult_below_l
-            cur_s_tp_m = tp_mult_below_s
-            cur_s_sl_m = sl_mult_below_s
+            l_tp_m, l_sl_m = tp_mult_below_l, sl_mult_below_l
+            s_tp_m, s_sl_m = tp_mult_below_s, sl_mult_below_s
             
-        # --- LONG ---
-        if not l_active:
-            l_entry_price = op
-            l_entry_idx = i
-            l_active = True
-            l_realized -= (l_entry_price * fee_rate)
-            # Lock in params at entry
-            l_current_tp_mult = cur_l_tp_m
-            l_current_sl_mult = cur_l_sl_m
-            
-        l_tp = l_entry_price * l_current_tp_mult
-        l_sl = l_entry_price * l_current_sl_mult
+        # --- LONG CALC ---
+        l_sl_price = op * l_sl_m
+        l_tp_price = op * l_tp_m
         
-        l_pnl = 0.0
+        l_exit = 0.0
         l_status = ""
-        l_exit_price = 0.0
         
-        if lo <= l_sl:
-            gross = l_sl - l_entry_price
-            fee = l_sl * fee_rate
-            l_pnl = gross - fee
-            l_realized += l_pnl
-            l_active = False
+        if lo <= l_sl_price:
+            l_exit = l_sl_price
             l_status = "SL"
-            l_exit_price = l_sl
-        elif hi >= l_tp:
-            gross = l_tp - l_entry_price
-            fee = l_tp * fee_rate
-            l_pnl = gross - fee
-            l_realized += l_pnl
-            l_active = False
+        elif hi >= l_tp_price:
+            l_exit = l_tp_price
             l_status = "TP"
-            l_exit_price = l_tp
-        
-        if not l_active:
-            trades.append({
-                'entry_time': pd.to_datetime(timestamps[l_entry_idx]),
-                'exit_time': pd.to_datetime(ts),
-                'type': 'LONG',
-                'entry_price': l_entry_price,
-                'exit_price': l_exit_price,
-                'pnl': l_pnl - (l_entry_price * fee_rate),
-                'status': l_status,
-                'regime': 'Above' if smas[l_entry_idx] < opens[l_entry_idx] else 'Below'
-            })
-            long_equity[i] = l_realized
         else:
-            long_equity[i] = l_realized + (cl - l_entry_price)
-
-        # --- SHORT ---
-        if not s_active:
-            s_entry_price = op
-            s_entry_idx = i
-            s_active = True
-            s_realized -= (s_entry_price * fee_rate)
-            s_current_tp_mult = cur_s_tp_m
-            s_current_sl_mult = cur_s_sl_m
+            l_exit = cl
+            l_status = "TIME" # Hourly Close
             
-        s_tp = s_entry_price * s_current_tp_mult
-        s_sl = s_entry_price * s_current_sl_mult
+        l_pnl = (l_exit - op) - (op * fee_rate) - (l_exit * fee_rate)
         
-        s_pnl = 0.0
+        # --- SHORT CALC ---
+        s_sl_price = op * s_sl_m
+        s_tp_price = op * s_tp_m
+        
+        s_exit = 0.0
         s_status = ""
-        s_exit_price = 0.0
         
-        if hi >= s_sl:
-            gross = s_entry_price - s_sl
-            fee = s_sl * fee_rate
-            s_pnl = gross - fee
-            s_realized += s_pnl
-            s_active = False
+        if hi >= s_sl_price:
+            s_exit = s_sl_price
             s_status = "SL"
-            s_exit_price = s_sl
-        elif lo <= s_tp:
-            gross = s_entry_price - s_tp
-            fee = s_tp * fee_rate
-            s_pnl = gross - fee
-            s_realized += s_pnl
-            s_active = False
+        elif lo <= s_tp_price:
+            s_exit = s_tp_price
             s_status = "TP"
-            s_exit_price = s_tp
-            
-        if not s_active:
-            trades.append({
-                'entry_time': pd.to_datetime(timestamps[s_entry_idx]),
-                'exit_time': pd.to_datetime(ts),
-                'type': 'SHORT',
-                'entry_price': s_entry_price,
-                'exit_price': s_exit_price,
-                'pnl': s_pnl - (s_entry_price * fee_rate),
-                'status': s_status,
-                'regime': 'Above' if smas[s_entry_idx] < opens[s_entry_idx] else 'Below'
-            })
-            short_equity[i] = s_realized
         else:
-            short_equity[i] = s_realized + (s_entry_price - cl)
+            s_exit = cl
+            s_status = "TIME"
             
-    return long_equity, short_equity, trades
+        s_pnl = (op - s_exit) - (op * fee_rate) - (s_exit * fee_rate)
+        
+        # Net for this candle
+        net_pnl = l_pnl + s_pnl
+        current_cum_pnl += net_pnl
+        net_equity[i] = current_cum_pnl
+        
+        # Log Interesting Trades (Only log if NOT Time/Time to reduce spam? 
+        # Or log all? Let's log if at least one side triggered)
+        if l_status != "TIME" or s_status != "TIME":
+             trades.append({
+                'entry_time': pd.to_datetime(ts),
+                'exit_time': pd.to_datetime(ts) + pd.Timedelta(hours=1),
+                'regime': 'Above' if is_above else 'Below',
+                'l_status': l_status,
+                's_status': s_status,
+                'pnl': net_pnl
+            })
+            
+    return net_equity, trades
 
 @app.route('/')
 def index():
@@ -385,19 +282,22 @@ def index():
         return "Data not loaded", 500
 
     calc_data = df.dropna(subset=['sma']).reset_index(drop=True)
-    _, _, trades = calculate_strategy_split(calc_data, tp_above, sl_above, tp_below, sl_below)
+    net_equity, trades = calculate_strategy_hourly(calc_data, tp_above, sl_above, tp_below, sl_below)
+    
+    # Store equity in DF for plotting convenience
+    # (Creating a temporary copy to avoid global state pollution)
+    plot_df = calc_data.copy()
+    plot_df['net_equity'] = net_equity
     
     rows = ""
+    # Show last 50 triggered trades
     for t in reversed(trades[-50:]):
         color = "#00ff00" if t['pnl'] > 0 else "#ff0000"
         rows += f"""
         <tr>
             <td>{t['entry_time']}</td>
-            <td>{t['exit_time']}</td>
             <td>{t['regime']}</td>
-            <td style="color: {'cyan' if t['type']=='LONG' else 'orange'}">{t['type']}</td>
-            <td>{t['entry_price']:.2f}</td>
-            <td>{t['status']}</td>
+            <td>L:{t['l_status']} / S:{t['s_status']}</td>
             <td style="color: {color}">{t['pnl']:.2f}</td>
         </tr>
         """
@@ -420,11 +320,11 @@ def index():
             </style>
             <script>
                 function runOptimization() {{
-                    document.getElementById('optimize-status').innerText = "Optimizing Separate Regimes... Please wait.";
+                    document.getElementById('optimize-status').innerText = "Optimizing Hourly Reset Strategy... Please wait.";
                     fetch('/optimize_split')
                         .then(response => response.json())
                         .then(data => {{
-                            document.getElementById('optimize-status').innerText = "Done! Above: TP " + data.tp_above + "/SL " + data.sl_above + " | Below: TP " + data.tp_below + "/SL " + data.sl_below;
+                            document.getElementById('optimize-status').innerText = "Done! Above: " + data.tp_above + "/" + data.sl_above + " | Below: " + data.tp_below + "/" + data.sl_below;
                             document.querySelector('input[name="tp_above"]').value = data.tp_above;
                             document.querySelector('input[name="sl_above"]').value = data.sl_above;
                             document.querySelector('input[name="tp_below"]').value = data.tp_below;
@@ -438,7 +338,8 @@ def index():
         </head>
         <body>
             <div class="container">
-                <h2>ETH/USDT Split Regime Strategy (0.02% Fee)</h2>
+                <h2>ETH/USDT Hourly Reset Strategy</h2>
+                <p>Opens L+S every hour. Closes at TP, SL, or End of Hour.</p>
                 
                 <form action="/" method="get">
                     <div class="params-box">
@@ -464,18 +365,15 @@ def index():
                 <br>
                 <img src="/plot.png?sl_above={sl_above}&tp_above={tp_above}&sl_below={sl_below}&tp_below={tp_below}" style="border: 1px solid #555; max-width: 100%; margin-top: 20px;">
                 
-                <h3>Recent Trade History</h3>
+                <h3>Recent Triggered Events (Non-Time Exits)</h3>
                 <div class="scroll-table">
                     <table>
                         <thead>
                             <tr>
                                 <th>Entry Time</th>
-                                <th>Exit Time</th>
                                 <th>Regime</th>
-                                <th>Type</th>
-                                <th>Entry</th>
-                                <th>Status</th>
-                                <th>PnL</th>
+                                <th>Status (Long/Short)</th>
+                                <th>Net PnL</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -508,14 +406,10 @@ def optimize_split():
     smas = market_data['smas']
     
     t0 = time.time()
-    
-    # Optimize Above Regime
     tp_a, sl_a, sharpe_a = optimize_regime_sharpe(opens, highs, lows, closes, smas, True)
-    
-    # Optimize Below Regime
     tp_b, sl_b, sharpe_b = optimize_regime_sharpe(opens, highs, lows, closes, smas, False)
     
-    print(f"Split Optimization done in {time.time() - t0:.2f}s")
+    print(f"Optimization done in {time.time() - t0:.2f}s")
     
     return jsonify({
         'tp_above': round(tp_a, 1),
@@ -543,9 +437,7 @@ def plot_png():
     if plot_data.empty:
         return "Not enough data", 400
     
-    long_eq, short_eq, _ = calculate_strategy_split(plot_data, tp_a, sl_a, tp_b, sl_b)
-    
-    plot_data['net_pnl'] = long_eq + short_eq
+    net_equity, _ = calculate_strategy_hourly(plot_data, tp_a, sl_a, tp_b, sl_b)
     
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), dpi=100, gridspec_kw={'height_ratios': [2, 1]}, sharex=True)
     
@@ -565,8 +457,8 @@ def plot_png():
     ax1.legend(loc='upper left')
     ax1.grid(True, alpha=0.2)
     
-    ax2.plot(plot_data['timestamp'], plot_data['net_pnl'], color='cyan', linewidth=2, label='Net Equity')
-    ax2.set_title(f'Split Regime Equity')
+    ax2.plot(plot_data['timestamp'], net_equity, color='cyan', linewidth=2, label='Net Equity')
+    ax2.set_title(f'Hourly Reset Equity (Cumulative PnL)')
     ax2.set_ylabel('PnL (USDT)')
     ax2.legend(loc='upper left')
     ax2.grid(True, alpha=0.2)
