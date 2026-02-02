@@ -15,24 +15,28 @@ class Config:
     # Exchange Settings
     SYMBOL = "BTCUSDT"
     INTERVAL = "4h"
-    START_TIME = "2024-01-01"
+    START_TIME = "2018-01-01" # Need more history for 365-day SMA
+    
+    # Regime Settings
+    SMA_PERIOD_DAYS = 365
+    CANDLES_PER_DAY = 6       # 4h candles
     
     # Backtest Settings
     LEVELS_COUNT = 5
-    TRAIN_SPLIT = 0.8
+    TRAIN_SPLIT = 0.6       
     ANNUALIZATION_FACTOR = 365 * 6 
     
     # Costs
-    TRADING_FEE = 0.0002  # 0.02% per side
-    SLIPPAGE = 0.0001     # 0.01% per execution
+    TRADING_FEE = 0.0002 
+    SLIPPAGE = 0.0001     
     
     # Genetic Algorithm Settings
-    POPULATION_SIZE = 100
+    POPULATION_SIZE = 50
     GENERATIONS = 15
     MUTATION_RATE = 0.2
-    ELITISM_COUNT = 5
+    ELITISM_COUNT = 2
     
-    # GA Constraints
+    # GA Constraints (Normalized Space)
     SL_MIN = 0.01           
     SL_MAX = 0.10           
     TP_MIN = 0.02           
@@ -47,7 +51,7 @@ class Config:
     OUTPUT_DIR = "server_root"
 
 # ==========================================
-# 1. DATA FETCHING (Binance)
+# 1. DATA PROCESSING
 # ==========================================
 def fetch_ohlc(symbol, interval, start_str):
     base_url = "https://api.binance.com/api/v3/klines"
@@ -81,6 +85,10 @@ def fetch_ohlc(symbol, interval, start_str):
         last_ts = chunk[-1][0]
         current_ts = last_ts + 1
         
+        # Safety break for very long histories
+        if len(data) > 15000: 
+            break
+            
         if len(chunk) < 1000:
             break
             
@@ -96,10 +104,67 @@ def fetch_ohlc(symbol, interval, start_str):
     print(f"[SYSTEM] Fetched {len(df)} candles.")
     return df[["open_time", "open", "high", "low", "close"]]
 
+def structure_market_data(df):
+    """
+    1. Calculates 365-Day SMA.
+    2. Segments data into Bull/Bear chunks.
+    3. Normalizes each chunk to start at 1.0.
+    4. Returns concatenated Bull and Bear DataFrames.
+    """
+    period = Config.SMA_PERIOD_DAYS * Config.CANDLES_PER_DAY
+    df['sma'] = df['close'].rolling(period).mean()
+    
+    # Drop NaN
+    df = df.dropna().reset_index(drop=True)
+    
+    # Identify Regime
+    # True = Bull, False = Bear
+    df['is_bull'] = df['close'] > df['sma']
+    
+    # Identify chunks (where regime changes)
+    # diff() != 0 marks the start of a new group
+    df['group'] = (df['is_bull'] != df['is_bull'].shift()).cumsum()
+    
+    bull_chunks = []
+    bear_chunks = []
+    
+    grouped = df.groupby('group')
+    
+    print(f"[SYSTEM] Processing {len(grouped)} market regimes...")
+    
+    for _, chunk in grouped:
+        chunk = chunk.copy()
+        if chunk.empty: continue
+        
+        # Normalize to the Open of the first candle in this chunk
+        base_price = chunk['open'].iloc[0]
+        
+        chunk['open'] = chunk['open'] / base_price
+        chunk['high'] = chunk['high'] / base_price
+        chunk['low'] = chunk['low'] / base_price
+        chunk['close'] = chunk['close'] / base_price
+        # SMA is also normalized relative to that start (for reference only)
+        chunk['sma'] = chunk['sma'] / base_price
+        
+        if chunk['is_bull'].iloc[0]:
+            bull_chunks.append(chunk)
+        else:
+            bear_chunks.append(chunk)
+            
+    # Concatenate to form synthetic datasets
+    # We define a synthetic index to keep plotting contiguous
+    
+    bull_df = pd.concat(bull_chunks).reset_index(drop=True) if bull_chunks else pd.DataFrame()
+    bear_df = pd.concat(bear_chunks).reset_index(drop=True) if bear_chunks else pd.DataFrame()
+    
+    return bull_df, bear_df
+
 # ==========================================
-# 2. BACKTEST ENGINE (HEDGE + FEES/SLIPPAGE)
+# 2. BACKTEST ENGINE
 # ==========================================
 def backtest(df, levels, stop_loss_pct, take_profit_pct):
+    if df.empty: return np.array([0.0]), [], 0.0
+
     highs = df["high"].values
     lows = df["low"].values
     times = df["open_time"].values
@@ -110,7 +175,7 @@ def backtest(df, levels, stop_loss_pct, take_profit_pct):
     equity = 0.0
     equity_curve = [0.0]
     
-    # Pre-calc multipliers for speed
+    # Pre-calc multipliers
     long_slip_entry = 1 + Config.SLIPPAGE
     short_slip_entry = 1 - Config.SLIPPAGE
     long_slip_exit = 1 - Config.SLIPPAGE
@@ -127,11 +192,11 @@ def backtest(df, levels, stop_loss_pct, take_profit_pct):
             if l <= level <= h:
                 # OPEN LONG
                 if not any(tr['entry_price'] == level and tr['type'] == 'long' for tr in active_trades):
-                    exec_price = level * long_slip_entry # Buy higher
+                    exec_price = level * long_slip_entry 
                     active_trades.append({
                         'type': 'long',
-                        'entry_price': level, # Logic Ref
-                        'exec_entry': exec_price, # Actual Cost
+                        'entry_price': level, 
+                        'exec_entry': exec_price, 
                         'entry_time': t,
                         'sl_price': level * (1 - stop_loss_pct),
                         'tp_price': level * (1 + take_profit_pct),
@@ -140,7 +205,7 @@ def backtest(df, levels, stop_loss_pct, take_profit_pct):
 
                 # OPEN SHORT
                 if not any(tr['entry_price'] == level and tr['type'] == 'short' for tr in active_trades):
-                    exec_price = level * short_slip_entry # Sell lower
+                    exec_price = level * short_slip_entry 
                     active_trades.append({
                         'type': 'short',
                         'entry_price': level,
@@ -163,15 +228,11 @@ def backtest(df, levels, stop_loss_pct, take_profit_pct):
                 
                 if sl_hit or tp_hit:
                     closed = True
-                    # Determine trigger price (Conservative: SL priority)
                     if sl_hit and tp_hit: raw_exit_ref = trade['sl_price']
                     elif sl_hit: raw_exit_ref = trade['sl_price']
                     else: raw_exit_ref = trade['tp_price']
                     
-                    # Apply Slippage to Exit (Sell Lower)
                     exec_exit = raw_exit_ref * long_slip_exit
-                    
-                    # Calculate PnL: (Exit - Entry) / Entry - Fees
                     gross_pnl = (exec_exit - trade['exec_entry']) / trade['exec_entry']
                     pnl = gross_pnl - total_fee_cost
             
@@ -185,16 +246,13 @@ def backtest(df, levels, stop_loss_pct, take_profit_pct):
                     elif sl_hit: raw_exit_ref = trade['sl_price']
                     else: raw_exit_ref = trade['tp_price']
                     
-                    # Apply Slippage to Exit (Buy Higher)
                     exec_exit = raw_exit_ref * short_slip_exit
-                    
-                    # Calculate PnL: (Entry - Exit) / Entry - Fees
                     gross_pnl = (trade['exec_entry'] - exec_exit) / trade['exec_entry']
                     pnl = gross_pnl - total_fee_cost
             
             if closed:
-                trade['exit_price'] = raw_exit_ref # Logical reference
-                trade['exec_exit'] = exec_exit     # Actual execution
+                trade['exit_price'] = raw_exit_ref
+                trade['exec_exit'] = exec_exit
                 trade['exit_time'] = t
                 trade['pnl'] = pnl
                 trade['status'] = 'closed'
@@ -234,9 +292,11 @@ def backtest(df, levels, stop_loss_pct, take_profit_pct):
 class GeneticOptimizer:
     def __init__(self, data):
         self.data = data
-        self.price_min = data['low'].min()
-        self.price_max = data['high'].max()
         self.levels_cnt = Config.LEVELS_COUNT
+        # For normalized data, min/max are around 1.0. 
+        # We allow levels between 0.5 (50% drop) and 2.0 (100% gain) relative to segment start
+        self.price_min = 0.5 
+        self.price_max = 2.0
         
     def init_population(self):
         pop = []
@@ -272,7 +332,7 @@ class GeneticOptimizer:
         price_cutoff = self.levels_cnt
         
         if idx < price_cutoff:
-            shift = np.random.normal(0, (self.price_max - self.price_min) * Config.PRICE_MUTATION_PCT)
+            shift = np.random.normal(0, 0.05) # Shift by 5% in normalized space
             genome[idx] += shift
         elif idx == price_cutoff:
             genome[idx] += np.random.normal(0, Config.SL_MUTATION_SIGMA)
@@ -326,24 +386,42 @@ def generate_plots(df, trades, equity_curve, levels):
     if not os.path.exists(Config.OUTPUT_DIR):
         os.makedirs(Config.OUTPUT_DIR)
 
-    # Price Plot
+    # Price Plot (Synthetic Normalized)
     plt.figure(figsize=(14, 8))
-    plt.plot(df['open_time'], df['close'], label='Price', color='gray', alpha=0.5, linewidth=1)
+    plt.plot(range(len(df)), df['close'], label='Normalized Price', color='gray', alpha=0.5, linewidth=1)
     
     for l in levels:
         plt.axhline(l, color='gold', linestyle='-', alpha=0.8, linewidth=1.5)
-        
-    long_entries = [t for t in trades if t['type'] == 'long']
-    short_entries = [t for t in trades if t['type'] == 'short']
     
-    if long_entries:
-        plt.scatter([t['entry_time'] for t in long_entries], [t['entry_price'] for t in long_entries], 
-                    marker='^', color='green', s=30, alpha=0.7)
-    if short_entries:
-        plt.scatter([t['entry_time'] for t in short_entries], [t['entry_price'] for t in short_entries], 
-                    marker='v', color='red', s=30, alpha=0.7)
+    # Map time to index for scatter since df is synthetic concatenated
+    # We use index 0..N
+    
+    long_idxs = []
+    long_prices = []
+    short_idxs = []
+    short_prices = []
+    
+    # We need to find the index corresponding to the time in the synthetic df
+    # Because trades have 'time', but df is concatenated chunks
+    # Optimized lookup:
+    time_map = { t: i for i, t in enumerate(df['open_time']) }
+    
+    for t in trades:
+        idx = time_map.get(t['entry_time'])
+        if idx is not None:
+            if t['type'] == 'long':
+                long_idxs.append(idx)
+                long_prices.append(t['entry_price'])
+            else:
+                short_idxs.append(idx)
+                short_prices.append(t['entry_price'])
+    
+    if long_idxs:
+        plt.scatter(long_idxs, long_prices, marker='^', color='green', s=20, alpha=0.7)
+    if short_idxs:
+        plt.scatter(short_idxs, short_prices, marker='v', color='red', s=20, alpha=0.7)
                     
-    plt.title(f"Strategy Execution: {Config.SYMBOL} (w/ Fees & Slippage)")
+    plt.title(f"Strategy: Normalized Bull Market Segments")
     plt.grid(True, alpha=0.3)
     plt.savefig(f"{Config.OUTPUT_DIR}/price_plot.png")
     plt.close()
@@ -373,24 +451,22 @@ def generate_html(trades, pnl, sharpe):
     </head>
     <body>
         <div class="container">
-            <h1>Strategy Report: {Config.SYMBOL}</h1>
+            <h1>Strategy Report: {Config.SYMBOL} (Bull Market Regimes)</h1>
             <h2>Total PnL (Net): <span class="{ 'profit' if pnl > 0 else 'loss' }">{pnl:.4f} R</span></h2>
             <h2>Sharpe Ratio: {sharpe:.4f}</h2>
-            <h3>Price Action</h3><img src="price_plot.png" style="max-width:100%">
+            <h3>Normalized Price Action</h3><img src="price_plot.png" style="max-width:100%">
             <h3>Equity Curve</h3><img src="pnl_plot.png" style="max-width:100%">
-            <h3>Trade Log (Fees: {Config.TRADING_FEE*2*100:.2f}%)</h3>
+            <h3>Trade Log</h3>
             <table>
-                <tr><th>Type</th><th>Trigger</th><th>Exec Entry</th><th>Exec Exit</th><th>Net PnL</th></tr>
+                <tr><th>Type</th><th>Trigger (Norm)</th><th>Net PnL</th></tr>
     """
     
-    for t in trades:
+    for t in trades[:100]: # Limit for brevity in HTML
         color = "profit" if t['pnl'] > 0 else "loss"
         html += f"""
         <tr>
             <td>{t['type']}</td>
-            <td>{t['entry_price']:.2f}</td>
-            <td>{t['exec_entry']:.2f}</td>
-            <td>{t['exec_exit']:.2f}</td>
+            <td>{t['entry_price']:.4f}</td>
             <td class='{color}'>{t['pnl']:.4f}</td>
         </tr>"""
         
@@ -415,13 +491,21 @@ def serve_results():
 if __name__ == "__main__":
     df = fetch_ohlc(Config.SYMBOL, Config.INTERVAL, Config.START_TIME)
     
-    split_idx = int(len(df) * Config.TRAIN_SPLIT)
-    train_data = df.iloc[:split_idx].reset_index(drop=True)
-    test_data = df.iloc[split_idx:].reset_index(drop=True)
+    print("[SYSTEM] Structuring Market Data (Bull/Bear + Normalization)...")
+    bull_df, bear_df = structure_market_data(df)
+    
+    print(f"[SYSTEM] Bull Data: {len(bull_df)} candles | Bear Data: {len(bear_df)} candles")
+    
+    # We will optimize on BULL data as an example
+    target_data = bull_df
+    
+    split_idx = int(len(target_data) * Config.TRAIN_SPLIT)
+    train_data = target_data.iloc[:split_idx].reset_index(drop=True)
+    test_data = target_data.iloc[split_idx:].reset_index(drop=True)
     
     print(f"[SYSTEM] Data Split: Train={len(train_data)}, Test={len(test_data)}")
     
-    print("[SYSTEM] Starting Genetic Optimization (Hedge Mode + Costs)...")
+    print("[SYSTEM] Starting Genetic Optimization (Target: Sharpe)...")
     ga = GeneticOptimizer(train_data)
     best_genome = ga.run()
     
@@ -429,7 +513,7 @@ if __name__ == "__main__":
     opt_sl = best_genome[-2]
     opt_tp = best_genome[-1]
     
-    print(f"[RESULT] Optimized Params:\n Levels: {opt_levels}")
+    print(f"[RESULT] Optimized Params (Normalized):\n Levels: {opt_levels}")
     print(f" SL: {opt_sl:.4f} | TP: {opt_tp:.4f}")
     
     print("[SYSTEM] Running Test on Out-of-Sample Data...")
