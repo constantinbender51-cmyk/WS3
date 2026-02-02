@@ -18,17 +18,21 @@ class Config:
     START_TIME = "2024-01-01"
     
     # Backtest Settings
-    LEVELS_COUNT = 5      # Increased count slightly for grid density
-    TRAIN_SPLIT = 0.8 
+    LEVELS_COUNT = 5
+    TRAIN_SPLIT = 0.8
     ANNUALIZATION_FACTOR = 365 * 6 
+    
+    # Costs
+    TRADING_FEE = 0.0002  # 0.02% per side
+    SLIPPAGE = 0.0001     # 0.01% per execution
     
     # Genetic Algorithm Settings
     POPULATION_SIZE = 100
-    GENERATIONS = 30
+    GENERATIONS = 15
     MUTATION_RATE = 0.2
     ELITISM_COUNT = 5
     
-    # GA Mutation/Bound Constraints
+    # GA Constraints
     SL_MIN = 0.01           
     SL_MAX = 0.10           
     TP_MIN = 0.02           
@@ -93,7 +97,7 @@ def fetch_ohlc(symbol, interval, start_str):
     return df[["open_time", "open", "high", "low", "close"]]
 
 # ==========================================
-# 2. BACKTEST ENGINE (HEDGING ENABLED)
+# 2. BACKTEST ENGINE (HEDGE + FEES/SLIPPAGE)
 # ==========================================
 def backtest(df, levels, stop_loss_pct, take_profit_pct):
     highs = df["high"].values
@@ -106,32 +110,41 @@ def backtest(df, levels, stop_loss_pct, take_profit_pct):
     equity = 0.0
     equity_curve = [0.0]
     
+    # Pre-calc multipliers for speed
+    long_slip_entry = 1 + Config.SLIPPAGE
+    short_slip_entry = 1 - Config.SLIPPAGE
+    long_slip_exit = 1 - Config.SLIPPAGE
+    short_slip_exit = 1 + Config.SLIPPAGE
+    total_fee_cost = Config.TRADING_FEE * 2
+    
     for i in range(len(df)):
         h = highs[i]
         l = lows[i]
         t = times[i]
         
-        # Entries: Check every level
+        # Entries
         for level in levels:
             if l <= level <= h:
-                # Hedge Mode: Try to open BOTH Long and Short at this level
-                
-                # Open Long if not already Long at this level
+                # OPEN LONG
                 if not any(tr['entry_price'] == level and tr['type'] == 'long' for tr in active_trades):
+                    exec_price = level * long_slip_entry # Buy higher
                     active_trades.append({
                         'type': 'long',
-                        'entry_price': level,
+                        'entry_price': level, # Logic Ref
+                        'exec_entry': exec_price, # Actual Cost
                         'entry_time': t,
                         'sl_price': level * (1 - stop_loss_pct),
                         'tp_price': level * (1 + take_profit_pct),
                         'status': 'open'
                     })
 
-                # Open Short if not already Short at this level
+                # OPEN SHORT
                 if not any(tr['entry_price'] == level and tr['type'] == 'short' for tr in active_trades):
+                    exec_price = level * short_slip_entry # Sell lower
                     active_trades.append({
                         'type': 'short',
                         'entry_price': level,
+                        'exec_entry': exec_price,
                         'entry_time': t,
                         'sl_price': level * (1 + stop_loss_pct),
                         'tp_price': level * (1 - take_profit_pct),
@@ -142,45 +155,46 @@ def backtest(df, levels, stop_loss_pct, take_profit_pct):
         for trade in active_trades[:]:
             pnl = 0.0
             closed = False
-            exit_p = 0.0
+            raw_exit_ref = 0.0
             
             if trade['type'] == 'long':
                 sl_hit = l <= trade['sl_price']
                 tp_hit = h >= trade['tp_price']
                 
-                if sl_hit and tp_hit:
-                    # Conservative: SL hit first
-                    exit_p = trade['sl_price']
-                    pnl = (exit_p - trade['entry_price']) / trade['entry_price']
+                if sl_hit or tp_hit:
                     closed = True
-                elif sl_hit:
-                    exit_p = trade['sl_price']
-                    pnl = (exit_p - trade['entry_price']) / trade['entry_price']
-                    closed = True
-                elif tp_hit:
-                    exit_p = trade['tp_price']
-                    pnl = (exit_p - trade['entry_price']) / trade['entry_price']
-                    closed = True
+                    # Determine trigger price (Conservative: SL priority)
+                    if sl_hit and tp_hit: raw_exit_ref = trade['sl_price']
+                    elif sl_hit: raw_exit_ref = trade['sl_price']
+                    else: raw_exit_ref = trade['tp_price']
+                    
+                    # Apply Slippage to Exit (Sell Lower)
+                    exec_exit = raw_exit_ref * long_slip_exit
+                    
+                    # Calculate PnL: (Exit - Entry) / Entry - Fees
+                    gross_pnl = (exec_exit - trade['exec_entry']) / trade['exec_entry']
+                    pnl = gross_pnl - total_fee_cost
             
             elif trade['type'] == 'short':
                 sl_hit = h >= trade['sl_price']
                 tp_hit = l <= trade['tp_price']
                 
-                if sl_hit and tp_hit:
-                    exit_p = trade['sl_price']
-                    pnl = (trade['entry_price'] - exit_p) / trade['entry_price']
+                if sl_hit or tp_hit:
                     closed = True
-                elif sl_hit:
-                    exit_p = trade['sl_price']
-                    pnl = (trade['entry_price'] - exit_p) / trade['entry_price']
-                    closed = True
-                elif tp_hit:
-                    exit_p = trade['tp_price']
-                    pnl = (trade['entry_price'] - exit_p) / trade['entry_price']
-                    closed = True
+                    if sl_hit and tp_hit: raw_exit_ref = trade['sl_price']
+                    elif sl_hit: raw_exit_ref = trade['sl_price']
+                    else: raw_exit_ref = trade['tp_price']
+                    
+                    # Apply Slippage to Exit (Buy Higher)
+                    exec_exit = raw_exit_ref * short_slip_exit
+                    
+                    # Calculate PnL: (Entry - Exit) / Entry - Fees
+                    gross_pnl = (trade['exec_entry'] - exec_exit) / trade['exec_entry']
+                    pnl = gross_pnl - total_fee_cost
             
             if closed:
-                trade['exit_price'] = exit_p
+                trade['exit_price'] = raw_exit_ref # Logical reference
+                trade['exec_exit'] = exec_exit     # Actual execution
                 trade['exit_time'] = t
                 trade['pnl'] = pnl
                 trade['status'] = 'closed'
@@ -196,11 +210,16 @@ def backtest(df, levels, stop_loss_pct, take_profit_pct):
     for trade in active_trades:
         pnl = 0.0
         if trade['type'] == 'long':
-            pnl = (last_price - trade['entry_price']) / trade['entry_price']
+            exec_exit = last_price * long_slip_exit
+            gross_pnl = (exec_exit - trade['exec_entry']) / trade['exec_entry']
         else:
-            pnl = (trade['entry_price'] - last_price) / trade['entry_price']
+            exec_exit = last_price * short_slip_exit
+            gross_pnl = (trade['exec_entry'] - exec_exit) / trade['exec_entry']
+        
+        pnl = gross_pnl - total_fee_cost
         
         trade['exit_price'] = last_price
+        trade['exec_exit'] = exec_exit
         trade['exit_time'] = last_time
         trade['pnl'] = pnl
         trade['status'] = 'force_closed'
@@ -222,11 +241,9 @@ class GeneticOptimizer:
     def init_population(self):
         pop = []
         for _ in range(Config.POPULATION_SIZE):
-            # Genome: [Level1, Level2, ..., LevelN, SL, TP]
             levels = np.random.uniform(self.price_min, self.price_max, self.levels_cnt)
             sl = np.random.uniform(Config.SL_MIN, Config.SL_MAX)
             tp = np.random.uniform(Config.TP_MIN, Config.TP_MAX)
-            
             genome = np.concatenate([levels, [sl, tp]])
             pop.append(genome)
         return pop
@@ -252,11 +269,6 @@ class GeneticOptimizer:
 
     def mutate(self, genome):
         idx = random.randint(0, len(genome)-1)
-        
-        # Indices: 0 to CNT-1 are prices. 
-        # CNT is SL. 
-        # CNT+1 is TP.
-        
         price_cutoff = self.levels_cnt
         
         if idx < price_cutoff:
@@ -268,7 +280,6 @@ class GeneticOptimizer:
         else:
             genome[idx] += np.random.normal(0, Config.TP_MUTATION_SIGMA)
             genome[idx] = np.clip(genome[idx], 0.001, 0.5)
-            
         return genome
 
     def crossover(self, p1, p2):
@@ -319,9 +330,8 @@ def generate_plots(df, trades, equity_curve, levels):
     plt.figure(figsize=(14, 8))
     plt.plot(df['open_time'], df['close'], label='Price', color='gray', alpha=0.5, linewidth=1)
     
-    # Unified Levels
     for l in levels:
-        plt.axhline(l, color='gold', linestyle='-', alpha=0.8, linewidth=1.5, label='Trigger Level' if l==levels[0] else "")
+        plt.axhline(l, color='gold', linestyle='-', alpha=0.8, linewidth=1.5)
         
     long_entries = [t for t in trades if t['type'] == 'long']
     short_entries = [t for t in trades if t['type'] == 'short']
@@ -333,15 +343,14 @@ def generate_plots(df, trades, equity_curve, levels):
         plt.scatter([t['entry_time'] for t in short_entries], [t['entry_price'] for t in short_entries], 
                     marker='v', color='red', s=30, alpha=0.7)
                     
-    plt.title(f"Strategy Execution: {Config.SYMBOL} (Hedge/Grid Mode)")
-    plt.legend()
+    plt.title(f"Strategy Execution: {Config.SYMBOL} (w/ Fees & Slippage)")
     plt.grid(True, alpha=0.3)
     plt.savefig(f"{Config.OUTPUT_DIR}/price_plot.png")
     plt.close()
 
     # PnL Plot
     plt.figure(figsize=(14, 6))
-    plt.plot(equity_curve, color='blue', label='Cumulative PnL')
+    plt.plot(equity_curve, color='blue', label='Cumulative PnL (Net)')
     plt.title("Equity Curve")
     plt.grid(True)
     plt.savefig(f"{Config.OUTPUT_DIR}/pnl_plot.png")
@@ -365,13 +374,13 @@ def generate_html(trades, pnl, sharpe):
     <body>
         <div class="container">
             <h1>Strategy Report: {Config.SYMBOL}</h1>
-            <h2>Total PnL: <span class="{ 'profit' if pnl > 0 else 'loss' }">{pnl:.4f} R</span></h2>
+            <h2>Total PnL (Net): <span class="{ 'profit' if pnl > 0 else 'loss' }">{pnl:.4f} R</span></h2>
             <h2>Sharpe Ratio: {sharpe:.4f}</h2>
             <h3>Price Action</h3><img src="price_plot.png" style="max-width:100%">
             <h3>Equity Curve</h3><img src="pnl_plot.png" style="max-width:100%">
-            <h3>Trade Log</h3>
+            <h3>Trade Log (Fees: {Config.TRADING_FEE*2*100:.2f}%)</h3>
             <table>
-                <tr><th>Type</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Status</th></tr>
+                <tr><th>Type</th><th>Trigger</th><th>Exec Entry</th><th>Exec Exit</th><th>Net PnL</th></tr>
     """
     
     for t in trades:
@@ -380,9 +389,9 @@ def generate_html(trades, pnl, sharpe):
         <tr>
             <td>{t['type']}</td>
             <td>{t['entry_price']:.2f}</td>
-            <td>{t['exit_price']:.2f}</td>
+            <td>{t['exec_entry']:.2f}</td>
+            <td>{t['exec_exit']:.2f}</td>
             <td class='{color}'>{t['pnl']:.4f}</td>
-            <td>{t['status']}</td>
         </tr>"""
         
     html += "</table></div></body></html>"
@@ -412,7 +421,7 @@ if __name__ == "__main__":
     
     print(f"[SYSTEM] Data Split: Train={len(train_data)}, Test={len(test_data)}")
     
-    print("[SYSTEM] Starting Genetic Optimization (Hedge Mode)...")
+    print("[SYSTEM] Starting Genetic Optimization (Hedge Mode + Costs)...")
     ga = GeneticOptimizer(train_data)
     best_genome = ga.run()
     
