@@ -56,16 +56,12 @@ def fetch_data():
     data = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
     
-    # Pre-calculate ALL SMA candidates (40-200 days)
-    for d in range(40, 410, 10):
-        data[f'sma_{d}d'] = data['close'].rolling(window=d*24).mean()
-        
     return data
 
 @njit(fastmath=True)
-def optimize_regime_pnl(opens, highs, lows, closes, smas, target_above_sma):
+def optimize_single_pnl(opens, highs, lows, closes):
     """
-    Optimizes for Total Net PnL (Profit).
+    Optimizes for Total Net PnL (Profit) using a single SL/TP pair.
     """
     n = len(opens)
     fee_rate = 0.0002
@@ -92,14 +88,6 @@ def optimize_regime_pnl(opens, highs, lows, closes, smas, target_above_sma):
             
             for i in range(n):
                 op = opens[i]
-                sma = smas[i]
-                
-                is_above = op > sma
-                if is_above != target_above_sma:
-                    l_closed_prev = True
-                    s_closed_prev = True
-                    continue
-                
                 hi = highs[i]
                 lo = lows[i]
                 cl = closes[i]
@@ -159,7 +147,7 @@ def optimize_regime_pnl(opens, highs, lows, closes, smas, target_above_sma):
                         
     return best_tp, best_sl, best_pnl
 
-def calculate_strategy_final(data, sma_days, tp_above, sl_above, tp_below, sl_below):
+def calculate_strategy_single(data, tp_pct, sl_pct):
     n = len(data)
     timestamps = data['timestamp'].values
     opens = data['open'].values
@@ -167,12 +155,6 @@ def calculate_strategy_final(data, sma_days, tp_above, sl_above, tp_below, sl_be
     lows = data['low'].values
     closes = data['close'].values
     
-    col_name = f'sma_{int(sma_days)}d'
-    if col_name in data.columns:
-        smas = data[col_name].values
-    else:
-        smas = data['close'].rolling(window=int(sma_days)*24).mean().fillna(0).values
-
     net_equity = np.zeros(n)
     trades = []
     current_cum_pnl = 0.0
@@ -181,15 +163,10 @@ def calculate_strategy_final(data, sma_days, tp_above, sl_above, tp_below, sl_be
     l_closed_prev = True
     s_closed_prev = True
     
-    tp_mult_above_l = 1 + tp_above / 100.0
-    sl_mult_above_l = 1 - sl_above / 100.0
-    tp_mult_above_s = 1 - tp_above / 100.0
-    sl_mult_above_s = 1 + sl_above / 100.0
-    
-    tp_mult_below_l = 1 + tp_below / 100.0
-    sl_mult_below_l = 1 - sl_below / 100.0
-    tp_mult_below_s = 1 - tp_below / 100.0
-    sl_mult_below_s = 1 + sl_below / 100.0
+    tp_mult_l = 1 + tp_pct / 100.0
+    sl_mult_l = 1 - sl_pct / 100.0
+    tp_mult_s = 1 - tp_pct / 100.0
+    sl_mult_s = 1 + sl_pct / 100.0
     
     for i in range(n):
         ts = timestamps[i]
@@ -197,26 +174,11 @@ def calculate_strategy_final(data, sma_days, tp_above, sl_above, tp_below, sl_be
         hi = highs[i]
         lo = lows[i]
         cl = closes[i]
-        sma = smas[i]
         
-        if sma == 0 or np.isnan(sma):
-            l_closed_prev = True
-            s_closed_prev = True
-            continue
-            
-        is_above = op > sma
-        
-        if is_above:
-            l_tp_m, l_sl_m = tp_mult_above_l, sl_mult_above_l
-            s_tp_m, s_sl_m = tp_mult_above_s, sl_mult_above_s
-        else:
-            l_tp_m, l_sl_m = tp_mult_below_l, sl_mult_below_l
-            s_tp_m, s_sl_m = tp_mult_below_s, sl_mult_below_s
-            
         # LONG
         l_entry_fee = op * fee_rate if l_closed_prev else 0.0
-        l_sl_price = op * l_sl_m
-        l_tp_price = op * l_tp_m
+        l_sl_price = op * sl_mult_l
+        l_tp_price = op * tp_mult_l
         
         l_exit = 0.0
         l_status = ""
@@ -242,8 +204,8 @@ def calculate_strategy_final(data, sma_days, tp_above, sl_above, tp_below, sl_be
         
         # SHORT
         s_entry_fee = op * fee_rate if s_closed_prev else 0.0
-        s_sl_price = op * s_sl_m
-        s_tp_price = op * s_tp_m
+        s_sl_price = op * sl_mult_s
+        s_tp_price = op * tp_mult_s
         
         s_exit = 0.0
         s_status = ""
@@ -274,33 +236,27 @@ def calculate_strategy_final(data, sma_days, tp_above, sl_above, tp_below, sl_be
         if l_status != "TIME" or s_status != "TIME":
              trades.append({
                 'entry_time': pd.to_datetime(ts),
-                'regime': 'Above' if is_above else 'Below',
                 'l_status': l_status,
                 's_status': s_status,
                 'pnl': net_pnl
             })
             
-    return net_equity, trades, smas
+    return net_equity, trades
 
 @app.route('/')
 def index():
     global df
     try:
-        sma_days = int(request.args.get('sma_days', 365))
-        sl_above = float(request.args.get('sl_above', 2.0))
-        tp_above = float(request.args.get('tp_above', 5.0))
-        sl_below = float(request.args.get('sl_below', 2.0))
-        tp_below = float(request.args.get('tp_below', 5.0))
+        sl = float(request.args.get('sl', 2.0))
+        tp = float(request.args.get('tp', 5.0))
     except:
-        sma_days = 365
-        sl_above, tp_above = 2.0, 5.0
-        sl_below, tp_below = 2.0, 5.0
+        sl, tp = 2.0, 5.0
         
     if df is None:
         return "Data not loaded", 500
 
     calc_data = df.dropna(subset=['close']).reset_index(drop=True)
-    net_equity, trades, _ = calculate_strategy_final(calc_data, sma_days, tp_above, sl_above, tp_below, sl_below)
+    net_equity, trades = calculate_strategy_single(calc_data, tp, sl)
     
     rows = ""
     for t in reversed(trades[-50:]):
@@ -308,7 +264,6 @@ def index():
         rows += f"""
         <tr>
             <td>{t['entry_time']}</td>
-            <td>{t['regime']}</td>
             <td>L:{t['l_status']} / S:{t['s_status']}</td>
             <td style="color: {color}">{t['pnl']:.2f}</td>
         </tr>
@@ -332,16 +287,13 @@ def index():
             </style>
             <script>
                 function runOptimization() {{
-                    document.getElementById('optimize-status').innerText = "Optimizing PnL (SMA 40-200)... Please wait.";
-                    fetch('/optimize_all')
+                    document.getElementById('optimize-status').innerText = "Optimizing Single SL/TP (Train PnL)... Please wait.";
+                    fetch('/optimize')
                         .then(response => response.json())
                         .then(data => {{
-                            document.getElementById('optimize-status').innerText = "Best SMA: " + data.best_sma + "d (PnL: " + data.total_pnl.toFixed(2) + ")";
-                            document.querySelector('input[name="sma_days"]').value = data.best_sma;
-                            document.querySelector('input[name="tp_above"]').value = data.tp_above;
-                            document.querySelector('input[name="sl_above"]').value = data.sl_above;
-                            document.querySelector('input[name="tp_below"]').value = data.tp_below;
-                            document.querySelector('input[name="sl_below"]').value = data.sl_below;
+                            document.getElementById('optimize-status').innerText = "Done! SL: " + data.sl + "% | TP: " + data.tp + "% (PnL: " + data.pnl.toFixed(2) + ")";
+                            document.querySelector('input[name="tp"]').value = data.tp;
+                            document.querySelector('input[name="sl"]').value = data.sl;
                         }})
                         .catch(err => {{
                             document.getElementById('optimize-status').innerText = "Error: " + err;
@@ -351,23 +303,15 @@ def index():
         </head>
         <body>
             <div class="container">
-                <h2>ETH/USDT Full PnL Optimization</h2>
-                <p>Grid Search: SMA (40-200d) + TP/SL (0.2-10%). Train < 2026.</p>
+                <h2>ETH/USDT Single Strategy Optimization</h2>
+                <p>Grid Search: Single TP/SL (0.2-10%). Train < 2026. Metric: PnL.</p>
                 
                 <form action="/" method="get">
                     <div class="params-box">
                         <div class="params-row">
-                             <strong>Trend Filter:</strong> SMA Days <input type="number" name="sma_days" value="{sma_days}">
-                        </div>
-                        <div class="params-row">
-                            <strong>Above SMA:</strong>
-                            SL % <input type="number" step="0.1" name="sl_above" value="{sl_above}">
-                            TP % <input type="number" step="0.1" name="tp_above" value="{tp_above}">
-                        </div>
-                        <div class="params-row">
-                            <strong>Below SMA:</strong>
-                            SL % <input type="number" step="0.1" name="sl_below" value="{sl_below}">
-                            TP % <input type="number" step="0.1" name="tp_below" value="{tp_below}">
+                            <strong>Global Params:</strong>
+                            SL % <input type="number" step="0.1" name="sl" value="{sl}">
+                            TP % <input type="number" step="0.1" name="tp" value="{tp}">
                         </div>
                         <div style="text-align: center; margin-top: 10px;">
                             <input type="submit" value="Update Plots" style="width: auto; cursor: pointer;">
@@ -375,11 +319,11 @@ def index():
                     </div>
                 </form>
                 
-                <button onclick="runOptimization()">Run Full PnL Search</button>
+                <button onclick="runOptimization()">Run Optimization</button>
                 <div id="optimize-status"></div>
                 
                 <br>
-                <img src="/plot.png?sma_days={sma_days}&sl_above={sl_above}&tp_above={tp_above}&sl_below={sl_below}&tp_below={tp_below}" style="border: 1px solid #555; max-width: 100%; margin-top: 20px;">
+                <img src="/plot.png?sl={sl}&tp={tp}" style="border: 1px solid #555; max-width: 100%; margin-top: 20px;">
                 
                 <h3>Recent Events</h3>
                 <div class="scroll-table">
@@ -387,7 +331,6 @@ def index():
                         <thead>
                             <tr>
                                 <th>Entry Time</th>
-                                <th>Regime</th>
                                 <th>Status</th>
                                 <th>Net PnL</th>
                             </tr>
@@ -403,8 +346,8 @@ def index():
     """
     return html
 
-@app.route('/optimize_all')
-def optimize_all():
+@app.route('/optimize')
+def optimize():
     global market_data, df
     
     cutoff_ts = pd.Timestamp('2026-01-01')
@@ -416,9 +359,6 @@ def optimize_all():
         market_data['highs'] = calc_data['high'].values.astype(np.float64)
         market_data['lows'] = calc_data['low'].values.astype(np.float64)
         market_data['closes'] = calc_data['close'].values.astype(np.float64)
-        for d in range(40, 210, 10):
-            col = f'sma_{d}d'
-            market_data[col] = calc_data[col].fillna(0).values.astype(np.float64)
 
     train_mask = market_data['timestamps'] < np.datetime64(cutoff_ts)
     
@@ -427,56 +367,31 @@ def optimize_all():
     lows = market_data['lows'][train_mask]
     closes = market_data['closes'][train_mask]
     
-    best_global_pnl = -np.inf
-    best_config = {}
-    
     t0 = time.time()
     
-    # Loop SMAs 40 to 200
-    for d in range(40, 210, 10):
-        col = f'sma_{d}d'
-        smas = market_data[col][train_mask]
-        
-        # Optimize Above for PnL
-        tp_a, sl_a, pnl_a = optimize_regime_pnl(opens, highs, lows, closes, smas, True)
-        
-        # Optimize Below for PnL
-        tp_b, sl_b, pnl_b = optimize_regime_pnl(opens, highs, lows, closes, smas, False)
-        
-        total_pnl = pnl_a + pnl_b
-        
-        if total_pnl > best_global_pnl:
-            best_global_pnl = total_pnl
-            best_config = {
-                'best_sma': d,
-                'tp_above': round(tp_a, 1),
-                'sl_above': round(sl_a, 1),
-                'tp_below': round(tp_b, 1),
-                'sl_below': round(sl_b, 1),
-                'total_pnl': total_pnl
-            }
-
-    print(f"Global Optimization done in {time.time() - t0:.2f}s")
-    return jsonify(best_config)
+    best_tp, best_sl, best_pnl = optimize_single_pnl(opens, highs, lows, closes)
+    
+    print(f"Optimization done in {time.time() - t0:.2f}s")
+    
+    return jsonify({
+        'tp': round(best_tp, 1),
+        'sl': round(best_sl, 1),
+        'pnl': best_pnl
+    })
 
 @app.route('/plot.png')
 def plot_png():
     global df
     try:
-        sma_days = int(request.args.get('sma_days', 365))
-        sl_a = float(request.args.get('sl_above', 2.0))
-        tp_a = float(request.args.get('tp_above', 5.0))
-        sl_b = float(request.args.get('sl_below', 2.0))
-        tp_b = float(request.args.get('tp_below', 5.0))
+        sl = float(request.args.get('sl', 2.0))
+        tp = float(request.args.get('tp', 5.0))
     except:
-        sma_days = 365
-        sl_a, tp_a, sl_b, tp_b = 2.0, 5.0, 2.0, 5.0
+        sl, tp = 2.0, 5.0
 
     plot_data = df.dropna(subset=['close']).reset_index(drop=True).copy()
     
-    net_equity, _, smas = calculate_strategy_final(plot_data, sma_days, tp_a, sl_a, tp_b, sl_b)
+    net_equity, _ = calculate_strategy_single(plot_data, tp, sl)
     plot_data['net_equity'] = net_equity
-    plot_data['sma_plot'] = smas
     
     cutoff_ts = pd.Timestamp('2026-01-01')
     unseen_data = plot_data[plot_data['timestamp'] >= cutoff_ts].copy()
@@ -487,20 +402,12 @@ def plot_png():
     
     x = matplotlib.dates.date2num(plot_data['timestamp'])
     y = plot_data['close'].values
-    sma_vals = plot_data['sma_plot'].values
     
-    points = np.array([x, y]).T.reshape(-1, 1, 2)
-    segments = np.concatenate([points[:-1], points[1:]], axis=1)
-    colors = ['green' if p > s else 'red' for p, s in zip(y[:-1], sma_vals[:-1])]
-    
-    lc = LineCollection(segments, colors=colors, linewidth=1)
-    ax1.add_collection(lc)
-    ax1.plot(plot_data['timestamp'], sma_vals, color='white', linewidth=1.5, label=f'{sma_days}d SMA')
-    ax1.set_title(f'ETH/USDT Price vs {sma_days}d SMA')
+    # Simple price plot, no color segments needed since no SMA
+    ax1.plot(plot_data['timestamp'], y, color='white', linewidth=1)
+    ax1.set_title('ETH/USDT Price')
     ax1.axvline(cutoff_ts, color='yellow', linestyle='--')
     ax1.set_xlim(plot_data['timestamp'].min(), plot_data['timestamp'].max())
-    ax1.set_ylim(plot_data['close'].min() * 0.9, plot_data['close'].max() * 1.1)
-    ax1.legend()
     ax1.grid(True, alpha=0.2)
     
     ax2.plot(plot_data['timestamp'], plot_data['net_equity'], color='cyan')
