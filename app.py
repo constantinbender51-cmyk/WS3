@@ -57,7 +57,7 @@ def fetch_data():
     data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
     
     # Pre-calculate ALL SMA candidates (40-200 days)
-    for d in range(40, 210, 10):
+    for d in range(40, 410, 10):
         data[f'sma_{d}d'] = data['close'].rolling(window=d*24).mean()
         
     return data
