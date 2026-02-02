@@ -3,6 +3,8 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+from matplotlib.colors import ListedColormap, BoundaryNorm
 from flask import Flask, send_file
 import io
 import numpy as np
@@ -41,33 +43,49 @@ def fetch_data():
 
 @app.route('/')
 def plot_png():
-    # Re-fetch or cache data here. For static serve, we use global df or fetch once. 
-    # Assuming global df for persistence as per previous logic flow.
     global df
+    
+    # Calculate 365-day SMA (24 hours * 365 days)
+    sma_window = 365 * 24
+    df['sma'] = df['close'].rolling(window=sma_window).mean()
+    
+    # Filter out NaN values from SMA calculation for clean plotting
+    plot_data = df.dropna(subset=['sma']).copy()
     
     fig, ax = plt.subplots(figsize=(15, 8), dpi=100)
     
-    # Vectorized candlestick construction using standard matplotlib
-    up = df[df.close >= df.open]
-    down = df[df.close < df.open]
+    # Data conversion for matplotlib
+    x = matplotlib.dates.date2num(plot_data['timestamp'])
+    y = plot_data['close'].values
+    sma = plot_data['sma'].values
     
-    # Width of 1h candle in matplotlib date units (1 day = 1.0). 
-    # 1h = 1/24. 0.03 is roughly 0.7 of an hour for spacing.
-    width = 0.03 
+    # Create segments for LineCollection
+    points = np.array([x, y]).T.reshape(-1, 1, 2)
+    segments = np.concatenate([points[:-1], points[1:]], axis=1)
     
-    # Plot Up candles
-    ax.bar(up.timestamp, up.close - up.open, width, bottom=up.open, color='green', edgecolor='green')
-    ax.vlines(up.timestamp, up.low, up.high, color='green', linewidth=1)
+    # Determine colors based on Price vs SMA relationship
+    # We compare the start of the segment to the SMA
+    # Logic: Green if Price > SMA, Red if Price <= SMA
+    # Using the first point of the segment for color determination
+    # Note: This is an approximation at the exact crossover point but sufficient for high density
+    colors = ['green' if p > s else 'red' for p, s in zip(y[:-1], sma[:-1])]
     
-    # Plot Down candles
-    ax.bar(down.timestamp, down.close - down.open, width, bottom=down.open, color='red', edgecolor='red')
-    ax.vlines(down.timestamp, down.low, down.high, color='red', linewidth=1)
+    lc = LineCollection(segments, colors=colors, linewidth=1)
+    ax.add_collection(lc)
     
-    ax.set_title('ETH/USDT - 5 Year 1H OHLC')
+    # Plot SMA
+    ax.plot(plot_data['timestamp'], sma, color='white', linewidth=1, label='365d SMA')
+    
+    ax.autoscale_view()
+    ax.set_title('ETH/USDT - 5 Year 1H Close Price vs 365d SMA')
     ax.set_ylabel('Price (USDT)')
-    ax.grid(True, alpha=0.3)
+    ax.legend(loc='upper left')
+    ax.grid(True, alpha=0.2)
     ax.set_facecolor('black')
     fig.patch.set_facecolor('white')
+    
+    # Format Date Axis
+    ax.xaxis.set_major_formatter(matplotlib.dates.DateFormatter('%Y-%m'))
     
     img = io.BytesIO()
     plt.savefig(img, format='png', bbox_inches='tight')
