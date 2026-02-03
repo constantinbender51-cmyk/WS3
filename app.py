@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore")
 # --- CONFIGURATION ---
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1d'
-START_YEAR = 2018      # Reverted to 2018
+START_YEAR = 2018
 SMA_PERIOD = 1460
 SMA_OFFSET = -1460     
 GA_POP_SIZE = 50
@@ -47,18 +47,19 @@ def fetch_ohlc():
     exchange = ccxt.binance()
     since = exchange.parse8601(f'{START_YEAR}-01-01T00:00:00Z')
     all_candles = []
+    limit = 1000 # Force limit to avoid premature break
     
     print(f"Fetching {SYMBOL} data from {START_YEAR}...")
     while True:
         try:
-            candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since)
+            candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since, limit=limit)
             if not candles:
                 break
             all_candles += candles
             since = candles[-1][0] + 1
             time.sleep(exchange.rateLimit / 1000)
             
-            if len(candles) < 1000:
+            if len(candles) < limit:
                 break
         except Exception as e:
             print(f"Fetch error: {e}")
@@ -68,6 +69,7 @@ def fetch_ohlc():
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
     df = df[~df.index.duplicated(keep='first')]
+    print(f"Total Rows Fetched: {len(df)}")
     return df
 
 # --- PROCESS ---
@@ -76,15 +78,13 @@ def apply_indicators(df):
     df['sma'] = df['close'].rolling(window=SMA_PERIOD).mean()
     
     # 2. Shift -1460 (Pulls t+1460 to t)
-    # This populates indices 0 to (N-1460) with valid SMA data
     df['sma_shifted'] = df['sma'].shift(SMA_OFFSET)
     
     # 3. Fit line
-    # Drop NaNs to find valid regression range (Start of DF)
     fit_df = df.dropna(subset=['sma_shifted'])
     
     if fit_df.empty:
-        raise ValueError(f"Insufficient data. Total Rows: {len(df)}. Required > {SMA_PERIOD}.")
+        raise ValueError(f"Insufficient data. Total Rows: {len(df)}. Required > {SMA_PERIOD} + valid overlap.")
 
     fit_df['ordinal'] = fit_df.index.map(pd.Timestamp.toordinal)
     
@@ -94,7 +94,7 @@ def apply_indicators(df):
     popt, _ = curve_fit(linear_func, fit_df['ordinal'], fit_df['sma_shifted'])
     m, c = popt
     
-    # 4. Extrapolate line to full dataset and Detrend
+    # 4. Extrapolate line and Detrend
     df['ordinal'] = df.index.map(pd.Timestamp.toordinal)
     df['trend_line'] = linear_func(df['ordinal'], m, c)
     df['detrended'] = df['close'] - df['trend_line']
