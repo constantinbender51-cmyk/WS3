@@ -25,8 +25,8 @@ TIMEFRAME = '1d'
 START_YEAR = 2018
 SMA_PERIOD = 1460
 SMA_OFFSET = -1460     
-GA_POP_SIZE = 50
-GA_NGEN = 15
+GA_POP_SIZE = 300
+GA_NGEN = 30
 GA_CXPB = 0.5
 GA_MUTPB = 0.2
 N_REVERSAL_LEVELS = 15
@@ -435,7 +435,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             <html>
             <head>
                 <title>Trading Strategy Dashboard</title>
-                <meta http-equiv="refresh" content="2">
                 <style>
                     body {{ font-family: monospace; background-color: #1e1e1e; color: #d4d4d4; padding: 20px; }}
                     .stats {{ display: flex; gap: 20px; background: #252526; padding: 15px; border-radius: 5px; margin-bottom: 20px; }}
