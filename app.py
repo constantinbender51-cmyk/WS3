@@ -26,7 +26,7 @@ GA_POP_SIZE = 50
 GA_NGEN = 15
 GA_CXPB = 0.5
 GA_MUTPB = 0.2
-N_REVERSAL_LEVELS = 40
+N_REVERSAL_LEVELS = 10
 INITIAL_BALANCE = 10000
 SERVER_PORT = 8080
 
@@ -47,7 +47,7 @@ def fetch_ohlc():
     exchange = ccxt.binance()
     since = exchange.parse8601(f'{START_YEAR}-01-01T00:00:00Z')
     all_candles = []
-    limit = 1000 # Force limit to avoid premature break
+    limit = 1000 
     
     print(f"Fetching {SYMBOL} data from {START_YEAR}...")
     while True:
@@ -74,17 +74,13 @@ def fetch_ohlc():
 
 # --- PROCESS ---
 def apply_indicators(df):
-    # 1. SMA 1460 (Valid from index 1459 onwards)
     df['sma'] = df['close'].rolling(window=SMA_PERIOD).mean()
-    
-    # 2. Shift -1460 (Pulls t+1460 to t)
     df['sma_shifted'] = df['sma'].shift(SMA_OFFSET)
     
-    # 3. Fit line
     fit_df = df.dropna(subset=['sma_shifted'])
     
     if fit_df.empty:
-        raise ValueError(f"Insufficient data. Total Rows: {len(df)}. Required > {SMA_PERIOD} + valid overlap.")
+        raise ValueError(f"Insufficient data. Total Rows: {len(df)}.")
 
     fit_df['ordinal'] = fit_df.index.map(pd.Timestamp.toordinal)
     
@@ -94,7 +90,6 @@ def apply_indicators(df):
     popt, _ = curve_fit(linear_func, fit_df['ordinal'], fit_df['sma_shifted'])
     m, c = popt
     
-    # 4. Extrapolate line and Detrend
     df['ordinal'] = df.index.map(pd.Timestamp.toordinal)
     df['trend_line'] = linear_func(df['ordinal'], m, c)
     df['detrended'] = df['close'] - df['trend_line']
@@ -125,25 +120,21 @@ def backtest_strategy(individual, data):
         prev_dt = detrended[i-1]
         price = closes[i]
         
-        # Exit
         if position != 0:
             pnl_pct = (price - entry_price) / entry_price if position == 1 else (entry_price - price) / entry_price
             if pnl_pct <= -active_sl or pnl_pct >= active_tp:
                 balance *= (1 + pnl_pct)
                 position = 0
         
-        # Entry
         if position == 0:
             for lvl in levels:
                 threshold = lvl['thresh']
-                # Cross UP -> Short
                 if prev_dt < threshold and curr_dt >= threshold:
                     position = -1
                     entry_price = price
                     active_sl = lvl['sl']
                     active_tp = lvl['tp']
                     break
-                # Cross DOWN -> Long
                 elif prev_dt > threshold and curr_dt <= threshold:
                     position = 1
                     entry_price = price
@@ -188,23 +179,24 @@ def optimize(df):
 
 # --- SERVE ---
 def generate_plot(df, best_genes):
-    plt.figure(figsize=(16, 9))
+    # Increase height to accommodate table
+    plt.figure(figsize=(16, 12))
     
-    # Train
-    ax1 = plt.subplot(2, 1, 1)
+    # 1. Training Phase
+    ax1 = plt.subplot(3, 1, 1) # Changed to 3 rows
     train_data = df.loc[:TRAIN_END_DATE]
     ax1.plot(train_data.index, train_data['detrended'], label='Detrended (Train)', color='black', lw=0.8)
     
     colors = ['r', 'g', 'b', 'orange', 'purple']
     for i in range(N_REVERSAL_LEVELS):
         lvl = best_genes[i*3]
-        ax1.axhline(lvl, color=colors[i%len(colors)], ls='--', label=f'Lvl {i+1}: {lvl:.2f}')
-    ax1.set_title(f'Train (2018-2025): Detrended Price')
-    ax1.legend()
+        ax1.axhline(lvl, color=colors[i%len(colors)], ls='--', label=f'Lvl {i+1}')
+    ax1.set_title(f'Train (2018-2025)')
+    ax1.legend(loc='upper left')
     ax1.grid(True, alpha=0.3)
     
-    # Test
-    ax2 = plt.subplot(2, 1, 2)
+    # 2. Testing Phase
+    ax2 = plt.subplot(3, 1, 2)
     test_data = df.loc[TEST_START_DATE:]
     
     if not test_data.empty:
@@ -212,10 +204,31 @@ def generate_plot(df, best_genes):
         for i in range(N_REVERSAL_LEVELS):
             lvl = best_genes[i*3]
             ax2.axhline(lvl, color=colors[i%len(colors)], ls='--', alpha=0.7)
-        ax2.set_title(f'Test (2026): Unseen Data | n={len(test_data)}')
+        ax2.set_title(f'Test (2026)')
         ax2.grid(True, alpha=0.3)
     else:
         ax2.text(0.5, 0.5, 'No Test Data', ha='center')
+
+    # 3. Parameter Table
+    ax3 = plt.subplot(3, 1, 3)
+    ax3.axis('tight')
+    ax3.axis('off')
+    
+    table_data = []
+    col_labels = ['Level Index', 'Threshold ($)', 'Stop Loss (%)', 'Take Profit (%)']
+    
+    for i in range(0, len(best_genes), 3):
+        idx = (i//3) + 1
+        thresh = best_genes[i]
+        sl = best_genes[i+1] * 100
+        tp = best_genes[i+2] * 100
+        table_data.append([f"Level {idx}", f"{thresh:.2f}", f"{sl:.2f}%", f"{tp:.2f}%"])
+        
+    table = ax3.table(cellText=table_data, colLabels=col_labels, loc='center', cellLoc='center')
+    table.scale(1, 2) # Scale height for readability
+    table.auto_set_font_size(False)
+    table.set_fontsize(12)
+    ax3.set_title("Optimized Strategy Parameters", pad=20)
         
     plt.tight_layout()
     buf = io.BytesIO()
@@ -243,10 +256,9 @@ if __name__ == "__main__":
         
     print("Running GA...")
     best_ind = optimize(df)
-    print(f"Best: {best_ind}")
+    print("Serving 8080...")
     
     plot_buffer = generate_plot(df, best_ind)
-    print(f"Serving 8080...")
     
     with socketserver.TCPServer(("", SERVER_PORT), PlotHandler) as httpd:
         try:
