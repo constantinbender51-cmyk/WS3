@@ -15,12 +15,13 @@ import warnings
 import threading
 import datetime
 import sys
+from collections import deque
 
 warnings.filterwarnings("ignore")
 
 # --- CONFIGURATION ---
 SYMBOL = 'BTC/USDT'
-TIMEFRAME = '1d' # Note: Live loop runs every minute, but strategy is configured for 1d. Logic below adapts to fetch latest available.
+TIMEFRAME = '1d'
 START_YEAR = 2018
 SMA_PERIOD = 1460
 SMA_OFFSET = -1460     
@@ -43,6 +44,17 @@ GENE_TP_MAX = 0.30
 # DATES
 TRAIN_END_DATE = '2025-12-31'
 TEST_START_DATE = '2026-01-01'
+
+# GLOBAL STATE FOR LIVE VIEW
+live_state = {
+    'price': 0.0,
+    'detrended': 0.0,
+    'balance': INITIAL_BALANCE,
+    'position': 0,
+    'last_update': 'Waiting...',
+    'logs': deque(maxlen=20)  # Keep last 20 logs
+}
+state_lock = threading.Lock()
 
 # --- FETCH ---
 def fetch_ohlc():
@@ -289,23 +301,29 @@ def generate_plot(df, best_genes):
     return buf
 
 # --- LIVE TRADING ---
+def log_message(msg):
+    ts = datetime.datetime.now().strftime('%H:%M:%S')
+    full_msg = f"[{ts}] {msg}"
+    print(full_msg)
+    with state_lock:
+        live_state['logs'].append(full_msg)
+
 def live_trading_loop(best_genes, m, c):
-    print("\n--- INITIALIZING LIVE TRADING ENGINE ---")
+    log_message("--- INITIALIZING LIVE TRADING ENGINE ---")
     exchange = ccxt.binance()
     balance = INITIAL_BALANCE
     position = 0
     entry_price = 0.0
     active_sl = 0.0
     active_tp = 0.0
-    trade_history = []
     
     # Parse levels
     levels = []
     for i in range(0, len(best_genes), 3):
         levels.append({'thresh': best_genes[i], 'sl': best_genes[i+1], 'tp': best_genes[i+2]})
 
-    # Initialize previous state using the last 2 closed candles
-    print("Pre-fetching initial state...")
+    # Initialize previous state
+    log_message("Pre-fetching initial state...")
     try:
         init_candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=2)
         if len(init_candles) >= 2:
@@ -313,12 +331,12 @@ def live_trading_loop(best_genes, m, c):
             prev_ts = pd.to_datetime(prev_candle[0], unit='ms')
             prev_ord = prev_ts.toordinal()
             prev_detrended = prev_candle[4] - (m * prev_ord + c)
-            print(f"State initialized. Prev Detrended: {prev_detrended:.2f}")
+            log_message(f"State initialized. Prev Detrended: {prev_detrended:.2f}")
         else:
             prev_detrended = 0
-            print("Warning: Insufficient history for initialization.")
+            log_message("Warning: Insufficient history for initialization.")
     except Exception as e:
-        print(f"Init Error: {e}")
+        log_message(f"Init Error: {e}")
         prev_detrended = 0
 
     while True:
@@ -332,10 +350,6 @@ def live_trading_loop(best_genes, m, c):
             time.sleep(sleep_sec)
             
             # Fetch Latest Candle
-            # Note: Strategy uses TIMEFRAME='1d', but live loop runs every minute. 
-            # Assuming intention is to check latest CLOSE price against levels regardless of candle close 
-            # OR checking the last closed candle of the timeframe. 
-            # Given "fetch a new candle", we fetch the latest available data point.
             candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=1)
             if not candles:
                 continue
@@ -349,7 +363,15 @@ def live_trading_loop(best_genes, m, c):
             trend = m * ordinal + c
             curr_detrended = price - trend
             
-            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Price: {price:.2f} | Detrended: {curr_detrended:.2f} | Bal: {balance:.2f} | Pos: {position}")
+            # Update Global State
+            with state_lock:
+                live_state['price'] = price
+                live_state['detrended'] = curr_detrended
+                live_state['balance'] = balance
+                live_state['position'] = position
+                live_state['last_update'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+            log_message(f"Price: {price:.2f} | Detrended: {curr_detrended:.2f} | Bal: {balance:.2f} | Pos: {position}")
             
             # Logic
             # Check Exit
@@ -357,9 +379,7 @@ def live_trading_loop(best_genes, m, c):
                 pnl_pct = (price - entry_price) / entry_price if position == 1 else (entry_price - price) / entry_price
                 if pnl_pct <= -active_sl or pnl_pct >= active_tp:
                     balance *= (1 + pnl_pct)
-                    pnl_abs = balance * pnl_pct
-                    print(f">>> EXIT {'LONG' if position==1 else 'SHORT'}: PnL {pnl_pct*100:.2f}% | New Balance: {balance:.2f}")
-                    trade_history.append({'ts': ts, 'type': 'exit', 'price': price, 'pnl': pnl_pct, 'balance': balance})
+                    log_message(f">>> EXIT {'LONG' if position==1 else 'SHORT'}: PnL {pnl_pct*100:.2f}% | New Balance: {balance:.2f}")
                     position = 0
             
             # Check Entry
@@ -372,8 +392,7 @@ def live_trading_loop(best_genes, m, c):
                         entry_price = price
                         active_sl = lvl['sl']
                         active_tp = lvl['tp']
-                        print(f">>> ENTRY SHORT @ {price:.2f} (Thresh: {threshold:.2f})")
-                        trade_history.append({'ts': ts, 'type': 'short', 'price': price})
+                        log_message(f">>> ENTRY SHORT @ {price:.2f} (Thresh: {threshold:.2f})")
                         break
                     # Cross DOWN -> Long
                     elif prev_detrended > threshold and curr_detrended <= threshold:
@@ -381,22 +400,72 @@ def live_trading_loop(best_genes, m, c):
                         entry_price = price
                         active_sl = lvl['sl']
                         active_tp = lvl['tp']
-                        print(f">>> ENTRY LONG @ {price:.2f} (Thresh: {threshold:.2f})")
-                        trade_history.append({'ts': ts, 'type': 'long', 'price': price})
+                        log_message(f">>> ENTRY LONG @ {price:.2f} (Thresh: {threshold:.2f})")
                         break
             
             prev_detrended = curr_detrended
             
         except Exception as e:
-            print(f"Live Loop Error: {e}")
+            log_message(f"Live Loop Error: {e}")
             time.sleep(5)
 
-class PlotHandler(http.server.SimpleHTTPRequestHandler):
+class DashboardHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'image/png')
-        self.end_headers()
-        self.wfile.write(plot_buffer.getvalue())
+        if self.path == '/plot.png':
+            self.send_response(200)
+            self.send_header('Content-type', 'image/png')
+            self.end_headers()
+            self.wfile.write(plot_buffer.getvalue())
+        else:
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            
+            with state_lock:
+                current_price = live_state['price']
+                current_detrend = live_state['detrended']
+                current_bal = live_state['balance']
+                current_pos = "NEUTRAL"
+                if live_state['position'] == 1: current_pos = "LONG"
+                elif live_state['position'] == -1: current_pos = "SHORT"
+                last_up = live_state['last_update']
+                logs_html = "<br>".join(reversed(list(live_state['logs'])))
+            
+            html = f"""
+            <html>
+            <head>
+                <title>Trading Strategy Dashboard</title>
+                <meta http-equiv="refresh" content="2">
+                <style>
+                    body {{ font-family: monospace; background-color: #1e1e1e; color: #d4d4d4; padding: 20px; }}
+                    .stats {{ display: flex; gap: 20px; background: #252526; padding: 15px; border-radius: 5px; margin-bottom: 20px; }}
+                    .stat-box {{ border: 1px solid #3e3e42; padding: 10px; min-width: 150px; }}
+                    .label {{ color: #858585; font-size: 0.9em; }}
+                    .value {{ font-size: 1.2em; font-weight: bold; color: #4ec9b0; }}
+                    .log-box {{ background: #000; padding: 10px; height: 200px; overflow-y: scroll; border: 1px solid #333; font-size: 0.9em; color: #ce9178; }}
+                    img {{ max-width: 100%; border: 1px solid #333; margin-top: 20px; }}
+                </style>
+            </head>
+            <body>
+                <h2>Strategy Live Execution: {SYMBOL}</h2>
+                <div class="stats">
+                    <div class="stat-box"><div class="label">Last Update</div><div class="value">{last_up}</div></div>
+                    <div class="stat-box"><div class="label">Price</div><div class="value">${current_price:.2f}</div></div>
+                    <div class="stat-box"><div class="label">Detrended</div><div class="value">{current_detrend:.2f}</div></div>
+                    <div class="stat-box"><div class="label">Balance</div><div class="value">${current_bal:.2f}</div></div>
+                    <div class="stat-box"><div class="label">Position</div><div class="value">{current_pos}</div></div>
+                </div>
+                
+                <h3>Live Logs</h3>
+                <div class="log-box">
+                    {logs_html}
+                </div>
+                
+                <img src="/plot.png" alt="Strategy Performance">
+            </body>
+            </html>
+            """
+            self.wfile.write(html.encode())
 
 if __name__ == "__main__":
     df = fetch_ohlc()
@@ -418,8 +487,8 @@ if __name__ == "__main__":
     live_thread = threading.Thread(target=live_trading_loop, args=(best_ind, trend_m, trend_c), daemon=True)
     live_thread.start()
     
-    print(f"Serving plot at http://localhost:{SERVER_PORT} ... (Ctrl+C to stop)")
-    with socketserver.TCPServer(("", SERVER_PORT), PlotHandler) as httpd:
+    print(f"Serving dashboard at http://localhost:{SERVER_PORT} ... (Ctrl+C to stop)")
+    with socketserver.TCPServer(("", SERVER_PORT), DashboardHandler) as httpd:
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
