@@ -13,12 +13,14 @@ import io
 import time
 import warnings
 import threading
+import datetime
+import sys
 
 warnings.filterwarnings("ignore")
 
 # --- CONFIGURATION ---
 SYMBOL = 'BTC/USDT'
-TIMEFRAME = '1d'
+TIMEFRAME = '1d' # Note: Live loop runs every minute, but strategy is configured for 1d. Logic below adapts to fetch latest available.
 START_YEAR = 2018
 SMA_PERIOD = 1460
 SMA_OFFSET = -1460     
@@ -94,7 +96,7 @@ def apply_indicators(df):
     df['trend_line'] = linear_func(df['ordinal'], m, c)
     df['detrended'] = df['close'] - df['trend_line']
     
-    return df
+    return df, m, c
 
 # --- STRATEGY ENGINE ---
 def run_strategy_logic(individual, data, record_trades=False):
@@ -204,19 +206,15 @@ def optimize(df):
 
 # --- HELPER FOR PLOTTING LOGIC ---
 def plot_strategy_performance(ax, data, best_genes, title):
-    # Run Simulation
     equity_curve, trades = run_strategy_logic(best_genes, data, record_trades=True)
     
-    # Plot Price (Detrended)
     ax.plot(data.index, data['detrended'], label='Detrended Price', color='grey', lw=0.8, alpha=0.8)
     
-    # Plot Levels
     colors = ['r', 'g', 'b', 'orange', 'purple']
     for i in range(N_REVERSAL_LEVELS):
         lvl = best_genes[i*3]
         ax.axhline(lvl, color=colors[i%len(colors)], ls='--', alpha=0.5)
     
-    # Plot Trades
     long_entries = [(t, p) for t, p, type_ in zip(trades['entry_dt'], trades['entry_price'], trades['type']) if type_ == 'long']
     short_entries = [(t, p) for t, p, type_ in zip(trades['entry_dt'], trades['entry_price'], trades['type']) if type_ == 'short']
     
@@ -234,12 +232,9 @@ def plot_strategy_performance(ax, data, best_genes, title):
     ax.legend(loc='upper left')
     ax.grid(True, alpha=0.3)
     
-    # Plot PnL (Twin Axis)
     ax_pnl = ax.twinx()
-    # Align equity curve
     if len(equity_curve) > 0:
         align_len = min(len(equity_curve), len(data))
-        # Usually equity curve is len(data)-1 because loop starts at 1
         plot_idx = data.index[-align_len:]
         plot_eq = equity_curve[-align_len:]
         
@@ -247,7 +242,6 @@ def plot_strategy_performance(ax, data, best_genes, title):
         ax_pnl.set_ylabel('Equity ($)', color='blue')
         ax_pnl.tick_params(axis='y', labelcolor='blue')
         
-        # Add PnL legend manually or via helper
         lines, labels = ax.get_legend_handles_labels()
         lines2, labels2 = ax_pnl.get_legend_handles_labels()
         ax.legend(lines + lines2, labels + labels2, loc='upper left')
@@ -256,13 +250,11 @@ def plot_strategy_performance(ax, data, best_genes, title):
 def generate_plot(df, best_genes):
     plt.figure(figsize=(16, 14))
     
-    # 1. Training Phase
     ax1 = plt.subplot(3, 1, 1)
     train_data = df.loc[:TRAIN_END_DATE]
     if not train_data.empty:
         plot_strategy_performance(ax1, train_data, best_genes, f'Training Phase (2018-2025): Trades & PnL')
     
-    # 2. Testing Phase
     ax2 = plt.subplot(3, 1, 2)
     test_data = df.loc[TEST_START_DATE:]
     if not test_data.empty:
@@ -270,7 +262,6 @@ def generate_plot(df, best_genes):
     else:
         ax2.text(0.5, 0.5, 'No Test Data', ha='center')
 
-    # 3. Parameter Table
     ax3 = plt.subplot(3, 1, 3)
     ax3.axis('tight')
     ax3.axis('off')
@@ -297,6 +288,109 @@ def generate_plot(df, best_genes):
     plt.close()
     return buf
 
+# --- LIVE TRADING ---
+def live_trading_loop(best_genes, m, c):
+    print("\n--- INITIALIZING LIVE TRADING ENGINE ---")
+    exchange = ccxt.binance()
+    balance = INITIAL_BALANCE
+    position = 0
+    entry_price = 0.0
+    active_sl = 0.0
+    active_tp = 0.0
+    trade_history = []
+    
+    # Parse levels
+    levels = []
+    for i in range(0, len(best_genes), 3):
+        levels.append({'thresh': best_genes[i], 'sl': best_genes[i+1], 'tp': best_genes[i+2]})
+
+    # Initialize previous state using the last 2 closed candles
+    print("Pre-fetching initial state...")
+    try:
+        init_candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=2)
+        if len(init_candles) >= 2:
+            prev_candle = init_candles[-2]
+            prev_ts = pd.to_datetime(prev_candle[0], unit='ms')
+            prev_ord = prev_ts.toordinal()
+            prev_detrended = prev_candle[4] - (m * prev_ord + c)
+            print(f"State initialized. Prev Detrended: {prev_detrended:.2f}")
+        else:
+            prev_detrended = 0
+            print("Warning: Insufficient history for initialization.")
+    except Exception as e:
+        print(f"Init Error: {e}")
+        prev_detrended = 0
+
+    while True:
+        try:
+            # Sync to 2 seconds after minute
+            now = datetime.datetime.now()
+            next_minute = (now + datetime.timedelta(minutes=1)).replace(second=2, microsecond=0)
+            sleep_sec = (next_minute - now).total_seconds()
+            if sleep_sec < 0: sleep_sec += 60
+            
+            time.sleep(sleep_sec)
+            
+            # Fetch Latest Candle
+            # Note: Strategy uses TIMEFRAME='1d', but live loop runs every minute. 
+            # Assuming intention is to check latest CLOSE price against levels regardless of candle close 
+            # OR checking the last closed candle of the timeframe. 
+            # Given "fetch a new candle", we fetch the latest available data point.
+            candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=1)
+            if not candles:
+                continue
+                
+            candle = candles[0]
+            ts = pd.to_datetime(candle[0], unit='ms')
+            price = candle[4]
+            ordinal = ts.toordinal()
+            
+            # Calculate Detrended
+            trend = m * ordinal + c
+            curr_detrended = price - trend
+            
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Price: {price:.2f} | Detrended: {curr_detrended:.2f} | Bal: {balance:.2f} | Pos: {position}")
+            
+            # Logic
+            # Check Exit
+            if position != 0:
+                pnl_pct = (price - entry_price) / entry_price if position == 1 else (entry_price - price) / entry_price
+                if pnl_pct <= -active_sl or pnl_pct >= active_tp:
+                    balance *= (1 + pnl_pct)
+                    pnl_abs = balance * pnl_pct
+                    print(f">>> EXIT {'LONG' if position==1 else 'SHORT'}: PnL {pnl_pct*100:.2f}% | New Balance: {balance:.2f}")
+                    trade_history.append({'ts': ts, 'type': 'exit', 'price': price, 'pnl': pnl_pct, 'balance': balance})
+                    position = 0
+            
+            # Check Entry
+            if position == 0:
+                for lvl in levels:
+                    threshold = lvl['thresh']
+                    # Cross UP -> Short
+                    if prev_detrended < threshold and curr_detrended >= threshold:
+                        position = -1
+                        entry_price = price
+                        active_sl = lvl['sl']
+                        active_tp = lvl['tp']
+                        print(f">>> ENTRY SHORT @ {price:.2f} (Thresh: {threshold:.2f})")
+                        trade_history.append({'ts': ts, 'type': 'short', 'price': price})
+                        break
+                    # Cross DOWN -> Long
+                    elif prev_detrended > threshold and curr_detrended <= threshold:
+                        position = 1
+                        entry_price = price
+                        active_sl = lvl['sl']
+                        active_tp = lvl['tp']
+                        print(f">>> ENTRY LONG @ {price:.2f} (Thresh: {threshold:.2f})")
+                        trade_history.append({'ts': ts, 'type': 'long', 'price': price})
+                        break
+            
+            prev_detrended = curr_detrended
+            
+        except Exception as e:
+            print(f"Live Loop Error: {e}")
+            time.sleep(5)
+
 class PlotHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -309,19 +403,24 @@ if __name__ == "__main__":
     if df.empty: exit()
     
     try:
-        df = apply_indicators(df)
+        df, trend_m, trend_c = apply_indicators(df)
     except ValueError as e:
         print(f"Error: {e}")
         exit()
         
     print("Running GA...")
     best_ind = optimize(df)
-    print("Serving 8080...")
     
+    print("Generating Plot...")
     plot_buffer = generate_plot(df, best_ind)
     
+    # Start Live Loop Thread
+    live_thread = threading.Thread(target=live_trading_loop, args=(best_ind, trend_m, trend_c), daemon=True)
+    live_thread.start()
+    
+    print(f"Serving plot at http://localhost:{SERVER_PORT} ... (Ctrl+C to stop)")
     with socketserver.TCPServer(("", SERVER_PORT), PlotHandler) as httpd:
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
-            pass #111
+            print("\nShutting down...")
