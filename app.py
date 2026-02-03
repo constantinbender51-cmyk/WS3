@@ -22,17 +22,17 @@ TIMEFRAME = '1d'
 START_YEAR = 2018
 SMA_PERIOD = 1460
 SMA_OFFSET = -1460     
-GA_POP_SIZE = 100
+GA_POP_SIZE = 50
 GA_NGEN = 15
 GA_CXPB = 0.5
 GA_MUTPB = 0.2
-N_REVERSAL_LEVELS = 10
+N_REVERSAL_LEVELS = 3
 INITIAL_BALANCE = 10000
 SERVER_PORT = 8080
 
 # GENE RANGES
-GENE_LEVEL_MIN = -40000
-GENE_LEVEL_MAX = 40000
+GENE_LEVEL_MIN = -20000
+GENE_LEVEL_MAX = 20000
 GENE_SL_MIN = 0.01
 GENE_SL_MAX = 0.15
 GENE_TP_MIN = 0.01
@@ -96,8 +96,9 @@ def apply_indicators(df):
     
     return df
 
-# --- GA ---
-def backtest_strategy(individual, data):
+# --- GA STRATEGY LOGIC ---
+def run_strategy_logic(individual, data, record_trades=False):
+    # Common logic for both GA and Plotting
     balance = INITIAL_BALANCE
     equity = []
     position = 0 
@@ -105,50 +106,77 @@ def backtest_strategy(individual, data):
     active_sl = 0.0
     active_tp = 0.0
     
+    # Recording lists
+    trades = {'entry_dt': [], 'entry_price': [], 'exit_dt': [], 'exit_price': [], 'type': []}
+    
     levels = []
     for i in range(0, len(individual), 3):
         levels.append({'thresh': individual[i], 'sl': individual[i+1], 'tp': individual[i+2]})
     
-    train_data = data.loc[:TRAIN_END_DATE]
-    if train_data.empty: return -999,
+    detrended = data['detrended'].values
+    closes = data['close'].values
+    timestamps = data.index
     
-    detrended = train_data['detrended'].values
-    closes = train_data['close'].values
-    
-    for i in range(1, len(train_data)):
+    for i in range(1, len(data)):
         curr_dt = detrended[i]
         prev_dt = detrended[i-1]
         price = closes[i]
+        ts = timestamps[i]
         
+        # Check Exit
         if position != 0:
             pnl_pct = (price - entry_price) / entry_price if position == 1 else (entry_price - price) / entry_price
             if pnl_pct <= -active_sl or pnl_pct >= active_tp:
                 balance *= (1 + pnl_pct)
+                if record_trades:
+                    trades['exit_dt'].append(ts)
+                    trades['exit_price'].append(curr_dt) # Plot on detrended curve
                 position = 0
         
+        # Check Entry
         if position == 0:
             for lvl in levels:
                 threshold = lvl['thresh']
+                # Cross UP -> Short
                 if prev_dt < threshold and curr_dt >= threshold:
                     position = -1
                     entry_price = price
                     active_sl = lvl['sl']
                     active_tp = lvl['tp']
+                    if record_trades:
+                        trades['entry_dt'].append(ts)
+                        trades['entry_price'].append(curr_dt)
+                        trades['type'].append('short')
                     break
+                # Cross DOWN -> Long
                 elif prev_dt > threshold and curr_dt <= threshold:
                     position = 1
                     entry_price = price
                     active_sl = lvl['sl']
                     active_tp = lvl['tp']
+                    if record_trades:
+                        trades['entry_dt'].append(ts)
+                        trades['entry_price'].append(curr_dt)
+                        trades['type'].append('long')
                     break
                     
         equity.append(balance)
+    
+    return equity, trades
+
+def backtest_strategy(individual, data):
+    # Wrapper for GA (only needs sharpe)
+    train_data = data.loc[:TRAIN_END_DATE]
+    if train_data.empty: return -999,
+    
+    equity, _ = run_strategy_logic(individual, train_data, record_trades=False)
     
     if not equity: return -999,
     returns = pd.Series(equity).pct_change().dropna()
     if len(returns) < 2 or returns.std() == 0: return -999,
     
-    return (returns.mean() / returns.std()) * np.sqrt(365),
+    sharpe = (returns.mean() / returns.std()) * np.sqrt(365)
+    return sharpe,
 
 def optimize(df):
     creator.create("FitnessMax", base.Fitness, weights=(1.0,))
@@ -177,34 +205,71 @@ def optimize(df):
     
     return tools.selBest(pop, 1)[0]
 
-# --- SERVE ---
+# --- PLOT ---
 def generate_plot(df, best_genes):
-    # Increase height to accommodate table
-    plt.figure(figsize=(16, 12))
+    plt.figure(figsize=(16, 14))
     
     # 1. Training Phase
-    ax1 = plt.subplot(3, 1, 1) # Changed to 3 rows
+    ax1 = plt.subplot(3, 1, 1)
     train_data = df.loc[:TRAIN_END_DATE]
-    ax1.plot(train_data.index, train_data['detrended'], label='Detrended (Train)', color='black', lw=0.8)
+    ax1.plot(train_data.index, train_data['detrended'], color='black', lw=0.8, alpha=0.7)
     
     colors = ['r', 'g', 'b', 'orange', 'purple']
     for i in range(N_REVERSAL_LEVELS):
         lvl = best_genes[i*3]
         ax1.axhline(lvl, color=colors[i%len(colors)], ls='--', label=f'Lvl {i+1}')
-    ax1.set_title(f'Train (2018-2025)')
+    ax1.set_title(f'Train Phase: Price Deviation & Levels')
     ax1.legend(loc='upper left')
     ax1.grid(True, alpha=0.3)
     
-    # 2. Testing Phase
+    # 2. Testing Phase + Trades + PnL
     ax2 = plt.subplot(3, 1, 2)
     test_data = df.loc[TEST_START_DATE:]
     
     if not test_data.empty:
-        ax2.plot(test_data.index, test_data['detrended'], label='Detrended (Test)', color='blue')
+        # Run Backtest specifically on Test Data to get entries/exits
+        equity_curve, trades = run_strategy_logic(best_genes, test_data, record_trades=True)
+        
+        # Plot Price (Detrended)
+        ax2.plot(test_data.index, test_data['detrended'], label='Detrended Price', color='grey', lw=1)
+        
+        # Plot Levels
         for i in range(N_REVERSAL_LEVELS):
             lvl = best_genes[i*3]
-            ax2.axhline(lvl, color=colors[i%len(colors)], ls='--', alpha=0.7)
-        ax2.set_title(f'Test (2026)')
+            ax2.axhline(lvl, color=colors[i%len(colors)], ls='--', alpha=0.5)
+            
+        # Plot Entries/Exits
+        # Separate Longs and Shorts
+        long_entries = [ (t, p) for t, p, type_ in zip(trades['entry_dt'], trades['entry_price'], trades['type']) if type_ == 'long']
+        short_entries = [ (t, p) for t, p, type_ in zip(trades['entry_dt'], trades['entry_price'], trades['type']) if type_ == 'short']
+        
+        if long_entries:
+            lx, ly = zip(*long_entries)
+            ax2.scatter(lx, ly, marker='^', color='green', s=100, label='Long Entry', zorder=5)
+        if short_entries:
+            sx, sy = zip(*short_entries)
+            ax2.scatter(sx, sy, marker='v', color='red', s=100, label='Short Entry', zorder=5)
+            
+        if trades['exit_dt']:
+            ax2.scatter(trades['exit_dt'], trades['exit_price'], marker='x', color='black', s=80, label='Exit', zorder=5)
+
+        ax2.set_ylabel('Detrended Price ($)')
+        ax2.legend(loc='upper left')
+        
+        # Twin Axis for PnL
+        ax2_pnl = ax2.twinx()
+        # Equity curve length matches data length minus 1 usually (due to loop start 1)
+        # We align it with index 1:
+        if len(equity_curve) == len(test_data) - 1:
+            ax2_pnl.plot(test_data.index[1:], equity_curve, color='blue', lw=2, alpha=0.6, label='Equity ($)')
+        else:
+            # Fallback alignment
+            ax2_pnl.plot(test_data.index[-len(equity_curve):], equity_curve, color='blue', lw=2, alpha=0.6, label='Equity ($)')
+            
+        ax2_pnl.set_ylabel('Portfolio Equity ($)', color='blue')
+        ax2_pnl.tick_params(axis='y', labelcolor='blue')
+        
+        ax2.set_title(f'Test Phase (2026): Signals & Performance')
         ax2.grid(True, alpha=0.3)
     else:
         ax2.text(0.5, 0.5, 'No Test Data', ha='center')
@@ -215,20 +280,19 @@ def generate_plot(df, best_genes):
     ax3.axis('off')
     
     table_data = []
-    col_labels = ['Level Index', 'Threshold ($)', 'Stop Loss (%)', 'Take Profit (%)']
+    col_labels = ['Level', 'Threshold', 'Stop Loss', 'Take Profit']
     
     for i in range(0, len(best_genes), 3):
         idx = (i//3) + 1
         thresh = best_genes[i]
         sl = best_genes[i+1] * 100
         tp = best_genes[i+2] * 100
-        table_data.append([f"Level {idx}", f"{thresh:.2f}", f"{sl:.2f}%", f"{tp:.2f}%"])
+        table_data.append([f"Lvl {idx}", f"{thresh:.2f}", f"{sl:.2f}%", f"{tp:.2f}%"])
         
     table = ax3.table(cellText=table_data, colLabels=col_labels, loc='center', cellLoc='center')
-    table.scale(1, 2) # Scale height for readability
-    table.auto_set_font_size(False)
+    table.scale(1, 1.5)
     table.set_fontsize(12)
-    ax3.set_title("Optimized Strategy Parameters", pad=20)
+    ax3.set_title("Strategy Parameters", pad=10)
         
     plt.tight_layout()
     buf = io.BytesIO()
