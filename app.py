@@ -26,7 +26,7 @@ GA_POP_SIZE = 100
 GA_NGEN = 15
 GA_CXPB = 0.5
 GA_MUTPB = 0.2
-N_REVERSAL_LEVELS = 5
+N_REVERSAL_LEVELS = 15
 INITIAL_BALANCE = 10000
 SERVER_PORT = 8080
 
@@ -96,9 +96,8 @@ def apply_indicators(df):
     
     return df
 
-# --- GA STRATEGY LOGIC ---
+# --- STRATEGY ENGINE ---
 def run_strategy_logic(individual, data, record_trades=False):
-    # Common logic for both GA and Plotting
     balance = INITIAL_BALANCE
     equity = []
     position = 0 
@@ -106,7 +105,6 @@ def run_strategy_logic(individual, data, record_trades=False):
     active_sl = 0.0
     active_tp = 0.0
     
-    # Recording lists
     trades = {'entry_dt': [], 'entry_price': [], 'exit_dt': [], 'exit_price': [], 'type': []}
     
     levels = []
@@ -130,7 +128,7 @@ def run_strategy_logic(individual, data, record_trades=False):
                 balance *= (1 + pnl_pct)
                 if record_trades:
                     trades['exit_dt'].append(ts)
-                    trades['exit_price'].append(curr_dt) # Plot on detrended curve
+                    trades['exit_price'].append(curr_dt)
                 position = 0
         
         # Check Entry
@@ -165,7 +163,6 @@ def run_strategy_logic(individual, data, record_trades=False):
     return equity, trades
 
 def backtest_strategy(individual, data):
-    # Wrapper for GA (only needs sharpe)
     train_data = data.loc[:TRAIN_END_DATE]
     if train_data.empty: return -999,
     
@@ -205,72 +202,71 @@ def optimize(df):
     
     return tools.selBest(pop, 1)[0]
 
-# --- PLOT ---
+# --- HELPER FOR PLOTTING LOGIC ---
+def plot_strategy_performance(ax, data, best_genes, title):
+    # Run Simulation
+    equity_curve, trades = run_strategy_logic(best_genes, data, record_trades=True)
+    
+    # Plot Price (Detrended)
+    ax.plot(data.index, data['detrended'], label='Detrended Price', color='grey', lw=0.8, alpha=0.8)
+    
+    # Plot Levels
+    colors = ['r', 'g', 'b', 'orange', 'purple']
+    for i in range(N_REVERSAL_LEVELS):
+        lvl = best_genes[i*3]
+        ax.axhline(lvl, color=colors[i%len(colors)], ls='--', alpha=0.5)
+    
+    # Plot Trades
+    long_entries = [(t, p) for t, p, type_ in zip(trades['entry_dt'], trades['entry_price'], trades['type']) if type_ == 'long']
+    short_entries = [(t, p) for t, p, type_ in zip(trades['entry_dt'], trades['entry_price'], trades['type']) if type_ == 'short']
+    
+    if long_entries:
+        lx, ly = zip(*long_entries)
+        ax.scatter(lx, ly, marker='^', color='green', s=60, label='Long', zorder=5)
+    if short_entries:
+        sx, sy = zip(*short_entries)
+        ax.scatter(sx, sy, marker='v', color='red', s=60, label='Short', zorder=5)
+    if trades['exit_dt']:
+        ax.scatter(trades['exit_dt'], trades['exit_price'], marker='x', color='black', s=40, label='Exit', zorder=5)
+
+    ax.set_title(title)
+    ax.set_ylabel('Detrended Price ($)')
+    ax.legend(loc='upper left')
+    ax.grid(True, alpha=0.3)
+    
+    # Plot PnL (Twin Axis)
+    ax_pnl = ax.twinx()
+    # Align equity curve
+    if len(equity_curve) > 0:
+        align_len = min(len(equity_curve), len(data))
+        # Usually equity curve is len(data)-1 because loop starts at 1
+        plot_idx = data.index[-align_len:]
+        plot_eq = equity_curve[-align_len:]
+        
+        ax_pnl.plot(plot_idx, plot_eq, color='blue', lw=1.5, alpha=0.6, label='Equity')
+        ax_pnl.set_ylabel('Equity ($)', color='blue')
+        ax_pnl.tick_params(axis='y', labelcolor='blue')
+        
+        # Add PnL legend manually or via helper
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax_pnl.get_legend_handles_labels()
+        ax.legend(lines + lines2, labels + labels2, loc='upper left')
+
+# --- PLOT GENERATION ---
 def generate_plot(df, best_genes):
     plt.figure(figsize=(16, 14))
     
     # 1. Training Phase
     ax1 = plt.subplot(3, 1, 1)
     train_data = df.loc[:TRAIN_END_DATE]
-    ax1.plot(train_data.index, train_data['detrended'], color='black', lw=0.8, alpha=0.7)
+    if not train_data.empty:
+        plot_strategy_performance(ax1, train_data, best_genes, f'Training Phase (2018-2025): Trades & PnL')
     
-    colors = ['r', 'g', 'b', 'orange', 'purple']
-    for i in range(N_REVERSAL_LEVELS):
-        lvl = best_genes[i*3]
-        ax1.axhline(lvl, color=colors[i%len(colors)], ls='--', label=f'Lvl {i+1}')
-    ax1.set_title(f'Train Phase: Price Deviation & Levels')
-    ax1.legend(loc='upper left')
-    ax1.grid(True, alpha=0.3)
-    
-    # 2. Testing Phase + Trades + PnL
+    # 2. Testing Phase
     ax2 = plt.subplot(3, 1, 2)
     test_data = df.loc[TEST_START_DATE:]
-    
     if not test_data.empty:
-        # Run Backtest specifically on Test Data to get entries/exits
-        equity_curve, trades = run_strategy_logic(best_genes, test_data, record_trades=True)
-        
-        # Plot Price (Detrended)
-        ax2.plot(test_data.index, test_data['detrended'], label='Detrended Price', color='grey', lw=1)
-        
-        # Plot Levels
-        for i in range(N_REVERSAL_LEVELS):
-            lvl = best_genes[i*3]
-            ax2.axhline(lvl, color=colors[i%len(colors)], ls='--', alpha=0.5)
-            
-        # Plot Entries/Exits
-        # Separate Longs and Shorts
-        long_entries = [ (t, p) for t, p, type_ in zip(trades['entry_dt'], trades['entry_price'], trades['type']) if type_ == 'long']
-        short_entries = [ (t, p) for t, p, type_ in zip(trades['entry_dt'], trades['entry_price'], trades['type']) if type_ == 'short']
-        
-        if long_entries:
-            lx, ly = zip(*long_entries)
-            ax2.scatter(lx, ly, marker='^', color='green', s=100, label='Long Entry', zorder=5)
-        if short_entries:
-            sx, sy = zip(*short_entries)
-            ax2.scatter(sx, sy, marker='v', color='red', s=100, label='Short Entry', zorder=5)
-            
-        if trades['exit_dt']:
-            ax2.scatter(trades['exit_dt'], trades['exit_price'], marker='x', color='black', s=80, label='Exit', zorder=5)
-
-        ax2.set_ylabel('Detrended Price ($)')
-        ax2.legend(loc='upper left')
-        
-        # Twin Axis for PnL
-        ax2_pnl = ax2.twinx()
-        # Equity curve length matches data length minus 1 usually (due to loop start 1)
-        # We align it with index 1:
-        if len(equity_curve) == len(test_data) - 1:
-            ax2_pnl.plot(test_data.index[1:], equity_curve, color='blue', lw=2, alpha=0.6, label='Equity ($)')
-        else:
-            # Fallback alignment
-            ax2_pnl.plot(test_data.index[-len(equity_curve):], equity_curve, color='blue', lw=2, alpha=0.6, label='Equity ($)')
-            
-        ax2_pnl.set_ylabel('Portfolio Equity ($)', color='blue')
-        ax2_pnl.tick_params(axis='y', labelcolor='blue')
-        
-        ax2.set_title(f'Test Phase (2026): Signals & Performance')
-        ax2.grid(True, alpha=0.3)
+        plot_strategy_performance(ax2, test_data, best_genes, f'Test Phase (2026): Unseen Data Performance')
     else:
         ax2.text(0.5, 0.5, 'No Test Data', ha='center')
 
