@@ -25,8 +25,8 @@ TIMEFRAME = '1d'
 START_YEAR = 2018
 SMA_PERIOD = 1460
 SMA_OFFSET = -1460     
-GA_POP_SIZE = 300
-GA_NGEN = 30
+GA_POP_SIZE = 50
+GA_NGEN = 15
 GA_CXPB = 0.5
 GA_MUTPB = 0.2
 N_REVERSAL_LEVELS = 15
@@ -204,12 +204,47 @@ def optimize(df):
             ind.extend([toolbox.attr_lvl(), toolbox.attr_sl(), toolbox.attr_tp()])
         return ind
     
+    # Custom Mutation to handle different gene scales
+    def custom_mutate(individual, indpb):
+        for i in range(len(individual)):
+            if random.random() < indpb:
+                if i % 3 == 0: # Level Gene
+                    sigma = 500
+                else: # SL or TP Gene
+                    sigma = 0.02 
+                individual[i] += random.gauss(0, sigma)
+        return individual,
+
+    # Bounds Checker Decorator
+    def checkBounds(min_lvl, max_lvl, min_sl, max_sl, min_tp, max_tp):
+        def decorator(func):
+            def wrapper(*args, **kargs):
+                offspring = func(*args, **kargs)
+                for child in offspring:
+                    for i in range(len(child)):
+                        if i % 3 == 0: # Level
+                            if child[i] > max_lvl: child[i] = max_lvl
+                            elif child[i] < min_lvl: child[i] = min_lvl
+                        elif i % 3 == 1: # SL
+                            if child[i] > max_sl: child[i] = max_sl
+                            elif child[i] < min_sl: child[i] = min_sl
+                        elif i % 3 == 2: # TP
+                            if child[i] > max_tp: child[i] = max_tp
+                            elif child[i] < min_tp: child[i] = min_tp
+                return offspring
+            return wrapper
+        return decorator
+    
     toolbox.register("individual", tools.initIterate, creator.Individual, create_ind)
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
     toolbox.register("evaluate", backtest_strategy, data=df)
     toolbox.register("mate", tools.cxTwoPoint)
-    toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=500, indpb=0.1)
+    toolbox.register("mutate", custom_mutate, indpb=0.1) # Register custom mutation
     toolbox.register("select", tools.selTournament, tournsize=3)
+    
+    # Apply Bounds Checking
+    toolbox.decorate("mate", checkBounds(GENE_LEVEL_MIN, GENE_LEVEL_MAX, GENE_SL_MIN, GENE_SL_MAX, GENE_TP_MIN, GENE_TP_MAX))
+    toolbox.decorate("mutate", checkBounds(GENE_LEVEL_MIN, GENE_LEVEL_MAX, GENE_SL_MIN, GENE_SL_MAX, GENE_TP_MIN, GENE_TP_MAX))
     
     pop = toolbox.population(n=GA_POP_SIZE)
     algorithms.eaSimple(pop, toolbox, cxpb=GA_CXPB, mutpb=GA_MUTPB, ngen=GA_NGEN, verbose=False)
