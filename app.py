@@ -1,286 +1,225 @@
 import ccxt
 import pandas as pd
 import numpy as np
-import random
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import io
+from scipy.optimize import curve_fit
+from deap import base, creator, tools, algorithms
+import random
 import http.server
 import socketserver
-from deap import base, creator, tools, algorithms
-from datetime import datetime
+import io
 import time
 import warnings
 
-# Configuration
-SYMBOL = 'BTC/USDT'
-TIMEFRAME = '1h'
-SINCE_STR = '2022-01-01 00:00:00'
-POPULATION_SIZE = 50
-GENERATIONS = 10  # Kept low for execution speed in demo; scale up for real use
-N_LEVELS = 5      # Number of price levels to optimize
-TRAIN_SPLIT = 0.85
-PORT = 8080
-
 warnings.filterwarnings("ignore")
 
-# 1. Fetch OHLCV Data
-def fetch_data(symbol, timeframe, since_str):
-    print(f"Fetching {timeframe} data for {symbol} since {since_str}...")
-    exchange = ccxt.binance({'enableRateLimit': True})
-    since = exchange.parse8601(since_str)
-    all_ohlcv = []
+# 1. Fetch OHLC (2018-Present)
+def fetch_data(symbol='BTC/USDT', timeframe='1d', since_year=2018):
+    exchange = ccxt.binance()
+    since = exchange.parse8601(f'{since_year}-01-01T00:00:00Z')
+    all_candles = []
     
+    print(f"Fetching {symbol}...")
     while True:
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
-            if not ohlcv:
+            candles = exchange.fetch_ohlcv(symbol, timeframe, since)
+            if not candles:
                 break
-            all_ohlcv.extend(ohlcv)
-            since = ohlcv[-1][0] + 1
-            # Check if reached present (approximate check using last timestamp)
-            if len(ohlcv) < 1000:
-                break
-            print(f"Fetched {len(all_ohlcv)} candles...", end='\r')
-        except Exception as e:
-            print(f"Error fetching data: {e}")
-            time.sleep(5)
-            continue
+            all_candles += candles
+            since = candles[-1][0] + 1
+            time.sleep(exchange.rateLimit / 1000)
+            if len(candles) < 1000: break
+        except:
+            break
             
-    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
-    print(f"\nTotal candles: {len(df)}")
+    df = df[~df.index.duplicated(keep='first')]
     return df
 
-# 2. Backtest Engine
-def backtest(df, levels, sl_pct, tp_pct):
-    # Logic:
-    # Levels are absolute prices. 
-    # If Previous_Close < Level and Current_Close > Level -> BUY
-    # If Previous_Close > Level and Current_Close < Level -> SELL
-    # FIFO for overlapping trades or simple single-trade logic?
-    # Complexity: Multi-trade allowed. Each entry tracks its own SL/TP.
+# 2, 3, 4. Process: SMA, Shift -1460, Fit Line, Detrend
+def process_data(df):
+    # SMA 1460
+    df['sma_1460'] = df['close'].rolling(window=1460).mean()
     
-    trades = [] # {'entry_price': float, 'direction': 1/-1, 'sl': float, 'tp': float, 'entry_time': timestamp, 'status': 'open'}
-    closed_trades = []
+    # Shift -1460 (Moves future values to current index)
+    # The last 1460 rows will be NaN
+    df['curve_future'] = df['sma_1460'].shift(-1460)
     
-    # Vectorized approach is hard with individual SL/TP logic per trade without look-ahead bias
-    # Iterative approach (dense/slow but accurate)
+    # Ordinal dates for regression
+    df['ordinal'] = df.index.map(pd.Timestamp.toordinal)
     
-    # Pre-calculate crosses
-    # We iterate row by row to simulate real execution
+    # Fit line ONLY to the valid shifted curve (historical data that has 'future' confirmation)
+    fit_mask = df['curve_future'].notna()
+    fit_data = df[fit_mask]
     
-    active_trades = []
-    equity = [0]
+    if fit_data.empty:
+        raise ValueError("Insufficient data length for -1460 shift + SMA window")
+
+    def linear_func(x, m, c):
+        return m * x + c
     
-    prices = df['close'].values
-    highs = df['high'].values
-    lows = df['low'].values
-    times = df.index
+    popt, _ = curve_fit(linear_func, fit_data['ordinal'], fit_data['curve_future'])
+    m, c = popt
     
-    # Optimization: Convert levels to array for broadcasting
-    levels = np.array(sorted(levels))
+    # Extrapolate line to entire dataset (including the recent 1460 days and 2026)
+    df['trend_line'] = linear_func(df['ordinal'], m, c)
     
-    for i in range(1, len(df)):
-        current_price = prices[i]
-        prev_price = prices[i-1]
-        current_high = highs[i]
-        current_low = lows[i]
-        ts = times[i]
+    # Subtract line from OHLC
+    df['close_dt'] = df['close'] - df['trend_line']
+    
+    return df
+
+# 5. GA Optimization
+N_LEVELS = 3 # n reversal price levels
+
+def backtest(individual, data):
+    # individual: [thresh1, sl1, tp1, thresh2, sl2, tp2, ...]
+    balance = 10000
+    equity = []
+    pos = 0 # 1=Long, -1=Short
+    entry_price = 0.0
+    active_sl = 0.0
+    active_tp = 0.0
+    
+    # Parse genes into levels
+    levels = []
+    for i in range(0, len(individual), 3):
+        levels.append({'val': individual[i], 'sl': individual[i+1], 'tp': individual[i+2]})
         
-        # Check Exits first
-        still_active = []
-        for trade in active_trades:
-            pnl = 0
-            closed = False
-            
-            if trade['direction'] == 1: # Long
-                if current_low <= trade['sl']:
-                    pnl = (trade['sl'] - trade['entry_price']) / trade['entry_price']
-                    closed = True
-                elif current_high >= trade['tp']:
-                    pnl = (trade['tp'] - trade['entry_price']) / trade['entry_price']
-                    closed = True
-            else: # Short
-                if current_high >= trade['sl']:
-                    pnl = (trade['entry_price'] - trade['sl']) / trade['entry_price']
-                    closed = True
-                elif current_low <= trade['tp']:
-                    pnl = (trade['entry_price'] - trade['tp']) / trade['entry_price']
-                    closed = True
-            
-            if closed:
-                trade['exit_time'] = ts
-                trade['pnl'] = pnl
-                closed_trades.append(trade)
-                equity.append(equity[-1] + pnl)
-            else:
-                still_active.append(trade)
-        active_trades = still_active
-
-        # Check Entries
-        # Cross Up
-        cross_up = (prev_price < levels) & (current_price > levels)
-        for lvl in levels[cross_up]:
-            active_trades.append({
-                'entry_price': current_price,
-                'direction': 1,
-                'sl': current_price * (1 - sl_pct),
-                'tp': current_price * (1 + tp_pct),
-                'entry_time': ts
-            })
-            
-        # Cross Down
-        cross_down = (prev_price > levels) & (current_price < levels)
-        for lvl in levels[cross_down]:
-            active_trades.append({
-                'entry_price': current_price,
-                'direction': -1,
-                'sl': current_price * (1 + sl_pct),
-                'tp': current_price * (1 - tp_pct),
-                'entry_time': ts
-            })
-            
-    total_pnl = equity[-1]
-    return total_pnl, closed_trades, equity
-
-# 3. GA Setup
-data = fetch_data(SYMBOL, TIMEFRAME, SINCE_STR)
-split_idx = int(len(data) * TRAIN_SPLIT)
-train_data = data.iloc[:split_idx]
-test_data = data.iloc[split_idx:]
-
-# Price range for gene initialization
-min_price = train_data['low'].min()
-max_price = train_data['high'].max()
-
-creator.create("FitnessMax", base.Fitness, weights=(1.0,))
-creator.create("Individual", list, fitness=creator.FitnessMax)
-
-toolbox = base.Toolbox()
-
-# Genes: [Level1, Level2, ..., LevelN, SL_pct, TP_pct]
-toolbox.register("attr_price", random.uniform, min_price, max_price)
-toolbox.register("attr_pct", random.uniform, 0.01, 0.20) # 1% to 20%
-toolbox.register("individual", tools.initCycle, creator.Individual,
-                 (toolbox.attr_price,) * N_LEVELS + (toolbox.attr_pct, toolbox.attr_pct), n=1)
-toolbox.register("population", tools.initRepeat, list, toolbox.individual)
-
-def evaluate(individual):
-    levels = individual[:N_LEVELS]
-    sl = individual[N_LEVELS]
-    tp = individual[N_LEVELS+1]
-    # Penalize negative SL/TP or illogical values
-    if sl <= 0 or tp <= 0: return -9999,
+    # Run on Training Data (Up to end of 2025)
+    train_slice = data.loc[:'2025-12-31']
+    closes = train_slice['close'].values
+    dt_closes = train_slice['close_dt'].values
     
-    pnl, _, _ = backtest(train_data, levels, sl, tp)
-    return pnl,
-
-toolbox.register("evaluate", evaluate)
-toolbox.register("mate", tools.cxTwoPoint)
-toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=[500]*N_LEVELS + [0.01, 0.01], indpb=0.2)
-toolbox.register("select", tools.selTournament, tournsize=3)
-
-# 4. Run Optimization
-print("Starting GA Optimization...")
-pop = toolbox.population(n=POPULATION_SIZE)
-hof = tools.HallOfFame(1)
-stats = tools.Statistics(lambda ind: ind.fitness.values)
-stats.register("avg", np.mean)
-stats.register("min", np.min)
-stats.register("max", np.max)
-
-pop, log = algorithms.eaSimple(pop, toolbox, cxpb=0.5, mutpb=0.2, ngen=GENERATIONS, 
-                               stats=stats, halloffame=hof, verbose=True)
-
-best_ind = hof[0]
-best_levels = sorted(best_ind[:N_LEVELS])
-best_sl = best_ind[N_LEVELS]
-best_tp = best_ind[N_LEVELS+1]
-
-print(f"Best Levels: {best_levels}")
-print(f"Best SL: {best_sl:.2%}, Best TP: {best_tp:.2%}")
-
-# 5. Test on Test Set
-print("Running on Test Set...")
-test_pnl, test_trades, test_equity = backtest(test_data, best_levels, best_sl, best_tp)
-print(f"Test Set PnL: {test_pnl:.4f}")
-
-# 6. Visualization & Serving
-def generate_plot():
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-    
-    # Price and Levels
-    ax1.plot(test_data.index, test_data['close'], label='Price', color='black', alpha=0.6)
-    for lvl in best_levels:
-        ax1.axhline(lvl, color='blue', linestyle='--', alpha=0.5, label=f'Level {int(lvl)}')
-    
-    # Entries
-    longs = [t for t in test_trades if t['direction'] == 1]
-    shorts = [t for t in test_trades if t['direction'] == -1]
-    
-    if longs:
-        ax1.scatter([t['entry_time'] for t in longs], [t['entry_price'] for t in longs], 
-                   marker='^', color='green', label='Buy', zorder=5)
-    if shorts:
-        ax1.scatter([t['entry_time'] for t in shorts], [t['entry_price'] for t in shorts], 
-                   marker='v', color='red', label='Sell', zorder=5)
+    for i in range(1, len(train_slice)):
+        price = closes[i]
+        dt_curr = dt_closes[i]
+        dt_prev = dt_closes[i-1]
         
-    ax1.set_title('Price & Entries')
-    ax1.legend(loc='upper left')
+        # Manage Open Position
+        if pos != 0:
+            pnl = (price - entry_price) / entry_price if pos == 1 else (entry_price - price) / entry_price
+            if pnl <= -active_sl or pnl >= active_tp:
+                balance *= (1 + pnl)
+                pos = 0
+        
+        # Entry Logic
+        if pos == 0:
+            for lvl in levels:
+                thresh = lvl['val']
+                # Short: From below cross (upwards) -> Reversal Short
+                # Assuming thresh is positive (upper bound)
+                if dt_prev < thresh and dt_curr >= thresh:
+                    pos = -1
+                    entry_price = price
+                    active_sl = lvl['sl']
+                    active_tp = lvl['tp']
+                    break
+                
+                # Long: From above cross (downwards) -> Reversal Long
+                # Using negative threshold for lower bounds
+                # If gene generates -5000:
+                elif dt_prev > thresh and dt_curr <= thresh:
+                    pos = 1
+                    entry_price = price
+                    active_sl = lvl['sl']
+                    active_tp = lvl['tp']
+                    break
+        
+        equity.append(balance)
+        
+    s = pd.Series(equity)
+    if len(s) < 2: return -999,
+    ret = s.pct_change().dropna()
+    if ret.std() == 0: return -999,
+    return (ret.mean() / ret.std()) * np.sqrt(365),
+
+def run_ga(df):
+    creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+    creator.create("Individual", list, fitness=creator.FitnessMax)
     
-    # Equity Curve
-    # Align equity curve to trade exit times for plotting
-    eq_times = [test_data.index[0]] + [t['exit_time'] for t in test_trades]
-    # This is a simplification; equity is list of cumulative sums. 
-    # Match lengths for plot:
-    ax2.plot(range(len(test_equity)), test_equity, label='Equity', color='purple')
-    ax2.set_title(f'Cumulative PnL (Test Set): {test_pnl:.2f}')
+    toolbox = base.Toolbox()
+    # Level: Deviation from linear trend
+    toolbox.register("attr_lvl", random.uniform, -20000, 20000)
+    toolbox.register("attr_sl", random.uniform, 0.01, 0.15)
+    toolbox.register("attr_tp", random.uniform, 0.01, 0.30)
     
+    def create_ind():
+        l = []
+        for _ in range(N_LEVELS):
+            l.extend([toolbox.attr_lvl(), toolbox.attr_sl(), toolbox.attr_tp()])
+        return l
+
+    toolbox.register("ind", tools.initIterate, creator.Individual, create_ind)
+    toolbox.register("pop", tools.initRepeat, list, toolbox.ind)
+    toolbox.register("eval", backtest, data=df)
+    toolbox.register("mate", tools.cxTwoPoint)
+    toolbox.register("mut", tools.mutGaussian, mu=0, sigma=1000, indpb=0.1)
+    toolbox.register("sel", tools.selTournament, tournsize=3)
+    
+    pop = toolbox.pop(n=50)
+    algorithms.eaSimple(pop, toolbox, cxpb=0.5, mutpb=0.2, ngen=15, verbose=False)
+    
+    return tools.selBest(pop, 1)[0]
+
+# 6 & 7. Plot and Test Unseen
+def serve_plot(df, best):
+    plt.figure(figsize=(15, 10))
+    
+    # Main Plot: Detrended Prices + Levels
+    ax1 = plt.subplot(2, 1, 1)
+    ax1.plot(df.index, df['close_dt'], label='Detrended Close', lw=0.8, color='black')
+    
+    # Plot Levels
+    cols = ['r', 'g', 'b']
+    for i in range(N_LEVELS):
+        lvl = best[i*3]
+        ax1.axhline(lvl, color=cols[i%3], ls='--', label=f'Lvl {i}: {lvl:.0f}')
+        
+    ax1.set_title('Detrended Price vs Linear Fit (Training Data)')
+    ax1.legend()
+    
+    # Test Data Zoom (2026+)
+    ax2 = plt.subplot(2, 1, 2)
+    test = df.loc['2026-01-01':]
+    
+    if not test.empty:
+        ax2.plot(test.index, test['close_dt'], label='2026 Unseen', lw=1.5, color='blue')
+        for i in range(N_LEVELS):
+            lvl = best[i*3]
+            ax2.axhline(lvl, color=cols[i%3], ls='--', alpha=0.6)
+        ax2.set_title(f'Performance on Unseen Data (Jan 2026 - Present) | Days: {len(test)}')
+    else:
+        ax2.text(0.5, 0.5, 'No 2026 Data', ha='center')
+
     plt.tight_layout()
-    
     buf = io.BytesIO()
     plt.savefig(buf, format='png')
     buf.seek(0)
-    return buf
-
-class Handler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/':
+    
+    # Simple Server
+    class H(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
             self.send_response(200)
-            self.send_header('Content-type', 'text/html')
+            self.send_header('Content-type','image/png')
             self.end_headers()
+            self.wfile.write(buf.getvalue())
             
-            # Generate Trade List HTML
-            trade_rows = ""
-            for t in test_trades[-50:]: # Show last 50
-                trade_rows += f"<tr><td>{t['entry_time']}</td><td>{t['direction']}</td><td>{t['entry_price']:.2f}</td><td>{t['pnl']:.4f}</td></tr>"
-            
-            html = f"""
-            <html>
-                <body>
-                    <h1>Optimization Results</h1>
-                    <p>Best Levels: {best_levels}</p>
-                    <p>SL: {best_sl:.2%} | TP: {best_tp:.2%}</p>
-                    <img src="/plot.png" width="1000" />
-                    <h2>Last 50 Trades (Test Set)</h2>
-                    <table border="1">
-                        <tr><th>Time</th><th>Dir</th><th>Price</th><th>PnL</th></tr>
-                        {trade_rows}
-                    </table>
-                </body>
-            </html>
-            """
-            self.wfile.write(html.encode())
-            
-        elif self.path == '/plot.png':
-            self.send_response(200)
-            self.send_header('Content-type', 'image/png')
-            self.end_headers()
-            plot_buf = generate_plot()
-            self.wfile.write(plot_buf.getvalue())
-            plot_buf.close()
+    print("Serving on 8080...")
+    try:
+        http.server.HTTPServer(("", 8080), H).serve_forever()
+    except KeyboardInterrupt:
+        pass
 
-print(f"Serving on port {PORT}...")
-with socketserver.TCPServer(("", PORT), Handler) as httpd:
-    httpd.serve_forever()
+if __name__ == "__main__":
+    df = fetch_data()
+    if not df.empty:
+        df = process_data(df)
+        print("Optimizing...")
+        best = run_ga(df)
+        print(f"Best: {best}")
+        serve_plot(df, best)
