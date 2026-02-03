@@ -12,26 +12,56 @@ import socketserver
 import io
 import time
 import warnings
+import threading
 
 warnings.filterwarnings("ignore")
 
-# 1. Fetch OHLC (2018-Present)
-def fetch_data(symbol='BTC/USDT', timeframe='1d', since_year=2018):
+# --- CONFIGURATION ---
+SYMBOL = 'BTC/USDT'
+TIMEFRAME = '1d'
+START_YEAR = 2018      # Reverted to 2018
+SMA_PERIOD = 1460
+SMA_OFFSET = -1460     
+GA_POP_SIZE = 50
+GA_NGEN = 15
+GA_CXPB = 0.5
+GA_MUTPB = 0.2
+N_REVERSAL_LEVELS = 3
+INITIAL_BALANCE = 10000
+SERVER_PORT = 8080
+
+# GENE RANGES
+GENE_LEVEL_MIN = -20000
+GENE_LEVEL_MAX = 20000
+GENE_SL_MIN = 0.01
+GENE_SL_MAX = 0.15
+GENE_TP_MIN = 0.01
+GENE_TP_MAX = 0.30
+
+# DATES
+TRAIN_END_DATE = '2025-12-31'
+TEST_START_DATE = '2026-01-01'
+
+# --- FETCH ---
+def fetch_ohlc():
     exchange = ccxt.binance()
-    since = exchange.parse8601(f'{since_year}-01-01T00:00:00Z')
+    since = exchange.parse8601(f'{START_YEAR}-01-01T00:00:00Z')
     all_candles = []
     
-    print(f"Fetching {symbol}...")
+    print(f"Fetching {SYMBOL} data from {START_YEAR}...")
     while True:
         try:
-            candles = exchange.fetch_ohlcv(symbol, timeframe, since)
+            candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since)
             if not candles:
                 break
             all_candles += candles
             since = candles[-1][0] + 1
             time.sleep(exchange.rateLimit / 1000)
-            if len(candles) < 1000: break
-        except:
+            
+            if len(candles) < 1000:
+                break
+        except Exception as e:
+            print(f"Fetch error: {e}")
             break
             
     df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -40,186 +70,186 @@ def fetch_data(symbol='BTC/USDT', timeframe='1d', since_year=2018):
     df = df[~df.index.duplicated(keep='first')]
     return df
 
-# 2, 3, 4. Process: SMA, Shift -1460, Fit Line, Detrend
-def process_data(df):
-    # SMA 1460
-    df['sma_1460'] = df['close'].rolling(window=1460).mean()
+# --- PROCESS ---
+def apply_indicators(df):
+    # 1. SMA 1460 (Valid from index 1459 onwards)
+    df['sma'] = df['close'].rolling(window=SMA_PERIOD).mean()
     
-    # Shift -1460 (Moves future values to current index)
-    # The last 1460 rows will be NaN
-    df['curve_future'] = df['sma_1460'].shift(-1460)
+    # 2. Shift -1460 (Pulls t+1460 to t)
+    # This populates indices 0 to (N-1460) with valid SMA data
+    df['sma_shifted'] = df['sma'].shift(SMA_OFFSET)
     
-    # Ordinal dates for regression
-    df['ordinal'] = df.index.map(pd.Timestamp.toordinal)
+    # 3. Fit line
+    # Drop NaNs to find valid regression range (Start of DF)
+    fit_df = df.dropna(subset=['sma_shifted'])
     
-    # Fit line ONLY to the valid shifted curve (historical data that has 'future' confirmation)
-    fit_mask = df['curve_future'].notna()
-    fit_data = df[fit_mask]
-    
-    if fit_data.empty:
-        raise ValueError("Insufficient data length for -1460 shift + SMA window")
+    if fit_df.empty:
+        raise ValueError(f"Insufficient data. Total Rows: {len(df)}. Required > {SMA_PERIOD}.")
 
+    fit_df['ordinal'] = fit_df.index.map(pd.Timestamp.toordinal)
+    
     def linear_func(x, m, c):
         return m * x + c
     
-    popt, _ = curve_fit(linear_func, fit_data['ordinal'], fit_data['curve_future'])
+    popt, _ = curve_fit(linear_func, fit_df['ordinal'], fit_df['sma_shifted'])
     m, c = popt
     
-    # Extrapolate line to entire dataset (including the recent 1460 days and 2026)
+    # 4. Extrapolate line to full dataset and Detrend
+    df['ordinal'] = df.index.map(pd.Timestamp.toordinal)
     df['trend_line'] = linear_func(df['ordinal'], m, c)
-    
-    # Subtract line from OHLC
-    df['close_dt'] = df['close'] - df['trend_line']
+    df['detrended'] = df['close'] - df['trend_line']
     
     return df
 
-# 5. GA Optimization
-N_LEVELS = 3 # n reversal price levels
-
-def backtest(individual, data):
-    # individual: [thresh1, sl1, tp1, thresh2, sl2, tp2, ...]
-    balance = 10000
+# --- GA ---
+def backtest_strategy(individual, data):
+    balance = INITIAL_BALANCE
     equity = []
-    pos = 0 # 1=Long, -1=Short
+    position = 0 
     entry_price = 0.0
     active_sl = 0.0
     active_tp = 0.0
     
-    # Parse genes into levels
     levels = []
     for i in range(0, len(individual), 3):
-        levels.append({'val': individual[i], 'sl': individual[i+1], 'tp': individual[i+2]})
-        
-    # Run on Training Data (Up to end of 2025)
-    train_slice = data.loc[:'2025-12-31']
-    closes = train_slice['close'].values
-    dt_closes = train_slice['close_dt'].values
+        levels.append({'thresh': individual[i], 'sl': individual[i+1], 'tp': individual[i+2]})
     
-    for i in range(1, len(train_slice)):
+    train_data = data.loc[:TRAIN_END_DATE]
+    if train_data.empty: return -999,
+    
+    detrended = train_data['detrended'].values
+    closes = train_data['close'].values
+    
+    for i in range(1, len(train_data)):
+        curr_dt = detrended[i]
+        prev_dt = detrended[i-1]
         price = closes[i]
-        dt_curr = dt_closes[i]
-        dt_prev = dt_closes[i-1]
         
-        # Manage Open Position
-        if pos != 0:
-            pnl = (price - entry_price) / entry_price if pos == 1 else (entry_price - price) / entry_price
-            if pnl <= -active_sl or pnl >= active_tp:
-                balance *= (1 + pnl)
-                pos = 0
+        # Exit
+        if position != 0:
+            pnl_pct = (price - entry_price) / entry_price if position == 1 else (entry_price - price) / entry_price
+            if pnl_pct <= -active_sl or pnl_pct >= active_tp:
+                balance *= (1 + pnl_pct)
+                position = 0
         
-        # Entry Logic
-        if pos == 0:
+        # Entry
+        if position == 0:
             for lvl in levels:
-                thresh = lvl['val']
-                # Short: From below cross (upwards) -> Reversal Short
-                # Assuming thresh is positive (upper bound)
-                if dt_prev < thresh and dt_curr >= thresh:
-                    pos = -1
+                threshold = lvl['thresh']
+                # Cross UP -> Short
+                if prev_dt < threshold and curr_dt >= threshold:
+                    position = -1
                     entry_price = price
                     active_sl = lvl['sl']
                     active_tp = lvl['tp']
                     break
-                
-                # Long: From above cross (downwards) -> Reversal Long
-                # Using negative threshold for lower bounds
-                # If gene generates -5000:
-                elif dt_prev > thresh and dt_curr <= thresh:
-                    pos = 1
+                # Cross DOWN -> Long
+                elif prev_dt > threshold and curr_dt <= threshold:
+                    position = 1
                     entry_price = price
                     active_sl = lvl['sl']
                     active_tp = lvl['tp']
                     break
-        
+                    
         equity.append(balance)
-        
-    s = pd.Series(equity)
-    if len(s) < 2: return -999,
-    ret = s.pct_change().dropna()
-    if ret.std() == 0: return -999,
-    return (ret.mean() / ret.std()) * np.sqrt(365),
+    
+    if not equity: return -999,
+    returns = pd.Series(equity).pct_change().dropna()
+    if len(returns) < 2 or returns.std() == 0: return -999,
+    
+    return (returns.mean() / returns.std()) * np.sqrt(365),
 
-def run_ga(df):
+def optimize(df):
     creator.create("FitnessMax", base.Fitness, weights=(1.0,))
     creator.create("Individual", list, fitness=creator.FitnessMax)
     
     toolbox = base.Toolbox()
-    # Level: Deviation from linear trend
-    toolbox.register("attr_lvl", random.uniform, -20000, 20000)
-    toolbox.register("attr_sl", random.uniform, 0.01, 0.15)
-    toolbox.register("attr_tp", random.uniform, 0.01, 0.30)
+    toolbox.register("attr_lvl", random.uniform, GENE_LEVEL_MIN, GENE_LEVEL_MAX)
+    toolbox.register("attr_sl", random.uniform, GENE_SL_MIN, GENE_SL_MAX)
+    toolbox.register("attr_tp", random.uniform, GENE_TP_MIN, GENE_TP_MAX)
     
     def create_ind():
-        l = []
-        for _ in range(N_LEVELS):
-            l.extend([toolbox.attr_lvl(), toolbox.attr_sl(), toolbox.attr_tp()])
-        return l
-
-    toolbox.register("ind", tools.initIterate, creator.Individual, create_ind)
-    toolbox.register("pop", tools.initRepeat, list, toolbox.ind)
-    toolbox.register("eval", backtest, data=df)
-    toolbox.register("mate", tools.cxTwoPoint)
-    toolbox.register("mut", tools.mutGaussian, mu=0, sigma=1000, indpb=0.1)
-    toolbox.register("sel", tools.selTournament, tournsize=3)
+        ind = []
+        for _ in range(N_REVERSAL_LEVELS):
+            ind.extend([toolbox.attr_lvl(), toolbox.attr_sl(), toolbox.attr_tp()])
+        return ind
     
-    pop = toolbox.pop(n=50)
-    algorithms.eaSimple(pop, toolbox, cxpb=0.5, mutpb=0.2, ngen=15, verbose=False)
+    toolbox.register("individual", tools.initIterate, creator.Individual, create_ind)
+    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+    toolbox.register("evaluate", backtest_strategy, data=df)
+    toolbox.register("mate", tools.cxTwoPoint)
+    toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=500, indpb=0.1)
+    toolbox.register("select", tools.selTournament, tournsize=3)
+    
+    pop = toolbox.population(n=GA_POP_SIZE)
+    algorithms.eaSimple(pop, toolbox, cxpb=GA_CXPB, mutpb=GA_MUTPB, ngen=GA_NGEN, verbose=False)
     
     return tools.selBest(pop, 1)[0]
 
-# 6 & 7. Plot and Test Unseen
-def serve_plot(df, best):
-    plt.figure(figsize=(15, 10))
+# --- SERVE ---
+def generate_plot(df, best_genes):
+    plt.figure(figsize=(16, 9))
     
-    # Main Plot: Detrended Prices + Levels
+    # Train
     ax1 = plt.subplot(2, 1, 1)
-    ax1.plot(df.index, df['close_dt'], label='Detrended Close', lw=0.8, color='black')
+    train_data = df.loc[:TRAIN_END_DATE]
+    ax1.plot(train_data.index, train_data['detrended'], label='Detrended (Train)', color='black', lw=0.8)
     
-    # Plot Levels
-    cols = ['r', 'g', 'b']
-    for i in range(N_LEVELS):
-        lvl = best[i*3]
-        ax1.axhline(lvl, color=cols[i%3], ls='--', label=f'Lvl {i}: {lvl:.0f}')
-        
-    ax1.set_title('Detrended Price vs Linear Fit (Training Data)')
+    colors = ['r', 'g', 'b', 'orange', 'purple']
+    for i in range(N_REVERSAL_LEVELS):
+        lvl = best_genes[i*3]
+        ax1.axhline(lvl, color=colors[i%len(colors)], ls='--', label=f'Lvl {i+1}: {lvl:.2f}')
+    ax1.set_title(f'Train (2018-2025): Detrended Price')
     ax1.legend()
+    ax1.grid(True, alpha=0.3)
     
-    # Test Data Zoom (2026+)
+    # Test
     ax2 = plt.subplot(2, 1, 2)
-    test = df.loc['2026-01-01':]
+    test_data = df.loc[TEST_START_DATE:]
     
-    if not test.empty:
-        ax2.plot(test.index, test['close_dt'], label='2026 Unseen', lw=1.5, color='blue')
-        for i in range(N_LEVELS):
-            lvl = best[i*3]
-            ax2.axhline(lvl, color=cols[i%3], ls='--', alpha=0.6)
-        ax2.set_title(f'Performance on Unseen Data (Jan 2026 - Present) | Days: {len(test)}')
+    if not test_data.empty:
+        ax2.plot(test_data.index, test_data['detrended'], label='Detrended (Test)', color='blue')
+        for i in range(N_REVERSAL_LEVELS):
+            lvl = best_genes[i*3]
+            ax2.axhline(lvl, color=colors[i%len(colors)], ls='--', alpha=0.7)
+        ax2.set_title(f'Test (2026): Unseen Data | n={len(test_data)}')
+        ax2.grid(True, alpha=0.3)
     else:
-        ax2.text(0.5, 0.5, 'No 2026 Data', ha='center')
-
+        ax2.text(0.5, 0.5, 'No Test Data', ha='center')
+        
     plt.tight_layout()
     buf = io.BytesIO()
     plt.savefig(buf, format='png')
     buf.seek(0)
-    
-    # Simple Server
-    class H(http.server.SimpleHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header('Content-type','image/png')
-            self.end_headers()
-            self.wfile.write(buf.getvalue())
-            
-    print("Serving on 8080...")
-    try:
-        http.server.HTTPServer(("", 8080), H).serve_forever()
-    except KeyboardInterrupt:
-        pass
+    plt.close()
+    return buf
+
+class PlotHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'image/png')
+        self.end_headers()
+        self.wfile.write(plot_buffer.getvalue())
 
 if __name__ == "__main__":
-    df = fetch_data()
-    if not df.empty:
-        df = process_data(df)
-        print("Optimizing...")
-        best = run_ga(df)
-        print(f"Best: {best}")
-        serve_plot(df, best)
+    df = fetch_ohlc()
+    if df.empty: exit()
+    
+    try:
+        df = apply_indicators(df)
+    except ValueError as e:
+        print(f"Error: {e}")
+        exit()
+        
+    print("Running GA...")
+    best_ind = optimize(df)
+    print(f"Best: {best_ind}")
+    
+    plot_buffer = generate_plot(df, best_ind)
+    print(f"Serving 8080...")
+    
+    with socketserver.TCPServer(("", SERVER_PORT), PlotHandler) as httpd:
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
