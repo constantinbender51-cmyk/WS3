@@ -70,32 +70,40 @@ def process_data(df):
     x_full = np.arange(len(df))
     trend_line = slope * x_full + intercept
     
-    # 2. Detrend (Deduce)
+    # 2. Detrend
     df_detrended = df[["open", "high", "low", "close"]].subtract(trend_line, axis=0)
     df_detrended["open_time"] = df["open_time"]
     
-    # 3. Fit Wave to Detrended Data (Fixed Lambda 1460)
-    # y = A * sin(2*pi/1460 * x + phi) + C
+    # 3. Fit Square Wave (Fixed Lambda 1460)
+    # Strategy: Fit sine to find phase, then fit amplitude to binary square wave
     fixed_period = 1460
     omega = 2 * np.pi / fixed_period
-    
-    def sine_wave(x, A, phi, C):
-        return A * np.sin(omega * x + phi) + C
-
     y_detrended = df_detrended["close"].values
     
-    # Initial guess: Amplitude=std_dev, phase=0, offset=mean
+    def sine_func(x, A, phi, C):
+        return A * np.sin(omega * x + phi) + C
+    
     p0 = [np.std(y_detrended), 0, np.mean(y_detrended)]
     
     try:
-        params_wave, _ = curve_fit(sine_wave, x_full, y_detrended, p0=p0)
-        A, phi, C = params_wave
-        fitted_wave = sine_wave(x_full, A, phi, C)
-        wave_str = f"Wave Fit: A={A:.2f}, φ={phi:.2f}, C={C:.2f}"
+        # A. Get Phase from Sine Fit
+        popt, _ = curve_fit(sine_func, x_full, y_detrended, p0=p0)
+        phi_opt = popt[1]
+        
+        # B. Create Square Basis (-1, 1) using optimized phase
+        sq_basis = np.sign(np.sin(omega * x_full + phi_opt))
+        
+        # C. Linear Regression to find best Amplitude & Offset for the square wave
+        # y = A_sq * sq_basis + C_sq
+        A_sq, C_sq = np.polyfit(sq_basis, y_detrended, 1)
+        
+        fitted_wave = A_sq * sq_basis + C_sq
+        wave_str = f"Square Fit: A={A_sq:.2f}, φ={phi_opt:.2f}"
+        
     except Exception as e:
         print(f"Fitting error: {e}")
         fitted_wave = np.zeros_like(x_full)
-        wave_str = "Wave Fit Failed"
+        wave_str = "Fit Failed"
 
     return df, trend_line, df_detrended, (slope, intercept), fitted_wave, wave_str
 
@@ -125,7 +133,7 @@ class PlotHandler(BaseHTTPRequestHandler):
             # Lower Plot
             ax2.set_title(f"Deduced OHLC & {wave_str} (λ=1460)")
             ax2.plot(df_detrended["open_time"], df_detrended["close"], label="Detrended Close", linewidth=1, color='green', alpha=0.6)
-            ax2.plot(df_detrended["open_time"], fitted_wave, label="Fitted Wave (λ=1460)", color='magenta', linewidth=2)
+            ax2.plot(df_detrended["open_time"], fitted_wave, label="Fitted Square Wave", color='magenta', linewidth=2)
             ax2.axhline(0, color='black', linewidth=0.5)
             ax2.legend()
             ax2.grid(True, alpha=0.3)
