@@ -20,9 +20,10 @@ TRAIN_SPLIT = 0.7
 PORT = 8080
 
 # Optimization Parameters
-GA_POPULATION = 300
+GA_POPULATION = 30l
 GA_GENERATIONS = 5
 GA_MUTATION_RATE = 0.1
+NUM_LINES = 1  # Number of optimized price levels
 
 # Trading Parameters
 FEE = 0.0002
@@ -181,6 +182,7 @@ def backtest(levels, df, record_history=False):
     if std_dev == 0:
         sharpe = -10.0
     else:
+        # Annualized Sharpe (Hours -> sqrt(24*365))
         sharpe = (np.mean(returns) / std_dev) * 93.6
 
     if record_history:
@@ -199,7 +201,8 @@ class GeneticAlgorithm:
         min_dt = df['detrended'].min()
         max_dt = df['detrended'].max()
         for _ in range(population_size):
-            individual = np.random.uniform(min_dt, max_dt, 100)
+            # Dynamic NUM_LINES
+            individual = np.random.uniform(min_dt, max_dt, NUM_LINES)
             self.population.append(individual)
 
     def optimize(self):
@@ -223,11 +226,13 @@ class GeneticAlgorithm:
                 p3, p4 = random.sample(list(zip(self.population, scores)), 2)
                 parent2 = p3[0] if p3[1] > p4[1] else p4[0]
                 
-                cut = random.randint(1, 99)
+                # Dynamic Crossover Cut
+                cut = random.randint(1, NUM_LINES - 1)
                 child = np.concatenate((parent1[:cut], parent2[cut:]))
                 
                 if random.random() < self.mutation_rate:
-                    idx = random.randint(0, 99)
+                    # Dynamic Mutation Index
+                    idx = random.randint(0, NUM_LINES - 1)
                     child[idx] = random.uniform(self.df['detrended'].min(), self.df['detrended'].max())
                 
                 next_pop.append(child)
@@ -265,6 +270,7 @@ def plot_chart():
     
     if levels is not None:
         for i, lvl in enumerate(levels):
+            # Downsample grid lines for visualization
             if i % 5 == 0: 
                 ax1.plot(dates, trend + lvl, color='green', alpha=0.15, linewidth=0.5)
     
@@ -306,7 +312,7 @@ def main_pipeline():
         df=train_df
     )
     
-    print(f"Starting Optimization (Target: Sharpe, {GA_GENERATIONS} Gens)...")
+    print(f"Starting Optimization (Target: Sharpe, {GA_GENERATIONS} Gens, {NUM_LINES} Lines)...")
     best_levels = ga.optimize()
     
     print("Generating full history...")
