@@ -58,6 +58,10 @@ def process_data(df):
     slope, intercept = np.polyfit(x, y, 1)
     trend_line = slope * x + intercept
     
+    # 730 SMA and Shift -730
+    df["sma_730"] = df["close"].rolling(window=730).mean()
+    df["sma_730_shifted"] = df["sma_730"].shift(-730)
+
     df_detrended = df[["open", "high", "low", "close"]].subtract(trend_line, axis=0)
     df_detrended["open_time"] = df["open_time"]
     
@@ -80,6 +84,10 @@ class PlotHandler(BaseHTTPRequestHandler):
             ax1.set_title(f"ETH/USDT (2018-Present) | Fit: y = {params[0]:.4f}x + {params[1]:.2f}")
             ax1.plot(df["open_time"], df["close"], label="Close Price", linewidth=1, color='blue')
             ax1.plot(df["open_time"], trend, label="Linear Trend", color='red', linestyle="--")
+            
+            # Plot SMA
+            ax1.plot(df["open_time"], df["sma_730_shifted"], label="730 SMA (Shift -730)", color='orange', linewidth=1.5)
+
             ax1.legend()
             ax1.grid(True, alpha=0.3)
             ax1.set_ylabel("Price (USDT)")
