@@ -1,581 +1,349 @@
 import ccxt
 import pandas as pd
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from scipy.optimize import curve_fit
-from deap import base, creator, tools, algorithms
-import random
-import http.server
-import socketserver
-import io
-import time
-import warnings
+from sklearn.linear_model import LinearRegression
+from flask import Flask, jsonify, send_file
 import threading
-import datetime
-import sys
-from collections import deque
+import time
+import io
+import random
 
-warnings.filterwarnings("ignore")
-
-# --- CONFIGURATION ---
-SYMBOL = 'BTC/USDT'
-TIMEFRAME = '1d'
+# Configuration
+SYMBOL = 'ETH/USDT'
+TIMEFRAME = '1h'
 START_YEAR = 2018
-SMA_PERIOD = 1460
-SMA_OFFSET = -1460     
-GA_POP_SIZE = 300
-GA_NGEN = 40
-GA_CXPB = 0.5
-GA_MUTPB = 0.2
-N_REVERSAL_LEVELS = 50
-INITIAL_BALANCE = 10000
-SERVER_PORT = 8080
+SMA_WINDOW_HOURS = 1460 * 24  # 35,040 hours
+TRAIN_SPLIT = 0.7
+PORT = 8080
 
-# GENE RANGES
-GENE_LEVEL_MIN = -40000
-GENE_LEVEL_MAX = 40000
-GENE_SL_MIN = 0.01
-GENE_SL_MAX = 0.05
-GENE_TP_MIN = 0.01
-GENE_TP_MAX = 0.1
+# Trading Parameters
+FEE = 0.0002
+SL_PCT = 0.01
+TP_PCT = 0.02
+BAND_PCT = 0.005
 
-# DATES
-TRAIN_END_DATE = '2025-12-31'
-TEST_START_DATE = '2026-01-01'
-
-# GLOBAL STORAGE
-FINAL_GENES = [] # Populated after optimization
-live_state = {
-    'price': 0.0,
-    'detrended': 0.0,
-    'balance': INITIAL_BALANCE,
-    'position': 0,
-    'last_update': 'Waiting...',
-    'logs': deque(maxlen=20),
-    'history': [] # Stores {'ts': datetime, 'detrended': float, 'price': float}
-}
-state_lock = threading.Lock()
-
-# --- FETCH ---
-def fetch_ohlc():
-    exchange = ccxt.binance()
+# ---------------------------------------------------------
+# 1. Fetch
+# ---------------------------------------------------------
+def fetch_data():
+    exchange = ccxt.binance({'enableRateLimit': True})
     since = exchange.parse8601(f'{START_YEAR}-01-01T00:00:00Z')
     all_candles = []
-    limit = 1000 
     
-    print(f"Fetching {SYMBOL} data from {START_YEAR}...")
+    print(f"Fetching {SYMBOL} from {START_YEAR}...")
     while True:
         try:
-            candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since, limit=limit)
+            candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since=since, limit=1000)
             if not candles:
                 break
-            all_candles += candles
             since = candles[-1][0] + 1
-            time.sleep(exchange.rateLimit / 1000)
-            
-            if len(candles) < limit:
+            all_candles += candles
+            # Break if reached current time (handled by fetch_ohlcv returning empty or near current)
+            if len(candles) < 1000:
                 break
         except Exception as e:
             print(f"Fetch error: {e}")
-            break
+            time.sleep(5)
+            continue
             
     df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
     df = df[~df.index.duplicated(keep='first')]
-    print(f"Total Rows Fetched: {len(df)}")
-    return df
+    return df.astype(float)
 
-# --- PROCESS ---
-def apply_indicators(df):
-    df['sma'] = df['close'].rolling(window=SMA_PERIOD).mean()
-    df['sma_shifted'] = df['sma'].shift(SMA_OFFSET)
+# ---------------------------------------------------------
+# 2. Detrend
+# ---------------------------------------------------------
+def apply_trend_logic(df):
+    # Split Data
+    n = len(df)
+    train_idx = int(n * TRAIN_SPLIT)
+    train_df = df.iloc[:train_idx].copy()
     
-    fit_df = df.dropna(subset=['sma_shifted'])
+    # Calculate SMA on Train
+    # Note: We need sufficient data. 35040 hours is ~4 years. 
+    # If train set < 4 years, this will result in NaNs.
+    train_df['sma'] = train_df['close'].rolling(window=SMA_WINDOW_HOURS).mean()
     
-    if fit_df.empty:
-        raise ValueError(f"Insufficient data. Total Rows: {len(df)}.")
+    # Shift SMA: Value at t becomes value at t - SMA_WINDOW
+    # This aligns the "future" average to the current point for training
+    train_df['sma_shifted'] = train_df['sma'].shift(-SMA_WINDOW_HOURS)
+    
+    # Linear Regression on valid Shifted SMA data
+    valid_train = train_df.dropna(subset=['sma_shifted'])
+    
+    if valid_train.empty:
+        raise ValueError("Insufficient training data to form one complete SMA window.")
 
-    fit_df['ordinal'] = fit_df.index.map(pd.Timestamp.toordinal)
+    X = np.arange(len(valid_train)).reshape(-1, 1)
+    y = valid_train['sma_shifted'].values
     
-    def linear_func(x, m, c):
-        return m * x + c
+    reg = LinearRegression().fit(X, y)
+    slope = reg.coef_[0]
+    intercept = reg.intercept_
     
-    popt, _ = curve_fit(linear_func, fit_df['ordinal'], fit_df['sma_shifted'])
-    m, c = popt
+    # Project Trend Line over ENTIRE dataset (Train + Test)
+    # X_full needs to align with the indices 0 to len(df)
+    X_full = np.arange(len(df)).reshape(-1, 1)
+    trend_values = reg.predict(X_full)
     
-    df['ordinal'] = df.index.map(pd.Timestamp.toordinal)
-    df['trend_line'] = linear_func(df['ordinal'], m, c)
-    df['detrended'] = df['close'] - df['trend_line']
+    df['trend'] = trend_values
+    df['detrended'] = df['close'] - df['trend']
     
-    return df, m, c
+    return df, slope, intercept
 
-# --- STRATEGY ENGINE ---
-def run_strategy_logic(individual, data, record_trades=False):
-    balance = INITIAL_BALANCE
-    equity = []
-    position = 0 
+# ---------------------------------------------------------
+# 3. Optimize (Genetic Algorithm)
+# ---------------------------------------------------------
+def backtest(levels, df):
+    # levels: np array of 100 detrended price levels
+    # Logic: 
+    # 1. Identify active line (nearest).
+    # 2. Band check (0.5% of RAW price).
+    # 3. Position logic.
+    
+    closes = df['close'].values
+    trends = df['trend'].values
+    
+    balance = 1000.0
+    position = 0 # 0: Flat, 1: Long, -1: Short
     entry_price = 0.0
-    active_sl = 0.0
-    active_tp = 0.0
+    active_line_val = None 
     
-    trades = {'entry_dt': [], 'entry_price': [], 'exit_dt': [], 'exit_price': [], 'type': []}
+    # Vectorized approaches are hard with state-dependent "active line". Using Numba or loop.
+    # Using loop for correctness of logic specified.
     
-    levels = []
-    for i in range(0, len(individual), 3):
-        levels.append({'thresh': individual[i], 'sl': individual[i+1], 'tp': individual[i+2]})
+    equity_curve = []
     
-    detrended = data['detrended'].values
-    closes = data['close'].values
-    timestamps = data.index
-    
-    for i in range(1, len(data)):
-        curr_dt = detrended[i]
-        prev_dt = detrended[i-1]
+    for i in range(len(closes)):
         price = closes[i]
-        ts = timestamps[i]
+        trend = trends[i]
         
-        # Check Exit
-        if position != 0:
-            pnl_pct = (price - entry_price) / entry_price if position == 1 else (entry_price - price) / entry_price
-            if pnl_pct <= -active_sl or pnl_pct >= active_tp:
-                balance *= (1 + pnl_pct)
-                if record_trades:
-                    trades['exit_dt'].append(ts)
-                    trades['exit_price'].append(curr_dt)
-                position = 0
+        # Determine specific line levels in Raw Price terms
+        # raw_levels = levels + trend
+        # But we only need the nearest one if we are "entering a zone"
         
-        # Check Entry
-        if position == 0:
-            for lvl in levels:
-                threshold = lvl['thresh']
-                # Cross UP -> Short
-                if prev_dt < threshold and curr_dt >= threshold:
-                    position = -1
-                    entry_price = price
-                    active_sl = lvl['sl']
-                    active_tp = lvl['tp']
-                    if record_trades:
-                        trades['entry_dt'].append(ts)
-                        trades['entry_price'].append(curr_dt)
-                        trades['type'].append('short')
-                    break
-                # Cross DOWN -> Long
-                elif prev_dt > threshold and curr_dt <= threshold:
-                    position = 1
-                    entry_price = price
-                    active_sl = lvl['sl']
-                    active_tp = lvl['tp']
-                    if record_trades:
-                        trades['entry_dt'].append(ts)
-                        trades['entry_price'].append(curr_dt)
-                        trades['type'].append('long')
-                    break
-                    
-        equity.append(balance)
-    
-    return equity, trades
-
-def backtest_strategy(individual, data):
-    train_data = data.loc[:TRAIN_END_DATE]
-    if train_data.empty: return -999,
-    
-    equity, _ = run_strategy_logic(individual, train_data, record_trades=False)
-    
-    if not equity: return -999,
-    returns = pd.Series(equity).pct_change().dropna()
-    if len(returns) < 2 or returns.std() == 0: return -999,
-    
-    sharpe = (returns.mean() / returns.std()) * np.sqrt(365)
-    return sharpe,
-
-def optimize(df):
-    creator.create("FitnessMax", base.Fitness, weights=(1.0,))
-    creator.create("Individual", list, fitness=creator.FitnessMax)
-    
-    toolbox = base.Toolbox()
-    toolbox.register("attr_lvl", random.uniform, GENE_LEVEL_MIN, GENE_LEVEL_MAX)
-    toolbox.register("attr_sl", random.uniform, GENE_SL_MIN, GENE_SL_MAX)
-    toolbox.register("attr_tp", random.uniform, GENE_TP_MIN, GENE_TP_MAX)
-    
-    def create_ind():
-        ind = []
-        for _ in range(N_REVERSAL_LEVELS):
-            ind.extend([toolbox.attr_lvl(), toolbox.attr_sl(), toolbox.attr_tp()])
-        return ind
-    
-    def custom_mutate(individual, indpb):
-        for i in range(len(individual)):
-            if random.random() < indpb:
-                if i % 3 == 0: # Level Gene
-                    sigma = 500
-                else: # SL or TP Gene
-                    sigma = 0.02 
-                individual[i] += random.gauss(0, sigma)
-        return individual,
-
-    def checkBounds(min_lvl, max_lvl, min_sl, max_sl, min_tp, max_tp):
-        def decorator(func):
-            def wrapper(*args, **kargs):
-                offspring = func(*args, **kargs)
-                for child in offspring:
-                    for i in range(len(child)):
-                        if i % 3 == 0: # Level
-                            if child[i] > max_lvl: child[i] = max_lvl
-                            elif child[i] < min_lvl: child[i] = min_lvl
-                        elif i % 3 == 1: # SL
-                            if child[i] > max_sl: child[i] = max_sl
-                            elif child[i] < min_sl: child[i] = min_sl
-                        elif i % 3 == 2: # TP
-                            if child[i] > max_tp: child[i] = max_tp
-                            elif child[i] < min_tp: child[i] = min_tp
-                return offspring
-            return wrapper
-        return decorator
-    
-    toolbox.register("individual", tools.initIterate, creator.Individual, create_ind)
-    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
-    toolbox.register("evaluate", backtest_strategy, data=df)
-    toolbox.register("mate", tools.cxTwoPoint)
-    toolbox.register("mutate", custom_mutate, indpb=0.1)
-    toolbox.register("select", tools.selTournament, tournsize=3)
-    
-    toolbox.decorate("mate", checkBounds(GENE_LEVEL_MIN, GENE_LEVEL_MAX, GENE_SL_MIN, GENE_SL_MAX, GENE_TP_MIN, GENE_TP_MAX))
-    toolbox.decorate("mutate", checkBounds(GENE_LEVEL_MIN, GENE_LEVEL_MAX, GENE_SL_MIN, GENE_SL_MAX, GENE_TP_MIN, GENE_TP_MAX))
-    
-    pop = toolbox.population(n=GA_POP_SIZE)
-    algorithms.eaSimple(pop, toolbox, cxpb=GA_CXPB, mutpb=GA_MUTPB, ngen=GA_NGEN, verbose=False)
-    
-    return tools.selBest(pop, 1)[0]
-
-# --- PLOTTING HELPERS ---
-def plot_strategy_performance(ax, data, best_genes, title):
-    equity_curve, trades = run_strategy_logic(best_genes, data, record_trades=True)
-    
-    ax.plot(data.index, data['detrended'], label='Detrended Price', color='grey', lw=0.8, alpha=0.8)
-    
-    colors = ['r', 'g', 'b', 'orange', 'purple']
-    for i in range(N_REVERSAL_LEVELS):
-        lvl = best_genes[i*3]
-        ax.axhline(lvl, color=colors[i%len(colors)], ls='--', alpha=0.5)
-    
-    long_entries = [(t, p) for t, p, type_ in zip(trades['entry_dt'], trades['entry_price'], trades['type']) if type_ == 'long']
-    short_entries = [(t, p) for t, p, type_ in zip(trades['entry_dt'], trades['entry_price'], trades['type']) if type_ == 'short']
-    
-    if long_entries:
-        lx, ly = zip(*long_entries)
-        ax.scatter(lx, ly, marker='^', color='green', s=60, label='Long', zorder=5)
-    if short_entries:
-        sx, sy = zip(*short_entries)
-        ax.scatter(sx, sy, marker='v', color='red', s=60, label='Short', zorder=5)
-    if trades['exit_dt']:
-        ax.scatter(trades['exit_dt'], trades['exit_price'], marker='x', color='black', s=40, label='Exit', zorder=5)
-
-    ax.set_title(title)
-    ax.set_ylabel('Detrended Price ($)')
-    ax.legend(loc='upper left')
-    ax.grid(True, alpha=0.3)
-    
-    ax_pnl = ax.twinx()
-    if len(equity_curve) > 0:
-        align_len = min(len(equity_curve), len(data))
-        plot_idx = data.index[-align_len:]
-        plot_eq = equity_curve[-align_len:]
+        # If we don't have an active line, find the nearest one
+        raw_levels = levels + trend
         
-        ax_pnl.plot(plot_idx, plot_eq, color='blue', lw=1.5, alpha=0.6, label='Equity')
-        ax_pnl.set_ylabel('Equity ($)', color='blue')
-        ax_pnl.tick_params(axis='y', labelcolor='blue')
-
-def generate_backtest_plot(df, best_genes):
-    plt.figure(figsize=(16, 14))
-    
-    ax1 = plt.subplot(3, 1, 1)
-    train_data = df.loc[:TRAIN_END_DATE]
-    if not train_data.empty:
-        plot_strategy_performance(ax1, train_data, best_genes, f'Training Phase (2018-2025): Trades & PnL')
-    
-    ax2 = plt.subplot(3, 1, 2)
-    test_data = df.loc[TEST_START_DATE:]
-    if not test_data.empty:
-        plot_strategy_performance(ax2, test_data, best_genes, f'Test Phase (2026): Unseen Data Performance')
-    else:
-        ax2.text(0.5, 0.5, 'No Test Data', ha='center')
-
-    ax3 = plt.subplot(3, 1, 3)
-    ax3.axis('tight')
-    ax3.axis('off')
-    
-    table_data = []
-    col_labels = ['Level', 'Threshold', 'Stop Loss', 'Take Profit']
-    
-    for i in range(0, len(best_genes), 3):
-        idx = (i//3) + 1
-        thresh = best_genes[i]
-        sl = best_genes[i+1] * 100
-        tp = best_genes[i+2] * 100
-        table_data.append([f"Lvl {idx}", f"{thresh:.2f}", f"{sl:.2f}%", f"{tp:.2f}%"])
+        # Find distance to all lines
+        dists = np.abs(raw_levels - price)
+        nearest_idx = np.argmin(dists)
+        nearest_line = raw_levels[nearest_idx]
         
-    table = ax3.table(cellText=table_data, colLabels=col_labels, loc='center', cellLoc='center')
-    table.scale(1, 1.5)
-    table.set_fontsize(12)
-    ax3.set_title("Strategy Parameters", pad=10)
+        # Band calculation: 0.5% of Raw Price
+        band = price * BAND_PCT
         
-    plt.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png')
-    buf.seek(0)
-    plt.close()
-    return buf
-
-def generate_live_plot():
-    # Use global state
-    with state_lock:
-        history = list(live_state['history'])
+        in_band = dists[nearest_idx] < band
         
-    plt.figure(figsize=(12, 6))
-    
-    if not history:
-        plt.text(0.5, 0.5, "Waiting for data...", ha='center')
-    else:
-        times = [x['ts'] for x in history]
-        vals = [x['detrended'] for x in history]
+        # Update active line if we enter a band
+        if in_band:
+            active_line_val = nearest_line
         
-        plt.plot(times, vals, color='cyan', lw=1.5, label='Live Detrended')
-        plt.scatter(times[-1], vals[-1], color='white', edgecolor='cyan', zorder=5)
-        
-        # Plot Levels
-        if FINAL_GENES:
-            colors = ['r', 'g', 'b', 'orange', 'purple']
-            for i in range(N_REVERSAL_LEVELS):
-                lvl = FINAL_GENES[i*3]
-                # Only plot levels visible within the range of current price to avoid scale compression
-                # But for now, let's just plot all, or maybe filter? 
-                # Let's plot all for context
-                plt.axhline(lvl, color=colors[i%len(colors)], ls=':', alpha=0.3)
-
-        # Formatting dates
-        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-        plt.title(f"Live Execution: {SYMBOL}")
-        plt.ylabel("Detrended Price")
-        plt.xlabel("Time (UTC)")
-        plt.grid(True, alpha=0.2, color='#444')
-        plt.legend()
-        
-        # Dark Theme for Live Plot
-        ax = plt.gca()
-        ax.set_facecolor('#1e1e1e')
-        plt.gcf().patch.set_facecolor('#1e1e1e')
-        ax.tick_params(colors='#d4d4d4')
-        ax.yaxis.label.set_color('#d4d4d4')
-        ax.xaxis.label.set_color('#d4d4d4')
-        ax.title.set_color('#d4d4d4')
-        
-    plt.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', facecolor='#1e1e1e')
-    buf.seek(0)
-    plt.close()
-    return buf
-
-# --- LIVE TRADING ---
-def log_message(msg):
-    ts = datetime.datetime.now().strftime('%H:%M:%S')
-    full_msg = f"[{ts}] {msg}"
-    print(full_msg)
-    with state_lock:
-        live_state['logs'].append(full_msg)
-
-def live_trading_loop(best_genes, m, c):
-    log_message("--- INITIALIZING LIVE TRADING ENGINE ---")
-    exchange = ccxt.binance()
-    balance = INITIAL_BALANCE
-    position = 0
-    entry_price = 0.0
-    active_sl = 0.0
-    active_tp = 0.0
-    
-    levels = []
-    for i in range(0, len(best_genes), 3):
-        levels.append({'thresh': best_genes[i], 'sl': best_genes[i+1], 'tp': best_genes[i+2]})
-
-    log_message("Pre-fetching initial state...")
-    try:
-        init_candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=2)
-        if len(init_candles) >= 2:
-            prev_candle = init_candles[-2]
-            prev_ts = pd.to_datetime(prev_candle[0], unit='ms')
-            prev_ord = prev_ts.toordinal()
-            prev_detrended = prev_candle[4] - (m * prev_ord + c)
-            log_message(f"State initialized. Prev Detrended: {prev_detrended:.2f}")
-        else:
-            prev_detrended = 0
-            log_message("Warning: Insufficient history for initialization.")
-    except Exception as e:
-        log_message(f"Init Error: {e}")
-        prev_detrended = 0
-
-    while True:
-        try:
-            now = datetime.datetime.now()
-            next_minute = (now + datetime.timedelta(minutes=1)).replace(second=2, microsecond=0)
-            sleep_sec = (next_minute - now).total_seconds()
-            if sleep_sec < 0: sleep_sec += 60
-            
-            time.sleep(sleep_sec)
-            
-            candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=1)
-            if not candles:
-                continue
-                
-            candle = candles[0]
-            ts = pd.to_datetime(candle[0], unit='ms')
-            price = candle[4]
-            ordinal = ts.toordinal()
-            
-            trend = m * ordinal + c
-            curr_detrended = price - trend
-            
-            # Update Global State
-            with state_lock:
-                live_state['price'] = price
-                live_state['detrended'] = curr_detrended
-                live_state['balance'] = balance
-                live_state['position'] = position
-                live_state['last_update'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                # Append to history for plotting
-                live_state['history'].append({
-                    'ts': datetime.datetime.now(), 
-                    'detrended': curr_detrended, 
-                    'price': price
-                })
-
-            log_message(f"Price: {price:.2f} | Detrended: {curr_detrended:.2f} | Bal: {balance:.2f} | Pos: {position}")
-            
-            # Logic
+        # Trading Logic
+        if in_band:
+            # Close position if open
             if position != 0:
-                pnl_pct = (price - entry_price) / entry_price if position == 1 else (entry_price - price) / entry_price
-                if pnl_pct <= -active_sl or pnl_pct >= active_tp:
-                    balance *= (1 + pnl_pct)
-                    log_message(f">>> EXIT {'LONG' if position==1 else 'SHORT'}: PnL {pnl_pct*100:.2f}% | New Balance: {balance:.2f}")
-                    position = 0
-            
-            if position == 0:
-                for lvl in levels:
-                    threshold = lvl['thresh']
-                    if prev_detrended < threshold and curr_detrended >= threshold:
-                        position = -1
-                        entry_price = price
-                        active_sl = lvl['sl']
-                        active_tp = lvl['tp']
-                        log_message(f">>> ENTRY SHORT @ {price:.2f} (Thresh: {threshold:.2f})")
-                        break
-                    elif prev_detrended > threshold and curr_detrended <= threshold:
+                # Close logic
+                pnl = (price - entry_price) / entry_price * position - FEE
+                balance *= (1 + pnl)
+                position = 0
+        else:
+            # Outside band
+            if active_line_val is not None:
+                # We have a reference line
+                # Recalculate band relative to the ACTIVE line? 
+                # Prompt: "If a zone is entered we use that line to determine the position relative to that"
+                # "0.5% from the raw price... plot those"
+                # Assuming the band is around the line. 
+                
+                upper_bound = active_line_val + (active_line_val * BAND_PCT)
+                lower_bound = active_line_val - (active_line_val * BAND_PCT)
+                
+                # Check Signals
+                if position == 0:
+                    if price > upper_bound:
                         position = 1
                         entry_price = price
-                        active_sl = lvl['sl']
-                        active_tp = lvl['tp']
-                        log_message(f">>> ENTRY LONG @ {price:.2f} (Thresh: {threshold:.2f})")
-                        break
-            
-            prev_detrended = curr_detrended
-            
-        except Exception as e:
-            log_message(f"Live Loop Error: {e}")
-            time.sleep(5)
+                        balance *= (1 - FEE) # Entry fee
+                    elif price < lower_bound:
+                        position = -1
+                        entry_price = price
+                        balance *= (1 - FEE) # Entry fee
+                
+                # Check SL/TP if in position
+                elif position == 1:
+                    # Long
+                    pnl_pct = (price - entry_price) / entry_price
+                    if pnl_pct <= -SL_PCT or pnl_pct >= TP_PCT:
+                        balance *= (1 + pnl_pct - FEE)
+                        position = 0
+                elif position == -1:
+                    # Short
+                    pnl_pct = (entry_price - price) / entry_price
+                    if pnl_pct <= -SL_PCT or pnl_pct >= TP_PCT:
+                        balance *= (1 + pnl_pct - FEE)
+                        position = 0
 
-class DashboardHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/plot.png':
-            self.send_response(200)
-            self.send_header('Content-type', 'image/png')
-            self.end_headers()
-            self.wfile.write(backtest_plot_buffer.getvalue())
-        elif self.path == '/live_plot.png':
-            self.send_response(200)
-            self.send_header('Content-type', 'image/png')
-            self.end_headers()
-            self.wfile.write(generate_live_plot().getvalue())
-        else:
-            self.send_response(200)
-            self.send_header('Content-type', 'text/html')
-            self.end_headers()
-            
-            with state_lock:
-                current_price = live_state['price']
-                current_detrend = live_state['detrended']
-                current_bal = live_state['balance']
-                current_pos = "NEUTRAL"
-                if live_state['position'] == 1: current_pos = "LONG"
-                elif live_state['position'] == -1: current_pos = "SHORT"
-                last_up = live_state['last_update']
-                logs_html = "<br>".join(reversed(list(live_state['logs'])))
-            
-            html = f"""
-            <html>
-            <head>
-                <title>Trading Strategy Dashboard</title>
-                <style>
-                    body {{ font-family: monospace; background-color: #1e1e1e; color: #d4d4d4; padding: 20px; }}
-                    .stats {{ display: flex; gap: 20px; background: #252526; padding: 15px; border-radius: 5px; margin-bottom: 20px; }}
-                    .stat-box {{ border: 1px solid #3e3e42; padding: 10px; min-width: 150px; }}
-                    .label {{ color: #858585; font-size: 0.9em; }}
-                    .value {{ font-size: 1.2em; font-weight: bold; color: #4ec9b0; }}
-                    .log-box {{ background: #000; padding: 10px; height: 200px; overflow-y: scroll; border: 1px solid #333; font-size: 0.9em; color: #ce9178; }}
-                    img {{ max-width: 100%; border: 1px solid #333; margin-top: 20px; }}
-                    h3 {{ margin-top: 30px; border-bottom: 1px solid #333; padding-bottom: 5px; }}
-                </style>
-            </head>
-            <body>
-                <h2>Strategy Live Execution: {SYMBOL}</h2>
-                <div class="stats">
-                    <div class="stat-box"><div class="label">Last Update</div><div class="value">{last_up}</div></div>
-                    <div class="stat-box"><div class="label">Price</div><div class="value">${current_price:.2f}</div></div>
-                    <div class="stat-box"><div class="label">Detrended</div><div class="value">{current_detrend:.2f}</div></div>
-                    <div class="stat-box"><div class="label">Balance</div><div class="value">${current_bal:.2f}</div></div>
-                    <div class="stat-box"><div class="label">Position</div><div class="value">{current_pos}</div></div>
-                </div>
-                
-                <h3>Live Execution Plot</h3>
-                <img src="/live_plot.png" alt="Live Execution" style="width: 100%; height: auto; max-height: 400px;">
-                
-                <h3>Live Logs</h3>
-                <div class="log-box">
-                    {logs_html}
-                </div>
-                
-                <h3>Backtest & Parameters</h3>
-                <img src="/plot.png" alt="Backtest Performance">
-            </body>
-            </html>
-            """
-            self.wfile.write(html.encode())
+    return balance
 
-if __name__ == "__main__":
-    df = fetch_ohlc()
-    if df.empty: exit()
-    
-    try:
-        df, trend_m, trend_c = apply_indicators(df)
-    except ValueError as e:
-        print(f"Error: {e}")
-        exit()
+class GeneticAlgorithm:
+    def __init__(self, population_size, generations, mutation_rate, df):
+        self.pop_size = population_size
+        self.generations = generations
+        self.mutation_rate = mutation_rate
+        self.df = df
+        self.population = []
         
-    print("Running GA...")
-    FINAL_GENES = optimize(df)
+        # Initialize population: 100 levels between min and max detrended price
+        min_dt = df['detrended'].min()
+        max_dt = df['detrended'].max()
+        for _ in range(population_size):
+            # Random uniform initialization
+            individual = np.random.uniform(min_dt, max_dt, 100)
+            self.population.append(individual)
+
+    def optimize(self):
+        best_fitness = -np.inf
+        best_sol = None
+        
+        for gen in range(self.generations):
+            scores = []
+            for ind in self.population:
+                fitness = backtest(ind, self.df)
+                scores.append(fitness)
+                
+                if fitness > best_fitness:
+                    best_fitness = fitness
+                    best_sol = ind
+            
+            # Selection (Tournament)
+            next_pop = []
+            for _ in range(self.pop_size):
+                p1, p2 = random.sample(list(zip(self.population, scores)), 2)
+                parent1 = p1[0] if p1[1] > p2[1] else p2[0]
+                p3, p4 = random.sample(list(zip(self.population, scores)), 2)
+                parent2 = p3[0] if p3[1] > p4[1] else p4[0]
+                
+                # Crossover
+                cut = random.randint(1, 99)
+                child = np.concatenate((parent1[:cut], parent2[cut:]))
+                
+                # Mutation
+                if random.random() < self.mutation_rate:
+                    idx = random.randint(0, 99)
+                    # Mutate one level
+                    child[idx] = random.uniform(self.df['detrended'].min(), self.df['detrended'].max())
+                
+                next_pop.append(child)
+            
+            self.population = next_pop
+            print(f"Gen {gen+1}/{self.generations} | Best Balance: {best_fitness:.2f}")
+            
+        return best_sol
+
+# ---------------------------------------------------------
+# 4. Serve
+# ---------------------------------------------------------
+app = Flask(__name__)
+final_levels = None
+global_df = None
+
+@app.route('/api/status', methods=['GET'])
+def get_status():
+    if final_levels is None:
+        return jsonify({"status": "Optimizing or Loading..."})
     
-    print("Generating Backtest Plot...")
-    backtest_plot_buffer = generate_backtest_plot(df, FINAL_GENES)
+    # Convert numpy array to list
+    return jsonify({
+        "status": "Ready",
+        "optimized_levels_detrended": final_levels.tolist(),
+        "parameters": {
+            "fee": FEE,
+            "sl": SL_PCT,
+            "tp": TP_PCT,
+            "band": BAND_PCT,
+            "sma_shift": -SMA_WINDOW_HOURS
+        }
+    })
+
+@app.route('/plot.png')
+def plot_chart():
+    if global_df is None or final_levels is None:
+        return "Data not ready", 503
     
-    # Start Live Loop Thread
-    live_thread = threading.Thread(target=live_trading_loop, args=(FINAL_GENES, trend_m, trend_c), daemon=True)
-    live_thread.start()
+    # Plotting latest portion of data for visibility
+    plot_df = global_df.iloc[-500:].copy() # Last 500 hours
     
-    print(f"Serving dashboard at http://localhost:{SERVER_PORT} ... (Ctrl+C to stop)")
-    with socketserver.TCPServer(("", SERVER_PORT), DashboardHandler) as httpd:
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("\nShutting down...")
+    plt.figure(figsize=(15, 8))
+    plt.plot(plot_df.index, plot_df['close'], label='Price', color='black', alpha=0.5)
+    
+    # Plot Trend
+    plt.plot(plot_df.index, plot_df['trend'], label='Trend Line', color='blue', linestyle='--')
+    
+    # Plot Optimized Lines (Raw)
+    # Only plotting a subset or it becomes unreadable, but prompt implies visual
+    # calculating raw levels for the last timestamp to show distribution
+    trend_last = plot_df['trend'].iloc[-1]
+    
+    # We need to plot the lines as they move with the trend.
+    # It's expensive to plot 100 lines for every timestamp. 
+    # We will just plot 10 representative lines or the active ones if we tracked them.
+    # To strictly follow "API with lines that have been optimized", we plot the grid for the visible range.
+    
+    t_values = plot_df['trend'].values
+    time_values = plot_df.index
+    
+    # Plotting 100 lines is computationally heavy for matplotlib backend, 
+    # we will plot them as a collection or just a few for validation.
+    # Given instructions "Accuracy", we plot all.
+    
+    for lvl in final_levels:
+        line_data = t_values + lvl
+        plt.plot(time_values, line_data, color='green', alpha=0.1, linewidth=0.5)
+
+    plt.title(f"ETH/USDT Optimized (Last 500h) - Best Levels")
+    plt.legend()
+    
+    img = io.BytesIO()
+    plt.savefig(img, format='png')
+    img.seek(0)
+    plt.close()
+    return send_file(img, mimetype='image/png')
+
+def main_pipeline():
+    global global_df, final_levels
+    
+    # 1. Fetch
+    df = fetch_data()
+    
+    # 2. Detrend (Train/Test split logic handled inside or passed explicitly)
+    # The requirement: "On 70% of the data: ... line fitted". 
+    # We fit the line on 70%, but we calculate detrended values for the WHOLE dataset based on that fit.
+    df_processed, slope, intercept = apply_trend_logic(df)
+    
+    # Split for optimization
+    train_size = int(len(df_processed) * TRAIN_SPLIT)
+    train_df = df_processed.iloc[:train_size]
+    
+    print(f"Data Processed. Slope: {slope:.5f}, Intercept: {intercept:.2f}")
+    
+    # 3. Optimize
+    # Run GA on the TRAINING set
+    ga = GeneticAlgorithm(population_size=20, generations=10, mutation_rate=0.1, df=train_df)
+    print("Starting Optimization...")
+    best_levels = ga.optimize()
+    final_levels = best_levels
+    global_df = df_processed
+    
+    print("Optimization Complete.")
+    
+if __name__ == "__main__":
+    # Run pipeline in separate thread to allow server to start
+    t = threading.Thread(target=main_pipeline)
+    t.start()
+    
+    # 4. Serve
+    app.run(host='0.0.0.0', port=PORT)
