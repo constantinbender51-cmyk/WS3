@@ -23,7 +23,7 @@ PORT = 8080
 GA_POPULATION = 300
 GA_GENERATIONS = 5
 GA_MUTATION_RATE = 0.1
-NUM_LINES = 2 # Number of optimized price levels
+NUM_LINES = 5 # Number of optimized price levels
 
 # Trading Parameters
 FEE = 0.0002
