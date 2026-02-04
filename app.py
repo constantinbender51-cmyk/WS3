@@ -9,13 +9,20 @@ import time
 import io
 import random
 
+# ---------------------------------------------------------
 # Configuration
+# ---------------------------------------------------------
 SYMBOL = 'ETH/USDT'
 TIMEFRAME = '1h'
 START_YEAR = 2018
-SMA_WINDOW_HOURS = 1460 * 24 
+SMA_WINDOW_HOURS = 1460 * 24  # 35,040 hours
 TRAIN_SPLIT = 0.7
 PORT = 8080
+
+# Optimization Parameters
+GA_POPULATION = 50
+GA_GENERATIONS = 50
+GA_MUTATION_RATE = 0.1
 
 # Trading Parameters
 FEE = 0.0002
@@ -23,15 +30,22 @@ SL_PCT = 0.01
 TP_PCT = 0.02
 BAND_PCT = 0.005
 
+# ---------------------------------------------------------
+# Global State
+# ---------------------------------------------------------
 full_history = {
     "dates": [],
     "price": [],
+    "sma": [],
     "equity": [],
     "position": [],
     "trend": [],
     "levels": None
 }
 
+# ---------------------------------------------------------
+# 1. Fetch
+# ---------------------------------------------------------
 def fetch_data():
     exchange = ccxt.binance({'enableRateLimit': True})
     since = exchange.parse8601(f'{START_YEAR}-01-01T00:00:00Z')
@@ -58,25 +72,34 @@ def fetch_data():
     df = df[~df.index.duplicated(keep='first')]
     return df.astype(float)
 
+# ---------------------------------------------------------
+# 2. Detrend
+# ---------------------------------------------------------
 def apply_trend_logic(df):
+    # Calculate SMA on entire dataset to maximize availability
+    df['sma'] = df['close'].rolling(window=SMA_WINDOW_HOURS).mean()
+    df['sma_shifted'] = df['sma'].shift(-SMA_WINDOW_HOURS)
+    
+    # Define Train Set
     n = len(df)
     train_idx = int(n * TRAIN_SPLIT)
     train_df = df.iloc[:train_idx].copy()
     
-    train_df['sma'] = train_df['close'].rolling(window=SMA_WINDOW_HOURS).mean()
-    train_df['sma_shifted'] = train_df['sma'].shift(-SMA_WINDOW_HOURS)
-    
     valid_train = train_df.dropna(subset=['sma_shifted'])
     
-    # Strict Mode: Crash if insufficient data
+    # STRICT MODE: Crash if insufficient data
     if valid_train.empty:
-        raise ValueError(f"Insufficient data for 1460-day SMA. Got {len(train_df)} hours.")
+        raise ValueError(
+            f"Insufficient data. Need > {SMA_WINDOW_HOURS} hours for SMA, "
+            f"but only had {len(train_df)} training hours."
+        )
 
     X = np.arange(len(valid_train)).reshape(-1, 1)
     y = valid_train['sma_shifted'].values
     
     reg = LinearRegression().fit(X, y)
     
+    # Predict Trend over full dataset
     X_full = np.arange(len(df)).reshape(-1, 1)
     trend_values = reg.predict(X_full)
     
@@ -85,6 +108,9 @@ def apply_trend_logic(df):
     
     return df
 
+# ---------------------------------------------------------
+# 3. Optimize (Sharpe) & Backtest
+# ---------------------------------------------------------
 def backtest(levels, df, record_history=False):
     closes = df['close'].values
     trends = df['trend'].values
@@ -94,13 +120,15 @@ def backtest(levels, df, record_history=False):
     entry_price = 0.0
     active_line_val = None 
     
-    history_equity = []
-    history_position = []
+    # Track equity for Sharpe Calculation
+    equity_curve = np.zeros(len(closes))
+    history_position = np.zeros(len(closes)) if record_history else None
     
     for i in range(len(closes)):
         price = closes[i]
         trend = trends[i]
         
+        # Calculate raw levels at current time
         raw_levels = levels + trend
         dists = np.abs(raw_levels - price)
         nearest_idx = np.argmin(dists)
@@ -112,8 +140,10 @@ def backtest(levels, df, record_history=False):
         if in_band:
             active_line_val = nearest_line
         
+        # Trading Logic
         if in_band:
             if position != 0:
+                # Close Position
                 pnl = (price - entry_price) / entry_price * position - FEE
                 balance *= (1 + pnl)
                 position = 0
@@ -123,6 +153,7 @@ def backtest(levels, df, record_history=False):
                 lower_bound = active_line_val - (active_line_val * BAND_PCT)
                 
                 if position == 0:
+                    # Entry
                     if price > upper_bound:
                         position = 1
                         entry_price = price
@@ -132,28 +163,44 @@ def backtest(levels, df, record_history=False):
                         entry_price = price
                         balance *= (1 - FEE)
                 elif position == 1:
+                    # Long Management
                     pnl_pct = (price - entry_price) / entry_price
                     if pnl_pct <= -SL_PCT or pnl_pct >= TP_PCT:
                         balance *= (1 + pnl_pct - FEE)
                         position = 0
                 elif position == -1:
+                    # Short Management
                     pnl_pct = (entry_price - price) / entry_price
                     if pnl_pct <= -SL_PCT or pnl_pct >= TP_PCT:
                         balance *= (1 + pnl_pct - FEE)
                         position = 0
 
-        current_equity = balance
-        if position != 0:
+        # Mark to Market Equity
+        if position == 0:
+            equity_curve[i] = balance
+        else:
             unrealized_pnl = (price - entry_price) / entry_price * position
-            current_equity = balance * (1 + unrealized_pnl)
-        
-        if record_history:
-            history_equity.append(current_equity)
-            history_position.append(position)
+            equity_curve[i] = balance * (1 + unrealized_pnl)
             
+        if record_history:
+            history_position[i] = position
+    
+    # Sharpe Calculation
+    # returns = (equity[t] - equity[t-1]) / equity[t-1]
+    # Using numpy diff
+    returns = np.diff(equity_curve) / equity_curve[:-1]
+    
+    std_dev = np.std(returns)
+    if std_dev == 0:
+        sharpe = -10.0
+    else:
+        # Annualized Sharpe (Hours -> sqrt(24*365))
+        sharpe = (np.mean(returns) / std_dev) * 93.6
+
     if record_history:
-        return balance, history_equity, history_position
-    return balance
+        return balance, equity_curve.tolist(), history_position.tolist()
+        
+    return sharpe
 
 class GeneticAlgorithm:
     def __init__(self, population_size, generations, mutation_rate, df):
@@ -163,6 +210,7 @@ class GeneticAlgorithm:
         self.df = df
         self.population = []
         
+        # Initialize population
         min_dt = df['detrended'].min()
         max_dt = df['detrended'].max()
         for _ in range(population_size):
@@ -183,31 +231,37 @@ class GeneticAlgorithm:
                     best_fitness = fitness
                     best_sol = ind
             
+            # Genetic Operations
             next_pop = []
             for _ in range(self.pop_size):
+                # Tournament Selection
                 p1, p2 = random.sample(list(zip(self.population, scores)), 2)
                 parent1 = p1[0] if p1[1] > p2[1] else p2[0]
                 p3, p4 = random.sample(list(zip(self.population, scores)), 2)
                 parent2 = p3[0] if p3[1] > p4[1] else p4[0]
                 
+                # Crossover
                 cut = random.randint(1, 99)
                 child = np.concatenate((parent1[:cut], parent2[cut:]))
                 
+                # Mutation
                 if random.random() < self.mutation_rate:
                     idx = random.randint(0, 99)
                     child[idx] = random.uniform(self.df['detrended'].min(), self.df['detrended'].max())
                 
                 next_pop.append(child)
             self.population = next_pop
-            print(f"Gen {gen+1}/{self.generations} | Best Balance: {best_fitness:.2f}")
+            print(f"Gen {gen+1}/{self.generations} | Best Sharpe: {best_fitness:.4f}")
             
         return best_sol
 
+# ---------------------------------------------------------
+# 4. Serve
+# ---------------------------------------------------------
 app = Flask(__name__)
 
 @app.route('/plot.png')
 def plot_chart():
-    # Fixed Boolean Check
     if len(full_history["dates"]) == 0:
         return "Data processing not complete", 503
     
@@ -215,27 +269,33 @@ def plot_chart():
     
     dates = full_history["dates"]
     price = np.array(full_history["price"])
+    sma = np.array(full_history["sma"])
     trend = np.array(full_history["trend"])
     equity = full_history["equity"]
     pos = np.array(full_history["position"])
     levels = full_history["levels"]
     
-    ax1.plot(dates, price, label='Price', color='black', linewidth=1)
-    ax1.plot(dates, trend, label='Trend', color='blue', linestyle='--', linewidth=1.5)
+    # 1. Price, Trend, SMA, Levels
+    ax1.plot(dates, price, label='Price', color='black', linewidth=0.8, alpha=0.7)
+    ax1.plot(dates, trend, label='Trend (LinReg of Shifted SMA)', color='blue', linestyle='--', linewidth=1.5)
+    ax1.plot(dates, sma, label='SMA (1460d)', color='orange', linewidth=1.5)
     
     if levels is not None:
+        # Plot every 5th level to avoid rendering artifacts
         for i, lvl in enumerate(levels):
             if i % 5 == 0: 
-                ax1.plot(dates, trend + lvl, color='green', alpha=0.05, linewidth=0.5)
+                ax1.plot(dates, trend + lvl, color='green', alpha=0.15, linewidth=0.5)
     
+    # 2. Positions Overlay
     y_min, y_max = ax1.get_ylim()
     ax1.fill_between(dates, y_min, y_max, where=(pos==1), color='green', alpha=0.1, label='Long')
     ax1.fill_between(dates, y_min, y_max, where=(pos==-1), color='red', alpha=0.1, label='Short')
     
-    ax1.set_title(f"{SYMBOL} Strategy Execution (2018-Present)")
+    ax1.set_title(f"{SYMBOL} Strategy Execution (2018-Present)\nSharpe Optimized")
     ax1.set_ylabel("Price")
     ax1.legend(loc='upper left')
     
+    # 3. Equity Curve
     ax2.plot(dates, equity, color='purple', linewidth=1.5, label='Account Balance')
     ax2.set_ylabel("Equity ($)")
     ax2.set_xlabel("Date")
@@ -253,22 +313,33 @@ def plot_chart():
 def main_pipeline():
     global full_history
     
+    # 1. Fetch
     df = fetch_data()
+    
+    # 2. Detrend
     df = apply_trend_logic(df)
     
+    # 3. Optimize (Sharpe)
     train_size = int(len(df) * TRAIN_SPLIT)
     train_df = df.iloc[:train_size]
     
-    # Increased to 50 Generations
-    ga = GeneticAlgorithm(population_size=50, generations=50, mutation_rate=0.1, df=train_df)
-    print("Optimizing (50 Gens)...")
+    ga = GeneticAlgorithm(
+        population_size=GA_POPULATION, 
+        generations=GA_GENERATIONS, 
+        mutation_rate=GA_MUTATION_RATE, 
+        df=train_df
+    )
+    
+    print(f"Starting Optimization (Target: Sharpe, {GA_GENERATIONS} Gens)...")
     best_levels = ga.optimize()
     
+    # 4. Generate Full History
     print("Generating full history...")
     _, hist_equity, hist_pos = backtest(best_levels, df, record_history=True)
     
     full_history["dates"] = df.index
     full_history["price"] = df['close'].values
+    full_history["sma"] = df['sma'].values  # Store SMA
     full_history["trend"] = df['trend'].values
     full_history["equity"] = hist_equity
     full_history["position"] = hist_pos
