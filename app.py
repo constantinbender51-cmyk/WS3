@@ -20,8 +20,8 @@ TRAIN_SPLIT = 0.7
 PORT = 8080
 
 # Optimization Parameters
-GA_POPULATION = 50
-GA_GENERATIONS = 50
+GA_POPULATION = 300
+GA_GENERATIONS = 5
 GA_MUTATION_RATE = 0.1
 
 # Trading Parameters
@@ -76,18 +76,17 @@ def fetch_data():
 # 2. Detrend
 # ---------------------------------------------------------
 def apply_trend_logic(df):
-    # Calculate SMA on entire dataset to maximize availability
+    # Calculate SMA on entire dataset
     df['sma'] = df['close'].rolling(window=SMA_WINDOW_HOURS).mean()
+    # Shift SMA: t -> t - 1460 days
     df['sma_shifted'] = df['sma'].shift(-SMA_WINDOW_HOURS)
     
-    # Define Train Set
     n = len(df)
     train_idx = int(n * TRAIN_SPLIT)
     train_df = df.iloc[:train_idx].copy()
     
     valid_train = train_df.dropna(subset=['sma_shifted'])
     
-    # STRICT MODE: Crash if insufficient data
     if valid_train.empty:
         raise ValueError(
             f"Insufficient data. Need > {SMA_WINDOW_HOURS} hours for SMA, "
@@ -99,7 +98,6 @@ def apply_trend_logic(df):
     
     reg = LinearRegression().fit(X, y)
     
-    # Predict Trend over full dataset
     X_full = np.arange(len(df)).reshape(-1, 1)
     trend_values = reg.predict(X_full)
     
@@ -120,7 +118,6 @@ def backtest(levels, df, record_history=False):
     entry_price = 0.0
     active_line_val = None 
     
-    # Track equity for Sharpe Calculation
     equity_curve = np.zeros(len(closes))
     history_position = np.zeros(len(closes)) if record_history else None
     
@@ -128,7 +125,6 @@ def backtest(levels, df, record_history=False):
         price = closes[i]
         trend = trends[i]
         
-        # Calculate raw levels at current time
         raw_levels = levels + trend
         dists = np.abs(raw_levels - price)
         nearest_idx = np.argmin(dists)
@@ -140,10 +136,8 @@ def backtest(levels, df, record_history=False):
         if in_band:
             active_line_val = nearest_line
         
-        # Trading Logic
         if in_band:
             if position != 0:
-                # Close Position
                 pnl = (price - entry_price) / entry_price * position - FEE
                 balance *= (1 + pnl)
                 position = 0
@@ -153,7 +147,6 @@ def backtest(levels, df, record_history=False):
                 lower_bound = active_line_val - (active_line_val * BAND_PCT)
                 
                 if position == 0:
-                    # Entry
                     if price > upper_bound:
                         position = 1
                         entry_price = price
@@ -163,19 +156,16 @@ def backtest(levels, df, record_history=False):
                         entry_price = price
                         balance *= (1 - FEE)
                 elif position == 1:
-                    # Long Management
                     pnl_pct = (price - entry_price) / entry_price
                     if pnl_pct <= -SL_PCT or pnl_pct >= TP_PCT:
                         balance *= (1 + pnl_pct - FEE)
                         position = 0
                 elif position == -1:
-                    # Short Management
                     pnl_pct = (entry_price - price) / entry_price
                     if pnl_pct <= -SL_PCT or pnl_pct >= TP_PCT:
                         balance *= (1 + pnl_pct - FEE)
                         position = 0
 
-        # Mark to Market Equity
         if position == 0:
             equity_curve[i] = balance
         else:
@@ -185,16 +175,12 @@ def backtest(levels, df, record_history=False):
         if record_history:
             history_position[i] = position
     
-    # Sharpe Calculation
-    # returns = (equity[t] - equity[t-1]) / equity[t-1]
-    # Using numpy diff
     returns = np.diff(equity_curve) / equity_curve[:-1]
     
     std_dev = np.std(returns)
     if std_dev == 0:
         sharpe = -10.0
     else:
-        # Annualized Sharpe (Hours -> sqrt(24*365))
         sharpe = (np.mean(returns) / std_dev) * 93.6
 
     if record_history:
@@ -210,7 +196,6 @@ class GeneticAlgorithm:
         self.df = df
         self.population = []
         
-        # Initialize population
         min_dt = df['detrended'].min()
         max_dt = df['detrended'].max()
         for _ in range(population_size):
@@ -231,20 +216,16 @@ class GeneticAlgorithm:
                     best_fitness = fitness
                     best_sol = ind
             
-            # Genetic Operations
             next_pop = []
             for _ in range(self.pop_size):
-                # Tournament Selection
                 p1, p2 = random.sample(list(zip(self.population, scores)), 2)
                 parent1 = p1[0] if p1[1] > p2[1] else p2[0]
                 p3, p4 = random.sample(list(zip(self.population, scores)), 2)
                 parent2 = p3[0] if p3[1] > p4[1] else p4[0]
                 
-                # Crossover
                 cut = random.randint(1, 99)
                 child = np.concatenate((parent1[:cut], parent2[cut:]))
                 
-                # Mutation
                 if random.random() < self.mutation_rate:
                     idx = random.randint(0, 99)
                     child[idx] = random.uniform(self.df['detrended'].min(), self.df['detrended'].max())
@@ -275,18 +256,18 @@ def plot_chart():
     pos = np.array(full_history["position"])
     levels = full_history["levels"]
     
-    # 1. Price, Trend, SMA, Levels
+    # 1. Price, Trend, Shifted SMA, Levels
     ax1.plot(dates, price, label='Price', color='black', linewidth=0.8, alpha=0.7)
-    ax1.plot(dates, trend, label='Trend (LinReg of Shifted SMA)', color='blue', linestyle='--', linewidth=1.5)
-    ax1.plot(dates, sma, label='SMA (1460d)', color='orange', linewidth=1.5)
+    ax1.plot(dates, trend, label='Trend (LinReg)', color='blue', linestyle='--', linewidth=1.5)
+    
+    # Plot Shifted SMA
+    ax1.plot(dates, sma, label='SMA (Shifted -1460d)', color='orange', linewidth=1.5)
     
     if levels is not None:
-        # Plot every 5th level to avoid rendering artifacts
         for i, lvl in enumerate(levels):
             if i % 5 == 0: 
                 ax1.plot(dates, trend + lvl, color='green', alpha=0.15, linewidth=0.5)
     
-    # 2. Positions Overlay
     y_min, y_max = ax1.get_ylim()
     ax1.fill_between(dates, y_min, y_max, where=(pos==1), color='green', alpha=0.1, label='Long')
     ax1.fill_between(dates, y_min, y_max, where=(pos==-1), color='red', alpha=0.1, label='Short')
@@ -295,7 +276,6 @@ def plot_chart():
     ax1.set_ylabel("Price")
     ax1.legend(loc='upper left')
     
-    # 3. Equity Curve
     ax2.plot(dates, equity, color='purple', linewidth=1.5, label='Account Balance')
     ax2.set_ylabel("Equity ($)")
     ax2.set_xlabel("Date")
@@ -313,13 +293,9 @@ def plot_chart():
 def main_pipeline():
     global full_history
     
-    # 1. Fetch
     df = fetch_data()
-    
-    # 2. Detrend
     df = apply_trend_logic(df)
     
-    # 3. Optimize (Sharpe)
     train_size = int(len(df) * TRAIN_SPLIT)
     train_df = df.iloc[:train_size]
     
@@ -333,13 +309,12 @@ def main_pipeline():
     print(f"Starting Optimization (Target: Sharpe, {GA_GENERATIONS} Gens)...")
     best_levels = ga.optimize()
     
-    # 4. Generate Full History
     print("Generating full history...")
     _, hist_equity, hist_pos = backtest(best_levels, df, record_history=True)
     
     full_history["dates"] = df.index
     full_history["price"] = df['close'].values
-    full_history["sma"] = df['sma'].values  # Store SMA
+    full_history["sma"] = df['sma_shifted'].values # STORE SHIFTED SMA
     full_history["trend"] = df['trend'].values
     full_history["equity"] = hist_equity
     full_history["position"] = hist_pos
