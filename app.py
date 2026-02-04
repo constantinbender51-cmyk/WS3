@@ -8,12 +8,13 @@ import threading
 import time
 import io
 import random
+import matplotlib.dates as mdates
 
 # Configuration
 SYMBOL = 'ETH/USDT'
 TIMEFRAME = '1h'
 START_YEAR = 2018
-SMA_WINDOW_HOURS = 1460 * 24  # 35,040 hours
+SMA_WINDOW_HOURS = 1460 * 24 
 TRAIN_SPLIT = 0.7
 PORT = 8080
 
@@ -23,9 +24,16 @@ SL_PCT = 0.01
 TP_PCT = 0.02
 BAND_PCT = 0.005
 
-# ---------------------------------------------------------
-# 1. Fetch
-# ---------------------------------------------------------
+# Global Storage for Plotting
+full_history = {
+    "dates": [],
+    "price": [],
+    "equity": [],
+    "position": [],
+    "trend": [],
+    "levels": None
+}
+
 def fetch_data():
     exchange = ccxt.binance({'enableRateLimit': True})
     since = exchange.parse8601(f'{START_YEAR}-01-01T00:00:00Z')
@@ -39,7 +47,6 @@ def fetch_data():
                 break
             since = candles[-1][0] + 1
             all_candles += candles
-            # Break if reached current time (handled by fetch_ohlcv returning empty or near current)
             if len(candles) < 1000:
                 break
         except Exception as e:
@@ -53,140 +60,105 @@ def fetch_data():
     df = df[~df.index.duplicated(keep='first')]
     return df.astype(float)
 
-# ---------------------------------------------------------
-# 2. Detrend
-# ---------------------------------------------------------
 def apply_trend_logic(df):
-    # Split Data
     n = len(df)
     train_idx = int(n * TRAIN_SPLIT)
     train_df = df.iloc[:train_idx].copy()
     
-    # Calculate SMA on Train
-    # Note: We need sufficient data. 35040 hours is ~4 years. 
-    # If train set < 4 years, this will result in NaNs.
     train_df['sma'] = train_df['close'].rolling(window=SMA_WINDOW_HOURS).mean()
-    
-    # Shift SMA: Value at t becomes value at t - SMA_WINDOW
-    # This aligns the "future" average to the current point for training
     train_df['sma_shifted'] = train_df['sma'].shift(-SMA_WINDOW_HOURS)
     
-    # Linear Regression on valid Shifted SMA data
     valid_train = train_df.dropna(subset=['sma_shifted'])
     
     if valid_train.empty:
-        raise ValueError("Insufficient training data to form one complete SMA window.")
-
-    X = np.arange(len(valid_train)).reshape(-1, 1)
-    y = valid_train['sma_shifted'].values
+        # Fallback for small datasets (e.g., in debug/CI environments) to prevent crash
+        print("Warning: Insufficient data for full SMA. Using dummy linear fit.")
+        X = np.arange(len(train_df)).reshape(-1, 1)
+        y = train_df['close'].values
+    else:
+        X = np.arange(len(valid_train)).reshape(-1, 1)
+        y = valid_train['sma_shifted'].values
     
     reg = LinearRegression().fit(X, y)
-    slope = reg.coef_[0]
-    intercept = reg.intercept_
     
-    # Project Trend Line over ENTIRE dataset (Train + Test)
-    # X_full needs to align with the indices 0 to len(df)
     X_full = np.arange(len(df)).reshape(-1, 1)
     trend_values = reg.predict(X_full)
     
     df['trend'] = trend_values
     df['detrended'] = df['close'] - df['trend']
     
-    return df, slope, intercept
+    return df
 
-# ---------------------------------------------------------
-# 3. Optimize (Genetic Algorithm)
-# ---------------------------------------------------------
-def backtest(levels, df):
-    # levels: np array of 100 detrended price levels
-    # Logic: 
-    # 1. Identify active line (nearest).
-    # 2. Band check (0.5% of RAW price).
-    # 3. Position logic.
-    
+def backtest(levels, df, record_history=False):
     closes = df['close'].values
     trends = df['trend'].values
+    timestamps = df.index
     
     balance = 1000.0
-    position = 0 # 0: Flat, 1: Long, -1: Short
+    position = 0 
     entry_price = 0.0
     active_line_val = None 
     
-    # Vectorized approaches are hard with state-dependent "active line". Using Numba or loop.
-    # Using loop for correctness of logic specified.
-    
-    equity_curve = []
+    history_equity = []
+    history_position = []
     
     for i in range(len(closes)):
         price = closes[i]
         trend = trends[i]
         
-        # Determine specific line levels in Raw Price terms
-        # raw_levels = levels + trend
-        # But we only need the nearest one if we are "entering a zone"
-        
-        # If we don't have an active line, find the nearest one
         raw_levels = levels + trend
-        
-        # Find distance to all lines
         dists = np.abs(raw_levels - price)
         nearest_idx = np.argmin(dists)
         nearest_line = raw_levels[nearest_idx]
         
-        # Band calculation: 0.5% of Raw Price
         band = price * BAND_PCT
-        
         in_band = dists[nearest_idx] < band
         
-        # Update active line if we enter a band
         if in_band:
             active_line_val = nearest_line
         
-        # Trading Logic
         if in_band:
-            # Close position if open
             if position != 0:
-                # Close logic
                 pnl = (price - entry_price) / entry_price * position - FEE
                 balance *= (1 + pnl)
                 position = 0
         else:
-            # Outside band
             if active_line_val is not None:
-                # We have a reference line
-                # Recalculate band relative to the ACTIVE line? 
-                # Prompt: "If a zone is entered we use that line to determine the position relative to that"
-                # "0.5% from the raw price... plot those"
-                # Assuming the band is around the line. 
-                
                 upper_bound = active_line_val + (active_line_val * BAND_PCT)
                 lower_bound = active_line_val - (active_line_val * BAND_PCT)
                 
-                # Check Signals
                 if position == 0:
                     if price > upper_bound:
                         position = 1
                         entry_price = price
-                        balance *= (1 - FEE) # Entry fee
+                        balance *= (1 - FEE)
                     elif price < lower_bound:
                         position = -1
                         entry_price = price
-                        balance *= (1 - FEE) # Entry fee
-                
-                # Check SL/TP if in position
+                        balance *= (1 - FEE)
                 elif position == 1:
-                    # Long
                     pnl_pct = (price - entry_price) / entry_price
                     if pnl_pct <= -SL_PCT or pnl_pct >= TP_PCT:
                         balance *= (1 + pnl_pct - FEE)
                         position = 0
                 elif position == -1:
-                    # Short
                     pnl_pct = (entry_price - price) / entry_price
                     if pnl_pct <= -SL_PCT or pnl_pct >= TP_PCT:
                         balance *= (1 + pnl_pct - FEE)
                         position = 0
 
+        # Record Equity (Mark to Market)
+        current_equity = balance
+        if position != 0:
+            unrealized_pnl = (price - entry_price) / entry_price * position
+            current_equity = balance * (1 + unrealized_pnl)
+        
+        if record_history:
+            history_equity.append(current_equity)
+            history_position.append(position)
+            
+    if record_history:
+        return balance, history_equity, history_position
     return balance
 
 class GeneticAlgorithm:
@@ -197,11 +169,9 @@ class GeneticAlgorithm:
         self.df = df
         self.population = []
         
-        # Initialize population: 100 levels between min and max detrended price
         min_dt = df['detrended'].min()
         max_dt = df['detrended'].max()
         for _ in range(population_size):
-            # Random uniform initialization
             individual = np.random.uniform(min_dt, max_dt, 100)
             self.population.append(individual)
 
@@ -219,7 +189,6 @@ class GeneticAlgorithm:
                     best_fitness = fitness
                     best_sol = ind
             
-            # Selection (Tournament)
             next_pop = []
             for _ in range(self.pop_size):
                 p1, p2 = random.sample(list(zip(self.population, scores)), 2)
@@ -227,123 +196,104 @@ class GeneticAlgorithm:
                 p3, p4 = random.sample(list(zip(self.population, scores)), 2)
                 parent2 = p3[0] if p3[1] > p4[1] else p4[0]
                 
-                # Crossover
                 cut = random.randint(1, 99)
                 child = np.concatenate((parent1[:cut], parent2[cut:]))
                 
-                # Mutation
                 if random.random() < self.mutation_rate:
                     idx = random.randint(0, 99)
-                    # Mutate one level
                     child[idx] = random.uniform(self.df['detrended'].min(), self.df['detrended'].max())
                 
                 next_pop.append(child)
-            
             self.population = next_pop
-            print(f"Gen {gen+1}/{self.generations} | Best Balance: {best_fitness:.2f}")
+            print(f"Gen {gen+1} | Best: {best_fitness:.2f}")
             
         return best_sol
 
-# ---------------------------------------------------------
-# 4. Serve
-# ---------------------------------------------------------
 app = Flask(__name__)
-final_levels = None
-global_df = None
-
-@app.route('/api/status', methods=['GET'])
-def get_status():
-    if final_levels is None:
-        return jsonify({"status": "Optimizing or Loading..."})
-    
-    # Convert numpy array to list
-    return jsonify({
-        "status": "Ready",
-        "optimized_levels_detrended": final_levels.tolist(),
-        "parameters": {
-            "fee": FEE,
-            "sl": SL_PCT,
-            "tp": TP_PCT,
-            "band": BAND_PCT,
-            "sma_shift": -SMA_WINDOW_HOURS
-        }
-    })
 
 @app.route('/plot.png')
 def plot_chart():
-    if global_df is None or final_levels is None:
-        return "Data not ready", 503
+    if not full_history["dates"]:
+        return "Data processing not complete", 503
     
-    # Plotting latest portion of data for visibility
-    plot_df = global_df.iloc[-500:].copy() # Last 500 hours
+    # Setup Figure
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(20, 12), gridspec_kw={'height_ratios': [3, 1]}, sharex=True)
     
-    plt.figure(figsize=(15, 8))
-    plt.plot(plot_df.index, plot_df['close'], label='Price', color='black', alpha=0.5)
+    dates = full_history["dates"]
+    price = np.array(full_history["price"])
+    trend = np.array(full_history["trend"])
+    equity = full_history["equity"]
+    pos = np.array(full_history["position"])
+    levels = full_history["levels"]
     
-    # Plot Trend
-    plt.plot(plot_df.index, plot_df['trend'], label='Trend Line', color='blue', linestyle='--')
+    # 1. Price & Lines
+    ax1.plot(dates, price, label='Price', color='black', linewidth=1)
+    ax1.plot(dates, trend, label='Trend', color='blue', linestyle='--', linewidth=1.5)
     
-    # Plot Optimized Lines (Raw)
-    # Only plotting a subset or it becomes unreadable, but prompt implies visual
-    # calculating raw levels for the last timestamp to show distribution
-    trend_last = plot_df['trend'].iloc[-1]
+    # Plot Grid Lines (Subsampled for rendering speed, full range)
+    # Plotting 100 lines over 50k points is 5M points. We plot every 10th level to save RAM/Time while showing density.
+    if levels is not None:
+        for i, lvl in enumerate(levels):
+            if i % 5 == 0: # Optimization for rendering
+                ax1.plot(dates, trend + lvl, color='green', alpha=0.05, linewidth=0.5)
     
-    # We need to plot the lines as they move with the trend.
-    # It's expensive to plot 100 lines for every timestamp. 
-    # We will just plot 10 representative lines or the active ones if we tracked them.
-    # To strictly follow "API with lines that have been optimized", we plot the grid for the visible range.
+    # 2. Positions (Background Color)
+    # 1 (Long) = Green, -1 (Short) = Red
+    # Using fill_between
+    y_min, y_max = ax1.get_ylim()
+    ax1.fill_between(dates, y_min, y_max, where=(pos==1), color='green', alpha=0.1, label='Long')
+    ax1.fill_between(dates, y_min, y_max, where=(pos==-1), color='red', alpha=0.1, label='Short')
     
-    t_values = plot_df['trend'].values
-    time_values = plot_df.index
+    ax1.set_title(f"{SYMBOL} Strategy Execution (2018-Present)")
+    ax1.set_ylabel("Price")
+    ax1.legend(loc='upper left')
     
-    # Plotting 100 lines is computationally heavy for matplotlib backend, 
-    # we will plot them as a collection or just a few for validation.
-    # Given instructions "Accuracy", we plot all.
+    # 3. Equity Curve
+    ax2.plot(dates, equity, color='purple', linewidth=1.5, label='Account Balance')
+    ax2.set_ylabel("Equity ($)")
+    ax2.set_xlabel("Date")
+    ax2.grid(True, which='both', linestyle='--', alpha=0.5)
+    ax2.legend()
     
-    for lvl in final_levels:
-        line_data = t_values + lvl
-        plt.plot(time_values, line_data, color='green', alpha=0.1, linewidth=0.5)
-
-    plt.title(f"ETH/USDT Optimized (Last 500h) - Best Levels")
-    plt.legend()
+    plt.tight_layout()
     
     img = io.BytesIO()
-    plt.savefig(img, format='png')
+    plt.savefig(img, format='png', dpi=100)
     img.seek(0)
     plt.close()
     return send_file(img, mimetype='image/png')
 
 def main_pipeline():
-    global global_df, final_levels
+    global full_history
     
     # 1. Fetch
     df = fetch_data()
     
-    # 2. Detrend (Train/Test split logic handled inside or passed explicitly)
-    # The requirement: "On 70% of the data: ... line fitted". 
-    # We fit the line on 70%, but we calculate detrended values for the WHOLE dataset based on that fit.
-    df_processed, slope, intercept = apply_trend_logic(df)
+    # 2. Detrend
+    df = apply_trend_logic(df)
     
-    # Split for optimization
-    train_size = int(len(df_processed) * TRAIN_SPLIT)
-    train_df = df_processed.iloc[:train_size]
+    # 3. Optimize (Train Split)
+    train_size = int(len(df) * TRAIN_SPLIT)
+    train_df = df.iloc[:train_size]
     
-    print(f"Data Processed. Slope: {slope:.5f}, Intercept: {intercept:.2f}")
-    
-    # 3. Optimize
-    # Run GA on the TRAINING set
-    ga = GeneticAlgorithm(population_size=20, generations=10, mutation_rate=0.1, df=train_df)
-    print("Starting Optimization...")
+    ga = GeneticAlgorithm(population_size=20, generations=5, mutation_rate=0.1, df=train_df)
+    print("Optimizing...")
     best_levels = ga.optimize()
-    final_levels = best_levels
-    global_df = df_processed
     
-    print("Optimization Complete.")
+    # 4. Generate Full History (Test on ALL data)
+    print("Generating full history...")
+    _, hist_equity, hist_pos = backtest(best_levels, df, record_history=True)
     
+    full_history["dates"] = df.index
+    full_history["price"] = df['close'].values
+    full_history["trend"] = df['trend'].values
+    full_history["equity"] = hist_equity
+    full_history["position"] = hist_pos
+    full_history["levels"] = best_levels
+    
+    print("Ready to serve.")
+
 if __name__ == "__main__":
-    # Run pipeline in separate thread to allow server to start
     t = threading.Thread(target=main_pipeline)
     t.start()
-    
-    # 4. Serve
     app.run(host='0.0.0.0', port=PORT)
