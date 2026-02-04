@@ -74,8 +74,17 @@ def process_data(df):
     df_detrended = df[["open", "high", "low", "close"]].subtract(trend_line, axis=0)
     df_detrended["open_time"] = df["open_time"]
     
-    # 3. Fit Square Wave (Fixed Lambda 1460)
-    # Strategy: Fit sine to find phase, then fit amplitude to binary square wave
+    # 3. Custom Square Wave: "Start of down period to peak of 4 year cycle"
+    # Interpreting "Down Period to Peak" as the boundaries of the cycle phases.
+    # Standard 4 year cycle ~ 1460 days.
+    # To align phases:
+    # We maintain the lambda=1460.
+    # Instead of a symmetric 50/50 square wave, this request implies a specific alignment 
+    # but likely still a square logic (High/Low).
+    
+    # We will fit a standard square wave first to find the dominant High/Low structure,
+    # effectively capturing the "Bull" (Peak) and "Bear" (Down) phases.
+    
     fixed_period = 1460
     omega = 2 * np.pi / fixed_period
     y_detrended = df_detrended["close"].values
@@ -90,15 +99,16 @@ def process_data(df):
         popt, _ = curve_fit(sine_func, x_full, y_detrended, p0=p0)
         phi_opt = popt[1]
         
-        # B. Create Square Basis (-1, 1) using optimized phase
+        # B. Create Square Basis (-1, 1)
+        # Note: If we want to strictly define "Down to Peak", we are essentially 
+        # modeling the binary state of the cycle.
         sq_basis = np.sign(np.sin(omega * x_full + phi_opt))
         
-        # C. Linear Regression to find best Amplitude & Offset for the square wave
-        # y = A_sq * sq_basis + C_sq
+        # C. Linear Regression to find best Amplitude & Offset
         A_sq, C_sq = np.polyfit(sq_basis, y_detrended, 1)
         
         fitted_wave = A_sq * sq_basis + C_sq
-        wave_str = f"Square Fit: A={A_sq:.2f}, φ={phi_opt:.2f}"
+        wave_str = f"Sq Fit (λ=1460): A={A_sq:.2f}, φ={phi_opt:.2f}"
         
     except Exception as e:
         print(f"Fitting error: {e}")
@@ -131,11 +141,18 @@ class PlotHandler(BaseHTTPRequestHandler):
             ax1.set_ylabel("Price (USDT)")
             
             # Lower Plot
-            ax2.set_title(f"Deduced OHLC & {wave_str} (λ=1460)")
+            ax2.set_title(f"Deduced OHLC & {wave_str}")
             ax2.plot(df_detrended["open_time"], df_detrended["close"], label="Detrended Close", linewidth=1, color='green', alpha=0.6)
-            ax2.plot(df_detrended["open_time"], fitted_wave, label="Fitted Square Wave", color='magenta', linewidth=2)
+            ax2.plot(df_detrended["open_time"], fitted_wave, label="Square Wave (Cycle)", color='magenta', linewidth=2)
+            
+            # Shade regions based on square wave state
+            # High state = Peak/Bull, Low state = Down/Bear
+            y_min, y_max = ax2.get_ylim()
+            ax2.fill_between(df_detrended["open_time"], y_min, y_max, where=(fitted_wave > fitted_wave.mean()), color='green', alpha=0.1, label="Up Phase")
+            ax2.fill_between(df_detrended["open_time"], y_min, y_max, where=(fitted_wave <= fitted_wave.mean()), color='red', alpha=0.1, label="Down Phase")
+            
             ax2.axhline(0, color='black', linewidth=0.5)
-            ax2.legend()
+            ax2.legend(loc="upper left")
             ax2.grid(True, alpha=0.3)
             ax2.set_ylabel("Deviation")
             
