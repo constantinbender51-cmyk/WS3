@@ -20,7 +20,7 @@ TRAIN_SPLIT = 0.7
 PORT = 8080
 
 # Optimization Parameters
-GA_POPULATION = 30l
+GA_POPULATION = 300
 GA_GENERATIONS = 5
 GA_MUTATION_RATE = 0.1
 NUM_LINES = 1  # Number of optimized price levels
