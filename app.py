@@ -52,16 +52,23 @@ def fetch_binance_data(symbol="ETHUSDT", interval="1d", start_year=2018):
     return df
 
 def process_data(df):
-    x = np.arange(len(df))
-    y = df["close"].values
-    
-    slope, intercept = np.polyfit(x, y, 1)
-    trend_line = slope * x + intercept
-    
-    # 730 SMA and Shift -730
+    # Calculate SMA and Shift
     df["sma_730"] = df["close"].rolling(window=730).mean()
     df["sma_730_shifted"] = df["sma_730"].shift(-730)
-
+    
+    # Fit line to shifted SMA
+    # Filter NaNs created by rolling and shifting
+    valid_mask = ~np.isnan(df["sma_730_shifted"])
+    x_valid = np.arange(len(df))[valid_mask]
+    y_valid = df.loc[valid_mask, "sma_730_shifted"].values
+    
+    slope, intercept = np.polyfit(x_valid, y_valid, 1)
+    
+    # Generate trend line for full dataset range
+    x_full = np.arange(len(df))
+    trend_line = slope * x_full + intercept
+    
+    # Deduce trend from OHLC
     df_detrended = df[["open", "high", "low", "close"]].subtract(trend_line, axis=0)
     df_detrended["open_time"] = df["open_time"]
     
@@ -81,13 +88,11 @@ class PlotHandler(BaseHTTPRequestHandler):
             fig = Figure(figsize=(12, 10), dpi=100)
             (ax1, ax2) = fig.subplots(2, 1, sharex=True)
             
-            ax1.set_title(f"ETH/USDT (2018-Present) | Fit: y = {params[0]:.4f}x + {params[1]:.2f}")
-            ax1.plot(df["open_time"], df["close"], label="Close Price", linewidth=1, color='blue')
-            ax1.plot(df["open_time"], trend, label="Linear Trend", color='red', linestyle="--")
-            
-            # Plot SMA
+            ax1.set_title(f"ETH/USDT | Fit to 730 SMA (Shift -730): y = {params[0]:.4f}x + {params[1]:.2f}")
+            ax1.plot(df["open_time"], df["close"], label="Close Price", linewidth=1, color='blue', alpha=0.5)
             ax1.plot(df["open_time"], df["sma_730_shifted"], label="730 SMA (Shift -730)", color='orange', linewidth=1.5)
-
+            ax1.plot(df["open_time"], trend, label="Linear Trend (Fit to SMA)", color='red', linestyle="--")
+            
             ax1.legend()
             ax1.grid(True, alpha=0.3)
             ax1.set_ylabel("Price (USDT)")
