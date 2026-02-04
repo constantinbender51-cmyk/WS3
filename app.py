@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from scipy.optimize import curve_fit
 from deap import base, creator, tools, algorithms
 import random
@@ -37,22 +38,24 @@ SERVER_PORT = 8080
 GENE_LEVEL_MIN = -40000
 GENE_LEVEL_MAX = 40000
 GENE_SL_MIN = 0.01
-GENE_SL_MAX = 0.05
+GENE_SL_MAX = 0.15
 GENE_TP_MIN = 0.01
-GENE_TP_MAX = 0.10
+GENE_TP_MAX = 0.30
 
 # DATES
 TRAIN_END_DATE = '2025-12-31'
 TEST_START_DATE = '2026-01-01'
 
-# GLOBAL STATE FOR LIVE VIEW
+# GLOBAL STORAGE
+FINAL_GENES = [] # Populated after optimization
 live_state = {
     'price': 0.0,
     'detrended': 0.0,
     'balance': INITIAL_BALANCE,
     'position': 0,
     'last_update': 'Waiting...',
-    'logs': deque(maxlen=20)  # Keep last 20 logs
+    'logs': deque(maxlen=20),
+    'history': [] # Stores {'ts': datetime, 'detrended': float, 'price': float}
 }
 state_lock = threading.Lock()
 
@@ -204,7 +207,6 @@ def optimize(df):
             ind.extend([toolbox.attr_lvl(), toolbox.attr_sl(), toolbox.attr_tp()])
         return ind
     
-    # Custom Mutation to handle different gene scales
     def custom_mutate(individual, indpb):
         for i in range(len(individual)):
             if random.random() < indpb:
@@ -215,7 +217,6 @@ def optimize(df):
                 individual[i] += random.gauss(0, sigma)
         return individual,
 
-    # Bounds Checker Decorator
     def checkBounds(min_lvl, max_lvl, min_sl, max_sl, min_tp, max_tp):
         def decorator(func):
             def wrapper(*args, **kargs):
@@ -239,10 +240,9 @@ def optimize(df):
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
     toolbox.register("evaluate", backtest_strategy, data=df)
     toolbox.register("mate", tools.cxTwoPoint)
-    toolbox.register("mutate", custom_mutate, indpb=0.1) # Register custom mutation
+    toolbox.register("mutate", custom_mutate, indpb=0.1)
     toolbox.register("select", tools.selTournament, tournsize=3)
     
-    # Apply Bounds Checking
     toolbox.decorate("mate", checkBounds(GENE_LEVEL_MIN, GENE_LEVEL_MAX, GENE_SL_MIN, GENE_SL_MAX, GENE_TP_MIN, GENE_TP_MAX))
     toolbox.decorate("mutate", checkBounds(GENE_LEVEL_MIN, GENE_LEVEL_MAX, GENE_SL_MIN, GENE_SL_MAX, GENE_TP_MIN, GENE_TP_MAX))
     
@@ -251,7 +251,7 @@ def optimize(df):
     
     return tools.selBest(pop, 1)[0]
 
-# --- HELPER FOR PLOTTING LOGIC ---
+# --- PLOTTING HELPERS ---
 def plot_strategy_performance(ax, data, best_genes, title):
     equity_curve, trades = run_strategy_logic(best_genes, data, record_trades=True)
     
@@ -288,13 +288,8 @@ def plot_strategy_performance(ax, data, best_genes, title):
         ax_pnl.plot(plot_idx, plot_eq, color='blue', lw=1.5, alpha=0.6, label='Equity')
         ax_pnl.set_ylabel('Equity ($)', color='blue')
         ax_pnl.tick_params(axis='y', labelcolor='blue')
-        
-        lines, labels = ax.get_legend_handles_labels()
-        lines2, labels2 = ax_pnl.get_legend_handles_labels()
-        ax.legend(lines + lines2, labels + labels2, loc='upper left')
 
-# --- PLOT GENERATION ---
-def generate_plot(df, best_genes):
+def generate_backtest_plot(df, best_genes):
     plt.figure(figsize=(16, 14))
     
     ax1 = plt.subplot(3, 1, 1)
@@ -335,6 +330,56 @@ def generate_plot(df, best_genes):
     plt.close()
     return buf
 
+def generate_live_plot():
+    # Use global state
+    with state_lock:
+        history = list(live_state['history'])
+        
+    plt.figure(figsize=(12, 6))
+    
+    if not history:
+        plt.text(0.5, 0.5, "Waiting for data...", ha='center')
+    else:
+        times = [x['ts'] for x in history]
+        vals = [x['detrended'] for x in history]
+        
+        plt.plot(times, vals, color='cyan', lw=1.5, label='Live Detrended')
+        plt.scatter(times[-1], vals[-1], color='white', edgecolor='cyan', zorder=5)
+        
+        # Plot Levels
+        if FINAL_GENES:
+            colors = ['r', 'g', 'b', 'orange', 'purple']
+            for i in range(N_REVERSAL_LEVELS):
+                lvl = FINAL_GENES[i*3]
+                # Only plot levels visible within the range of current price to avoid scale compression
+                # But for now, let's just plot all, or maybe filter? 
+                # Let's plot all for context
+                plt.axhline(lvl, color=colors[i%len(colors)], ls=':', alpha=0.3)
+
+        # Formatting dates
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+        plt.title(f"Live Execution: {SYMBOL}")
+        plt.ylabel("Detrended Price")
+        plt.xlabel("Time (UTC)")
+        plt.grid(True, alpha=0.2, color='#444')
+        plt.legend()
+        
+        # Dark Theme for Live Plot
+        ax = plt.gca()
+        ax.set_facecolor('#1e1e1e')
+        plt.gcf().patch.set_facecolor('#1e1e1e')
+        ax.tick_params(colors='#d4d4d4')
+        ax.yaxis.label.set_color('#d4d4d4')
+        ax.xaxis.label.set_color('#d4d4d4')
+        ax.title.set_color('#d4d4d4')
+        
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', facecolor='#1e1e1e')
+    buf.seek(0)
+    plt.close()
+    return buf
+
 # --- LIVE TRADING ---
 def log_message(msg):
     ts = datetime.datetime.now().strftime('%H:%M:%S')
@@ -352,12 +397,10 @@ def live_trading_loop(best_genes, m, c):
     active_sl = 0.0
     active_tp = 0.0
     
-    # Parse levels
     levels = []
     for i in range(0, len(best_genes), 3):
         levels.append({'thresh': best_genes[i], 'sl': best_genes[i+1], 'tp': best_genes[i+2]})
 
-    # Initialize previous state
     log_message("Pre-fetching initial state...")
     try:
         init_candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=2)
@@ -376,7 +419,6 @@ def live_trading_loop(best_genes, m, c):
 
     while True:
         try:
-            # Sync to 2 seconds after minute
             now = datetime.datetime.now()
             next_minute = (now + datetime.timedelta(minutes=1)).replace(second=2, microsecond=0)
             sleep_sec = (next_minute - now).total_seconds()
@@ -384,7 +426,6 @@ def live_trading_loop(best_genes, m, c):
             
             time.sleep(sleep_sec)
             
-            # Fetch Latest Candle
             candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=1)
             if not candles:
                 continue
@@ -394,7 +435,6 @@ def live_trading_loop(best_genes, m, c):
             price = candle[4]
             ordinal = ts.toordinal()
             
-            # Calculate Detrended
             trend = m * ordinal + c
             curr_detrended = price - trend
             
@@ -405,11 +445,16 @@ def live_trading_loop(best_genes, m, c):
                 live_state['balance'] = balance
                 live_state['position'] = position
                 live_state['last_update'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                # Append to history for plotting
+                live_state['history'].append({
+                    'ts': datetime.datetime.now(), 
+                    'detrended': curr_detrended, 
+                    'price': price
+                })
 
             log_message(f"Price: {price:.2f} | Detrended: {curr_detrended:.2f} | Bal: {balance:.2f} | Pos: {position}")
             
             # Logic
-            # Check Exit
             if position != 0:
                 pnl_pct = (price - entry_price) / entry_price if position == 1 else (entry_price - price) / entry_price
                 if pnl_pct <= -active_sl or pnl_pct >= active_tp:
@@ -417,11 +462,9 @@ def live_trading_loop(best_genes, m, c):
                     log_message(f">>> EXIT {'LONG' if position==1 else 'SHORT'}: PnL {pnl_pct*100:.2f}% | New Balance: {balance:.2f}")
                     position = 0
             
-            # Check Entry
             if position == 0:
                 for lvl in levels:
                     threshold = lvl['thresh']
-                    # Cross UP -> Short
                     if prev_detrended < threshold and curr_detrended >= threshold:
                         position = -1
                         entry_price = price
@@ -429,7 +472,6 @@ def live_trading_loop(best_genes, m, c):
                         active_tp = lvl['tp']
                         log_message(f">>> ENTRY SHORT @ {price:.2f} (Thresh: {threshold:.2f})")
                         break
-                    # Cross DOWN -> Long
                     elif prev_detrended > threshold and curr_detrended <= threshold:
                         position = 1
                         entry_price = price
@@ -450,7 +492,12 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-type', 'image/png')
             self.end_headers()
-            self.wfile.write(plot_buffer.getvalue())
+            self.wfile.write(backtest_plot_buffer.getvalue())
+        elif self.path == '/live_plot.png':
+            self.send_response(200)
+            self.send_header('Content-type', 'image/png')
+            self.end_headers()
+            self.wfile.write(generate_live_plot().getvalue())
         else:
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
@@ -478,6 +525,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     .value {{ font-size: 1.2em; font-weight: bold; color: #4ec9b0; }}
                     .log-box {{ background: #000; padding: 10px; height: 200px; overflow-y: scroll; border: 1px solid #333; font-size: 0.9em; color: #ce9178; }}
                     img {{ max-width: 100%; border: 1px solid #333; margin-top: 20px; }}
+                    h3 {{ margin-top: 30px; border-bottom: 1px solid #333; padding-bottom: 5px; }}
                 </style>
             </head>
             <body>
@@ -490,12 +538,16 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     <div class="stat-box"><div class="label">Position</div><div class="value">{current_pos}</div></div>
                 </div>
                 
+                <h3>Live Execution Plot</h3>
+                <img src="/live_plot.png" alt="Live Execution" style="width: 100%; height: auto; max-height: 400px;">
+                
                 <h3>Live Logs</h3>
                 <div class="log-box">
                     {logs_html}
                 </div>
                 
-                <img src="/plot.png" alt="Strategy Performance">
+                <h3>Backtest & Parameters</h3>
+                <img src="/plot.png" alt="Backtest Performance">
             </body>
             </html>
             """
@@ -512,13 +564,13 @@ if __name__ == "__main__":
         exit()
         
     print("Running GA...")
-    best_ind = optimize(df)
+    FINAL_GENES = optimize(df)
     
-    print("Generating Plot...")
-    plot_buffer = generate_plot(df, best_ind)
+    print("Generating Backtest Plot...")
+    backtest_plot_buffer = generate_backtest_plot(df, FINAL_GENES)
     
     # Start Live Loop Thread
-    live_thread = threading.Thread(target=live_trading_loop, args=(best_ind, trend_m, trend_c), daemon=True)
+    live_thread = threading.Thread(target=live_trading_loop, args=(FINAL_GENES, trend_m, trend_c), daemon=True)
     live_thread.start()
     
     print(f"Serving dashboard at http://localhost:{SERVER_PORT} ... (Ctrl+C to stop)")
