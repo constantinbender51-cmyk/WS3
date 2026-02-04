@@ -53,7 +53,7 @@ def fetch_binance_data(symbol="ETHUSDT", interval="1d", start_year=2018):
     return df
 
 def process_data(df):
-    # 1. Linear Trend via Shifted SMA
+    # --- 1. Linear Trend (1460 Logic) ---
     df["sma_1460"] = df["close"].rolling(window=1460).mean()
     df["sma_1460_shifted"] = df["sma_1460"].shift(-1460)
     
@@ -69,40 +69,54 @@ def process_data(df):
     x_full = np.arange(len(df))
     trend_line = slope * x_full + intercept
     
-    # 2. Detrend
+    # --- 2. 365 SMA Logic ---
+    df["sma_365"] = df["close"].rolling(window=365).mean()
+    # "Shifted 365 days" usually implies forward projection or alignment
+    # Assuming shift(-365) to match the previous logic of projecting backwards/fitting
+    df["sma_365_shifted"] = df["sma_365"].shift(-365)
+
+    # --- 3. Detrend ---
     df_detrended = df[["open", "high", "low", "close"]].subtract(trend_line, axis=0)
     df_detrended["open_time"] = df["open_time"]
-    
-    # 3. Square Wave (Peak Aligned)
-    fixed_period = 1460
-    omega = 2 * np.pi / fixed_period
     y_detrended = df_detrended["close"].values
-    
-    def sine_func(x, A, phi, C):
-        return A * np.sin(omega * x + phi) + C
-    
-    p0 = [np.std(y_detrended), 0, np.mean(y_detrended)]
-    
-    try:
-        # A. Fit Sine to get parameters
-        popt, _ = curve_fit(sine_func, x_full, y_detrended, p0=p0)
-        A_sine, phi_opt, C_sine = popt
-        
-        # B. Construct Square Wave using Sine Amplitude directly
-        # Use Sign(Cos) to align falling edge with Sine Peak
-        sq_basis = np.sign(np.cos(omega * x_full + phi_opt))
-        
-        # Force Amplitude from Sine fit to prevent flattening
-        fitted_wave = np.abs(A_sine) * sq_basis + C_sine
-        
-        wave_str = f"Sq Fit (Forced Amp): A={abs(A_sine):.2f}, φ={phi_opt:.2f}"
-        
-    except Exception as e:
-        print(f"Fitting error: {e}")
-        fitted_wave = np.zeros_like(x_full)
-        wave_str = "Fit Failed"
 
-    return df, trend_line, df_detrended, (slope, intercept), fitted_wave, wave_str
+    # --- 4. Square Wave Fits ---
+    
+    def sine_func(x, A, phi, C, omega):
+        return A * np.sin(omega * x + phi) + C
+
+    def fit_square_wave(period, label_prefix):
+        omega = 2 * np.pi / period
+        p0 = [np.std(y_detrended), 0, np.mean(y_detrended)]
+        
+        try:
+            # A. Fit Sine to get parameters
+            # Use a lambda wrapper to fix omega for curve_fit
+            fit_func = lambda x, A, phi, C: sine_func(x, A, phi, C, omega)
+            
+            popt, _ = curve_fit(fit_func, x_full, y_detrended, p0=p0)
+            A_sine, phi_opt, C_sine = popt
+            
+            # B. Construct Square Wave
+            # Peak Aligned: Drop at Peak (Cosine Logic)
+            sq_basis = np.sign(np.cos(omega * x_full + phi_opt))
+            
+            # Force Amplitude
+            fitted_wave = np.abs(A_sine) * sq_basis + C_sine
+            info_str = f"{label_prefix} Sq (A={abs(A_sine):.0f})"
+            return fitted_wave, info_str, abs(A_sine)
+            
+        except Exception as e:
+            print(f"Fitting error {label_prefix}: {e}")
+            return np.zeros_like(x_full), "Fit Failed", 0
+
+    # Fit 1460 Square
+    wave_1460, str_1460, amp_1460 = fit_square_wave(1460, "1460")
+    
+    # Fit 365 Square
+    wave_365, str_365, amp_365 = fit_square_wave(365, "365")
+
+    return df, trend_line, df_detrended, (slope, intercept), (wave_1460, str_1460), (wave_365, str_365)
 
 class PlotHandler(BaseHTTPRequestHandler):
     data_context = None 
@@ -113,36 +127,37 @@ class PlotHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'image/png')
             self.end_headers()
             
-            df, trend, df_detrended, lin_params, fitted_wave, wave_str = self.data_context
+            df, trend, df_detrended, lin_params, (w1460, s1460), (w365, s365) = self.data_context
             
-            fig = Figure(figsize=(12, 10), dpi=100)
+            fig = Figure(figsize=(12, 12), dpi=100)
             (ax1, ax2) = fig.subplots(2, 1, sharex=True)
             
             # Upper Plot
-            ax1.set_title(f"ETH/USDT | Fit to 1460 SMA (Shift -1460): y = {lin_params[0]:.4f}x + {lin_params[1]:.2f}")
-            ax1.plot(df["open_time"], df["close"], label="Close Price", linewidth=1, color='blue', alpha=0.5)
-            ax1.plot(df["open_time"], df["sma_1460_shifted"], label="1460 SMA (Shift -1460)", color='orange', linewidth=1.5)
+            ax1.set_title(f"ETH/USDT | Trend Fit (1460 SMA): y = {lin_params[0]:.2f}x + {lin_params[1]:.2f}")
+            ax1.plot(df["open_time"], df["close"], label="Close Price", linewidth=1, color='blue', alpha=0.4)
+            ax1.plot(df["open_time"], df["sma_1460_shifted"], label="1460 SMA (Shift -1460)", color='orange', linewidth=1.5, linestyle=":")
+            ax1.plot(df["open_time"], df["sma_365_shifted"], label="365 SMA (Shift -365)", color='cyan', linewidth=1.5)
             ax1.plot(df["open_time"], trend, label="Linear Trend", color='red', linestyle="--")
-            ax1.legend()
+            ax1.legend(loc="upper left", fontsize='small')
             ax1.grid(True, alpha=0.3)
             ax1.set_ylabel("Price (USDT)")
             
             # Lower Plot
-            ax2.set_title(f"Deduced OHLC & {wave_str}")
-            ax2.plot(df_detrended["open_time"], df_detrended["close"], label="Detrended Close", linewidth=1, color='green', alpha=0.6)
-            ax2.plot(df_detrended["open_time"], fitted_wave, label="Square Wave (Peak Aligned)", color='magenta', linewidth=2)
+            ax2.set_title(f"Deduced OHLC | {s1460} & {s365}")
+            ax2.plot(df_detrended["open_time"], df_detrended["close"], label="Detrended Close", linewidth=1, color='green', alpha=0.5)
             
-            # Shading
+            # Plot Square Waves
+            ax2.plot(df_detrended["open_time"], w1460, label="Sq 1460 (Peak Aligned)", color='magenta', linewidth=2, alpha=0.8)
+            ax2.plot(df_detrended["open_time"], w365, label="Sq 365 (Peak Aligned)", color='purple', linewidth=1.5, alpha=0.9)
+            
+            # Shading (using 1460 as primary cycle for background)
             y_min, y_max = ax2.get_ylim()
-            # Determine Up/Down based on wave value relative to its center
-            center = fitted_wave.mean()
-            # If wave is high -> Up Phase (Green). If wave is low -> Down Phase (Red)
-            # This aligns with "Peak starts the down period" (High ends, Low begins)
-            ax2.fill_between(df_detrended["open_time"], y_min, y_max, where=(fitted_wave >= center), color='green', alpha=0.1, label="Up Phase")
-            ax2.fill_between(df_detrended["open_time"], y_min, y_max, where=(fitted_wave < center), color='red', alpha=0.1, label="Down Phase")
+            center = w1460.mean()
+            ax2.fill_between(df_detrended["open_time"], y_min, y_max, where=(w1460 >= center), color='green', alpha=0.05)
+            ax2.fill_between(df_detrended["open_time"], y_min, y_max, where=(w1460 < center), color='red', alpha=0.05)
             
             ax2.axhline(0, color='black', linewidth=0.5)
-            ax2.legend(loc="upper left")
+            ax2.legend(loc="upper left", fontsize='small')
             ax2.grid(True, alpha=0.3)
             ax2.set_ylabel("Deviation")
             
