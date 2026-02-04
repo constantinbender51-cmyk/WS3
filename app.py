@@ -213,7 +213,8 @@ app = Flask(__name__)
 
 @app.route('/plot.png')
 def plot_chart():
-    if not full_history["dates"]:
+    # FIX: Check length instead of implicit boolean truth value of DatetimeIndex
+    if len(full_history["dates"]) == 0:
         return "Data processing not complete", 503
     
     # Setup Figure
@@ -230,16 +231,13 @@ def plot_chart():
     ax1.plot(dates, price, label='Price', color='black', linewidth=1)
     ax1.plot(dates, trend, label='Trend', color='blue', linestyle='--', linewidth=1.5)
     
-    # Plot Grid Lines (Subsampled for rendering speed, full range)
-    # Plotting 100 lines over 50k points is 5M points. We plot every 10th level to save RAM/Time while showing density.
+    # Plot Grid Lines (Subsampled for rendering speed)
     if levels is not None:
         for i, lvl in enumerate(levels):
-            if i % 5 == 0: # Optimization for rendering
+            if i % 5 == 0: 
                 ax1.plot(dates, trend + lvl, color='green', alpha=0.05, linewidth=0.5)
     
-    # 2. Positions (Background Color)
-    # 1 (Long) = Green, -1 (Short) = Red
-    # Using fill_between
+    # 2. Positions
     y_min, y_max = ax1.get_ylim()
     ax1.fill_between(dates, y_min, y_max, where=(pos==1), color='green', alpha=0.1, label='Long')
     ax1.fill_between(dates, y_min, y_max, where=(pos==-1), color='red', alpha=0.1, label='Short')
