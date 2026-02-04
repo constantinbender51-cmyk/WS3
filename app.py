@@ -53,11 +53,10 @@ def fetch_binance_data(symbol="ETHUSDT", interval="1d", start_year=2018):
     return df
 
 def process_data(df):
-    # 1. Calculate 1460 SMA and Shift for Linear Trend
+    # 1. Linear Trend via Shifted SMA
     df["sma_1460"] = df["close"].rolling(window=1460).mean()
     df["sma_1460_shifted"] = df["sma_1460"].shift(-1460)
     
-    # Fit line to shifted SMA
     valid_mask = ~np.isnan(df["sma_1460_shifted"])
     x_valid = np.arange(len(df))[valid_mask]
     y_valid = df.loc[valid_mask, "sma_1460_shifted"].values
@@ -74,7 +73,7 @@ def process_data(df):
     df_detrended = df[["open", "high", "low", "close"]].subtract(trend_line, axis=0)
     df_detrended["open_time"] = df["open_time"]
     
-    # 3. Custom Square Wave: Down Start = Peak
+    # 3. Square Wave (Peak Aligned)
     fixed_period = 1460
     omega = 2 * np.pi / fixed_period
     y_detrended = df_detrended["close"].values
@@ -85,22 +84,18 @@ def process_data(df):
     p0 = [np.std(y_detrended), 0, np.mean(y_detrended)]
     
     try:
-        # A. Fit Sine to find natural phase of the cycle
+        # A. Fit Sine to get parameters
         popt, _ = curve_fit(sine_func, x_full, y_detrended, p0=p0)
-        phi_opt = popt[1]
+        A_sine, phi_opt, C_sine = popt
         
-        # B. Create Square Basis using Cosine
-        # Sine Peaks at pi/2.
-        # We want Square Wave to Drop (Transition High->Low) at pi/2.
-        # Cosine crosses zero downwards at pi/2.
-        # Therefore, Sign(Cos) gives High before Peak and Low after Peak.
+        # B. Construct Square Wave using Sine Amplitude directly
+        # Use Sign(Cos) to align falling edge with Sine Peak
         sq_basis = np.sign(np.cos(omega * x_full + phi_opt))
         
-        # C. Linear Regression for Amplitude & Offset
-        A_sq, C_sq = np.polyfit(sq_basis, y_detrended, 1)
+        # Force Amplitude from Sine fit to prevent flattening
+        fitted_wave = np.abs(A_sine) * sq_basis + C_sine
         
-        fitted_wave = A_sq * sq_basis + C_sq
-        wave_str = f"Sq Fit (Peak Aligned): A={A_sq:.2f}, φ={phi_opt:.2f}"
+        wave_str = f"Sq Fit (Forced Amp): A={abs(A_sine):.2f}, φ={phi_opt:.2f}"
         
     except Exception as e:
         print(f"Fitting error: {e}")
@@ -137,13 +132,14 @@ class PlotHandler(BaseHTTPRequestHandler):
             ax2.plot(df_detrended["open_time"], df_detrended["close"], label="Detrended Close", linewidth=1, color='green', alpha=0.6)
             ax2.plot(df_detrended["open_time"], fitted_wave, label="Square Wave (Peak Aligned)", color='magenta', linewidth=2)
             
-            # Fill regions
+            # Shading
             y_min, y_max = ax2.get_ylim()
-            # Note: Logic holds if A_sq is positive. If A_sq is negative, the wave flips.
-            # We use the fitted_wave values directly to determine Up/Down phase.
-            mean_level = fitted_wave.mean() # Or C_sq
-            ax2.fill_between(df_detrended["open_time"], y_min, y_max, where=(fitted_wave > mean_level), color='green', alpha=0.1, label="Up Phase")
-            ax2.fill_between(df_detrended["open_time"], y_min, y_max, where=(fitted_wave <= mean_level), color='red', alpha=0.1, label="Down Phase")
+            # Determine Up/Down based on wave value relative to its center
+            center = fitted_wave.mean()
+            # If wave is high -> Up Phase (Green). If wave is low -> Down Phase (Red)
+            # This aligns with "Peak starts the down period" (High ends, Low begins)
+            ax2.fill_between(df_detrended["open_time"], y_min, y_max, where=(fitted_wave >= center), color='green', alpha=0.1, label="Up Phase")
+            ax2.fill_between(df_detrended["open_time"], y_min, y_max, where=(fitted_wave < center), color='red', alpha=0.1, label="Down Phase")
             
             ax2.axhline(0, color='black', linewidth=0.5)
             ax2.legend(loc="upper left")
