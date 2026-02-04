@@ -5,6 +5,7 @@ import io
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+from scipy.optimize import curve_fit
 import time
 
 def fetch_binance_data(symbol="ETHUSDT", interval="1d", start_year=2018):
@@ -52,7 +53,7 @@ def fetch_binance_data(symbol="ETHUSDT", interval="1d", start_year=2018):
     return df
 
 def process_data(df):
-    # Calculate 1460 SMA and Shift
+    # 1. Calculate 1460 SMA and Shift for Linear Trend
     df["sma_1460"] = df["close"].rolling(window=1460).mean()
     df["sma_1460_shifted"] = df["sma_1460"].shift(-1460)
     
@@ -64,18 +65,39 @@ def process_data(df):
     if len(x_valid) > 0:
         slope, intercept = np.polyfit(x_valid, y_valid, 1)
     else:
-        # Fallback if insufficient data for 1460 window
         slope, intercept = 0, 0
     
-    # Generate trend line for full dataset range
     x_full = np.arange(len(df))
     trend_line = slope * x_full + intercept
     
-    # Deduce trend from OHLC
+    # 2. Detrend (Deduce)
     df_detrended = df[["open", "high", "low", "close"]].subtract(trend_line, axis=0)
     df_detrended["open_time"] = df["open_time"]
     
-    return df, trend_line, df_detrended, (slope, intercept)
+    # 3. Fit Wave to Detrended Data (Fixed Lambda 1460)
+    # y = A * sin(2*pi/1460 * x + phi) + C
+    fixed_period = 1460
+    omega = 2 * np.pi / fixed_period
+    
+    def sine_wave(x, A, phi, C):
+        return A * np.sin(omega * x + phi) + C
+
+    y_detrended = df_detrended["close"].values
+    
+    # Initial guess: Amplitude=std_dev, phase=0, offset=mean
+    p0 = [np.std(y_detrended), 0, np.mean(y_detrended)]
+    
+    try:
+        params_wave, _ = curve_fit(sine_wave, x_full, y_detrended, p0=p0)
+        A, phi, C = params_wave
+        fitted_wave = sine_wave(x_full, A, phi, C)
+        wave_str = f"Wave Fit: A={A:.2f}, φ={phi:.2f}, C={C:.2f}"
+    except Exception as e:
+        print(f"Fitting error: {e}")
+        fitted_wave = np.zeros_like(x_full)
+        wave_str = "Wave Fit Failed"
+
+    return df, trend_line, df_detrended, (slope, intercept), fitted_wave, wave_str
 
 class PlotHandler(BaseHTTPRequestHandler):
     data_context = None 
@@ -86,25 +108,28 @@ class PlotHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'image/png')
             self.end_headers()
             
-            df, trend, df_detrended, params = self.data_context
+            df, trend, df_detrended, lin_params, fitted_wave, wave_str = self.data_context
             
             fig = Figure(figsize=(12, 10), dpi=100)
             (ax1, ax2) = fig.subplots(2, 1, sharex=True)
             
-            ax1.set_title(f"ETH/USDT | Fit to 1460 SMA (Shift -1460): y = {params[0]:.4f}x + {params[1]:.2f}")
+            # Upper Plot
+            ax1.set_title(f"ETH/USDT | Fit to 1460 SMA (Shift -1460): y = {lin_params[0]:.4f}x + {lin_params[1]:.2f}")
             ax1.plot(df["open_time"], df["close"], label="Close Price", linewidth=1, color='blue', alpha=0.5)
             ax1.plot(df["open_time"], df["sma_1460_shifted"], label="1460 SMA (Shift -1460)", color='orange', linewidth=1.5)
-            ax1.plot(df["open_time"], trend, label="Linear Trend (Fit to SMA)", color='red', linestyle="--")
-            
+            ax1.plot(df["open_time"], trend, label="Linear Trend", color='red', linestyle="--")
             ax1.legend()
             ax1.grid(True, alpha=0.3)
             ax1.set_ylabel("Price (USDT)")
             
-            ax2.set_title("Deduced OHLC (Detrended Residuals)")
-            ax2.plot(df_detrended["open_time"], df_detrended["close"], label="Detrended Close", linewidth=1, color='green')
+            # Lower Plot
+            ax2.set_title(f"Deduced OHLC & {wave_str} (λ=1460)")
+            ax2.plot(df_detrended["open_time"], df_detrended["close"], label="Detrended Close", linewidth=1, color='green', alpha=0.6)
+            ax2.plot(df_detrended["open_time"], fitted_wave, label="Fitted Wave (λ=1460)", color='magenta', linewidth=2)
             ax2.axhline(0, color='black', linewidth=0.5)
+            ax2.legend()
             ax2.grid(True, alpha=0.3)
-            ax2.set_ylabel("Deviation from Trend")
+            ax2.set_ylabel("Deviation")
             
             fig.autofmt_xdate()
             
