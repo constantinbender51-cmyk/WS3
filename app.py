@@ -8,7 +8,6 @@ import threading
 import time
 import io
 import random
-import matplotlib.dates as mdates
 
 # Configuration
 SYMBOL = 'ETH/USDT'
@@ -24,7 +23,6 @@ SL_PCT = 0.01
 TP_PCT = 0.02
 BAND_PCT = 0.005
 
-# Global Storage for Plotting
 full_history = {
     "dates": [],
     "price": [],
@@ -70,14 +68,12 @@ def apply_trend_logic(df):
     
     valid_train = train_df.dropna(subset=['sma_shifted'])
     
+    # Strict Mode: Crash if insufficient data
     if valid_train.empty:
-        # Fallback for small datasets (e.g., in debug/CI environments) to prevent crash
-        print("Warning: Insufficient data for full SMA. Using dummy linear fit.")
-        X = np.arange(len(train_df)).reshape(-1, 1)
-        y = train_df['close'].values
-    else:
-        X = np.arange(len(valid_train)).reshape(-1, 1)
-        y = valid_train['sma_shifted'].values
+        raise ValueError(f"Insufficient data for 1460-day SMA. Got {len(train_df)} hours.")
+
+    X = np.arange(len(valid_train)).reshape(-1, 1)
+    y = valid_train['sma_shifted'].values
     
     reg = LinearRegression().fit(X, y)
     
@@ -92,7 +88,6 @@ def apply_trend_logic(df):
 def backtest(levels, df, record_history=False):
     closes = df['close'].values
     trends = df['trend'].values
-    timestamps = df.index
     
     balance = 1000.0
     position = 0 
@@ -147,7 +142,6 @@ def backtest(levels, df, record_history=False):
                         balance *= (1 + pnl_pct - FEE)
                         position = 0
 
-        # Record Equity (Mark to Market)
         current_equity = balance
         if position != 0:
             unrealized_pnl = (price - entry_price) / entry_price * position
@@ -205,7 +199,7 @@ class GeneticAlgorithm:
                 
                 next_pop.append(child)
             self.population = next_pop
-            print(f"Gen {gen+1} | Best: {best_fitness:.2f}")
+            print(f"Gen {gen+1}/{self.generations} | Best Balance: {best_fitness:.2f}")
             
         return best_sol
 
@@ -213,11 +207,10 @@ app = Flask(__name__)
 
 @app.route('/plot.png')
 def plot_chart():
-    # FIX: Check length instead of implicit boolean truth value of DatetimeIndex
+    # Fixed Boolean Check
     if len(full_history["dates"]) == 0:
         return "Data processing not complete", 503
     
-    # Setup Figure
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(20, 12), gridspec_kw={'height_ratios': [3, 1]}, sharex=True)
     
     dates = full_history["dates"]
@@ -227,17 +220,14 @@ def plot_chart():
     pos = np.array(full_history["position"])
     levels = full_history["levels"]
     
-    # 1. Price & Lines
     ax1.plot(dates, price, label='Price', color='black', linewidth=1)
     ax1.plot(dates, trend, label='Trend', color='blue', linestyle='--', linewidth=1.5)
     
-    # Plot Grid Lines (Subsampled for rendering speed)
     if levels is not None:
         for i, lvl in enumerate(levels):
             if i % 5 == 0: 
                 ax1.plot(dates, trend + lvl, color='green', alpha=0.05, linewidth=0.5)
     
-    # 2. Positions
     y_min, y_max = ax1.get_ylim()
     ax1.fill_between(dates, y_min, y_max, where=(pos==1), color='green', alpha=0.1, label='Long')
     ax1.fill_between(dates, y_min, y_max, where=(pos==-1), color='red', alpha=0.1, label='Short')
@@ -246,7 +236,6 @@ def plot_chart():
     ax1.set_ylabel("Price")
     ax1.legend(loc='upper left')
     
-    # 3. Equity Curve
     ax2.plot(dates, equity, color='purple', linewidth=1.5, label='Account Balance')
     ax2.set_ylabel("Equity ($)")
     ax2.set_xlabel("Date")
@@ -264,21 +253,17 @@ def plot_chart():
 def main_pipeline():
     global full_history
     
-    # 1. Fetch
     df = fetch_data()
-    
-    # 2. Detrend
     df = apply_trend_logic(df)
     
-    # 3. Optimize (Train Split)
     train_size = int(len(df) * TRAIN_SPLIT)
     train_df = df.iloc[:train_size]
     
-    ga = GeneticAlgorithm(population_size=20, generations=5, mutation_rate=0.1, df=train_df)
-    print("Optimizing...")
+    # Increased to 50 Generations
+    ga = GeneticAlgorithm(population_size=50, generations=50, mutation_rate=0.1, df=train_df)
+    print("Optimizing (50 Gens)...")
     best_levels = ga.optimize()
     
-    # 4. Generate Full History (Test on ALL data)
     print("Generating full history...")
     _, hist_equity, hist_pos = backtest(best_levels, df, record_history=True)
     
