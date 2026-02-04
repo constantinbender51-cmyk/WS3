@@ -29,13 +29,12 @@ def fetch_binance_data(symbol="ETHUSDT", interval="1d", start_year=2018):
                 break
                 
             all_data.extend(data)
-            start_ts = data[-1][0] + 1 # Next timestamp
+            start_ts = data[-1][0] + 1 
             
-            # Break if we reached current time (handled by empty return usually, but safety check)
             if len(data) < 1000:
                 break
                 
-            time.sleep(0.1) # Rate limit compliance
+            time.sleep(0.1)
             
         except Exception as e:
             print(f"Fetch error: {e}")
@@ -53,24 +52,19 @@ def fetch_binance_data(symbol="ETHUSDT", interval="1d", start_year=2018):
     return df
 
 def process_data(df):
-    # Fit straight line (Linear Regression on Close)
-    # x is integer index, y is close price
     x = np.arange(len(df))
     y = df["close"].values
     
-    # y = mx + c
     slope, intercept = np.polyfit(x, y, 1)
     trend_line = slope * x + intercept
     
-    # Deduce line from OHLC (Detrending)
-    # Subtract trend from Open, High, Low, Close
     df_detrended = df[["open", "high", "low", "close"]].subtract(trend_line, axis=0)
     df_detrended["open_time"] = df["open_time"]
     
     return df, trend_line, df_detrended, (slope, intercept)
 
 class PlotHandler(BaseHTTPRequestHandler):
-    data_context = None # Injected class-level for simplicity in this script
+    data_context = None 
     
     def do_GET(self):
         if self.path == '/':
@@ -80,11 +74,9 @@ class PlotHandler(BaseHTTPRequestHandler):
             
             df, trend, df_detrended, params = self.data_context
             
-            # Generate Plot
             fig = Figure(figsize=(12, 10), dpi=100)
             (ax1, ax2) = fig.subplots(2, 1, sharex=True)
             
-            # Subplot 1: Original + Trend
             ax1.set_title(f"ETH/USDT (2018-Present) | Fit: y = {params[0]:.4f}x + {params[1]:.2f}")
             ax1.plot(df["open_time"], df["close"], label="Close Price", linewidth=1, color='blue')
             ax1.plot(df["open_time"], trend, label="Linear Trend", color='red', linestyle="--")
@@ -92,7 +84,6 @@ class PlotHandler(BaseHTTPRequestHandler):
             ax1.grid(True, alpha=0.3)
             ax1.set_ylabel("Price (USDT)")
             
-            # Subplot 2: Deduced (Detrended)
             ax2.set_title("Deduced OHLC (Detrended Residuals)")
             ax2.plot(df_detrended["open_time"], df_detrended["close"], label="Detrended Close", linewidth=1, color='green')
             ax2.axhline(0, color='black', linewidth=0.5)
@@ -101,9 +92,8 @@ class PlotHandler(BaseHTTPRequestHandler):
             
             fig.autofmt_xdate()
             
-            # Write to buffer
             output = io.BytesIO()
-            FigureCanvas(fig).print_png(output)
+            FigureCanvasAgg(fig).print_png(output)
             self.wfile.write(output.getvalue())
         else:
             self.send_error(404)
@@ -115,7 +105,6 @@ if __name__ == "__main__":
     print(f"Data fetched: {len(df)} records. Processing...")
     processed_data = process_data(df)
     
-    # Inject data into handler
     PlotHandler.data_context = processed_data
     
     port = 8080
