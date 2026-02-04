@@ -52,17 +52,20 @@ def fetch_binance_data(symbol="ETHUSDT", interval="1d", start_year=2018):
     return df
 
 def process_data(df):
-    # Calculate SMA and Shift
-    df["sma_730"] = df["close"].rolling(window=730).mean()
-    df["sma_730_shifted"] = df["sma_730"].shift(-730)
+    # Calculate 1460 SMA and Shift
+    df["sma_1460"] = df["close"].rolling(window=1460).mean()
+    df["sma_1460_shifted"] = df["sma_1460"].shift(-1460)
     
     # Fit line to shifted SMA
-    # Filter NaNs created by rolling and shifting
-    valid_mask = ~np.isnan(df["sma_730_shifted"])
+    valid_mask = ~np.isnan(df["sma_1460_shifted"])
     x_valid = np.arange(len(df))[valid_mask]
-    y_valid = df.loc[valid_mask, "sma_730_shifted"].values
+    y_valid = df.loc[valid_mask, "sma_1460_shifted"].values
     
-    slope, intercept = np.polyfit(x_valid, y_valid, 1)
+    if len(x_valid) > 0:
+        slope, intercept = np.polyfit(x_valid, y_valid, 1)
+    else:
+        # Fallback if insufficient data for 1460 window
+        slope, intercept = 0, 0
     
     # Generate trend line for full dataset range
     x_full = np.arange(len(df))
@@ -88,9 +91,9 @@ class PlotHandler(BaseHTTPRequestHandler):
             fig = Figure(figsize=(12, 10), dpi=100)
             (ax1, ax2) = fig.subplots(2, 1, sharex=True)
             
-            ax1.set_title(f"ETH/USDT | Fit to 730 SMA (Shift -730): y = {params[0]:.4f}x + {params[1]:.2f}")
+            ax1.set_title(f"ETH/USDT | Fit to 1460 SMA (Shift -1460): y = {params[0]:.4f}x + {params[1]:.2f}")
             ax1.plot(df["open_time"], df["close"], label="Close Price", linewidth=1, color='blue', alpha=0.5)
-            ax1.plot(df["open_time"], df["sma_730_shifted"], label="730 SMA (Shift -730)", color='orange', linewidth=1.5)
+            ax1.plot(df["open_time"], df["sma_1460_shifted"], label="1460 SMA (Shift -1460)", color='orange', linewidth=1.5)
             ax1.plot(df["open_time"], trend, label="Linear Trend (Fit to SMA)", color='red', linestyle="--")
             
             ax1.legend()
