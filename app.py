@@ -8,27 +8,26 @@ import base64
 import http.server
 import socketserver
 import numpy as np
-from datetime import datetime
 
-# 1. Fetch Data (Binance via CCXT)
+# 1. Fetch Data
 def fetch_binance_history(symbol, start_date_str):
     exchange = ccxt.binance({'enableRateLimit': True})
     timeframe = '1d'
     since = exchange.parse8601(f'{start_date_str}T00:00:00Z')
     all_ohlcv = []
     
-    print(f"Fetching {symbol} from {start_date_str}...")
+    print(f"Fetching {symbol}...")
     while True:
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
             if not ohlcv:
                 break
             all_ohlcv.extend(ohlcv)
-            since = ohlcv[-1][0] + 86400000  # Advance by 1 day in ms
+            since = ohlcv[-1][0] + 86400000 
             if since > exchange.milliseconds():
                 break
         except Exception as e:
-            print(f"Error fetching {symbol}: {e}")
+            print(f"Error: {e}")
             break
             
     df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -36,51 +35,49 @@ def fetch_binance_history(symbol, start_date_str):
     df.set_index('timestamp', inplace=True)
     return df['close']
 
-# Symbols map
 symbols = ['BTC/USDT', 'ETH/USDT', 'XRP/USDT', 'SOL/USDT']
 start_date = '2018-01-01'
 
-# Dict to hold series
-closes = {}
+data_frames = {}
 for sym in symbols:
-    closes[sym] = fetch_binance_history(sym, start_date)
+    data_frames[sym] = fetch_binance_history(sym, start_date)
 
-# Combine and align (Outer join to keep index integrity, then ffill)
-data = pd.DataFrame(closes).sort_index()
-# Rename cols for easier access
+# Align Data
+data = pd.DataFrame(data_frames).sort_index()
 data.columns = ['BTC', 'ETH', 'XRP', 'SOL']
 data = data.ffill()
 
 # 2. Strategy Logic
-btc_price = data['BTC']
-sma_365 = btc_price.rolling(window=365).mean()
+btc = data['BTC']
+sma_365 = btc.rolling(window=365).mean()
 
-# Signal Logic
-# SMA > Price -> Signal = 1 (Long BTC, Short Others)
-# SMA < Price -> Signal = -1 (Short BTC, Long Others)
-raw_signal = np.where(sma_365 > btc_price, 1, -1)
-signal_series = pd.Series(raw_signal, index=data.index).shift(1)
+# Signal Generation
+# Signal 1: Long BTC, Short Others
+# Signal -1: Short BTC, Long Others
+raw_signal = np.where(sma_365 > btc, 1, -1)
+signal_lagged = pd.Series(raw_signal, index=data.index).shift(1)
 
 # Returns
 daily_rets = data.pct_change()
 btc_ret = daily_rets['BTC']
 
-# "Others" return: Equal weight of available alts (ignores NaNs for pre-listing dates)
-# This dynamically handles when XRP or SOL didn't exist yet
+# Basket Return Construction
+# Size of BTC (1.0) = Size of Others Combined (1.0)
+# 'mean(axis=1)' calculates the return of an equal-weighted basket summing to 1.0
+# Handles NaN dynamically (e.g., before SOL listing, basket is 50% ETH / 50% XRP)
 others_ret = daily_rets[['ETH', 'XRP', 'SOL']].mean(axis=1)
 
-# Strategy PnL
-# If Signal 1: +1*BTC, -1*Others
-# If Signal -1: -1*BTC, +1*Others
-# Result: Signal * (BTC - Others)
-strat_ret = signal_series * (btc_ret - others_ret)
+# Strategy Calculation
+# If Signal=1:  (1.0 * BTC_Ret) - (1.0 * Others_Ret)
+# If Signal=-1: (-1.0 * BTC_Ret) + (1.0 * Others_Ret)
+strat_ret = signal_lagged * (btc_ret - others_ret)
 strat_cum = (1 + strat_ret.fillna(0)).cumprod()
 
 # 3. Plotting
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
 
 # Price vs SMA
-ax1.plot(btc_price.index, btc_price, label='BTC/USDT', color='black', alpha=0.6)
+ax1.plot(btc.index, btc, label='BTC Price', color='black', alpha=0.6)
 ax1.plot(sma_365.index, sma_365, label='SMA 365', color='orange', linewidth=2)
 ax1.set_yscale('log')
 ax1.set_title('Binance BTC/USDT vs SMA 365')
@@ -88,35 +85,33 @@ ax1.legend()
 ax1.grid(True, which="both", alpha=0.3)
 
 # PnL
-ax2.plot(strat_cum.index, strat_cum, label='Strategy PnL', color='green')
-ax2.set_title('Cumulative PnL (Base 1.0)')
+ax2.plot(strat_cum.index, strat_cum, label='Dollar Neutral (1 BTC : 1 Basket)', color='green')
+ax2.set_title('Cumulative PnL')
 ax2.legend()
 ax2.grid(True, alpha=0.3)
 
 plt.tight_layout()
 
-# Save to buffer
 buf = io.BytesIO()
 plt.savefig(buf, format='png')
 buf.seek(0)
-img_base64 = base64.b64encode(buf.read()).decode('utf-8')
+img_b64 = base64.b64encode(buf.read()).decode('utf-8')
 plt.close(fig)
 
-# 4. Server
+# 4. Serve
 PORT = 8080
 html = f"""
 <!DOCTYPE html>
 <html>
-<head><title>Binance Strategy</title></head>
-<body style="font-family: monospace; background: #f0f0f0; padding: 20px;">
-    <h2>Source: Binance | Start: {start_date}</h2>
+<head><title>Strategy Output</title></head>
+<body style="font-family: monospace; background: #eee; padding: 20px;">
+    <h2>BTC vs Alts Mean Reversion</h2>
     <div>
-        <b>Logic:</b><br>
-        IF SMA_365 > BTC_PRICE: LONG BTC, SHORT BASKET(ETH, XRP, SOL)<br>
-        ELSE: SHORT BTC, LONG BASKET
+        <b>Weighting:</b> 100% BTC vs 100% Alts Basket (Equal Weight)<br>
+        <b>Signal:</b> SMA365 > BTC ? Long BTC/Short Alts : Short BTC/Long Alts
     </div>
     <br>
-    <img src="data:image/png;base64,{img_base64}" style="border: 1px solid #ccc;">
+    <img src="data:image/png;base64,{img_b64}" style="border: 2px solid #555;">
 </body>
 </html>
 """
@@ -128,7 +123,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(html.encode('utf-8'))
 
-print(f"Serving on port {PORT}")
+print(f"Serving on port {PORT}...")
 with socketserver.TCPServer(("", PORT), Handler) as httpd:
     try:
         httpd.serve_forever()
