@@ -31,6 +31,7 @@ def fetch_data():
     df = df[~df.index.duplicated(keep='first')]
     return df
 
+# Analysis
 df = fetch_data()
 df['t'] = np.arange(len(df))
 
@@ -47,64 +48,59 @@ else:
     coeffs = np.polyfit(df['t'], df['close'], 1) 
     df['linear_trend'] = coeffs[0] * df['t'] + coeffs[1]
 
+# Residuals
 df['residuals'] = df['close'] - df['linear_trend']
 
-# Multi-Wave Fit (Triangle)
-# Periods: 1460, 730, 365, 182.5 (6mo), 91.25 (3mo), 42 (6wk), 21 (3wk)
-def triangle_wave_component(t, amp, phase, period):
-    freq = 2 * np.pi / period
-    return amp * (2 / np.pi) * np.arcsin(np.sin(freq * (t - phase)))
+# Composite Triangle Wave Fit (1460d + 730d)
+def triangle_func(t, period, phase):
+    frequency = 2 * np.pi / period
+    return (2 / np.pi) * np.arcsin(np.sin(frequency * (t - phase)))
 
-def composite_wave(t, off, 
-                   a1, p1, 
-                   a2, p2, 
-                   a3, p3, 
-                   a4, p4, 
-                   a5, p5, 
-                   a6, p6, 
-                   a7, p7):
-    w1 = triangle_wave_component(t, a1, p1, 1460)
-    w2 = triangle_wave_component(t, a2, p2, 730)
-    w3 = triangle_wave_component(t, a3, p3, 365)
-    w4 = triangle_wave_component(t, a4, p4, 182.5) # 6 months
-    w5 = triangle_wave_component(t, a5, p5, 91.25) # 3 months
-    w6 = triangle_wave_component(t, a6, p6, 42)    # 6 weeks
-    w7 = triangle_wave_component(t, a7, p7, 21)    # 3 weeks
-    return off + w1 + w2 + w3 + w4 + w5 + w6 + w7
+def composite_wave(t, a1, p1, a2, p2, offset):
+    w1 = a1 * triangle_func(t, 1460, p1)
+    w2 = a2 * triangle_func(t, 730, p2)
+    return offset + w1 + w2
 
-# Initial guesses: std of residuals for amps, 0 for phases
-std = df['residuals'].std()
-p0 = [0, 
-      std, 0, 
-      std/2, 0, 
-      std/3, 0, 
-      std/4, 0, 
-      std/5, 0, 
-      std/6, 0, 
-      std/7, 0]
+# Fit
+# Initial guess: split variance between amplitudes, zero phase
+std_res = df['residuals'].std()
+p0 = [std_res, 0, std_res/2, 0, 0] 
 
 try:
-    popt, _ = curve_fit(composite_wave, df['t'], df['residuals'], p0=p0, maxfev=10000)
+    popt, _ = curve_fit(composite_wave, df['t'], df['residuals'], p0=p0)
     df['composite_fit'] = composite_wave(df['t'], *popt)
+    df['w1460'] = popt[0] * triangle_func(df['t'], 1460, popt[1])
+    df['w730'] = popt[2] * triangle_func(df['t'], 730, popt[3]) + popt[4] # Add offset to one component for viz
 except Exception as e:
     print(f"Fit failed: {e}")
     df['composite_fit'] = np.zeros(len(df))
+    df['w1460'] = np.zeros(len(df))
+    df['w730'] = np.zeros(len(df))
 
+# Plot Server
 class PlotHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         plt.figure(figsize=(12, 10))
         
-        plt.subplot(2, 1, 1)
-        plt.plot(df.index, df['close'], label='BTC Close', alpha=0.4, color='gray')
-        plt.plot(df.index, df['linear_trend'] + df['composite_fit'], label='Trend + Composite Waves', color='blue', linewidth=1)
-        plt.title('BTC/USDT: Price vs Composite Triangle Model')
+        plt.subplot(3, 1, 1)
+        plt.plot(df.index, df['close'], label='BTC Close', alpha=0.5)
+        plt.plot(df.index, df['linear_trend'], label='Linear Trend', color='red', linestyle='--')
+        plt.plot(df.index, df['sma_shifted'], label='SMA(1460) Shift(-1460)', color='orange', alpha=0.7)
+        plt.title('BTC/USDT: Close vs Linear Trend')
         plt.legend()
         plt.grid(True)
 
-        plt.subplot(2, 1, 2)
-        plt.plot(df.index, df['residuals'], label='Residuals', alpha=0.3, color='gray')
-        plt.plot(df.index, df['composite_fit'], label='Composite Fit (1460, 730, 365, 6m, 3m, 6w, 3w)', color='green', linewidth=1.5)
-        plt.title('Detrended Residuals vs Multi-Frequency Triangle Fit')
+        plt.subplot(3, 1, 2)
+        plt.plot(df.index, df['residuals'], label='Residuals', alpha=0.4, color='gray')
+        plt.plot(df.index, df['composite_fit'], label='Composite Fit (1460d + 730d)', color='blue', linewidth=2)
+        plt.title('Residuals vs Composite Triangle Wave Fit')
+        plt.legend()
+        plt.grid(True)
+
+        plt.subplot(3, 1, 3)
+        plt.plot(df.index, df['w1460'], label='1460d Component', color='green', linestyle='--')
+        plt.plot(df.index, df['w730'], label='730d Component', color='purple', linestyle='--')
+        plt.title('Wave Components')
         plt.legend()
         plt.grid(True)
 
