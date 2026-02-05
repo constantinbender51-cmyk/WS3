@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
+from scipy.signal import sawtooth
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import io
 
@@ -51,16 +52,17 @@ else:
 # Residuals
 df['residuals'] = df['close'] - df['linear_trend']
 
-# Sine Wave Fit (Period 1460)
-def sine_wave(t, amplitude, phase, offset):
-    return offset + amplitude * np.sin(2 * np.pi * (t - phase) / 1460)
+# Triangle Wave Fit (Period 1460)
+def triangle_wave(t, amplitude, phase, offset):
+    # width=0.5 creates a symmetric triangle wave
+    return offset + amplitude * sawtooth(2 * np.pi * (t - phase) / 1460, width=0.5)
 
 p0 = [df['residuals'].std(), 0, 0]
 try:
-    popt, _ = curve_fit(sine_wave, df['t'], df['residuals'], p0=p0)
-    df['sine_fit'] = sine_wave(df['t'], *popt)
+    popt, _ = curve_fit(triangle_wave, df['t'], df['residuals'], p0=p0)
+    df['triangle_fit'] = triangle_wave(df['t'], *popt)
 except:
-    df['sine_fit'] = np.zeros(len(df))
+    df['triangle_fit'] = np.zeros(len(df))
 
 # Plot Server
 class PlotHandler(BaseHTTPRequestHandler):
@@ -77,8 +79,8 @@ class PlotHandler(BaseHTTPRequestHandler):
 
         plt.subplot(2, 1, 2)
         plt.plot(df.index, df['residuals'], label='Residuals (Close - Trend)', alpha=0.5)
-        plt.plot(df.index, df['sine_fit'], label=f'Sine Fit ($\lambda=1460$)', color='green', linewidth=2)
-        plt.title('Detrended Residuals vs 1460-Day Sine Wave Fit')
+        plt.plot(df.index, df['triangle_fit'], label=f'Triangle Fit ($\lambda=1460$)', color='green', linewidth=2)
+        plt.title('Detrended Residuals vs 1460-Day Triangle Wave Fit')
         plt.legend()
         plt.grid(True)
 
