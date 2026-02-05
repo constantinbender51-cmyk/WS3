@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
-from scipy.signal import sawtooth
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import io
 
@@ -52,10 +51,11 @@ else:
 # Residuals
 df['residuals'] = df['close'] - df['linear_trend']
 
-# Triangle Wave Fit (Period 1460)
+# Triangle Wave Fit (using arcsin(sin))
 def triangle_wave(t, amplitude, phase, offset):
-    # width=0.5 creates a symmetric triangle wave
-    return offset + amplitude * sawtooth(2 * np.pi * (t - phase) / 1460, width=0.5)
+    # (2/pi) * arcsin(sin(x)) produces a triangle wave between -1 and 1
+    frequency = 2 * np.pi / 1460
+    return offset + amplitude * (2 / np.pi) * np.arcsin(np.sin(frequency * (t - phase)))
 
 p0 = [df['residuals'].std(), 0, 0]
 try:
