@@ -11,8 +11,6 @@ def fetch_btc_data():
     exchange = ccxt.binance()
     symbol = 'BTC/USDT'
     timeframe = '1d'
-    # Fetch enough history to cover the new start date if needed, 
-    # though 2018-01-01 is still the data boundary.
     since = exchange.parse8601('2018-01-01T00:00:00Z')
     
     all_candles = []
@@ -32,10 +30,13 @@ def fetch_btc_data():
 
 # 2. Strategy Logic
 def apply_strategy(df):
-    # Anchor date: July 1, 2017 (Shifted -1 year)
+    # Anchor date: July 1, 2017
     anchor_date = pd.Timestamp('2017-07-01')
     
     df['returns'] = df['close'].pct_change()
+    
+    # 730 SMA
+    df['sma730'] = df['close'].rolling(window=730).mean()
     
     def get_signal(date):
         if date < anchor_date:
@@ -69,22 +70,38 @@ def serve_plot():
     df = fetch_btc_data()
     df = apply_strategy(df)
     
-    fig, ax = plt.subplots(figsize=(12, 6))
+    # Create figure with secondary y-axis for price vs cumulative returns
+    fig, ax1 = plt.subplots(figsize=(12, 6))
     
-    ax.plot(df.index, df['cum_bnh'], label='Buy & Hold (BTC)', alpha=0.5, color='gray')
-    ax.plot(df.index, df['cum_strat'], label='4Y Cycle (1S/3L)', color='blue')
+    # Plot Cumulative Returns (Left Axis)
+    ax1.plot(df.index, df['cum_bnh'], label='Buy & Hold (Left)', alpha=0.5, color='gray')
+    ax1.plot(df.index, df['cum_strat'], label='Strategy (Left)', color='blue')
+    ax1.set_ylabel('Cumulative Return')
+    ax1.set_yscale('log')
     
-    # Visual markers for cycle resets (July 1sts, starting 2017)
+    # Plot Price and SMA (Right Axis) to scale correctly
+    ax2 = ax1.twinx()
+    ax2.plot(df.index, df['sma730'], label='730 SMA (Right)', color='orange', linewidth=1.5)
+    # Optional: Plot underlying price on right axis for reference against SMA
+    # ax2.plot(df.index, df['close'], label='Price (Right)', color='black', alpha=0.1)
+    ax2.set_ylabel('Price (USDT)')
+    ax2.set_yscale('log')
+    
+    # Markers
     cycle_years = range(2017, df.index.year.max() + 1, 4)
     for y in cycle_years:
         d = pd.Timestamp(f'{y}-07-01')
         if d >= df.index.min() and d <= df.index.max():
-            ax.axvline(d, color='red', linestyle='--', alpha=0.3)
+            ax1.axvline(d, color='red', linestyle='--', alpha=0.3)
 
-    ax.set_title('BTC 4-Year Cycle Strategy (Anchor July 1 2017)')
-    ax.set_yscale('log')
-    ax.legend()
-    ax.grid(True, which="both", ls="-", alpha=0.2)
+    plt.title('BTC 4-Year Cycle Strategy + 730 SMA')
+    
+    # Combine legends
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+    
+    ax1.grid(True, which="both", ls="-", alpha=0.2)
     
     img = io.BytesIO()
     fig.savefig(img, format='png', bbox_inches='tight')
