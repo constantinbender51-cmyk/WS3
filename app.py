@@ -1,187 +1,101 @@
-import ccxt
 import pandas as pd
-import numpy as np
+import yfinance as yf
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use('Agg') # Non-interactive backend
 import matplotlib.pyplot as plt
-from flask import Flask, Response
 import io
-import time
-from datetime import timedelta
+import base64
+import http.server
+import socketserver
+import numpy as np
 
-app = Flask(__name__)
+# 1. Fetch Data
+tickers = ['BTC-USD', 'ETH-USD', 'XRP-USD', 'SOL-USD']
+start_date = '2018-01-01'
+print(f"Fetching data for {tickers} from {start_date}...")
+data = yf.download(tickers, start=start_date, progress=False)['Close']
 
-# --- Configuration ---
-SYMBOL = 'ETH/USDT'
-TIMEFRAME = '1d'
-START_DATE_STR = '2018-01-01 00:00:00'
-VOLATILITY_THRESHOLD = 0.2
-DEFAULT_DURATION_DAYS = 365
-TRAILING_TP_PCT = 0.01
+# Forward fill to handle any potential missing daily prints (though crypto is 24/7)
+data = data.ffill()
 
-# Global cache
-_cache = {'data': None, 'timestamp': 0}
+# 2. Strategy Logic
+# BTC SMA 365
+btc_price = data['BTC-USD']
+sma_365 = btc_price.rolling(window=365).mean()
 
-def fetch_data():
-    if _cache['data'] is not None and time.time() - _cache['timestamp'] < 3600:
-        return _cache['data']
+# Signal: 
+# SMA > Price -> Long BTC, Short Others (Signal = 1)
+# SMA < Price -> Short BTC, Long Others (Signal = -1)
+# Signal is lagged by 1 day to avoid lookahead bias (trade next day based on today's close)
+signal = np.where(sma_365 > btc_price, 1, -1)
+signal_series = pd.Series(signal, index=data.index).shift(1)
 
-    exchange = ccxt.binance({'enableRateLimit': True})
-    since = exchange.parse8601(START_DATE_STR)
-    all_candles = []
-    
-    while True:
-        try:
-            candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since=since)
-            if not candles:
-                break
-            all_candles.extend(candles)
-            since = candles[-1][0] + 1
-            if candles[-1][0] >= exchange.milliseconds() - 24*60*60*1000: 
-                break
-            time.sleep(exchange.rateLimit / 1000)
-        except Exception as e:
-            print(f"Error fetching data: {e}")
-            break
-            
-    df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('date', inplace=True)
-    _cache['data'] = df
-    _cache['timestamp'] = time.time()
-    return df
+# Returns
+daily_rets = data.pct_change()
 
-def backtest_strategies(df):
-    df['range_pct'] = (df['high'] / df['low']) - 1
-    
-    active_positions = [] 
-    completed_trades = []
-    triangles = []
-    
-    # 1. Identify Non-Overlapping Triangles
-    next_available_date = pd.Timestamp.min
-    
-    for date, row in df.iterrows():
-        # Check if we are inside a blocking triangle window
-        if date < next_available_date:
-            continue
-            
-        if row['range_pct'] > VOLATILITY_THRESHOLD:
-            y_start = row['high']
-            y_end = row['low']
-            direction = 1 if row['close'] > row['open'] else -1
-            slope = (y_end - y_start) / DEFAULT_DURATION_DAYS
-            
-            triangle = {
-                'start_date': date,
-                'end_date': date + timedelta(days=DEFAULT_DURATION_DAYS),
-                'm': slope,
-                'c': y_start,
-                'direction': direction
-            }
-            triangles.append(triangle)
-            
-            # Block new triangles until this one finishes
-            next_available_date = triangle['end_date']
+# Components
+btc_ret = daily_rets['BTC-USD']
+others_ret = daily_rets[['ETH-USD', 'XRP-USD', 'SOL-USD']].mean(axis=1) # Equal weight basket of available alts
 
-    # 2. Iterate through history to execute trades
-    if not triangles:
-        return [], []
-        
-    start_sim = triangles[0]['start_date']
-    sim_data = df.loc[start_sim:]
-    
-    for current_date, row in sim_data.iterrows():
-        day_high = row['high']
-        day_low = row['low']
-        
-        # A. Check Triangle Entries
-        for tri in triangles:
-            if tri['start_date'] < current_date <= tri['end_date']:
-                days_passed = (current_date - tri['start_date']).days
-                hypo_price = tri['m'] * days_passed + tri['c']
-                
-                # Check fill: Price crossed hypotenuse
-                if day_low <= hypo_price <= day_high:
-                    active_positions.append({
-                        'entry_price': hypo_price,
-                        'direction': tri['direction'],
-                        'extreme_price': hypo_price, 
-                        'entry_date': current_date
-                    })
+# Strategy Return
+# Signal=1: Long BTC (+1 * btc), Short Others (-1 * others) -> BTC - Others
+# Signal=-1: Short BTC (-1 * btc), Long Others (-(-1) * others) -> Others - BTC
+# Formula: Signal * (BTC - Others)
+strat_ret = signal_series * (btc_ret - others_ret)
 
-        # B. Check Trailing TP
-        remaining_positions = []
-        for pos in active_positions:
-            triggered = False
-            
-            if pos['direction'] == 1: # Long
-                if day_high > pos['extreme_price']:
-                    pos['extreme_price'] = day_high
-                
-                stop_price = pos['extreme_price'] * (1 - TRAILING_TP_PCT)
-                if day_low <= stop_price:
-                    completed_trades.append({'date': current_date, 'price': stop_price, 'type': 'exit_long'})
-                    triggered = True
-            else: # Short
-                if day_low < pos['extreme_price']:
-                    pos['extreme_price'] = day_low
-                
-                stop_price = pos['extreme_price'] * (1 + TRAILING_TP_PCT)
-                if day_high >= stop_price:
-                    completed_trades.append({'date': current_date, 'price': stop_price, 'type': 'exit_short'})
-                    triggered = True
-            
-            if not triggered:
-                remaining_positions.append(pos)
-        
-        active_positions = remaining_positions
+# Cumulative PnL
+strat_cum = (1 + strat_ret.fillna(0)).cumprod()
 
-    return triangles, completed_trades
+# 3. Plotting
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
 
-def analyze_and_plot():
-    df = fetch_data()
-    triangles, trades = backtest_strategies(df)
-    
-    plt.figure(figsize=(15, 8))
-    plt.plot(df.index, df['close'], label='Close', color='gray', alpha=0.3, linewidth=1)
+# Top: Price vs SMA
+ax1.plot(btc_price.index, btc_price, label='BTC Price', color='black', alpha=0.6)
+ax1.plot(sma_365.index, sma_365, label='SMA 365', color='orange', linewidth=2)
+ax1.set_yscale('log')
+ax1.set_title('BTC Price vs 365 SMA (Log Scale)')
+ax1.legend()
+ax1.grid(True, which="both", ls="-", alpha=0.2)
 
-    for tri in triangles:
-        plt.plot([tri['start_date'], tri['end_date']], 
-                 [tri['c'], tri['m'] * DEFAULT_DURATION_DAYS + tri['c']], 
-                 'r--', linewidth=0.8, alpha=0.7)
+# Bottom: PnL
+ax2.plot(strat_cum.index, strat_cum, label='Long BTC / Short Alts (Mean Reversion)', color='green')
+ax2.set_title('Cumulative Strategy PnL (Initial=1.0)')
+ax2.legend()
+ax2.grid(True)
 
-    if trades:
-        exit_df = pd.DataFrame(trades)
-        long_exits = exit_df[exit_df['type'] == 'exit_long']
-        short_exits = exit_df[exit_df['type'] == 'exit_short']
-        
-        if not long_exits.empty:
-            plt.scatter(long_exits['date'], long_exits['price'], c='green', marker='^', s=30, label='Long Exit')
-        if not short_exits.empty:
-            plt.scatter(short_exits['date'], short_exits['price'], c='red', marker='v', s=30, label='Short Exit')
+plt.tight_layout()
 
-    plt.title(f"ETH/USDT 1D: >10% Volatility Triangles (Non-Overlapping) & 1% Trailing TP")
-    plt.yscale('log')
-    plt.legend()
-    plt.grid(True, which='both', linestyle='--', linewidth=0.3)
-    plt.tight_layout()
+# Save to buffer
+buf = io.BytesIO()
+plt.savefig(buf, format='png')
+buf.seek(0)
+img_base64 = base64.b64encode(buf.read()).decode('utf-8')
+plt.close(fig)
 
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=150)
-    plt.close()
-    buf.seek(0)
-    return buf
+# 4. Serve on 8080
+PORT = 8080
+html_content = f"""
+<!DOCTYPE html>
+<html>
+<head><title>Strategy Output</title></head>
+<body>
+    <h1>BTC vs Alts Mean Reversion Strategy</h1>
+    <p><b>Logic:</b> If SMA365 > BTC Price: Long BTC, Short Alts. Else: Short BTC, Long Alts.</p>
+    <img src="data:image/png;base64,{img_base64}" alt="Strategy Plot">
+</body>
+</html>
+"""
 
-@app.route('/')
-def serve_plot():
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+        self.wfile.write(html_content.encode('utf-8'))
+
+print(f"Serving plot on port {PORT}...")
+with socketserver.TCPServer(("", PORT), Handler) as httpd:
     try:
-        img_buf = analyze_and_plot()
-        return Response(img_buf, mimetype='image/png')
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return f"Server Error: {str(e)}", 500
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080, debug=False)
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
