@@ -1,17 +1,18 @@
 import ccxt
 import pandas as pd
 import matplotlib
-matplotlib.use('Agg') # Non-interactive backend for server
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import io
 from flask import Flask, send_file
-from datetime import datetime, timedelta
 
 # 1. Fetch Data
 def fetch_btc_data():
     exchange = ccxt.binance()
     symbol = 'BTC/USDT'
     timeframe = '1d'
+    # Fetch enough history to cover the new start date if needed, 
+    # though 2018-01-01 is still the data boundary.
     since = exchange.parse8601('2018-01-01T00:00:00Z')
     
     all_candles = []
@@ -31,19 +32,15 @@ def fetch_btc_data():
 
 # 2. Strategy Logic
 def apply_strategy(df):
-    # Anchor date: July 1, 2018 (First July 1 in dataset)
-    anchor_date = pd.Timestamp('2018-07-01')
+    # Anchor date: July 1, 2017 (Shifted -1 year)
+    anchor_date = pd.Timestamp('2017-07-01')
     
-    # Calculate daily returns
     df['returns'] = df['close'].pct_change()
     
-    # Define signal function
     def get_signal(date):
         if date < anchor_date:
-            return 0 # No position before cycle start
+            return 0 
         
-        # Calculate years since anchor
-        # We use days/365.25 to approximate position in 4-year cycle
         days_since = (date - anchor_date).days
         years_passed = days_since / 365.25
         cycle_position = years_passed % 4
@@ -57,10 +54,8 @@ def apply_strategy(df):
 
     df['signal'] = df.index.to_series().apply(get_signal)
     
-    # Calculate Strategy Returns
     df['strategy_returns'] = df['returns'] * df['signal'].shift(1)
     
-    # Cumulative Returns
     df['cum_bnh'] = (1 + df['returns']).cumprod()
     df['cum_strat'] = (1 + df['strategy_returns']).cumprod()
     
@@ -71,32 +66,26 @@ app = Flask(__name__)
 
 @app.route('/')
 def serve_plot():
-    # Fetch and Calculate
     df = fetch_btc_data()
     df = apply_strategy(df)
     
-    # Plot
     fig, ax = plt.subplots(figsize=(12, 6))
     
-    # Plot Buy & Hold
     ax.plot(df.index, df['cum_bnh'], label='Buy & Hold (BTC)', alpha=0.5, color='gray')
-    
-    # Plot Strategy
     ax.plot(df.index, df['cum_strat'], label='4Y Cycle (1S/3L)', color='blue')
     
-    # Visual markers for cycle resets (July 1sts)
-    cycle_years = range(2018, df.index.year.max() + 1, 4)
+    # Visual markers for cycle resets (July 1sts, starting 2017)
+    cycle_years = range(2017, df.index.year.max() + 1, 4)
     for y in cycle_years:
         d = pd.Timestamp(f'{y}-07-01')
         if d >= df.index.min() and d <= df.index.max():
-            ax.axvline(d, color='red', linestyle='--', alpha=0.3, label='Cycle Start (Short)' if y == 2018 else "")
+            ax.axvline(d, color='red', linestyle='--', alpha=0.3)
 
-    ax.set_title('BTC 4-Year Cycle Strategy (Start July 1: 1y Short, 3y Long)')
+    ax.set_title('BTC 4-Year Cycle Strategy (Anchor July 1 2017)')
     ax.set_yscale('log')
     ax.legend()
     ax.grid(True, which="both", ls="-", alpha=0.2)
     
-    # Save to buffer
     img = io.BytesIO()
     fig.savefig(img, format='png', bbox_inches='tight')
     img.seek(0)
