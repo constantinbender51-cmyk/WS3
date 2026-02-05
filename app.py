@@ -1,5 +1,6 @@
 import ccxt
 import pandas as pd
+import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -11,7 +12,7 @@ def fetch_btc_data():
     exchange = ccxt.binance()
     symbol = 'BTC/USDT'
     timeframe = '1d'
-    since = exchange.parse8601('2018-01-01T00:00:00Z')
+    since = exchange.parse8601('2017-01-01T00:00:00Z') # Extended history for moving averages
     
     all_candles = []
     while True:
@@ -28,16 +29,38 @@ def fetch_btc_data():
     df.set_index('date', inplace=True)
     return df
 
-# 2. Strategy Logic
-def apply_strategy(df):
-    # Anchor date: July 1, 2017
+# 2. Strategy & Analysis Logic
+def apply_analysis(df):
+    # --- Strategy Anchors ---
     anchor_date = pd.Timestamp('2017-07-01')
     
+    # --- Basic Returns ---
     df['returns'] = df['close'].pct_change()
     
-    # 730 SMA
+    # --- Moving Averages ---
     df['sma730'] = df['close'].rolling(window=730).mean()
+    df['sma1460'] = df['close'].rolling(window=1460).mean()
     
+    # Offset 1460 SMA by -1460 days (shift backwards)
+    # Note: This moves future values to the past. Recent 1460 days will be NaN.
+    df['sma1460_shifted'] = df['sma1460'].shift(-1460)
+
+    # --- Linear Regression (Log-Linear) ---
+    # Convert dates to ordinal for regression
+    df_reg = df.dropna(subset=['close']).copy()
+    df_reg['ordinal'] = df_reg.index.map(pd.Timestamp.toordinal)
+    
+    # Fit log(price) = mx + c
+    slope, intercept = np.polyfit(df_reg['ordinal'], np.log(df_reg['close']), 1)
+    
+    # Calculate Regression Line Values for original df
+    df['ordinal'] = df.index.map(pd.Timestamp.toordinal)
+    df['log_lin_reg'] = np.exp(slope * df['ordinal'] + intercept)
+    
+    # --- Deduction (730 SMA - Regression Line) ---
+    df['deduced_metric'] = df['sma730'] - df['log_lin_reg']
+
+    # --- Cycle Signal ---
     def get_signal(date):
         if date < anchor_date:
             return 0 
@@ -46,17 +69,15 @@ def apply_strategy(df):
         years_passed = days_since / 365.25
         cycle_position = years_passed % 4
         
-        # 0.0 - 1.0: Short (1st year)
-        # 1.0 - 4.0: Long (Next 3 years)
         if 0 <= cycle_position < 1:
             return -1
         else:
             return 1
 
     df['signal'] = df.index.to_series().apply(get_signal)
-    
     df['strategy_returns'] = df['returns'] * df['signal'].shift(1)
     
+    # --- Cumulative Results ---
     df['cum_bnh'] = (1 + df['returns']).cumprod()
     df['cum_strat'] = (1 + df['strategy_returns']).cumprod()
     
@@ -68,40 +89,51 @@ app = Flask(__name__)
 @app.route('/')
 def serve_plot():
     df = fetch_btc_data()
-    df = apply_strategy(df)
+    df = apply_analysis(df)
     
-    # Create figure with secondary y-axis for price vs cumulative returns
-    fig, ax1 = plt.subplots(figsize=(12, 6))
+    # Create 2 subplots sharing x-axis
+    fig, (ax1, ax3) = plt.subplots(2, 1, figsize=(12, 10), sharex=True, gridspec_kw={'height_ratios': [3, 1]})
     
-    # Plot Cumulative Returns (Left Axis)
-    ax1.plot(df.index, df['cum_bnh'], label='Buy & Hold (Left)', alpha=0.5, color='gray')
-    ax1.plot(df.index, df['cum_strat'], label='Strategy (Left)', color='blue')
-    ax1.set_ylabel('Cumulative Return')
+    # --- Top Plot: Strategy & Price ---
+    ax2 = ax1.twinx() # Secondary y-axis for Price/SMAs
+    
+    # Left Axis: Cumulative Returns
+    ax1.plot(df.index, df['cum_bnh'], label='Buy & Hold (Left)', alpha=0.3, color='gray', linestyle=':')
+    ax1.plot(df.index, df['cum_strat'], label='Strat (Left)', color='blue', linewidth=2)
+    ax1.set_ylabel('Cum. Return')
     ax1.set_yscale('log')
     
-    # Plot Price and SMA (Right Axis) to scale correctly
-    ax2 = ax1.twinx()
-    ax2.plot(df.index, df['sma730'], label='730 SMA (Right)', color='orange', linewidth=1.5)
-    # Optional: Plot underlying price on right axis for reference against SMA
-    # ax2.plot(df.index, df['close'], label='Price (Right)', color='black', alpha=0.1)
+    # Right Axis: Price, SMAs, Regression
+    ax2.plot(df.index, df['close'], label='Price', color='black', alpha=0.1)
+    ax2.plot(df.index, df['sma730'], label='SMA 730', color='orange')
+    ax2.plot(df.index, df['sma1460_shifted'], label='SMA 1460 (Shift -1460)', color='purple', linestyle='--')
+    ax2.plot(df.index, df['log_lin_reg'], label='Log-Lin Reg', color='green', linestyle='-.')
     ax2.set_ylabel('Price (USDT)')
     ax2.set_yscale('log')
-    
-    # Markers
+
+    # Cycle Markers (Top Plot)
     cycle_years = range(2017, df.index.year.max() + 1, 4)
     for y in cycle_years:
         d = pd.Timestamp(f'{y}-07-01')
         if d >= df.index.min() and d <= df.index.max():
             ax1.axvline(d, color='red', linestyle='--', alpha=0.3)
-
-    plt.title('BTC 4-Year Cycle Strategy + 730 SMA')
     
-    # Combine legends
+    ax1.set_title('BTC Strategy | 730 SMA | 1460 SMA Offset | Regression')
+    
+    # Legends
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
-    
-    ax1.grid(True, which="both", ls="-", alpha=0.2)
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize='small')
+
+    # --- Bottom Plot: Deduction ---
+    ax3.plot(df.index, df['deduced_metric'], label='730 SMA - Regression', color='brown')
+    ax3.axhline(0, color='black', linewidth=0.5)
+    ax3.set_ylabel('Diff (USDT)')
+    ax3.set_title('Deduction: SMA 730 - Log Linear Regression')
+    ax3.legend(loc='upper left', fontsize='small')
+    ax3.grid(True, alpha=0.3)
+
+    plt.tight_layout()
     
     img = io.BytesIO()
     fig.savefig(img, format='png', bbox_inches='tight')
