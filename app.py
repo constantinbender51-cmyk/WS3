@@ -1,125 +1,109 @@
 import ccxt
 import pandas as pd
-import numpy as np
+import matplotlib
+matplotlib.use('Agg') # Non-interactive backend for server
 import matplotlib.pyplot as plt
-from scipy.optimize import curve_fit
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import io
+from flask import Flask, send_file
+from datetime import datetime, timedelta
 
-def fetch_data():
+# 1. Fetch Data
+def fetch_btc_data():
     exchange = ccxt.binance()
     symbol = 'BTC/USDT'
     timeframe = '1d'
     since = exchange.parse8601('2018-01-01T00:00:00Z')
-    all_ohlcv = []
     
+    all_candles = []
     while True:
-        try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
-            if not ohlcv:
-                break
-            all_ohlcv.extend(ohlcv)
-            since = ohlcv[-1][0] + 86400000 
-            if since > exchange.milliseconds():
-                break
-        except Exception:
+        candles = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
+        if not candles:
+            break
+        all_candles.extend(candles)
+        since = candles[-1][0] + 1
+        if len(candles) < 1000:
             break
             
-    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
-    df = df[~df.index.duplicated(keep='first')]
+    df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('date', inplace=True)
     return df
 
-# Analysis
-df = fetch_data()
-df['t'] = np.arange(len(df))
-
-# SMA 1460 and Offset
-df['sma'] = df['close'].rolling(window=1460).mean()
-df['sma_shifted'] = df['sma'].shift(-1460)
-
-# Linear Fit to Shifted SMA
-fit_data = df.dropna(subset=['sma_shifted'])
-if not fit_data.empty:
-    coeffs = np.polyfit(fit_data['t'], fit_data['sma_shifted'], 1)
-    df['linear_trend'] = coeffs[0] * df['t'] + coeffs[1]
-else:
-    coeffs = np.polyfit(df['t'], df['close'], 1) 
-    df['linear_trend'] = coeffs[0] * df['t'] + coeffs[1]
-
-# Residuals
-df['residuals'] = df['close'] - df['linear_trend']
-
-# Composite Triangle Wave Fit (1460d + 730d)
-def triangle_func(t, period, phase):
-    frequency = 2 * np.pi / period
-    return (2 / np.pi) * np.arcsin(np.sin(frequency * (t - phase)))
-
-def composite_wave(t, a1, p1, a2, p2, offset):
-    w1 = a1 * triangle_func(t, 1460, p1)
-    w2 = a2 * triangle_func(t, 730, p2)
-    return offset + w1 + w2
-
-# Fit
-# Initial guess: split variance between amplitudes, zero phase
-std_res = df['residuals'].std()
-p0 = [std_res, 0, std_res/2, 0, 0] 
-
-try:
-    popt, _ = curve_fit(composite_wave, df['t'], df['residuals'], p0=p0)
-    df['composite_fit'] = composite_wave(df['t'], *popt)
-    df['w1460'] = popt[0] * triangle_func(df['t'], 1460, popt[1])
-    df['w730'] = popt[2] * triangle_func(df['t'], 730, popt[3]) + popt[4] # Add offset to one component for viz
-except Exception as e:
-    print(f"Fit failed: {e}")
-    df['composite_fit'] = np.zeros(len(df))
-    df['w1460'] = np.zeros(len(df))
-    df['w730'] = np.zeros(len(df))
-
-# Plot Server
-class PlotHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        plt.figure(figsize=(12, 10))
+# 2. Strategy Logic
+def apply_strategy(df):
+    # Anchor date: July 1, 2018 (First July 1 in dataset)
+    anchor_date = pd.Timestamp('2018-07-01')
+    
+    # Calculate daily returns
+    df['returns'] = df['close'].pct_change()
+    
+    # Define signal function
+    def get_signal(date):
+        if date < anchor_date:
+            return 0 # No position before cycle start
         
-        plt.subplot(3, 1, 1)
-        plt.plot(df.index, df['close'], label='BTC Close', alpha=0.5)
-        plt.plot(df.index, df['linear_trend'], label='Linear Trend', color='red', linestyle='--')
-        plt.plot(df.index, df['sma_shifted'], label='SMA(1460) Shift(-1460)', color='orange', alpha=0.7)
-        plt.title('BTC/USDT: Close vs Linear Trend')
-        plt.legend()
-        plt.grid(True)
-
-        plt.subplot(3, 1, 2)
-        plt.plot(df.index, df['residuals'], label='Residuals', alpha=0.4, color='gray')
-        plt.plot(df.index, df['composite_fit'], label='Composite Fit (1460d + 730d)', color='blue', linewidth=2)
-        plt.title('Residuals vs Composite Triangle Wave Fit')
-        plt.legend()
-        plt.grid(True)
-
-        plt.subplot(3, 1, 3)
-        plt.plot(df.index, df['w1460'], label='1460d Component', color='green', linestyle='--')
-        plt.plot(df.index, df['w730'], label='730d Component', color='purple', linestyle='--')
-        plt.title('Wave Components')
-        plt.legend()
-        plt.grid(True)
-
-        plt.tight_layout()
+        # Calculate years since anchor
+        # We use days/365.25 to approximate position in 4-year cycle
+        days_since = (date - anchor_date).days
+        years_passed = days_since / 365.25
+        cycle_position = years_passed % 4
         
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png')
-        buf.seek(0)
-        plt.close()
-        
-        self.send_response(200)
-        self.send_header('Content-type', 'image/png')
-        self.end_headers()
-        self.wfile.write(buf.getvalue())
+        # 0.0 - 1.0: Short (1st year)
+        # 1.0 - 4.0: Long (Next 3 years)
+        if 0 <= cycle_position < 1:
+            return -1
+        else:
+            return 1
 
-def run(port=8080):
-    server = HTTPServer(('', port), PlotHandler)
-    print(f'Serving plot on port {port}...')
-    server.serve_forever()
+    df['signal'] = df.index.to_series().apply(get_signal)
+    
+    # Calculate Strategy Returns
+    df['strategy_returns'] = df['returns'] * df['signal'].shift(1)
+    
+    # Cumulative Returns
+    df['cum_bnh'] = (1 + df['returns']).cumprod()
+    df['cum_strat'] = (1 + df['strategy_returns']).cumprod()
+    
+    return df
 
-if __name__ == "__main__":
-    run()
+# 3. Server
+app = Flask(__name__)
+
+@app.route('/')
+def serve_plot():
+    # Fetch and Calculate
+    df = fetch_btc_data()
+    df = apply_strategy(df)
+    
+    # Plot
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    # Plot Buy & Hold
+    ax.plot(df.index, df['cum_bnh'], label='Buy & Hold (BTC)', alpha=0.5, color='gray')
+    
+    # Plot Strategy
+    ax.plot(df.index, df['cum_strat'], label='4Y Cycle (1S/3L)', color='blue')
+    
+    # Visual markers for cycle resets (July 1sts)
+    cycle_years = range(2018, df.index.year.max() + 1, 4)
+    for y in cycle_years:
+        d = pd.Timestamp(f'{y}-07-01')
+        if d >= df.index.min() and d <= df.index.max():
+            ax.axvline(d, color='red', linestyle='--', alpha=0.3, label='Cycle Start (Short)' if y == 2018 else "")
+
+    ax.set_title('BTC 4-Year Cycle Strategy (Start July 1: 1y Short, 3y Long)')
+    ax.set_yscale('log')
+    ax.legend()
+    ax.grid(True, which="both", ls="-", alpha=0.2)
+    
+    # Save to buffer
+    img = io.BytesIO()
+    fig.savefig(img, format='png', bbox_inches='tight')
+    img.seek(0)
+    plt.close(fig)
+    
+    return send_file(img, mimetype='image/png')
+
+if __name__ == '__main__':
+    print("Serving plot on port 8080...")
+    app.run(host='0.0.0.0', port=8080)
