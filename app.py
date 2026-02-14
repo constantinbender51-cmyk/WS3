@@ -1,69 +1,105 @@
 import httpx
 import time
+import json
+import os
 from flask import Flask, jsonify
 
-SCRAPED_DATA = {}
-SUBS = ["CryptoCurrency", "Bitcoin", "ethereum", "WallStreetBets", "Solana"]
+# File configuration
+DATA_DIR = "/app/data"
+DATA_FILE = os.path.join(DATA_DIR, "reddit_store.json")
 
-def fetch_max_data():
-    print("🚀 Extracting max data (100 posts per sub)...")
-    
-    with httpx.Client(http2=True) as client:
-        for sub in SUBS:
-            # limit=100 is the absolute maximum for a single listing call
-            url = f"https://www.reddit.com/r/{sub}/hot.json?limit=100"
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-                "Accept": "application/json"
-            }
-            
-            try:
-                resp = client.get(url, headers=headers)
-                if resp.status_code == 200:
-                    raw_items = resp.json().get('data', {}).get('children', [])
-                    
-                    # Capture everything available in this single call
-                    posts = []
-                    for p in raw_items:
-                        d = p['data']
-                        if d.get('stickied'): continue # Skip the noise
-                        
-                        posts.append({
-                            "title": d.get('title'),
-                            "author": d.get('author'),
-                            "ups": d.get('ups'),
-                            "upvote_ratio": d.get('upvote_ratio'),
-                            "num_comments": d.get('num_comments'),
-                            "created_utc": d.get('created_utc'),
-                            "body": d.get('selftext'),
-                            "permalink": f"https://reddit.com{d.get('permalink')}",
-                            "is_video": d.get('is_video'),
-                            "over_18": d.get('over_18')
-                        })
-                    
-                    SCRAPED_DATA[sub] = posts
-                    print(f"✅ /r/{sub}: Indexed {len(posts)} items.")
-                else:
-                    print(f"❌ Error {resp.status_code} on /r/{sub}")
-            except Exception as e:
-                print(f"⚠️ Exception: {e}")
-            
-            # The 6-second "Safe Zone" delay
-            time.sleep(6)
-
-    print("🏁 Buffer full. Server live at http://0.0.0.0:8080")
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR)
 
 app = Flask(__name__)
+SUBS = ["CryptoCurrency", "Bitcoin", "ethereum", "WallStreetBets", "Solana"]
+
+def load_data():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, 'r') as f:
+                return json.load(f)
+        except: return {}
+    return {}
+
+def save_data(data):
+    with open(DATA_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
+
+def fetch_and_sync():
+    stored_data = load_data()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+    }
+
+    with httpx.Client(http2=True, headers=headers, timeout=30) as client:
+        for sub in SUBS:
+            if sub not in stored_data:
+                stored_data[sub] = []
+            
+            print(f"🔍 Accessing /r/{sub} listing...")
+            try:
+                # Step 1: Get 100 posts
+                list_url = f"https://www.reddit.com/r/{sub}/hot.json?limit=100"
+                list_resp = client.get(list_url)
+                time.sleep(6) # Rate limit safety
+                
+                if list_resp.status_code != 200: continue
+                
+                items = [i for i in list_resp.json()['data']['children'] if not i['data']['stickied']]
+                
+                for item in items:
+                    post_id = item['data']['id']
+                    
+                    # Deduplication
+                    if any(p['id'] == post_id for p in stored_data[sub]):
+                        continue
+                    
+                    # Step 2: Fetch post + comments
+                    print(f"   📥 Syncing new post [{post_id}] from /r/{sub}")
+                    post_url = f"https://www.reddit.com{item['data']['permalink']}.json"
+                    post_resp = client.get(post_url)
+                    
+                    if post_resp.status_code == 200:
+                        raw_json = post_resp.json()
+                        post_info = raw_json[0]['data']['children'][0]['data']
+                        comment_data = raw_json[1]['data']['children']
+                        
+                        # Extract top 5 comments
+                        comments = []
+                        for c in comment_data[:5]:
+                            if c['kind'] == 't1': # Valid comment type
+                                comments.append({
+                                    "user": c['data'].get('author'),
+                                    "text": c['data'].get('body'),
+                                    "ups": c['data'].get('ups')
+                                })
+                        
+                        stored_data[sub].append({
+                            "id": post_id,
+                            "title": post_info.get('title'),
+                            "body": post_info.get('selftext'),
+                            "ups": post_info.get('ups'),
+                            "comments": comments,
+                            "timestamp": time.time()
+                        })
+                        # Save periodically so we don't lose progress if interrupted
+                        save_data(stored_data)
+                    
+                    time.sleep(6) # Strict 6s wait per individual post fetch
+                
+            except Exception as e:
+                print(f"⚠️ Error: {e}")
+
+    return stored_data
 
 @app.route('/')
 def home():
-    return jsonify({
-        "engine": "Max-Extraction-v1",
-        "timestamp": time.time(),
-        "total_subreddits": len(SCRAPED_DATA),
-        "payload": SCRAPED_DATA
-    })
+    return jsonify(load_data())
 
 if __name__ == '__main__':
-    fetch_max_data()
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    # Update logic: this will run for a long time on first launch
+    print("🚦 Starting initial sync. This may take a while for 500 new posts...")
+    fetch_and_sync()
+    app.run(host='0.0.0.0', port=8080)
