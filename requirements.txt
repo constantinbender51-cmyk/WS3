@@ -1,5 +1,7 @@
-httpx
+
 requests 
+httpx[http2]
+
 ccxt
 pandas
 numpy
