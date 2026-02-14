@@ -1,12 +1,12 @@
 import requests
 import pandas as pd
+import numpy as np  # FIXED: Import numpy directly
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from http.server import SimpleHTTPRequestHandler
 import socketserver
-import threading
-import time
 import os
+import sys
 
 # --- Configuration ---
 PORT = 8080
@@ -15,11 +15,14 @@ PLOT_FILENAME = "market_cap_vs_hashrate.png"
 
 def fetch_blockchain_data(chart_name):
     """Fetches JSON data from Blockchain.com public charts API."""
-    url = f"https://api.blockchain.info/charts/{chart_name}?timespan={TIMESPAM}&format=json"
+    # Using 'timespan' (some endpoints use 'timespan', others 'time')
+    url = f"https://api.blockchain.info/charts/{chart_name}?timespan={TIMESPAM}&format=json&sampled=true"
     print(f"Fetching {chart_name} data from {url}...")
     
     try:
-        response = requests.get(url)
+        # specific header to avoid 403 errors on some systems
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers)
         response.raise_for_status()
         data = response.json()
         
@@ -53,7 +56,7 @@ def process_and_plot():
     # Rename columns for clarity
     df.columns = ['Hashrate_THs', 'MarketCap_USD']
     
-    # Convert Hashrate to Exahash (EH/s) for readability (1 EH/s = 1,000,000 TH/s)
+    # Convert Hashrate to Exahash (EH/s) (1 EH/s = 1,000,000 TH/s)
     df['Hashrate_EH'] = df['Hashrate_THs'] / 1_000_000
     
     # Convert Market Cap to Billions ($B)
@@ -77,26 +80,38 @@ def process_and_plot():
         s=30
     )
     
-    # Add trend line (Polynomial fit just to show direction)
-    z = pd.np.polyfit(df['Hashrate_EH'], df['MarketCap_B'], 2)
-    p = pd.np.poly1d(z)
-    plt.plot(df['Hashrate_EH'], p(df['Hashrate_EH']), "r--", alpha=0.5, label="Equilibrium Trend")
+    # Add trend line (Polynomial fit)
+    # FIXED: Use np.polyfit instead of pd.np.polyfit
+    if len(df) > 0:
+        try:
+            z = np.polyfit(df['Hashrate_EH'], df['MarketCap_B'], 2)
+            p = np.poly1d(z)
+            
+            # Sort X values for a smooth line
+            sorted_x = np.sort(df['Hashrate_EH'])
+            plt.plot(sorted_x, p(sorted_x), "r--", alpha=0.8, linewidth=2, label="Equilibrium Trend")
+        except Exception as e:
+            print(f"Could not plot trendline: {e}")
 
     # Labels and Style
     plt.title(f'Bitcoin Security-Utility Equilibrium (8 Years)\nSupply (Hashrate) vs Demand (Market Cap)', fontsize=14)
     plt.xlabel('Security Supply (Hashrate in EH/s)', fontsize=12)
     plt.ylabel('Network Demand (Market Cap in $ Billions)', fontsize=12)
     plt.grid(True, linestyle='--', alpha=0.5)
+    plt.legend()
     
     # Colorbar
     cbar = plt.colorbar(scatter)
     cbar.set_label('Year')
     
-    # Annotate the start and end
-    start_row = df.iloc[0]
-    end_row = df.iloc[-1]
-    plt.annotate('Start', (start_row['Hashrate_EH'], start_row['MarketCap_B']), xytext=(10, 10), textcoords='offset points')
-    plt.annotate('Now', (end_row['Hashrate_EH'], end_row['MarketCap_B']), xytext=(-20, 20), textcoords='offset points', fontweight='bold')
+    # Annotate Start and End if data exists
+    if not df.empty:
+        start_row = df.iloc[0]
+        end_row = df.iloc[-1]
+        plt.annotate('Start', (start_row['Hashrate_EH'], start_row['MarketCap_B']), 
+                     xytext=(10, 10), textcoords='offset points', arrowprops=dict(arrowstyle="->"))
+        plt.annotate('Now', (end_row['Hashrate_EH'], end_row['MarketCap_B']), 
+                     xytext=(-40, 20), textcoords='offset points', fontweight='bold', arrowprops=dict(arrowstyle="->"))
 
     plt.tight_layout()
     plt.savefig(PLOT_FILENAME)
@@ -104,6 +119,9 @@ def process_and_plot():
 
 def run_server():
     """Serves the current directory on PORT."""
+    # Allow address reuse to prevent "Address already in use" errors
+    socketserver.TCPServer.allow_reuse_address = True
+    
     handler = SimpleHTTPRequestHandler
     try:
         with socketserver.TCPServer(("", PORT), handler) as httpd:
@@ -112,10 +130,18 @@ def run_server():
             httpd.serve_forever()
     except OSError as e:
         print(f"Error starting server on port {PORT}: {e}")
-        print("Try changing the PORT variable at the top of the script.")
 
 if __name__ == "__main__":
+    # Ensure required packages are installed
+    try:
+        import numpy
+        import matplotlib
+    except ImportError as e:
+        print("Missing required libraries. Please run: pip install pandas numpy matplotlib requests")
+        sys.exit(1)
+
     process_and_plot()
+    
     # Check if plot exists before starting server
     if os.path.exists(PLOT_FILENAME):
         run_server()
