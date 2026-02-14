@@ -3,7 +3,7 @@ import time
 import json
 import os
 import threading
-from flask import Flask, jsonify
+from flask import Flask, Response
 
 # Config
 DATA_DIR = "/app/data"
@@ -20,7 +20,8 @@ def load_db():
         try:
             with open(DATA_FILE, 'r') as f:
                 return json.load(f)
-        except: return {}
+        except:
+            return {}
     return {}
 
 def save_db(data):
@@ -28,87 +29,68 @@ def save_db(data):
         json.dump(data, f, indent=4)
 
 def fetch_worker():
-    """Background process: 100 posts + 5 comments per post."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Accept": "application/json"
-    }
-    
+    """Background Deep Scraper"""
+    headers = {"User-Agent": "Mozilla/5.0 Chrome/121.0.0.0", "Accept": "application/json"}
     while True:
         db = load_db()
         with httpx.Client(http2=True, headers=headers, timeout=30) as client:
             for sub in SUBS:
                 if sub not in db: db[sub] = []
-                
                 try:
-                    # Get top 100 listing
                     r = client.get(f"https://www.reddit.com/r/{sub}/hot.json?limit=100")
-                    time.sleep(6) 
-                    
+                    time.sleep(6.1)
                     if r.status_code != 200: continue
-                    listing = r.json().get('data', {}).get('children', [])
                     
+                    listing = r.json().get('data', {}).get('children', [])
                     for entry in listing:
                         p_data = entry['data']
-                        p_id = p_data['id']
+                        if any(item['id'] == p_data['id'] for item in db[sub]): continue
                         
-                        # Skip Duplicates
-                        if any(item['id'] == p_id for item in db[sub]):
-                            continue
-                            
-                        # Deep fetch for actual content + comments
-                        post_url = f"https://www.reddit.com{p_data['permalink']}.json"
-                        p_res = client.get(post_url)
-                        
+                        # Deep fetch post content + 5 comments
+                        p_res = client.get(f"https://www.reddit.com{p_data['permalink']}.json")
                         if p_res.status_code == 200:
-                            raw_payload = p_res.json()
-                            full_post = raw_payload[0]['data']['children'][0]['data']
-                            raw_comments = raw_payload[1]['data']['children']
-                            
-                            comments = []
-                            for c in raw_comments[:10]:
-                                if c['kind'] == 't1' and len(comments) < 5:
-                                    comments.append({
-                                        "author": c['data'].get('author'),
-                                        "body": c['data'].get('body')
-                                    })
+                            raw = p_res.json()
+                            post = raw[0]['data']['children'][0]['data']
+                            coms = [{"u": c['data'].get('author'), "b": c['data'].get('body')} 
+                                    for c in raw[1]['data']['children'][:5] if c['kind'] == 't1']
                             
                             db[sub].append({
-                                "id": p_id,
-                                "title": full_post.get('title'),
-                                "content": full_post.get('selftext') or "[Link/Media]",
-                                "comments": comments
+                                "id": p_data['id'],
+                                "title": post.get('title'),
+                                "content": post.get('selftext') or "[Link]",
+                                "comments": coms
                             })
-                            save_db(db)
-                        
-                        time.sleep(6) # The mandatory 6s wait
-                        
-                except Exception as e:
-                    print(f"Error: {e}")
+                            save_db(db) # Save immediately
+                        time.sleep(6.1)
+                except Exception:
+                    pass
         time.sleep(3600)
 
 @app.route('/')
-def get_data():
+def index():
+    # Force a fresh read from the disk
     db = load_db()
     
-    # Calculate counts
-    total_posts = sum(len(posts) for posts in db.values())
-    total_comments = sum(
-        len(post.get('comments', [])) 
-        for posts in db.values() 
-        for post in posts
-    )
+    # Calculate stats for the header
+    p_count = sum(len(v) for v in db.values())
+    c_count = sum(len(p.get('comments', [])) for v in db.values() for p in v)
     
-    return jsonify({
-        "stats": {
-            "total_posts_saved": total_posts,
-            "total_comments_saved": total_comments,
-            "subreddits_tracked": list(db.keys())
+    output = {
+        "status": "RUNNING",
+        "counts": {
+            "total_posts": p_count,
+            "total_comments": c_count
         },
-        "data": db
-    })
+        "database_location": DATA_FILE,
+        "results": db
+    }
+    
+    # Returning as a proper JSON response with indentation for readability
+    return Response(
+        json.dumps(output, indent=2),
+        mimetype='application/json'
+    )
 
 if __name__ == '__main__':
-    thread = threading.Thread(target=fetch_worker, daemon=True)
-    thread.start()
+    threading.Thread(target=fetch_worker, daemon=True).start()
     app.run(host='0.0.0.0', port=8080)
