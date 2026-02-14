@@ -2,6 +2,7 @@ import httpx
 import time
 import json
 import os
+import threading
 from flask import Flask, jsonify
 
 # File configuration
@@ -26,80 +27,80 @@ def save_data(data):
     with open(DATA_FILE, 'w') as f:
         json.dump(data, f, indent=4)
 
-def fetch_and_sync():
-    stored_data = load_data()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "application/json"
-    }
+def fetch_worker():
+    """Background worker to fetch data without blocking the web server."""
+    while True:
+        stored_data = load_data()
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "application/json"
+        }
 
-    with httpx.Client(http2=True, headers=headers, timeout=30) as client:
-        for sub in SUBS:
-            if sub not in stored_data:
-                stored_data[sub] = []
-            
-            print(f"🔍 Accessing /r/{sub} listing...")
-            try:
-                # Step 1: Get 100 posts
-                list_url = f"https://www.reddit.com/r/{sub}/hot.json?limit=100"
-                list_resp = client.get(list_url)
-                time.sleep(6) # Rate limit safety
+        with httpx.Client(http2=True, headers=headers, timeout=30) as client:
+            for sub in SUBS:
+                if sub not in stored_data:
+                    stored_data[sub] = []
                 
-                if list_resp.status_code != 200: continue
-                
-                items = [i for i in list_resp.json()['data']['children'] if not i['data']['stickied']]
-                
-                for item in items:
-                    post_id = item['data']['id']
+                print(f"🔍 Background: Checking /r/{sub}...")
+                try:
+                    list_url = f"https://www.reddit.com/r/{sub}/hot.json?limit=100"
+                    list_resp = client.get(list_url)
+                    time.sleep(6) # Rate limit safety
                     
-                    # Deduplication
-                    if any(p['id'] == post_id for p in stored_data[sub]):
-                        continue
+                    if list_resp.status_code != 200: continue
                     
-                    # Step 2: Fetch post + comments
-                    print(f"   📥 Syncing new post [{post_id}] from /r/{sub}")
-                    post_url = f"https://www.reddit.com{item['data']['permalink']}.json"
-                    post_resp = client.get(post_url)
+                    items = [i for i in list_resp.json()['data']['children'] if not i['data']['stickied']]
                     
-                    if post_resp.status_code == 200:
-                        raw_json = post_resp.json()
-                        post_info = raw_json[0]['data']['children'][0]['data']
-                        comment_data = raw_json[1]['data']['children']
+                    for item in items:
+                        post_id = item['data']['id']
+                        if any(p['id'] == post_id for p in stored_data[sub]):
+                            continue
                         
-                        # Extract top 5 comments
-                        comments = []
-                        for c in comment_data[:5]:
-                            if c['kind'] == 't1': # Valid comment type
-                                comments.append({
-                                    "user": c['data'].get('author'),
-                                    "text": c['data'].get('body'),
-                                    "ups": c['data'].get('ups')
-                                })
+                        # Deep fetch post + 5 comments
+                        post_url = f"https://www.reddit.com{item['data']['permalink']}.json"
+                        post_resp = client.get(post_url)
                         
-                        stored_data[sub].append({
-                            "id": post_id,
-                            "title": post_info.get('title'),
-                            "body": post_info.get('selftext'),
-                            "ups": post_info.get('ups'),
-                            "comments": comments,
-                            "timestamp": time.time()
-                        })
-                        # Save periodically so we don't lose progress if interrupted
-                        save_data(stored_data)
-                    
-                    time.sleep(6) # Strict 6s wait per individual post fetch
-                
-            except Exception as e:
-                print(f"⚠️ Error: {e}")
-
-    return stored_data
+                        if post_resp.status_code == 200:
+                            raw_json = post_resp.json()
+                            post_info = raw_json[0]['data']['children'][0]['data']
+                            comment_data = raw_json[1]['data']['children']
+                            
+                            comments = []
+                            for c in comment_data[:5]:
+                                if c['kind'] == 't1':
+                                    comments.append({
+                                        "user": c['data'].get('author'),
+                                        "text": c['data'].get('body'),
+                                        "ups": c['data'].get('ups')
+                                    })
+                            
+                            stored_data[sub].append({
+                                "id": post_id,
+                                "title": post_info.get('title'),
+                                "body": post_info.get('selftext'),
+                                "ups": post_info.get('ups'),
+                                "comments": comments,
+                                "timestamp": time.time()
+                            })
+                            save_data(stored_data) # Save immediately so web view updates
+                            print(f"   ✨ Added: [{post_id}] to /r/{sub}")
+                        
+                        time.sleep(6) # Essential 6s delay
+                except Exception as e:
+                    print(f"⚠️ Worker Error: {e}")
+        
+        print("😴 Cycle complete. Sleeping 1 hour before next full scan...")
+        time.sleep(3600)
 
 @app.route('/')
 def home():
+    # Always reads the latest version of the file
     return jsonify(load_data())
 
 if __name__ == '__main__':
-    # Update logic: this will run for a long time on first launch
-    print("🚦 Starting initial sync. This may take a while for 500 new posts...")
-    fetch_and_sync()
-    app.run(host='0.0.0.0', port=8080)
+    # Start the scraper in a separate thread
+    scraper_thread = threading.Thread(target=fetch_worker, daemon=True)
+    scraper_thread.start()
+    
+    # Start the Flask server immediately on port 8080
+    app.run(host='0.0.0.0', port=8080, debug=False)
