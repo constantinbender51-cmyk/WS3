@@ -1,148 +1,121 @@
-import ccxt
+import requests
 import pandas as pd
-import numpy as np
-from scipy.optimize import curve_fit
-import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import io
-from flask import Flask, send_file
+import matplotlib.dates as mdates
+from http.server import SimpleHTTPRequestHandler
+import socketserver
+import threading
+import time
+import os
 
-# 1. Fetch Data
-def fetch_btc_data():
-    exchange = ccxt.binance()
-    symbol = 'BTC/USDT'
-    timeframe = '1d'
-    since = exchange.parse8601('2018-01-01T00:00:00Z')
-    
-    all_candles = []
-    while True:
-        candles = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
-        if not candles:
-            break
-        all_candles.extend(candles)
-        since = candles[-1][0] + 1
-        if len(candles) < 1000:
-            break
-            
-    df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('date', inplace=True)
-    return df
+# --- Configuration ---
+PORT = 8080
+TIMESPAM = "8years"  # Blockchain.com API format
+PLOT_FILENAME = "market_cap_vs_hashrate.png"
 
-# 2. Strategy Logic
-def apply_strategy(df):
-    anchor_date = pd.Timestamp('2017-07-01')
+def fetch_blockchain_data(chart_name):
+    """Fetches JSON data from Blockchain.com public charts API."""
+    url = f"https://api.blockchain.info/charts/{chart_name}?timespan={TIMESPAM}&format=json"
+    print(f"Fetching {chart_name} data from {url}...")
     
-    df['returns'] = df['close'].pct_change()
-    
-    # 730 SMA
-    df['sma730'] = df['close'].rolling(window=730).mean()
-    
-    # Offset SMA: Shift future values back to present
-    df['sma730_shifted'] = df['sma730'].shift(-730)
-    
-    # --- Curve Fitting ---
-    # Log-transform is maintained for fitting stability across orders of magnitude
-    df['log_sma_shifted'] = np.log(df['sma730_shifted'])
-    
-    df['t'] = np.arange(len(df))
-    
-    fit_data = df.dropna(subset=['log_sma_shifted'])
-    
-    if not fit_data.empty:
-        X = fit_data['t'].values
-        Y = fit_data['log_sma_shifted'].values
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
         
-        def sine_slope_model(t, slope, intercept, amp, phase, period):
-            return slope * t + intercept + amp * np.sin(2 * np.pi * t / period + phase)
+        # Convert to DataFrame
+        df = pd.DataFrame(data['values'])
+        df['x'] = pd.to_datetime(df['x'], unit='s')
+        df.columns = ['Date', chart_name]
+        return df.set_index('Date')
         
-        p0 = [
-            (Y[-1] - Y[0]) / (X[-1] - X[0]), 
-            Y[0],                            
-            0.5,                             
-            0,                               
-            1460                             
-        ]
-        
-        try:
-            popt, _ = curve_fit(sine_slope_model, X, Y, p0=p0, maxfev=10000)
-            df['fitted_log'] = sine_slope_model(df['t'].values, *popt)
-            df['sine_curve'] = np.exp(df['fitted_log'])
-        except Exception:
-            df['sine_curve'] = np.nan
-    else:
-        df['sine_curve'] = np.nan
+    except Exception as e:
+        print(f"Error fetching {chart_name}: {e}")
+        return None
 
-    # Strategy Signal
-    def get_signal(date):
-        if date < anchor_date:
-            return 0 
-        days_since = (date - anchor_date).days
-        years_passed = days_since / 365.25
-        cycle_position = years_passed % 4
-        
-        if 0 <= cycle_position < 1:
-            return -1
-        else:
-            return 1
+def process_and_plot():
+    # 1. Fetch Data
+    df_hash = fetch_blockchain_data("hash-rate")
+    df_cap = fetch_blockchain_data("market-cap")
 
-    df['signal'] = df.index.to_series().apply(get_signal)
-    df['strategy_returns'] = df['returns'] * df['signal'].shift(1)
-    df['cum_bnh'] = (1 + df['returns']).cumprod()
-    df['cum_strat'] = (1 + df['strategy_returns']).cumprod()
-    
-    return df
+    if df_hash is None or df_cap is None:
+        print("Failed to retrieve data. Exiting.")
+        return
 
-# 3. Server
-app = Flask(__name__)
+    # 2. Merge Data (Align by Date)
+    # Resample to daily to ensure alignment, then interpolate missing values
+    df_hash = df_hash.resample('D').mean().interpolate()
+    df_cap = df_cap.resample('D').mean().interpolate()
+    
+    # Inner join to keep only overlapping dates
+    df = pd.merge(df_hash, df_cap, left_index=True, right_index=True)
+    
+    # Rename columns for clarity
+    df.columns = ['Hashrate_THs', 'MarketCap_USD']
+    
+    # Convert Hashrate to Exahash (EH/s) for readability (1 EH/s = 1,000,000 TH/s)
+    df['Hashrate_EH'] = df['Hashrate_THs'] / 1_000_000
+    
+    # Convert Market Cap to Billions ($B)
+    df['MarketCap_B'] = df['MarketCap_USD'] / 1_000_000_000
 
-@app.route('/')
-def serve_plot():
-    df = fetch_btc_data()
-    df = apply_strategy(df)
-    
-    fig, ax1 = plt.subplots(figsize=(12, 6))
-    
-    # Left Axis: Returns (Linear)
-    ax1.plot(df.index, df['cum_bnh'], label='Buy & Hold', alpha=0.3, color='gray')
-    ax1.plot(df.index, df['cum_strat'], label='Strategy', color='blue', alpha=0.6)
-    ax1.set_ylabel('Cumulative Return')
-    ax1.set_yscale('linear')
-    
-    # Right Axis: Price & Models (Linear)
-    ax2 = ax1.twinx()
-    
-    ax2.plot(df.index, df['sma730_shifted'], label='730 SMA (Offset -730)', color='orange', linewidth=2)
-    
-    if 'sine_curve' in df.columns:
-        ax2.plot(df.index, df['sine_curve'], label='Fitted Sine Slope', color='magenta', linestyle='--', linewidth=1.5)
-        
-    ax2.set_ylabel('Price / Model (USDT)')
-    ax2.set_yscale('linear')
-    
-    # Cycle Markers
-    cycle_years = range(2017, df.index.year.max() + 1, 4)
-    for y in cycle_years:
-        d = pd.Timestamp(f'{y}-07-01')
-        if d >= df.index.min() and d <= df.index.max():
-            ax1.axvline(d, color='red', linestyle=':', alpha=0.5)
+    # Create 'Year' column for color coding
+    df['Year'] = df.index.year
 
-    plt.title('BTC: 4-Year Cycle + Sine Fit (Linear Scale)')
+    # 3. Plotting
+    print("Generating plot...")
+    plt.figure(figsize=(12, 8))
     
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+    # Scatter plot: X=Hashrate (Security Supply), Y=Market Cap (Demand)
+    scatter = plt.scatter(
+        df['Hashrate_EH'], 
+        df['MarketCap_B'], 
+        c=df['Year'], 
+        cmap='viridis', 
+        alpha=0.7, 
+        edgecolors='k',
+        s=30
+    )
     
-    ax1.grid(True, which="both", ls="-", alpha=0.1)
-    
-    img = io.BytesIO()
-    fig.savefig(img, format='png', bbox_inches='tight')
-    img.seek(0)
-    plt.close(fig)
-    
-    return send_file(img, mimetype='image/png')
+    # Add trend line (Polynomial fit just to show direction)
+    z = pd.np.polyfit(df['Hashrate_EH'], df['MarketCap_B'], 2)
+    p = pd.np.poly1d(z)
+    plt.plot(df['Hashrate_EH'], p(df['Hashrate_EH']), "r--", alpha=0.5, label="Equilibrium Trend")
 
-if __name__ == '__main__':
-    print("Serving plot on port 8080...")
-    app.run(host='0.0.0.0', port=8080)
+    # Labels and Style
+    plt.title(f'Bitcoin Security-Utility Equilibrium (8 Years)\nSupply (Hashrate) vs Demand (Market Cap)', fontsize=14)
+    plt.xlabel('Security Supply (Hashrate in EH/s)', fontsize=12)
+    plt.ylabel('Network Demand (Market Cap in $ Billions)', fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.5)
+    
+    # Colorbar
+    cbar = plt.colorbar(scatter)
+    cbar.set_label('Year')
+    
+    # Annotate the start and end
+    start_row = df.iloc[0]
+    end_row = df.iloc[-1]
+    plt.annotate('Start', (start_row['Hashrate_EH'], start_row['MarketCap_B']), xytext=(10, 10), textcoords='offset points')
+    plt.annotate('Now', (end_row['Hashrate_EH'], end_row['MarketCap_B']), xytext=(-20, 20), textcoords='offset points', fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(PLOT_FILENAME)
+    print(f"Plot saved to {PLOT_FILENAME}")
+
+def run_server():
+    """Serves the current directory on PORT."""
+    handler = SimpleHTTPRequestHandler
+    try:
+        with socketserver.TCPServer(("", PORT), handler) as httpd:
+            print(f"\nServing plot at http://localhost:{PORT}/{PLOT_FILENAME}")
+            print("Press Ctrl+C to stop.")
+            httpd.serve_forever()
+    except OSError as e:
+        print(f"Error starting server on port {PORT}: {e}")
+        print("Try changing the PORT variable at the top of the script.")
+
+if __name__ == "__main__":
+    process_and_plot()
+    # Check if plot exists before starting server
+    if os.path.exists(PLOT_FILENAME):
+        run_server()
