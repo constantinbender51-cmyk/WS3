@@ -90,7 +90,6 @@ def generate_plot(df_closed):
             is_long = last_close > (u_line[-1] + thresh_val)
             
             if is_short or is_long:
-                # Store lines and threshold area for visualization
                 breakout_visuals.append({
                     'x': x_win,
                     'upper': u_line,
@@ -109,11 +108,11 @@ def generate_plot(df_closed):
     if potential_long and not any(t['type'] == 'long' for t in active_trades):
         active_trades.append(potential_long)
 
-    # Render visuals for triggered windows
+    # Render visuals for triggered windows only
     for vis in breakout_visuals:
-        # Opposite lines
-        plt.plot(vis['x'], vis['upper'], color='red', linewidth=1.0, zorder=1)
-        plt.plot(vis['x'], vis['lower'], color='red', linewidth=1.0, zorder=1)
+        # Dotted lines for used Upper and Lower lines
+        plt.plot(vis['x'], vis['upper'], color='red', linestyle=':', linewidth=1.5, zorder=1)
+        plt.plot(vis['x'], vis['lower'], color='red', linestyle=':', linewidth=1.5, zorder=1)
         
         # Opaque threshold areas
         if vis['type'] == 'short':
