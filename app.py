@@ -62,11 +62,11 @@ def generate_plot(df_closed):
     last_idx = x_full[-1]
     last_close = df_closed['close'].iloc[-1]
     
-    # Track potential entries for this tick
     potential_short = None
     potential_long = None
-    
-    # Iterate 100 to 10 to find biggest window breakout first
+    lines_to_draw = []
+
+    # Detect biggest window breakout
     for w in range(100, 9, -1):
         if len(df_closed) < w: continue
         x_win = x_full[-w:]
@@ -91,27 +91,31 @@ def generate_plot(df_closed):
             is_long = last_close > (u_val + thresh)
             
             if is_short or is_long:
-                plt.plot(x_win, y_trend, color='red', linewidth=0.5, zorder=1)
-                plt.plot(x_win, m_u * x_win + c_u, color='red', linewidth=0.5, zorder=1)
-                plt.plot(x_win, m_l * x_win + c_l, color='red', linewidth=0.5, zorder=1)
+                lines_to_draw.append((x_win, y_trend, m_u * x_win + c_u, m_l * x_win + c_l))
                 
                 if is_short and potential_short is None:
                     potential_short = {'type': 'short', 'entry': last_close, 'stop': l_val, 'target': l_val - dist, 'window': w}
                 if is_long and potential_long is None:
                     potential_long = {'type': 'long', 'entry': last_close, 'stop': u_val, 'target': u_val + dist, 'window': w}
 
-    # Execute entries if slots are open
+    # Execute entries
     if potential_short and not any(t['type'] == 'short' for t in active_trades):
         active_trades.append(potential_short)
     if potential_long and not any(t['type'] == 'long' for t in active_trades):
         active_trades.append(potential_long)
 
-    # Candles
-    up, down = df_closed[df_closed.close >= df_closed.open], df_closed[df_closed.close < df_closed.open]
-    for c, d in [('green', up), ('red', down)]:
-        plt.bar(d.index, d.close - d.open, 0.6, bottom=d.open, color=c, zorder=2)
-        plt.bar(d.index, d.high - np.maximum(d.close, d.open), 0.05, bottom=np.maximum(d.close, d.open), color=c, zorder=2)
-        plt.bar(d.index, np.minimum(d.close, d.open) - d.low, 0.05, bottom=d.low, color=c, zorder=2)
+    # Only render lines that triggered a potential or active trade
+    for x_win, mid, up, low in lines_to_draw:
+        plt.plot(x_win, mid, color='red', linewidth=0.5, zorder=1)
+        plt.plot(x_win, up, color='red', linewidth=0.5, zorder=1)
+        plt.plot(x_win, low, color='red', linewidth=0.5, zorder=1)
+
+    # Render Candles
+    up_c, down_c = df_closed[df_closed.close >= df_closed.open], df_closed[df_closed.close < df_closed.open]
+    for color, d in [('green', up_c), ('red', down_c)]:
+        plt.bar(d.index, d.close - d.open, 0.6, bottom=d.open, color=color, zorder=2)
+        plt.bar(d.index, d.high - np.maximum(d.close, d.open), 0.05, bottom=np.maximum(d.close, d.open), color=color, zorder=2)
+        plt.bar(d.index, np.minimum(d.close, d.open) - d.low, 0.05, bottom=d.low, color=color, zorder=2)
 
     buf = BytesIO()
     plt.savefig(buf, format='png'); plt.close(); buf.seek(0)
