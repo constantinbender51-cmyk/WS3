@@ -47,11 +47,19 @@ def generate_plot(df):
     plt.bar(down.index, np.minimum(down.close, down.open) - down.low, 0.05, bottom=down.low, color='red')
     
     x = np.arange(len(df))
-    y = df['close'].values
     
-    # OLS Fit
-    m, c = fit_ols(x, y)
-    plt.plot(x, m * x + c, color='yellow', linewidth=2, label='OLS Trendline')
+    # OLS Trendline (Close)
+    m_mid, c_mid = fit_ols(x, df['close'].values)
+    
+    # Upper Line (Highs)
+    m_up, c_up = fit_ols(x, df['high'].values)
+    
+    # Lower Line (Lows)
+    m_low, c_low = fit_ols(x, df['low'].values)
+    
+    plt.plot(x, m_mid * x + c_mid, color='yellow', linestyle='--', alpha=0.5, label='Mid Trend')
+    plt.plot(x, m_up * x + c_up, color='cyan', linewidth=2, label='Upper Boundary')
+    plt.plot(x, m_low * x + c_low, color='magenta', linewidth=2, label='Lower Boundary')
 
     plt.legend()
     buf = BytesIO()
