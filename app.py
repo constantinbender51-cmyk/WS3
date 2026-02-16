@@ -25,6 +25,8 @@ def get_data():
         return pd.DataFrame()
 
 def fit_ols(x, y):
+    if len(x) == 0:
+        return 0, 0
     A = np.vstack([x, np.ones(len(x))]).T
     m, c = np.linalg.lstsq(A, y, rcond=None)[0]
     return m, c
@@ -46,20 +48,25 @@ def generate_plot(df):
     plt.bar(down.index, down.high - np.maximum(down.close, down.open), 0.05, bottom=np.maximum(down.close, down.open), color='red')
     plt.bar(down.index, np.minimum(down.close, down.open) - down.low, 0.05, bottom=down.low, color='red')
     
-    x = np.arange(len(df))
+    x_full = np.arange(len(df))
     
-    # OLS Trendline (Close)
-    m_mid, c_mid = fit_ols(x, df['close'].values)
+    # Base Trendline
+    m_mid, c_mid = fit_ols(x_full, df['close'].values)
+    y_trend = m_mid * x_full + c_mid
     
-    # Upper Line (Highs)
-    m_up, c_up = fit_ols(x, df['high'].values)
+    # Filter points above/below base trend
+    upper_mask = df['high'] > y_trend
+    lower_mask = df['low'] < y_trend
     
-    # Lower Line (Lows)
-    m_low, c_low = fit_ols(x, df['low'].values)
+    # Upper Boundary (OLS on points above trend)
+    m_up, c_up = fit_ols(x_full[upper_mask], df['high'].values[upper_mask])
     
-    plt.plot(x, m_mid * x + c_mid, color='yellow', linestyle='--', alpha=0.5, label='Mid Trend')
-    plt.plot(x, m_up * x + c_up, color='cyan', linewidth=2, label='Upper Boundary')
-    plt.plot(x, m_low * x + c_low, color='magenta', linewidth=2, label='Lower Boundary')
+    # Lower Boundary (OLS on points below trend)
+    m_low, c_low = fit_ols(x_full[lower_mask], df['low'].values[lower_mask])
+    
+    plt.plot(x_full, y_trend, color='yellow', linestyle='--', alpha=0.5, label='Mid Trend')
+    plt.plot(x_full, m_up * x_full + c_up, color='cyan', linewidth=2, label='Upper Boundary (Filtered)')
+    plt.plot(x_full, m_low * x_full + c_low, color='magenta', linewidth=2, label='Lower Boundary (Filtered)')
 
     plt.legend()
     buf = BytesIO()
