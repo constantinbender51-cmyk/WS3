@@ -183,4 +183,24 @@ def logic_loop():
             full_df = fetch_historical(LIMIT)
             if not full_df.empty:
                 df_closed, price = full_df.iloc[:-1].copy(), full_df.iloc[-1]['close']
-                active_trades = [t for t in active_trades if not ((t['type'] == 'short' and (price >= t['stop'] or price <= t['target'])) or (t['type'] == 'long' and (price
+                active_trades = [t for t in active_trades if not ((t['type'] == 'short' and (price >= t['stop'] or price <= t['target'])) or (t['type'] == 'long' and (price <= t['stop'] or price >= t['target'])))]
+                lc = df_closed['close'].iloc[-1]; xf = np.arange(len(df_closed))
+                for w in range(MAX_WINDOW, MIN_WINDOW -1, -1):
+                    xw = xf[-w:]; yc, yh, yl = df_closed['close'].values[-w:], df_closed['high'].values[-w:], df_closed['low'].values[-w:]
+                    mm, cm = fit_ols(xw, yc)
+                    if mm:
+                        yt = mm * xw + cm; mu, cu = fit_ols(xw[yh > yt], yh[yh > yt]); ml, cl = fit_ols(xw[yl < yt], yl[yl < yt])
+                        if mu and ml:
+                            uv, lv = mu * xw[-1] + cu, ml * xw[-1] + cl; di = uv - lv; th = di * THRESHOLD_PCT
+                            if lc > (uv + th) and not any(t['type'] == 'long' for t in active_trades):
+                                active_trades.append({'type': 'long', 'entry': lc, 'stop': uv, 'target': uv + di, 'window': w}); break
+                            if lc < (lv - th) and not any(t['type'] == 'short' for t in active_trades):
+                                active_trades.append({'type': 'short', 'entry': lc, 'stop': lv, 'target': lv - di, 'window': w}); break
+                current_plot_data = generate_plot(df_closed, price)
+        except: pass
+        time.sleep(UPDATE_INTERVAL)
+
+if __name__ == "__main__":
+    threading.Thread(target=run_backtest, daemon=True).start()
+    threading.Thread(target=lambda: HTTPServer(('', PORT), DashboardHandler).serve_forever(), daemon=True).start()
+    logic_loop()
