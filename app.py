@@ -39,6 +39,7 @@ def generate_plot(df):
     last_idx = x_full[-1]
     last_close = df['close'].iloc[-1]
     
+    # 1. Render Lines First (Background)
     for w in range(10, 101):
         if len(df) < w:
             continue
@@ -58,20 +59,20 @@ def generate_plot(df):
         m_u, c_u = fit_ols(x_win[upper_mask], y_win_high[upper_mask])
         m_l, c_l = fit_ols(x_win[lower_mask], y_win_low[lower_mask])
         
-        line_color = 'cyan'
-        
+        # Determine if lines should be shown (only if crossed)
+        show_lines = False
         if m_u is not None and m_l is not None:
             upper_val = m_u * last_idx + c_u
             lower_val = m_l * last_idx + c_l
             if last_close > upper_val or last_close < lower_val:
-                line_color = 'red'
+                show_lines = True
         
-        plt.plot(x_win, y_trend, color=line_color, linewidth=0.5, zorder=1)
-        if m_u is not None:
-            plt.plot(x_win, m_u * x_win + c_u, color=line_color, linewidth=0.5, zorder=1)
-        if m_l is not None:
-            plt.plot(x_win, m_l * x_win + c_l, color=line_color, linewidth=0.5, zorder=1)
+        if show_lines:
+            plt.plot(x_win, y_trend, color='red', linewidth=0.5, zorder=1)
+            plt.plot(x_win, m_u * x_win + c_u, color='red', linewidth=0.5, zorder=1)
+            plt.plot(x_win, m_l * x_win + c_l, color='red', linewidth=0.5, zorder=1)
 
+    # 2. Render Candles Second (Foreground)
     width = .6
     up = df[df.close >= df.open]
     down = df[df.close < df.open]
