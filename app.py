@@ -11,25 +11,35 @@ from datetime import datetime
 # Configuration
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1h'
-LIMIT = 105  # Fetch slightly more to ensure valid 100 window
-WINDOW = 100 # Fixed lookback
+LIMIT = 150  # Increased to accommodate max window + offset
 PORT = 8080
-CROSS_PENALTY = 100000.0 # Massive penalty for crossing the line (simulating hard constraint)
+CROSS_PENALTY = 100000.0 
+
+# Collective Ownership Protocol Constants
+IDENTITY = "Jimmy"
 
 class Trade:
-    def __init__(self, entry_price, direction, stop_price, entry_time):
+    def __init__(self, entry_price, direction, stop_price, entry_time, timeframe_length):
         self.entry_price = entry_price
         self.direction = direction  # 1 for Long, -1 for Short
         self.stop_price = stop_price
         self.entry_time = entry_time
+        self.timeframe_length = timeframe_length # The seq length that triggered this
         self.is_active = True
-        # Target 2x risk
-        dist = abs(entry_price - stop_price)
-        self.take_profit = entry_price + (dist * 2 * direction)
+        
+        # Risk is distance to breakout line (stop)
+        risk = abs(entry_price - stop_price)
+        # Prevent division by zero or microscopic risk causing instant TP
+        if risk == 0: risk = entry_price * 0.005 
+        
+        self.take_profit = entry_price + (risk * 2 * direction)
         self.pnl = 0.0
 
     def update(self, current_price):
         if not self.is_active: return
+
+        # PnL Calculation
+        self.pnl = (current_price - self.entry_price) / self.entry_price * self.direction
 
         # TP Check
         if (self.direction == 1 and current_price >= self.take_profit) or \
@@ -37,19 +47,20 @@ class Trade:
             self.close(current_price, "TP")
             return
 
-        # SL Check (Price crosses back into channel / hits stop)
+        # SL Check (Price crosses back over breakout line)
+        # Note: Stop is fixed to the breakout line price at entry (static stop) 
+        # or dynamic if we re-evaluate line. Using static based on prompt "Stop is set to the breakout line".
         if (self.direction == 1 and current_price < self.stop_price) or \
            (self.direction == -1 and current_price > self.stop_price):
             self.close(current_price, "SL")
             return
-
-        self.pnl = (current_price - self.entry_price) / self.entry_price * self.direction
 
     def close(self, price, reason):
         self.pnl = (price - self.entry_price) / self.entry_price * self.direction
         self.is_active = False
         self.exit_price = price
         self.exit_reason = reason
+        self.exit_time = datetime.now()
 
 # Global State
 trade_history = []
@@ -57,62 +68,56 @@ active_trades = []
 current_plot_data = None
 exchange = ccxt.binance()
 
-def get_candles():
+def get_data():
     try:
-        # Fetch enough data
         ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=LIMIT)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
     except Exception as e:
-        print(f"Fetch Error: {e}")
+        print(f"[{IDENTITY}] Data Fetch Error: {e}")
         return pd.DataFrame()
 
-def find_best_line_geometric(series, direction):
+def get_current_price():
+    try:
+        ticker = exchange.fetch_ticker(SYMBOL)
+        return ticker['last']
+    except:
+        return None
+
+def find_best_line_geometric(series_values, direction):
     """
-    Finds the line connecting two points (i, j) in the series that minimizes:
-    Mean(Distance to all points) + Penalty * (Sum of violations)
+    Minimizes: Mean(Distance) + Penalty * Violations
     """
-    values = series.values
-    n = len(values)
+    n = len(series_values)
     if n < 2: return None, None
 
     x = np.arange(n)
     best_cost = float('inf')
-    best_m = 0
-    best_c = 0
-    found = False
+    best_m = None
+    best_c = None
 
-    # Brute force all pairs (approx 5000 iterations for n=100, very fast)
-    # Optimization: Only connect local pivots? 
-    # For strict compliance with prompt "connect two highs", we check all.
+    # Optimization: Check outer hull points primarily, but full brute force 
+    # is safer for "best" compliance. 
+    # Logic simplified for performance: Check pairs of local extrema? 
+    # Proceeding with O(N^2) as requested complexity requires accuracy.
     
     for i in range(n):
         for j in range(i + 1, n):
-            # Define Line between i and j
-            y1 = values[i]
-            y2 = values[j]
+            y1 = series_values[i]
+            y2 = series_values[j]
             
-            # Prevent division by zero (impossible since j > i)
             m = (y2 - y1) / (j - i)
             c = y1 - m * i
             
-            # Calculate Line for entire window
             line_y = m * x + c
             
-            # Calculate Cost
             if direction == 'top':
-                # Distance: We want line > price. Dist = line_y - price
-                diff = line_y - values 
-                # Violation: Price > Line (diff < 0)
+                diff = line_y - series_values
                 violations = diff < 0
-                # Cost = Average positive distance (fit) + Penalty for violations
                 cost = np.mean(np.abs(diff)) + (np.sum(violations) * CROSS_PENALTY)
-                
-            else: # bottom
-                # Distance: We want line < price. Dist = price - line_y
-                diff = values - line_y
-                # Violation: Price < Line (diff < 0)
+            else:
+                diff = series_values - line_y
                 violations = diff < 0
                 cost = np.mean(np.abs(diff)) + (np.sum(violations) * CROSS_PENALTY)
 
@@ -120,35 +125,113 @@ def find_best_line_geometric(series, direction):
                 best_cost = cost
                 best_m = m
                 best_c = c
-                found = True
 
-    if not found: return None, None
     return best_m, best_c
 
-def generate_plot(df, top_line_y, bot_line_y):
+def scan_for_breakouts(df):
+    """
+    Scans sequence lengths 10-100 and offsets 0-10.
+    Returns the detected breakout with the HIGHEST sequence length.
+    """
+    best_signal = None # (length, direction, stop_price_at_current, m, c, offset)
+    
+    current_idx = len(df) - 1
+    current_close = df.iloc[-1]['close']
+    
+    # Iterate offsets (recent history)
+    # offset 0 = fit ending at current candle
+    # offset 10 = fit ending 10 candles ago
+    for offset in range(0, 11): 
+        # The end index for the fitting window
+        fit_end_idx = current_idx - offset 
+        if fit_end_idx < 10: continue
+
+        # Iterate sequence lengths
+        for length in range(10, 101):
+            start_idx = fit_end_idx - length + 1
+            if start_idx < 0: continue
+            
+            # Slice the window for fitting
+            window_highs = df.iloc[start_idx : fit_end_idx + 1]['high'].values
+            window_lows = df.iloc[start_idx : fit_end_idx + 1]['low'].values
+            
+            # Fit lines
+            m_top, c_top = find_best_line_geometric(window_highs, 'top')
+            m_bot, c_bot = find_best_line_geometric(window_lows, 'bottom')
+            
+            if m_top is None or m_bot is None: continue
+
+            # Project line to CURRENT time (current_idx)
+            # The line x-axis starts at 0 (start_idx). 
+            # Current index relative to start is:
+            rel_current_x = current_idx - start_idx
+            
+            proj_res = m_top * rel_current_x + c_top
+            proj_sup = m_bot * rel_current_x + c_bot
+            
+            # Check for Breakout State
+            # We are "In a breakout" if Price > Projected Resistance or Price < Projected Support
+            
+            signal_found = False
+            direction = 0
+            stop_level = 0.0
+
+            if current_close > proj_res:
+                direction = 1
+                stop_level = proj_res
+                signal_found = True
+            elif current_close < proj_sup:
+                direction = -1
+                stop_level = proj_sup
+                signal_found = True
+            
+            if signal_found:
+                # Priority Logic: Max Sequence Length
+                if best_signal is None or length > best_signal['length']:
+                    best_signal = {
+                        'length': length,
+                        'direction': direction,
+                        'stop': stop_level,
+                        'offset': offset,
+                        'm_top': m_top, 'c_top': c_top,
+                        'm_bot': m_bot, 'c_bot': c_bot,
+                        'start_idx': start_idx # for plotting
+                    }
+
+    return best_signal
+
+def generate_plot(df, signal):
     plt.figure(figsize=(12, 6))
     plt.style.use('dark_background')
     
     # Plot Candles
     width = .6
-    width2 = .05
     up = df[df.close >= df.open]
     down = df[df.close < df.open]
-    
     plt.bar(up.index, up.close - up.open, width, bottom=up.open, color='#26a69a')
-    plt.bar(up.index, up.high - up.close, width2, bottom=up.close, color='#26a69a')
-    plt.bar(up.index, up.low - up.open, width2, bottom=up.open, color='#26a69a')
-    
+    plt.bar(up.index, up.high - up.close, 0.05, bottom=up.close, color='#26a69a')
+    plt.bar(up.index, up.low - up.open, 0.05, bottom=up.open, color='#26a69a')
     plt.bar(down.index, down.close - down.open, width, bottom=down.open, color='#ef5350')
-    plt.bar(down.index, down.high - down.open, width2, bottom=down.open, color='#ef5350')
-    plt.bar(down.index, down.low - down.close, width2, bottom=down.close, color='#ef5350')
+    plt.bar(down.index, down.high - down.open, 0.05, bottom=down.open, color='#ef5350')
+    plt.bar(down.index, down.low - down.close, 0.05, bottom=down.close, color='#ef5350')
     
-    # Plot Lines
-    x = np.arange(len(df))
-    plt.plot(x, top_line_y, color='cyan', linewidth=1.5, label='Resistance')
-    plt.plot(x, bot_line_y, color='magenta', linewidth=1.5, label='Support')
-    
-    plt.title(f'BTC/USDT Geometric Channels - {datetime.now().strftime("%H:%M")}')
+    if signal:
+        # Reconstruct the winning lines
+        x_start = signal['start_idx']
+        # Plot full length of df starting from x_start
+        x_len = len(df) - x_start
+        x_vals = np.arange(x_len)
+        
+        y_top = signal['m_top'] * x_vals + signal['c_top']
+        y_bot = signal['m_bot'] * x_vals + signal['c_bot']
+        
+        # Shift x to match dataframe index
+        x_plot = np.arange(x_start, len(df))
+        
+        plt.plot(x_plot, y_top, color='cyan', linewidth=2, label=f'Res (L={signal["length"]})')
+        plt.plot(x_plot, y_bot, color='magenta', linewidth=2, label=f'Sup (L={signal["length"]})')
+        
+    plt.title(f'BTC/USDT Geometric Breakout - {datetime.now().strftime("%H:%M")}')
     plt.legend()
     plt.grid(True, alpha=0.1)
     
@@ -166,21 +249,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             
             html = f"""
-            <html><head><meta http-equiv="refresh" content="60">
-            <style>body{{background:#111;color:#eee;font-family:monospace;padding:20px}} 
-            table{{width:100%;border-collapse:collapse;margin-top:10px}} 
-            th,td{{border:1px solid #444;padding:8px;text-align:left}}
-            .pos{{color:#0f0}} .neg{{color:#f00}}</style></head>
+            <html><head><meta http-equiv="refresh" content="30">
+            <style>body{{background:#000;color:#0f0;font-family:monospace;padding:20px}} 
+            table{{width:100%;border-collapse:collapse;margin-top:10px;border:1px solid #333}} 
+            th,td{{border:1px solid #333;padding:8px;text-align:left}}
+            .pos{{color:#0f0}} .neg{{color:#f00}}
+            h2, h3 {{text-transform: uppercase; border-bottom: 1px solid #333; padding-bottom: 5px;}}
+            </style></head>
             <body>
-            <h2>Collective Ownership Protocol - {datetime.now().strftime("%H:%M UTC")}</h2>
+            <h2>Collective Ownership Protocol // {datetime.now().strftime("%H:%M UTC")}</h2>
+            <div style="border: 1px solid #333; padding: 10px; margin-bottom: 20px;">
+                STATUS: MONITORING<br>
+                SCANNER: SEQ 10-100 | OFFSET 0-10<br>
+                PRIORITY: MAX LENGTH
+            </div>
             <img src="/chart.png" style="width:100%; border:1px solid #333">
-            <h3>Active Positions</h3>
-            <table><tr><th>Time</th><th>Type</th><th>Entry</th><th>Stop</th><th>Target</th><th>PnL</th></tr>
-            {''.join([f"<tr><td>{t.entry_time.strftime('%H:%M')}</td><td>{'LONG' if t.direction==1 else 'SHORT'}</td><td>{t.entry_price:.2f}</td><td>{t.stop_price:.2f}</td><td>{t.take_profit:.2f}</td><td class='{'pos' if t.pnl>=0 else 'neg'}'>{t.pnl*100:.2f}%</td></tr>" for t in active_trades])}
+            <h3>Active Vector</h3>
+            <table><tr><th>Entry Time</th><th>Dir</th><th>Entry</th><th>Stop (Breakout Line)</th><th>Target (2x)</th><th>Len</th><th>PnL</th></tr>
+            {''.join([f"<tr><td>{t.entry_time.strftime('%H:%M')}</td><td>{'LONG' if t.direction==1 else 'SHORT'}</td><td>{t.entry_price:.2f}</td><td>{t.stop_price:.2f}</td><td>{t.take_profit:.2f}</td><td>{t.timeframe_length}</td><td class='{'pos' if t.pnl>=0 else 'neg'}'>{t.pnl*100:.2f}%</td></tr>" for t in active_trades])}
             </table>
-            <h3>History</h3>
+            <h3>Archive</h3>
             <table><tr><th>Reason</th><th>Exit</th><th>PnL</th></tr>
-            {''.join([f"<tr><td>{t.exit_reason}</td><td>{t.exit_price:.2f}</td><td class='{'pos' if t.pnl>=0 else 'neg'}'>{t.pnl*100:.2f}%</td></tr>" for t in trade_history[-5:]])}
+            {''.join([f"<tr><td>{t.exit_reason}</td><td>{t.exit_price:.2f}</td><td class='{'pos' if t.pnl>=0 else 'neg'}'>{t.pnl*100:.2f}%</td></tr>" for t in trade_history[-10:]])}
             </table></body></html>
             """
             self.wfile.write(html.encode())
@@ -195,79 +285,52 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 def run_server():
     server = HTTPServer(('', PORT), DashboardHandler)
-    print(f"Dashboard active at port {PORT}")
+    print(f"[{IDENTITY}] Interface active: Port {PORT}")
     server.serve_forever()
 
 def logic_loop():
     global current_plot_data
+    print(f"[{IDENTITY}] Logic loop initiated.")
+    
     while True:
-        # 1. Fetch Data
-        df = get_candles()
-        if len(df) < WINDOW + 1:
-            print("Waiting for more data...")
-            time.sleep(60)
-            continue
+        # 1. Real-time PnL Tracking (Every Minute/Loop)
+        current_ticker_price = get_current_price()
+        
+        if current_ticker_price:
+            for t in active_trades:
+                t.update(current_ticker_price)
             
-        # We work with the last 'WINDOW' candles for fitting, EXCLUDING the current active candle if possible
-        # to prevent repainting, or including it if closed.
-        # Assuming last row is the just-closed candle or currently forming. 
-        # Safety: Look at the last 100 closed candles.
-        
-        # Slicing: -101 to -1 (100 candles)
-        history_df = df.iloc[-(WINDOW+1):-1].reset_index(drop=True)
-        current_candle = df.iloc[-1]
-        current_price = current_candle['close']
-        
-        # 2. Update Trades
-        for t in active_trades:
-            t.update(current_price)
-        for t in [x for x in active_trades if not x.is_active]:
-            trade_history.append(t)
-            active_trades.remove(t)
+            # Clean up closed trades
+            for t in [x for x in active_trades if not x.is_active]:
+                trade_history.append(t)
+                active_trades.remove(t)
+                print(f"[{IDENTITY}] Trade Closed: {t.exit_reason} | PnL: {t.pnl*100:.2f}%")
 
-        # 3. Fit Lines
-        # Top: Highs, Bottom: Lows
-        m_top, c_top = find_best_line_geometric(history_df['high'], 'top')
-        m_bot, c_bot = find_best_line_geometric(history_df['low'], 'bottom')
+        # 2. Strategy Scan (Requires Candle Data)
+        # We assume this loop runs every minute. 
+        # Deep scan is expensive, but necessary per requirements.
+        df = get_data()
         
-        if m_top is not None and m_bot is not None:
-            # Generate Y values for plotting (history + current projection)
-            # history indices 0..99. Current index 100.
-            x_range = np.arange(WINDOW + 1)
-            line_top_vals = m_top * x_range + c_top
-            line_bot_vals = m_bot * x_range + c_bot
-            
-            current_resistance = line_top_vals[-1]
-            current_support = line_bot_vals[-1]
+        if len(df) > 100:
+            signal = scan_for_breakouts(df)
+            current_plot_data = generate_plot(df, signal)
 
-            # 4. Check Breakouts (on current candle)
-            # Long
-            if current_price > current_resistance:
-                # Filter spam
-                if not any(t.direction == 1 for t in active_trades):
-                    print(f"Long Signal: {current_price} > {current_resistance}")
-                    active_trades.append(Trade(current_price, 1, current_support, current_candle['timestamp']))
-            
-            # Short
-            elif current_price < current_support:
-                if not any(t.direction == -1 for t in active_trades):
-                    print(f"Short Signal: {current_price} < {current_support}")
-                    active_trades.append(Trade(current_price, -1, current_resistance, current_candle['timestamp']))
-
-            # Update Plot Data
-            # Note: We need to pass the FULL df to plot, but the lines correspond to the last 101 points
-            # Padding line arrays to match full df length
-            pad = len(df) - len(line_top_vals)
-            full_top = np.pad(line_top_vals, (pad, 0), constant_values=np.nan)
-            full_bot = np.pad(line_bot_vals, (pad, 0), constant_values=np.nan)
-            
-            current_plot_data = generate_plot(df, full_top, full_bot)
+            if signal:
+                price = df.iloc[-1]['close']
+                ts = df.iloc[-1]['timestamp']
+                
+                # Check if we should enter
+                # Filter: Don't enter if we already have a trade in the same direction? 
+                # Or simply allow one trade at a time. Assuming 1 active trade limit for safety.
+                if not active_trades:
+                    print(f"[{IDENTITY}] Signal Detected. Length: {signal['length']} Offset: {signal['offset']} Dir: {signal['direction']}")
+                    
+                    # Stop is set to the breakout line (signal['stop'])
+                    t = Trade(price, signal['direction'], signal['stop'], ts, signal['length'])
+                    active_trades.append(t)
         
-        # 5. Wait for next hour
-        # Calculate time to sleep until next hour start + buffer
-        # For simplicity in this script, just sleep 60s and check timestamp or sleep 1h
-        print(f"Cycle complete. Price: {current_price}. Sleeping...")
-        time.sleep(3600) 
+        # 3. Wait 60s
+        time.sleep(60)
 
 if __name__ == "__main__":
     t = threading.Thread(target=run_server)
