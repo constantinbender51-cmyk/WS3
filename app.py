@@ -8,6 +8,7 @@ import http.server
 import socketserver
 import time
 import threading
+import itertools
 from datetime import datetime, timedelta
 
 # --- Configuration ---
@@ -21,9 +22,11 @@ PORT = int(os.environ.get("PORT", 8000))
 def fetch_data(days, limit=1000):
     exchange = ccxt.binance()
     now = exchange.milliseconds()
-    since = now - (days * 24 * 60 * 60 * 1000) - (100 * 3600 * 1000) # Buffer for lookback
+    # Add buffer for indicators
+    since = now - (days * 24 * 60 * 60 * 1000) - (200 * 3600 * 1000) 
     all_candles = []
     
+    print(f"Fetching {days} days of data...")
     while since < now:
         try:
             candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since, limit)
@@ -31,13 +34,15 @@ def fetch_data(days, limit=1000):
             since = candles[-1][0] + 1
             all_candles += candles
             time.sleep(exchange.rateLimit / 1000)
-        except Exception: break
+        except Exception as e: 
+            print(f"Fetch Error: {e}")
+            break
 
     df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df = df.drop_duplicates(subset=['timestamp']).reset_index(drop=True)
     
-    # Drop the last candle as it is likely unfinished (unless fetched exactly at close, but better safe)
+    # Drop unfinished candle
     if len(df) > 0:
         df = df.iloc[:-1]
         
@@ -51,7 +56,7 @@ def fit_line(x, y):
 def get_line_point(results, x_val):
     return results.params[0] + results.params[1] * x_val
 
-def detect_breakout(df, i, window_size):
+def detect_breakout(df, i, window_size, threshold_pct):
     start_idx = i - window_size
     window_df = df.iloc[start_idx:i]
     current_candle = df.iloc[i]
@@ -70,42 +75,56 @@ def detect_breakout(df, i, window_size):
     upper_x, upper_y = x[upper_mask], window_df.iloc[upper_mask]['high'].values
     lower_x, lower_y = x[lower_mask], window_df.iloc[lower_mask]['low'].values
     
-    res = {'signal': None, 'stop_dist': 0, 'params': (None, None, mid_model)}
+    res = {
+        'signal': None, 
+        'raw_stop_dist': 0, 
+        'breakout_line_val': 0,
+        'params': (None, None, mid_model),
+        'window_df': window_df
+    }
     
-    # 3. Fit Bounds
+    # 3. Fit Bounds & Check Threshold
     upper_model = None
     lower_model = None
     
     bullish = False
     bearish = False
     
+    # Check Long
     if len(upper_x) > 2:
         upper_model = fit_line(upper_x, upper_y)
-        if current_candle['close'] > get_line_point(upper_model, i):
+        line_val = get_line_point(upper_model, i)
+        trigger_price = line_val * (1 + threshold_pct)
+        
+        if current_candle['close'] > trigger_price:
             bullish = True
-            res['breakout_level'] = get_line_point(upper_model, i)
+            res['breakout_line_val'] = line_val
             
+    # Check Short
     if len(lower_x) > 2:
         lower_model = fit_line(lower_x, lower_y)
-        if current_candle['close'] < get_line_point(lower_model, i):
+        line_val = get_line_point(lower_model, i)
+        trigger_price = line_val * (1 - threshold_pct)
+        
+        if current_candle['close'] < trigger_price:
             bearish = True
-            res['breakout_level'] = get_line_point(lower_model, i)
+            res['breakout_line_val'] = line_val
     
     res['params'] = (upper_model, lower_model, mid_model)
-    res['window_df'] = window_df
     
     if bullish or bearish:
         res['signal'] = 'long' if bullish else 'short'
         entry = current_candle['close']
-        # Dynamic stop distance calculation
-        dist = abs(entry - res['breakout_level']) / entry
-        res['stop_dist'] = max(dist, 0.001) # Min 0.1% stop
+        
+        # Calculate raw dynamic distance (distance from entry to the line)
+        # Note: We use the line value, not the threshold trigger, for the stop calculation base
+        dist = abs(entry - res['breakout_line_val']) / entry
+        res['raw_stop_dist'] = max(dist, 0.001) # Min 0.1% floor
         
     return res
 
 # --- Backtesting Engine ---
-def run_simulation(df, stop_config, save_plots=False):
-    # stop_config: 'dynamic', 0.005, 0.01, 0.02
+def run_simulation(df, stop_multiplier, threshold_pct, save_plots=False):
     trades = []
     equity = 100.0
     equity_curve = [equity]
@@ -116,33 +135,26 @@ def run_simulation(df, stop_config, save_plots=False):
         
         # Window shrinking loop 100 -> 10
         for window_size in range(100, 9, -1):
-            detection = detect_breakout(df, i, window_size)
+            detection = detect_breakout(df, i, window_size, threshold_pct)
             
             if detection['signal']:
                 direction = detection['signal']
                 entry_price = df.iloc[i]['close']
                 
-                # Determine Stop Distance
-                if stop_config == 'dynamic':
-                    stop_pct = detection['stop_dist']
-                else:
-                    stop_pct = float(stop_config)
+                # Apply Dynamic Multiplier
+                stop_pct = detection['raw_stop_dist'] * stop_multiplier
                 
                 # Execute Trade
                 exit_data = simulate_trade_execution(df, i, direction, stop_pct)
                 
                 # Calculate Result (Compounding + Fees)
-                # Entry Fee
-                position_size = equity * (1 - FEES)
+                position_size = equity * (1 - FEES) # Entry Fee
                 
-                # Price Movement
                 raw_return = (exit_data['price'] - entry_price) / entry_price
                 if direction == 'short': raw_return *= -1
                 
                 position_val = position_size * (1 + raw_return)
-                
-                # Exit Fee
-                equity = position_val * (1 - FEES)
+                equity = position_val * (1 - FEES) # Exit Fee
                 equity_curve.append(equity)
                 
                 trade_record = {
@@ -154,11 +166,12 @@ def run_simulation(df, stop_config, save_plots=False):
                     'direction': direction,
                     'pnl_pct': raw_return,
                     'equity': equity,
-                    'stop_dist': stop_pct
+                    'stop_dist': stop_pct,
+                    'window': window_size
                 }
                 trades.append(trade_record)
                 
-                if save_plots and len(trades) <= 10:
+                if save_plots and len(trades) <= 20:
                     context = {
                         'window_df': detection['window_df'],
                         'upper_params': detection['params'][0],
@@ -166,6 +179,7 @@ def run_simulation(df, stop_config, save_plots=False):
                         'mid_params': detection['params'][2],
                         'pnl': raw_return
                     }
+                    # Plot ID
                     plot_trade(df, context, i, exit_data['idx'], entry_price, exit_data['price'], direction, len(trades))
 
                 i = exit_data['idx'] + 1
@@ -211,7 +225,7 @@ def plot_trade(df, context, entry_idx, exit_idx, entry_price, exit_price, direct
     
     plt.figure(figsize=(10, 5))
     
-    # Plot Candles (Subset)
+    # Plot Candles
     plot_start = max(0, window_df.index[0] - 5)
     plot_end = min(exit_idx + 10, len(df))
     sub = df.iloc[plot_start:plot_end]
@@ -241,7 +255,7 @@ def plot_trade(df, context, entry_idx, exit_idx, entry_price, exit_price, direct
     
     plt.title(f"Trade {plot_id} ({direction}) PnL: {context['pnl']:.2%}")
     plt.grid(True, alpha=0.3)
-    plt.savefig(f"{OUTPUT_DIR}/trade_{plot_id}.png")
+    plt.savefig(f"{OUTPUT_DIR}/trade_{plot_id:03d}.png")
     plt.close()
 
 def plot_equity(curve, title="Equity Curve"):
@@ -256,17 +270,18 @@ def plot_equity(curve, title="Equity Curve"):
     plt.close()
 
 def update_html(trades, best_config, is_live=False):
-    html = f"""<html><body>
+    stop_mul, thresh = best_config
+    html = f"""<html><head><meta http-equiv="refresh" content="60"></head><body>
     <h1>System Status: {'LIVE' if is_live else 'BACKTEST COMPLETE'}</h1>
-    <h2>Best Config: {best_config}</h2>
+    <h2>Config: Stop={stop_mul}x Dynamic | Threshold={thresh*100}%</h2>
     <h3>Equity Curve</h3>
     <img src="equity_curve.png" width="800"><br>
-    <h3>Recent Trades</h3>
-    <table border="1">
-    <tr><th>ID</th><th>Dir</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Eq</th></tr>
+    <h3>Trades</h3>
+    <table border="1" cellpadding="5">
+    <tr><th>ID</th><th>Dir</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Eq</th><th>Win</th></tr>
     """
     for t in reversed(trades[-20:]):
-        html += f"<tr><td>{t['index']}</td><td>{t['direction']}</td><td>{t['entry_price']:.2f}</td><td>{t['exit_price']:.2f}</td><td>{t['pnl_pct']:.2%}</td><td>{t['equity']:.2f}</td></tr>"
+        html += f"<tr><td>{t['index']}</td><td>{t['direction']}</td><td>{t['entry_price']:.2f}</td><td>{t['exit_price']:.2f}</td><td>{t['pnl_pct']:.2%}</td><td>{t['equity']:.2f}</td><td>{t['window']}</td></tr>"
     html += "</table><hr><h3>Setup Plots</h3>"
     
     images = sorted([f for f in os.listdir(OUTPUT_DIR) if f.startswith('trade_')])
@@ -276,40 +291,49 @@ def update_html(trades, best_config, is_live=False):
     with open(f"{OUTPUT_DIR}/index.html", "w") as f:
         f.write(html)
 
-# --- Workflow Control ---
+# --- Optimization & Workflow ---
 def optimize_and_run():
-    print("Fetching optimization data (20 days)...")
+    # 1. Fetch Optimization Data (20 Days)
+    print("Fetching 20 days for optimization...")
     df_opt = fetch_data(20)
     
-    configs = ['dynamic', 0.005, 0.01, 0.02]
-    results = {}
+    # Candidates
+    stop_multipliers = [1, 2, 3] # dynamic, dynamic*2, dynamic*3
+    thresholds = [0.0, 0.005, 0.01] # 0%, 0.5%, 1%
     
-    print("Running optimization...")
-    for cfg in configs:
-        _, curve = run_simulation(df_opt, cfg)
+    best_final_eq = -1.0
+    best_config = (1, 0.0) # default
+    
+    print("Running optimization grid...")
+    for mul, thresh in itertools.product(stop_multipliers, thresholds):
+        _, curve = run_simulation(df_opt, stop_multiplier=mul, threshold_pct=thresh)
         final_eq = curve[-1]
-        results[cfg] = final_eq
-        print(f"Config {cfg}: ${final_eq:.2f}")
+        print(f"Config [Stop: {mul}x, Thresh: {thresh*100}%] -> Equity: ${final_eq:.2f}")
         
-    best_config = max(results, key=results.get)
-    print(f"Winner: {best_config}")
+        if final_eq > best_final_eq:
+            best_final_eq = final_eq
+            best_config = (mul, thresh)
+            
+    print(f"Winner: Stop {best_config[0]}x, Threshold {best_config[1]*100}%")
     
-    print("Fetching full data (60 days)...")
+    # 2. Run Full Backtest (60 Days)
+    print("Fetching 60 days for validation...")
     df_full = fetch_data(60)
     
-    print(f"Running full backtest with {best_config}...")
-    trades, curve = run_simulation(df_full, best_config, save_plots=True)
+    print(f"Running full backtest with winning config...")
+    trades, curve = run_simulation(df_full, best_config[0], best_config[1], save_plots=True)
     
-    plot_equity(curve, f"Equity Curve ({best_config})")
+    plot_equity(curve, f"Equity (Stop {best_config[0]}x, Thresh {best_config[1]*100}%)")
     update_html(trades, best_config)
     
-    return best_config, df_full, trades, curve
+    return best_config, curve[-1]
 
 # --- Live Loop ---
 def live_trader(best_config, initial_equity):
+    stop_mul, thresh_pct = best_config
     print("Starting Live Trader...")
     equity = initial_equity
-    trades = [] # Keep local track
+    trades = [] 
     
     while True:
         now = datetime.utcnow()
@@ -317,49 +341,45 @@ def live_trader(best_config, initial_equity):
         next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
         sleep_sec = (next_hour - now).total_seconds() + 5
         
-        print(f"Live: Sleeping {sleep_sec:.1f}s until {next_hour.strftime('%H:%M:%S')} + 5s...")
+        print(f"Live: Sleeping {sleep_sec:.1f}s...")
         time.sleep(sleep_sec)
         
         print("Live: Waking up. Fetching data...")
-        # Fetch enough history for 100 candle window
-        df = fetch_data(5) # 5 days is plenty for 100h
+        df = fetch_data(5) # 5 days buffer
         
-        # Latest completed candle is at index -1
         i = len(df) - 1
         current_candle = df.iloc[i]
         
-        print(f"Live: Analyzing candle {current_candle['timestamp']} Close: {current_candle['close']}")
+        print(f"Live: Analyzing {current_candle['timestamp']} Close: {current_candle['close']}")
         
         trade_found = False
         for window_size in range(100, 9, -1):
-            det = detect_breakout(df, i, window_size)
+            det = detect_breakout(df, i, window_size, thresh_pct)
+            
             if det['signal']:
-                print(f"Live: SIGNAL FOUND! {det['signal']}")
-                
-                # In live mode, we don't have the future, so we can't 'simulate' the exit immediately
-                # We just log the entry signal. 
-                # Real implementation would need a websocket or ticker loop to manage the open trade.
-                # For this scope, we record the signal and hypothetically enter.
-                
                 direction = det['signal']
-                stop_pct = det['stop_dist'] if best_config == 'dynamic' else float(best_config)
+                stop_dist = det['raw_stop_dist'] * stop_mul
                 
+                print(f"Live: SIGNAL FOUND! {direction} Stop Dist: {stop_dist:.2%}")
+                
+                # Log Signal
                 trade_record = {
-                    'index': len(trades) + 999, # Offset ID
+                    'index': 'LIVE',
                     'entry_idx': i,
-                    'exit_idx': -1, # Unknown
+                    'exit_idx': -1, 
                     'entry_price': current_candle['close'],
                     'exit_price': 0,
                     'direction': direction,
                     'pnl_pct': 0,
                     'equity': equity,
-                    'stop_dist': stop_pct
+                    'stop_dist': stop_dist,
+                    'window': window_size
                 }
                 trades.append(trade_record)
                 
-                # Append to HTML (simplified)
+                # Append to HTML log
                 with open(f"{OUTPUT_DIR}/index.html", "a") as f:
-                    f.write(f"<p>LIVE SIGNAL: {direction} @ {current_candle['close']} (Stop: {stop_pct:.2%})</p>")
+                    f.write(f"<p style='color:red; font-weight:bold;'>LIVE SIGNAL: {direction} @ {current_candle['close']} (Stop: {stop_dist:.2%})</p>")
                 
                 trade_found = True
                 break
@@ -377,14 +397,13 @@ def start_server():
 if __name__ == "__main__":
     if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
     
-    # 1. Optimize & Backtest
-    best_cfg, _, trades, curve = optimize_and_run()
+    # 1. Optimize
+    best_cfg, final_equity = optimize_and_run()
     
-    # 2. Start Web Server (Thread)
-    t_server = threading.Thread(target=start_server)
-    t_server.daemon = True
-    t_server.start()
+    # 2. Start Server
+    t = threading.Thread(target=start_server)
+    t.daemon = True
+    t.start()
     
-    # 3. Enter Live Loop
-    # Pass final equity from backtest as starting point
-    live_trader(best_cfg, curve[-1])
+    # 3. Live Loop
+    live_trader(best_cfg, final_equity)
