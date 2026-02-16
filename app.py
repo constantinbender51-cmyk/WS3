@@ -11,7 +11,7 @@ from urllib.parse import urlparse, parse_qs
 # Configuration
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1h'
-LIMIT = 200
+LIMIT = 100 # Restricted to 100 candles
 PORT = 8080
 
 # Global State
@@ -66,7 +66,6 @@ def generate_plot(df_closed):
     potential_long = None
     lines_to_draw = []
 
-    # Detect biggest window breakout
     for w in range(100, 9, -1):
         if len(df_closed) < w: continue
         x_win = x_full[-w:]
@@ -91,26 +90,22 @@ def generate_plot(df_closed):
             is_long = last_close > (u_val + thresh)
             
             if is_short or is_long:
-                lines_to_draw.append((x_win, y_trend, m_u * x_win + c_u, m_l * x_win + c_l))
+                lines_to_draw.append((x_win, m_u * x_win + c_u, m_l * x_win + c_l))
                 
                 if is_short and potential_short is None:
                     potential_short = {'type': 'short', 'entry': last_close, 'stop': l_val, 'target': l_val - dist, 'window': w}
                 if is_long and potential_long is None:
                     potential_long = {'type': 'long', 'entry': last_close, 'stop': u_val, 'target': u_val + dist, 'window': w}
 
-    # Execute entries
     if potential_short and not any(t['type'] == 'short' for t in active_trades):
         active_trades.append(potential_short)
     if potential_long and not any(t['type'] == 'long' for t in active_trades):
         active_trades.append(potential_long)
 
-    # Only render lines that triggered a potential or active trade
-    for x_win, mid, up, low in lines_to_draw:
-        plt.plot(x_win, mid, color='red', linewidth=0.5, zorder=1)
+    for x_win, up, low in lines_to_draw:
         plt.plot(x_win, up, color='red', linewidth=0.5, zorder=1)
         plt.plot(x_win, low, color='red', linewidth=0.5, zorder=1)
 
-    # Render Candles
     up_c, down_c = df_closed[df_closed.close >= df_closed.open], df_closed[df_closed.close < df_closed.open]
     for color, d in [('green', up_c), ('red', down_c)]:
         plt.bar(d.index, d.close - d.open, 0.6, bottom=d.open, color=color, zorder=2)
