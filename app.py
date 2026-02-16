@@ -36,6 +36,8 @@ def generate_plot(df):
     plt.style.use('dark_background')
     
     x_full = np.arange(len(df))
+    last_idx = x_full[-1]
+    last_close = df['close'].iloc[-1]
     
     # 1. Render Lines First (Background)
     for w in range(10, 101):
@@ -57,24 +59,30 @@ def generate_plot(df):
         m_u, c_u = fit_ols(x_win[upper_mask], y_win_high[upper_mask])
         m_l, c_l = fit_ols(x_win[lower_mask], y_win_low[lower_mask])
         
-        # All 3 lines in Cyan, no transparency
-        plt.plot(x_win, y_trend, color='cyan', linewidth=0.5, zorder=1)
+        line_color = 'cyan'
+        
+        # Check condition for the current window's boundary lines
+        if m_u is not None and m_l is not None:
+            upper_val = m_u * last_idx + c_u
+            lower_val = m_l * last_idx + c_l
+            if last_close > upper_val or last_close < lower_val:
+                line_color = 'red'
+        
+        plt.plot(x_win, y_trend, color=line_color, linewidth=0.5, zorder=1)
         if m_u is not None:
-            plt.plot(x_win, m_u * x_win + c_u, color='cyan', linewidth=0.5, zorder=1)
+            plt.plot(x_win, m_u * x_win + c_u, color=line_color, linewidth=0.5, zorder=1)
         if m_l is not None:
-            plt.plot(x_win, m_l * x_win + c_l, color='cyan', linewidth=0.5, zorder=1)
+            plt.plot(x_win, m_l * x_win + c_l, color=line_color, linewidth=0.5, zorder=1)
 
     # 2. Render Candles Second (Foreground)
     width = .6
     up = df[df.close >= df.open]
     down = df[df.close < df.open]
     
-    # Green Candles
     plt.bar(up.index, up.close - up.open, width, bottom=up.open, color='green', zorder=2)
     plt.bar(up.index, up.high - np.maximum(up.close, up.open), 0.05, bottom=np.maximum(up.close, up.open), color='green', zorder=2)
     plt.bar(up.index, np.minimum(up.close, up.open) - up.low, 0.05, bottom=up.low, color='green', zorder=2)
     
-    # Red Candles
     plt.bar(down.index, down.close - down.open, width, bottom=down.open, color='red', zorder=2)
     plt.bar(down.index, down.high - np.maximum(down.close, down.open), 0.05, bottom=np.maximum(down.close, down.open), color='red', zorder=2)
     plt.bar(down.index, np.minimum(down.close, down.open) - down.low, 0.05, bottom=down.low, color='red', zorder=2)
