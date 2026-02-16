@@ -10,7 +10,7 @@ from io import BytesIO
 # Configuration
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1h'
-LIMIT = 100
+LIMIT = 200
 PORT = 8080
 
 # Global State
@@ -32,7 +32,7 @@ def fit_ols(x, y):
     return m, c
 
 def generate_plot(df):
-    plt.figure(figsize=(12, 8))
+    plt.figure(figsize=(15, 9))
     plt.style.use('dark_background')
     
     # Candles
@@ -40,51 +40,47 @@ def generate_plot(df):
     up = df[df.close >= df.open]
     down = df[df.close < df.open]
     
-    plt.bar(up.index, up.close - up.open, width, bottom=up.open, color='green', alpha=0.3)
-    plt.bar(up.index, up.high - np.maximum(up.close, up.open), 0.05, bottom=np.maximum(up.close, up.open), color='green', alpha=0.3)
-    plt.bar(up.index, np.minimum(up.close, up.open) - up.low, 0.05, bottom=up.low, color='green', alpha=0.3)
+    plt.bar(up.index, up.close - up.open, width, bottom=up.open, color='green')
+    plt.bar(up.index, up.high - np.maximum(up.close, up.open), 0.05, bottom=np.maximum(up.close, up.open), color='green')
+    plt.bar(up.index, np.minimum(up.close, up.open) - up.low, 0.05, bottom=up.low, color='green')
     
-    plt.bar(down.index, down.close - down.open, width, bottom=down.open, color='red', alpha=0.3)
-    plt.bar(down.index, down.high - np.maximum(down.close, down.open), 0.05, bottom=np.maximum(down.close, down.open), color='red', alpha=0.3)
-    plt.bar(down.index, np.minimum(down.close, down.open) - down.low, 0.05, bottom=down.low, color='red', alpha=0.3)
-    
-    # Multi-window OLS fitting
-    windows = [10, 20, 50, 100]
-    colors_up = ['#00FFFF', '#00CED1', '#4682B4', '#5F9EA0'] # Cyans
-    colors_low = ['#FF00FF', '#DA70D6', '#BA55D3', '#9932CC'] # Magentas
+    plt.bar(down.index, down.close - down.open, width, bottom=down.open, color='red')
+    plt.bar(down.index, down.high - np.maximum(down.close, down.open), 0.05, bottom=np.maximum(down.close, down.open), color='red')
+    plt.bar(down.index, np.minimum(down.close, down.open) - down.low, 0.05, bottom=down.low, color='red')
     
     x_full = np.arange(len(df))
     
-    for i, w in enumerate(windows):
+    # Windows from 10 to 100 in 1 unit increments
+    for w in range(10, 101):
         if len(df) < w:
             continue
             
-        # Select trailing window
-        window_df = df.suffix(w) if hasattr(df, 'suffix') else df.iloc[-w:]
         x_win = x_full[-w:]
+        y_win_close = df['close'].values[-w:]
+        y_win_high = df['high'].values[-w:]
+        y_win_low = df['low'].values[-w:]
         
-        # Base Trend for the window
-        m_mid, c_mid = fit_ols(x_win, window_df['close'].values)
+        # Mid Trend
+        m_mid, c_mid = fit_ols(x_win, y_win_close)
         if m_mid is None: continue
         y_trend = m_mid * x_win + c_mid
         
-        # Filter points above/below window trend
-        upper_mask = window_df['high'].values > y_trend
-        lower_mask = window_df['low'].values < y_trend
+        # Upper/Lower Filter masks
+        upper_mask = y_win_high > y_trend
+        lower_mask = y_win_low < y_trend
         
-        # OLS Upper
-        m_u, c_u = fit_ols(x_win[upper_mask], window_df['high'].values[upper_mask])
+        # Upper Line
+        m_u, c_u = fit_ols(x_win[upper_mask], y_win_high[upper_mask])
+        # Lower Line
+        m_l, c_l = fit_ols(x_win[lower_mask], y_win_low[lower_mask])
+        
+        # Rendering 3 lines per window (Mid, Upper, Lower) in same color (Cyan)
+        plt.plot(x_win, y_trend, color='cyan', linewidth=0.5)
         if m_u is not None:
-            plt.plot(x_win, m_u * x_win + c_u, color=colors_up[i], 
-                     linewidth=1, label=f'Upper {w}', alpha=0.8)
-            
-        # OLS Lower
-        m_l, c_l = fit_ols(x_win[lower_mask], window_df['low'].values[lower_mask])
+            plt.plot(x_win, m_u * x_win + c_u, color='cyan', linewidth=0.5)
         if m_l is not None:
-            plt.plot(x_win, m_l * x_win + c_l, color=colors_low[i], 
-                     linewidth=1, label=f'Lower {w}', alpha=0.8)
+            plt.plot(x_win, m_l * x_win + c_l, color='cyan', linewidth=0.5)
 
-    plt.legend(loc='upper left', fontsize='small', ncol=2)
     buf = BytesIO()
     plt.savefig(buf, format='png')
     plt.close()
@@ -97,7 +93,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
             self.end_headers()
-            self.wfile.write(b'<html><body style="background:black;display:flex;justify-content:center"><img src="/chart.png"></body></html>')
+            self.wfile.write(b'<html><body style="background:black;margin:0;padding:0;overflow:hidden"><img src="/chart.png" style="width:100%"></body></html>')
         elif self.path == '/chart.png':
             if current_plot_data:
                 self.send_response(200)
@@ -117,7 +113,7 @@ def logic_loop():
         df = get_data()
         if not df.empty:
             current_plot_data = generate_plot(df)
-            print(f"Plot updated: {df.iloc[-1]['close']}")
+            print(f"Update: {df.iloc[-1]['close']}")
         time.sleep(10)
 
 if __name__ == "__main__":
