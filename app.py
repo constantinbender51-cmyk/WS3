@@ -245,7 +245,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             
             html = f"""
-            <html><head><meta http-equiv="refresh" content="30">
+            <html><head><meta http-equiv="refresh" content="300000">
             <style>body{{background:#000;color:#0f0;font-family:monospace;padding:20px}} 
             table{{width:100%;border-collapse:collapse;margin-top:10px;border:1px solid #333}} 
             th,td{{border:1px solid #333;padding:8px;text-align:left}}
