@@ -11,7 +11,7 @@ from urllib.parse import urlparse, parse_qs
 # Configuration
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1h'
-LIMIT = 100 # Restricted to 100 candles
+LIMIT = 101 # Set to 101
 PORT = 8080
 
 # Global State
@@ -64,7 +64,7 @@ def generate_plot(df_closed):
     
     potential_short = None
     potential_long = None
-    lines_to_draw = []
+    breakout_lines = []
 
     for w in range(100, 9, -1):
         if len(df_closed) < w: continue
@@ -89,22 +89,20 @@ def generate_plot(df_closed):
             is_short = last_close < (l_val - thresh)
             is_long = last_close > (u_val + thresh)
             
-            if is_short or is_long:
-                lines_to_draw.append((x_win, m_u * x_win + c_u, m_l * x_win + c_l))
-                
-                if is_short and potential_short is None:
-                    potential_short = {'type': 'short', 'entry': last_close, 'stop': l_val, 'target': l_val - dist, 'window': w}
-                if is_long and potential_long is None:
-                    potential_long = {'type': 'long', 'entry': last_close, 'stop': u_val, 'target': u_val + dist, 'window': w}
+            if is_short and potential_short is None:
+                potential_short = {'type': 'short', 'entry': last_close, 'stop': l_val, 'target': l_val - dist, 'window': w}
+                breakout_lines.append((x_win, m_l * x_win + c_l))
+            elif is_long and potential_long is None:
+                potential_long = {'type': 'long', 'entry': last_close, 'stop': u_val, 'target': u_val + dist, 'window': w}
+                breakout_lines.append((x_win, m_u * x_win + c_u))
 
     if potential_short and not any(t['type'] == 'short' for t in active_trades):
         active_trades.append(potential_short)
     if potential_long and not any(t['type'] == 'long' for t in active_trades):
         active_trades.append(potential_long)
 
-    for x_win, up, low in lines_to_draw:
-        plt.plot(x_win, up, color='red', linewidth=0.5, zorder=1)
-        plt.plot(x_win, low, color='red', linewidth=0.5, zorder=1)
+    for x_win, line_vals in breakout_lines:
+        plt.plot(x_win, line_vals, color='red', linewidth=1.0, zorder=1)
 
     up_c, down_c = df_closed[df_closed.close >= df_closed.open], df_closed[df_closed.close < df_closed.open]
     for color, d in [('green', up_c), ('red', down_c)]:
