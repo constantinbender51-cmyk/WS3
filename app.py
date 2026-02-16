@@ -21,36 +21,50 @@ exchange = ccxt.binance()
 def get_data():
     try:
         ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=LIMIT)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        return df
-    except Exception as e:
-        print(f"Data Fetch Error: {e}")
+        return pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    except:
         return pd.DataFrame()
 
-def generate_random_line_data(df):
-    # Generate valid coordinates within chart limits
-    x_min, x_max = 0, len(df)
-    y_min, y_max = df['low'].min(), df['high'].max()
+def get_cost(m, c, x, target):
+    line_y = m * x + c
+    return np.sum(np.abs(line_y - target))
+
+def optimize_slope(x, target_y):
+    # Initialize Randomly around center
+    cx = x[len(x)//2]
+    cy = np.mean(target_y)
+    m = random.uniform(-100, 100)
     
-    # Random points
-    x1, x2 = random.uniform(x_min, x_max), random.uniform(x_min, x_max)
-    y1, y2 = random.uniform(y_min, y_max), random.uniform(y_min, y_max)
-    
-    # Slope (m) and Intercept (c)
-    if x2 - x1 == 0: m = 0
-    else: m = (y2 - y1) / (x2 - x1)
-    c = y1 - m * x1
-    
-    # Generate Y values for the whole range
-    x_vals = np.arange(len(df))
-    y_vals = m * x_vals + c
-    return x_vals, y_vals
+    # Hill Climbing Optimization for Slope
+    step = 10.0
+    for _ in range(200):
+        c = cy - m * cx
+        cost_curr = get_cost(m, c, x, target_y)
+        
+        # Test Up
+        m_up = m + step
+        c_up = cy - m_up * cx
+        cost_up = get_cost(m_up, c_up, x, target_y)
+        
+        # Test Down
+        m_dn = m - step
+        c_dn = cy - m_dn * cx
+        cost_dn = get_cost(m_dn, c_dn, x, target_y)
+        
+        if cost_up < cost_curr:
+            m = m_up
+        elif cost_dn < cost_curr:
+            m = m_dn
+        else:
+            step *= 0.9 # Refine step
+            
+    return m, cy - m * cx
 
 def generate_plot(df):
     plt.figure(figsize=(10, 6))
     plt.style.use('dark_background')
     
-    # Plot Candles
+    # Candles
     width = .6
     up = df[df.close >= df.open]
     down = df[df.close < df.open]
@@ -61,11 +75,17 @@ def generate_plot(df):
     plt.bar(down.index, down.high - down.open, 0.05, bottom=down.open, color='red')
     plt.bar(down.index, down.low - down.close, 0.05, bottom=down.close, color='red')
     
-    # Generate and Plot 2 Random Lines
-    for color in ['cyan', 'magenta']:
-        x, y = generate_random_line_data(df)
-        plt.plot(x, y, color=color, linewidth=2)
+    x = np.arange(len(df))
+    
+    # Line 1: Resistance -> Minimizes distance to Low
+    m1, c1 = optimize_slope(x, df['low'].values)
+    plt.plot(x, m1 * x + c1, color='cyan', linewidth=2, label='Res (Target Low)')
+    
+    # Line 2: Support -> Minimizes distance to High
+    m2, c2 = optimize_slope(x, df['high'].values)
+    plt.plot(x, m2 * x + c2, color='magenta', linewidth=2, label='Sup (Target High)')
 
+    plt.legend()
     buf = BytesIO()
     plt.savefig(buf, format='png')
     plt.close()
@@ -89,9 +109,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_error(404)
 
 def run_server():
-    server = HTTPServer(('', PORT), DashboardHandler)
-    print(f"Server on {PORT}")
-    server.serve_forever()
+    HTTPServer(('', PORT), DashboardHandler).serve_forever()
 
 def logic_loop():
     global current_plot_data
@@ -99,7 +117,7 @@ def logic_loop():
         df = get_data()
         if not df.empty:
             current_plot_data = generate_plot(df)
-            print("Plot updated.")
+            print(f"Plot updated: {df.iloc[-1]['close']}")
         time.sleep(10)
 
 if __name__ == "__main__":
