@@ -247,7 +247,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         <html>
         <head>
             <title>Forensic Backtest Dashboard</title>
-            <meta http-equiv="refresh" content="3">
+            <meta http-equiv="refresh" content="55445663">
             <style>
                 body {{ background:#050505; color:#e0e0e0; font-family:'Courier New', monospace; text-align:center; margin:0; padding:20px; }}
                 .progress-container {{ width:80%; background:#222; margin:20px auto; border:1px solid #444; height:20px; }}
