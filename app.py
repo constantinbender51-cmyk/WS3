@@ -4,7 +4,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import time
 import threading
-import random
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 
@@ -25,40 +24,10 @@ def get_data():
     except:
         return pd.DataFrame()
 
-def get_cost(m, c, x, target):
-    line_y = m * x + c
-    return np.sum(np.abs(line_y - target))
-
-def optimize_slope(x, target_y):
-    # Initialize Randomly around center
-    cx = x[len(x)//2]
-    cy = np.mean(target_y)
-    m = random.uniform(-100, 100)
-    
-    # Hill Climbing Optimization for Slope
-    step = 10.0
-    for _ in range(200):
-        c = cy - m * cx
-        cost_curr = get_cost(m, c, x, target_y)
-        
-        # Test Up
-        m_up = m + step
-        c_up = cy - m_up * cx
-        cost_up = get_cost(m_up, c_up, x, target_y)
-        
-        # Test Down
-        m_dn = m - step
-        c_dn = cy - m_dn * cx
-        cost_dn = get_cost(m_dn, c_dn, x, target_y)
-        
-        if cost_up < cost_curr:
-            m = m_up
-        elif cost_dn < cost_curr:
-            m = m_dn
-        else:
-            step *= 0.9 # Refine step
-            
-    return m, cy - m * cx
+def fit_ols(x, y):
+    A = np.vstack([x, np.ones(len(x))]).T
+    m, c = np.linalg.lstsq(A, y, rcond=None)[0]
+    return m, c
 
 def generate_plot(df):
     plt.figure(figsize=(10, 6))
@@ -68,22 +37,21 @@ def generate_plot(df):
     width = .6
     up = df[df.close >= df.open]
     down = df[df.close < df.open]
+    
     plt.bar(up.index, up.close - up.open, width, bottom=up.open, color='green')
-    plt.bar(up.index, up.high - up.close, 0.05, bottom=up.close, color='green')
-    plt.bar(up.index, up.low - up.open, 0.05, bottom=up.open, color='green')
+    plt.bar(up.index, up.high - np.maximum(up.close, up.open), 0.05, bottom=np.maximum(up.close, up.open), color='green')
+    plt.bar(up.index, np.minimum(up.close, up.open) - up.low, 0.05, bottom=up.low, color='green')
+    
     plt.bar(down.index, down.close - down.open, width, bottom=down.open, color='red')
-    plt.bar(down.index, down.high - down.open, 0.05, bottom=down.open, color='red')
-    plt.bar(down.index, down.low - down.close, 0.05, bottom=down.close, color='red')
+    plt.bar(down.index, down.high - np.maximum(down.close, down.open), 0.05, bottom=np.maximum(down.close, down.open), color='red')
+    plt.bar(down.index, np.minimum(down.close, down.open) - down.low, 0.05, bottom=down.low, color='red')
     
     x = np.arange(len(df))
+    y = df['close'].values
     
-    # Line 1: Resistance -> Minimizes distance to Low
-    m1, c1 = optimize_slope(x, df['low'].values)
-    plt.plot(x, m1 * x + c1, color='cyan', linewidth=2, label='Res (Target Low)')
-    
-    # Line 2: Support -> Minimizes distance to High
-    m2, c2 = optimize_slope(x, df['high'].values)
-    plt.plot(x, m2 * x + c2, color='magenta', linewidth=2, label='Sup (Target High)')
+    # OLS Fit
+    m, c = fit_ols(x, y)
+    plt.plot(x, m * x + c, color='yellow', linewidth=2, label='OLS Trendline')
 
     plt.legend()
     buf = BytesIO()
@@ -109,7 +77,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_error(404)
 
 def run_server():
-    HTTPServer(('', PORT), DashboardHandler).serve_forever()
+    server = HTTPServer(('', PORT), DashboardHandler)
+    server.serve_forever()
 
 def logic_loop():
     global current_plot_data
