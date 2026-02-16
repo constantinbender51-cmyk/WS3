@@ -11,10 +11,10 @@ from datetime import datetime
 # Configuration
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1h'
-LIMIT = 150
+LIMIT = 100  # Modified: Reduced from 150 to 100
 PORT = 8080
 CROSS_PENALTY = 100000.0 
-TIMEFRAME_SECONDS = 3600 # Derived from '1h'
+TIMEFRAME_SECONDS = 3600
 
 # Collective Ownership Protocol Constants
 IDENTITY = "Jimmy"
@@ -22,12 +22,12 @@ IDENTITY = "Jimmy"
 class Trade:
     def __init__(self, entry_price, direction, initial_stop_price, entry_time, timeframe_length, slope):
         self.entry_price = entry_price
-        self.direction = direction  # 1 for Long, -1 for Short
-        self.initial_stop_price = initial_stop_price # The price of the line at entry
+        self.direction = direction  # 1 for Long
+        self.initial_stop_price = initial_stop_price 
         self.current_stop_price = initial_stop_price
         self.entry_time = entry_time
         self.timeframe_length = timeframe_length 
-        self.slope = slope # Price change per candle (index unit)
+        self.slope = slope 
         self.is_active = True
         
         # Risk is distance to breakout line at entry
@@ -42,25 +42,22 @@ class Trade:
         if not self.is_active: return
 
         # Update Stop Price (Tracking the line)
-        # Calculate elapsed time in terms of timeframe units (candles)
         elapsed_seconds = (datetime.now() - self.entry_time).total_seconds()
         elapsed_candles = elapsed_seconds / TIMEFRAME_SECONDS
         
-        # Project line: y = mx + c (where x is elapsed time since entry)
+        # Project line: y = mx + c
         self.current_stop_price = self.initial_stop_price + (self.slope * elapsed_candles)
 
         # PnL Calculation
         self.pnl = (current_price - self.entry_price) / self.entry_price * self.direction
 
         # TP Check
-        if (self.direction == 1 and current_price >= self.take_profit) or \
-           (self.direction == -1 and current_price <= self.take_profit):
+        if (self.direction == 1 and current_price >= self.take_profit):
             self.close(current_price, "TP")
             return
 
         # SL Check (Dynamic Line Cross)
-        if (self.direction == 1 and current_price < self.current_stop_price) or \
-           (self.direction == -1 and current_price > self.current_stop_price):
+        if (self.direction == 1 and current_price < self.current_stop_price):
             self.close(current_price, "SL")
             return
 
@@ -120,10 +117,8 @@ def find_best_line_geometric(series_values, direction):
                 diff = line_y - series_values
                 violations = diff < 0
                 cost = np.mean(np.abs(diff)) + (np.sum(violations) * CROSS_PENALTY)
-            else:
-                diff = series_values - line_y
-                violations = diff < 0
-                cost = np.mean(np.abs(diff)) + (np.sum(violations) * CROSS_PENALTY)
+            
+            # direction == 'bottom' logic removed as per instruction to only use Highs
 
             if cost < best_cost:
                 best_cost = cost
@@ -134,15 +129,15 @@ def find_best_line_geometric(series_values, direction):
 
 def scan_for_breakouts(df):
     """
-    Scans sequence lengths 10-100. Offset removed (always 0).
+    Scans sequence lengths 10-100.
     Returns the detected breakout with the HIGHEST sequence length.
+    Only fits line to Highs.
     """
     best_signal = None 
     
     current_idx = len(df) - 1
     current_close = df.iloc[-1]['close']
     
-    # Offset removed; always fit to current candle
     fit_end_idx = current_idx 
 
     # Iterate sequence lengths
@@ -150,41 +145,24 @@ def scan_for_breakouts(df):
         start_idx = fit_end_idx - length + 1
         if start_idx < 0: continue
         
-        # Slice the window for fitting
+        # Slice the window for fitting (Highs only)
         window_highs = df.iloc[start_idx : fit_end_idx + 1]['high'].values
-        window_lows = df.iloc[start_idx : fit_end_idx + 1]['low'].values
         
-        # Fit lines
+        # Fit line to Highs
         m_top, c_top = find_best_line_geometric(window_highs, 'top')
-        m_bot, c_bot = find_best_line_geometric(window_lows, 'bottom')
         
-        if m_top is None or m_bot is None: continue
+        if m_top is None: continue
 
         # Project line to CURRENT time (current_idx)
-        # rel_current_x is the last index of the window (length-1)
         rel_current_x = current_idx - start_idx
-        
         proj_res = m_top * rel_current_x + c_top
-        proj_sup = m_bot * rel_current_x + c_bot
         
-        # Check for Breakout State
-        signal_found = False
-        direction = 0
-        stop_level = 0.0
-        active_slope = 0.0
-
+        # Check for Breakout State (Price > Resistance Line)
         if current_close > proj_res:
             direction = 1
             stop_level = proj_res
             active_slope = m_top
-            signal_found = True
-        elif current_close < proj_sup:
-            direction = -1
-            stop_level = proj_sup
-            active_slope = m_bot
-            signal_found = True
-        
-        if signal_found:
+            
             # Priority Logic: Max Sequence Length
             if best_signal is None or length > best_signal['length']:
                 best_signal = {
@@ -193,7 +171,6 @@ def scan_for_breakouts(df):
                     'stop': stop_level,
                     'slope': active_slope,
                     'm_top': m_top, 'c_top': c_top,
-                    'm_bot': m_bot, 'c_bot': c_bot,
                     'start_idx': start_idx 
                 }
 
@@ -220,14 +197,12 @@ def generate_plot(df, signal):
         x_vals = np.arange(x_len)
         
         y_top = signal['m_top'] * x_vals + signal['c_top']
-        y_bot = signal['m_bot'] * x_vals + signal['c_bot']
         
         x_plot = np.arange(x_start, len(df))
         
         plt.plot(x_plot, y_top, color='cyan', linewidth=2, label=f'Res (L={signal["length"]})')
-        plt.plot(x_plot, y_bot, color='magenta', linewidth=2, label=f'Sup (L={signal["length"]})')
         
-    plt.title(f'BTC/USDT Geometric Breakout - {datetime.now().strftime("%H:%M")}')
+    plt.title(f'BTC/USDT Geometric Breakout (Highs) - {datetime.now().strftime("%H:%M")}')
     plt.legend()
     plt.grid(True, alpha=0.1)
     
@@ -256,13 +231,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             <h2>Collective Ownership Protocol // {datetime.now().strftime("%H:%M UTC")}</h2>
             <div style="border: 1px solid #333; padding: 10px; margin-bottom: 20px;">
                 STATUS: MONITORING<br>
-                SCANNER: SEQ 10-100 | OFFSET 0 (STRICT)<br>
+                SCANNER: SEQ 10-100 | TARGET: HIGHS ONLY<br>
                 PRIORITY: MAX LENGTH | DYNAMIC TRACKING
             </div>
             <img src="/chart.png" style="width:100%; border:1px solid #333">
             <h3>Active Vector</h3>
             <table><tr><th>Entry Time</th><th>Dir</th><th>Entry</th><th>Dynamic Stop</th><th>Target (2x)</th><th>Len</th><th>PnL</th></tr>
-            {''.join([f"<tr><td>{t.entry_time.strftime('%H:%M')}</td><td>{'LONG' if t.direction==1 else 'SHORT'}</td><td>{t.entry_price:.2f}</td><td>{t.current_stop_price:.2f}</td><td>{t.take_profit:.2f}</td><td>{t.timeframe_length}</td><td class='{'pos' if t.pnl>=0 else 'neg'}'>{t.pnl*100:.2f}%</td></tr>" for t in active_trades])}
+            {''.join([f"<tr><td>{t.entry_time.strftime('%H:%M')}</td><td>{'LONG'}</td><td>{t.entry_price:.2f}</td><td>{t.current_stop_price:.2f}</td><td>{t.take_profit:.2f}</td><td>{t.timeframe_length}</td><td class='{'pos' if t.pnl>=0 else 'neg'}'>{t.pnl*100:.2f}%</td></tr>" for t in active_trades])}
             </table>
             <h3>Archive</h3>
             <table><tr><th>Reason</th><th>Exit</th><th>PnL</th></tr>
@@ -303,7 +278,7 @@ def logic_loop():
 
         df = get_data()
         
-        if len(df) > 100:
+        if len(df) > 50: # Reduced threshold slightly due to lower LIMIT
             signal = scan_for_breakouts(df)
             current_plot_data = generate_plot(df, signal)
 
