@@ -16,14 +16,13 @@ PORT = 8080
 # Global State
 current_plot_data = None
 trade_pnl_history = []
-active_trades = [] # List of dicts: {'type': 'long'|'short', 'entry': price, 'stop': price, 'target': price, 'window': int}
+active_trades = [] # Limit: 1 long, 1 short
 exchange = ccxt.binance()
 
 def get_data():
     try:
         ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=LIMIT)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        # Ignore the open candle
         return df.iloc[:-1].copy()
     except:
         return pd.DataFrame()
@@ -41,7 +40,6 @@ def process_trades(current_close):
     for trade in active_trades:
         closed = False
         pnl = 0
-        
         if trade['type'] == 'short':
             if current_close >= trade['stop'] or current_close <= trade['target']:
                 pnl = trade['entry'] - current_close
@@ -67,6 +65,9 @@ def generate_plot(df):
     
     process_trades(last_close)
     
+    has_long = any(t['type'] == 'long' for t in active_trades)
+    has_short = any(t['type'] == 'short' for t in active_trades)
+    
     for w in range(10, 101):
         if len(df) < w:
             continue
@@ -90,32 +91,33 @@ def generate_plot(df):
             u_val = m_u * last_idx + c_u
             l_val = m_l * last_idx + c_l
             dist = u_val - l_val
-            # 10% threshold applied here
             threshold = dist * 0.10
             
-            # Short detection (Low cross)
+            # Short detection
             if last_close < (l_val - threshold):
                 plt.plot(x_win, y_trend, color='red', linewidth=0.5, zorder=1)
                 plt.plot(x_win, m_u * x_win + c_u, color='red', linewidth=0.5, zorder=1)
                 plt.plot(x_win, m_l * x_win + c_l, color='red', linewidth=0.5, zorder=1)
                 
-                if not any(t['window'] == w and t['type'] == 'short' for t in active_trades):
+                if not has_short:
                     active_trades.append({
                         'type': 'short', 'entry': last_close, 'stop': l_val, 
                         'target': l_val - dist, 'window': w
                     })
+                    has_short = True
             
-            # Long detection (High cross)
+            # Long detection
             elif last_close > (u_val + threshold):
                 plt.plot(x_win, y_trend, color='red', linewidth=0.5, zorder=1)
                 plt.plot(x_win, m_u * x_win + c_u, color='red', linewidth=0.5, zorder=1)
                 plt.plot(x_win, m_l * x_win + c_l, color='red', linewidth=0.5, zorder=1)
 
-                if not any(t['window'] == w and t['type'] == 'long' for t in active_trades):
+                if not has_long:
                     active_trades.append({
                         'type': 'long', 'entry': last_close, 'stop': u_val, 
                         'target': u_val + dist, 'window': w
                     })
+                    has_long = True
 
     width = .6
     up, down = df[df.close >= df.open], df[df.close < df.open]
@@ -124,7 +126,7 @@ def generate_plot(df):
         plt.bar(d.index, d.high - np.maximum(d.close, d.open), 0.05, bottom=np.maximum(d.close, d.open), color=c, zorder=2)
         plt.bar(d.index, np.minimum(d.close, d.open) - d.low, 0.05, bottom=d.low, color=c, zorder=2)
 
-    plt.title(f"Total PnL: {sum(trade_pnl_history):.2f} | Active Positions: {len(active_trades)}")
+    plt.title(f"Total PnL: {sum(trade_pnl_history):.2f} | Active: {len(active_trades)}")
     buf = BytesIO()
     plt.savefig(buf, format='png')
     plt.close()
@@ -156,19 +158,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     img {{ width: 95%; max-width: 1200px; margin-top: 10px; }}
                     input {{ background: #333; color: red; border: 1px solid red; cursor: pointer; }}
                 </style>
-                <script>
-                    setInterval(() => {{
-                        location.reload();
-                    }}, 10000);
-                </script>
             </head>
             <body>
                 <img src="/chart.png?t={int(time.time())}">
+                <button onclick="location.reload()">Refresh Data</button>
                 <table>
-                    <thead><tr><th>Side</th><th>Window</th><th>Entry</th><th>Stop (Line)</th><th>Target (Dist)</th><th>Action</th></tr></thead>
+                    <thead><tr><th>Side</th><th>Window</th><th>Entry</th><th>Stop</th><th>Target</th><th>Action</th></tr></thead>
                     <tbody>{trades_html}</tbody>
                 </table>
-                <div style="margin-top:20px; font-size: 1.2em;">PnL History: {[round(p, 2) for p in trade_pnl_history]}</div>
+                <div style="margin-top:20px;">PnL History: {[round(p, 2) for p in trade_pnl_history]}</div>
             </body>
             </html>
             """
@@ -202,7 +200,6 @@ def logic_loop():
         df = get_data()
         if not df.empty:
             current_plot_data = generate_plot(df)
-            print(f"Tick: {df.iloc[-1]['close']} | PnL Sum: {sum(trade_pnl_history):.2f}")
         time.sleep(10)
 
 if __name__ == "__main__":
