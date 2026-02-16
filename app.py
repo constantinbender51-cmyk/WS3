@@ -7,14 +7,13 @@ import os
 import http.server
 import socketserver
 import time
-import webbrowser
-from threading import Thread
+from datetime import datetime
 
 # Configuration
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1h'
 LIMIT = 1000 
-LOOKBACK_DAYS = 365
+LOOKBACK_DAYS = 60 # Reduced to 2 months
 OUTPUT_DIR = 'trade_plots'
 
 def fetch_data():
@@ -158,7 +157,6 @@ def plot_trade_setup(df, context, entry_idx, exit_idx, entry_price, exit_price, 
     plt.bar(down.index, down.low-down.close, width2, bottom=down.close, color=col2)
     
     # Plot Regression Lines
-    # Extend X range to cover the entry candle for visualization
     x_range = np.arange(window_df.index[0], entry_idx + 2) 
     X_range = sm.add_constant(x_range)
     
@@ -168,7 +166,6 @@ def plot_trade_setup(df, context, entry_idx, exit_idx, entry_price, exit_price, 
     
     # Upper Line
     if upper_params:
-        # Create X for upper model prediction
         X_upper = sm.add_constant(x_range)
         y_upper = upper_params.predict(X_upper)
         plt.plot(x_range, y_upper, 'g-', label='Upper Line')
@@ -239,14 +236,11 @@ def run_strategy():
             window_df = df.iloc[start_idx:end_idx]
             current_candle = df.iloc[i]
             
-            # Use .values for numpy array performance
             x = window_df.index.values
             y = window_df['close'].values
             
             # 1. Main Trendline
             mid_model = fit_line(x, y)
-            
-            # Predict manually to avoid index alignment issues
             mid_preds = mid_model.predict(sm.add_constant(x))
             
             # 2. Split Sets
@@ -254,11 +248,9 @@ def run_strategy():
             lower_mask = y < mid_preds
             
             upper_set_x = x[upper_mask]
-            # Use Highs for upper fit
             upper_set_y = window_df.iloc[upper_mask]['high'].values 
             
             lower_set_x = x[lower_mask]
-            # Use Lows for lower fit
             lower_set_y = window_df.iloc[lower_mask]['low'].values 
             
             # 3. Fit 2nd and 3rd lines
@@ -270,7 +262,6 @@ def run_strategy():
             upper_val_now = 0
             lower_val_now = 0
             
-            # Require minimum points to fit
             if len(upper_set_x) > 2:
                 upper_model = fit_line(upper_set_x, upper_set_y)
                 upper_val_now = get_line_point(upper_model, i)
@@ -288,10 +279,8 @@ def run_strategy():
                 breakout_level = upper_val_now if breakout_long else lower_val_now
                 
                 entry_price = current_candle['close']
-                # Trailing stop distance
                 dist_pct = abs(entry_price - breakout_level) / entry_price
                 
-                # Sanity check
                 if dist_pct <= 0: dist_pct = 0.005
                 
                 context = {
@@ -309,7 +298,6 @@ def run_strategy():
                 
                 print(f"Trade {len(trades)}: {direction} | Entry: {entry_price:.2f} | PnL: {result['pnl']:.2%} | Window: {window_size}")
                 
-                # Advance past this trade
                 i = result['exit_idx'] + 1
                 trade_found = True
                 break 
@@ -321,12 +309,17 @@ def run_strategy():
     return trades
 
 def start_server():
+    # Switch to output directory
     os.chdir(OUTPUT_DIR)
-    PORT = 8000
+    
+    # Railway provides PORT env var, defaults to 8000
+    PORT = int(os.environ.get("PORT", 8000))
+    
     Handler = http.server.SimpleHTTPRequestHandler
-    with socketserver.TCPServer(("", PORT), Handler) as httpd:
-        print(f"Serving at http://localhost:{PORT}")
-        webbrowser.open(f"http://localhost:{PORT}")
+    
+    # Bind to 0.0.0.0 for external access
+    with socketserver.TCPServer(("0.0.0.0", PORT), Handler) as httpd:
+        print(f"Serving at 0.0.0.0:{PORT}")
         httpd.serve_forever()
 
 if __name__ == "__main__":
@@ -335,4 +328,4 @@ if __name__ == "__main__":
     if len(trades) > 0:
         start_server()
     else:
-        print("No trades found.")
+        print("No trades found. Exiting.")
