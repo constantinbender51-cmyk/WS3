@@ -11,7 +11,7 @@ from urllib.parse import urlparse, parse_qs
 # Configuration
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1h'
-LIMIT = 101 # Set to 101
+LIMIT = 101 
 PORT = 8080
 
 # Global State
@@ -64,7 +64,7 @@ def generate_plot(df_closed):
     
     potential_short = None
     potential_long = None
-    breakout_lines = []
+    breakout_visuals = []
 
     for w in range(100, 9, -1):
         if len(df_closed) < w: continue
@@ -81,29 +81,47 @@ def generate_plot(df_closed):
         m_l, c_l = fit_ols(x_win[y_win_low < y_trend], y_win_low[y_win_low < y_trend])
         
         if m_u is not None and m_l is not None:
-            u_val = m_u * last_idx + c_u
-            l_val = m_l * last_idx + c_l
-            dist = u_val - l_val
-            thresh = dist * 0.10
+            u_line = m_u * x_win + c_u
+            l_line = m_l * x_win + c_l
+            dist = u_line[-1] - l_line[-1]
+            thresh_val = dist * 0.10
             
-            is_short = last_close < (l_val - thresh)
-            is_long = last_close > (u_val + thresh)
+            is_short = last_close < (l_line[-1] - thresh_val)
+            is_long = last_close > (u_line[-1] + thresh_val)
             
-            if is_short and potential_short is None:
-                potential_short = {'type': 'short', 'entry': last_close, 'stop': l_val, 'target': l_val - dist, 'window': w}
-                breakout_lines.append((x_win, m_l * x_win + c_l))
-            elif is_long and potential_long is None:
-                potential_long = {'type': 'long', 'entry': last_close, 'stop': u_val, 'target': u_val + dist, 'window': w}
-                breakout_lines.append((x_win, m_u * x_win + c_u))
+            if is_short or is_long:
+                # Store lines and threshold area for visualization
+                breakout_visuals.append({
+                    'x': x_win,
+                    'upper': u_line,
+                    'lower': l_line,
+                    'thresh': thresh_val,
+                    'type': 'short' if is_short else 'long'
+                })
+                
+                if is_short and potential_short is None:
+                    potential_short = {'type': 'short', 'entry': last_close, 'stop': l_line[-1], 'target': l_line[-1] - dist, 'window': w}
+                if is_long and potential_long is None:
+                    potential_long = {'type': 'long', 'entry': last_close, 'stop': u_line[-1], 'target': u_line[-1] + dist, 'window': w}
 
     if potential_short and not any(t['type'] == 'short' for t in active_trades):
         active_trades.append(potential_short)
     if potential_long and not any(t['type'] == 'long' for t in active_trades):
         active_trades.append(potential_long)
 
-    for x_win, line_vals in breakout_lines:
-        plt.plot(x_win, line_vals, color='red', linewidth=1.0, zorder=1)
+    # Render visuals for triggered windows
+    for vis in breakout_visuals:
+        # Opposite lines
+        plt.plot(vis['x'], vis['upper'], color='red', linewidth=1.0, zorder=1)
+        plt.plot(vis['x'], vis['lower'], color='red', linewidth=1.0, zorder=1)
+        
+        # Opaque threshold areas
+        if vis['type'] == 'short':
+            plt.fill_between(vis['x'], vis['lower'], vis['lower'] - vis['thresh'], color='red', alpha=0.3, zorder=1)
+        else:
+            plt.fill_between(vis['x'], vis['upper'], vis['upper'] + vis['thresh'], color='red', alpha=0.3, zorder=1)
 
+    # Render Candles
     up_c, down_c = df_closed[df_closed.close >= df_closed.open], df_closed[df_closed.close < df_closed.open]
     for color, d in [('green', up_c), ('red', down_c)]:
         plt.bar(d.index, d.close - d.open, 0.6, bottom=d.open, color=color, zorder=2)
