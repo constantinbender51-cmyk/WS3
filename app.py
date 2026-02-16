@@ -35,22 +35,9 @@ def generate_plot(df):
     plt.figure(figsize=(15, 9))
     plt.style.use('dark_background')
     
-    # Candles
-    width = .6
-    up = df[df.close >= df.open]
-    down = df[df.close < df.open]
-    
-    plt.bar(up.index, up.close - up.open, width, bottom=up.open, color='green')
-    plt.bar(up.index, up.high - np.maximum(up.close, up.open), 0.05, bottom=np.maximum(up.close, up.open), color='green')
-    plt.bar(up.index, np.minimum(up.close, up.open) - up.low, 0.05, bottom=up.low, color='green')
-    
-    plt.bar(down.index, down.close - down.open, width, bottom=down.open, color='red')
-    plt.bar(down.index, down.high - np.maximum(down.close, down.open), 0.05, bottom=np.maximum(down.close, down.open), color='red')
-    plt.bar(down.index, np.minimum(down.close, down.open) - down.low, 0.05, bottom=down.low, color='red')
-    
     x_full = np.arange(len(df))
     
-    # Windows from 10 to 100 in 1 unit increments
+    # 1. Render Lines First (Background)
     for w in range(10, 101):
         if len(df) < w:
             continue
@@ -60,26 +47,37 @@ def generate_plot(df):
         y_win_high = df['high'].values[-w:]
         y_win_low = df['low'].values[-w:]
         
-        # Mid Trend
         m_mid, c_mid = fit_ols(x_win, y_win_close)
         if m_mid is None: continue
         y_trend = m_mid * x_win + c_mid
         
-        # Upper/Lower Filter masks
         upper_mask = y_win_high > y_trend
         lower_mask = y_win_low < y_trend
         
-        # Upper Line
         m_u, c_u = fit_ols(x_win[upper_mask], y_win_high[upper_mask])
-        # Lower Line
         m_l, c_l = fit_ols(x_win[lower_mask], y_win_low[lower_mask])
         
-        # Rendering 3 lines per window (Mid, Upper, Lower) in same color (Cyan)
-        plt.plot(x_win, y_trend, color='cyan', linewidth=0.5)
+        # All 3 lines in Cyan, no transparency
+        plt.plot(x_win, y_trend, color='cyan', linewidth=0.5, zorder=1)
         if m_u is not None:
-            plt.plot(x_win, m_u * x_win + c_u, color='cyan', linewidth=0.5)
+            plt.plot(x_win, m_u * x_win + c_u, color='cyan', linewidth=0.5, zorder=1)
         if m_l is not None:
-            plt.plot(x_win, m_l * x_win + c_l, color='cyan', linewidth=0.5)
+            plt.plot(x_win, m_l * x_win + c_l, color='cyan', linewidth=0.5, zorder=1)
+
+    # 2. Render Candles Second (Foreground)
+    width = .6
+    up = df[df.close >= df.open]
+    down = df[df.close < df.open]
+    
+    # Green Candles
+    plt.bar(up.index, up.close - up.open, width, bottom=up.open, color='green', zorder=2)
+    plt.bar(up.index, up.high - np.maximum(up.close, up.open), 0.05, bottom=np.maximum(up.close, up.open), color='green', zorder=2)
+    plt.bar(up.index, np.minimum(up.close, up.open) - up.low, 0.05, bottom=up.low, color='green', zorder=2)
+    
+    # Red Candles
+    plt.bar(down.index, down.close - down.open, width, bottom=down.open, color='red', zorder=2)
+    plt.bar(down.index, down.high - np.maximum(down.close, down.open), 0.05, bottom=np.maximum(down.close, down.open), color='red', zorder=2)
+    plt.bar(down.index, np.minimum(down.close, down.open) - down.low, 0.05, bottom=down.low, color='red', zorder=2)
 
     buf = BytesIO()
     plt.savefig(buf, format='png')
