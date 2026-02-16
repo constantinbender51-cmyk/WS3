@@ -1,4 +1,4 @@
-
+statsmodels 
 requests 
 httpx[http2]
 
