@@ -66,7 +66,7 @@ def generate_plot(df_closed):
     potential_long = None
     breakout_visuals = []
 
-    # Detect breakouts starting from the largest window
+    # Detect breakouts from largest window down to 10
     for w in range(100, 9, -1):
         if len(df_closed) < w: continue
         x_win = x_full[-w:]
@@ -78,7 +78,6 @@ def generate_plot(df_closed):
         if m_mid is None: continue
         y_trend = m_mid * x_win + c_mid
         
-        # OLS for upper and lower bounds
         m_u, c_u = fit_ols(x_win[y_win_high > y_trend], y_win_high[y_win_high > y_trend])
         m_l, c_l = fit_ols(x_win[y_win_low < y_trend], y_win_low[y_win_low < y_trend])
         
@@ -91,37 +90,24 @@ def generate_plot(df_closed):
             is_short = last_close < (l_line[-1] - thresh_val)
             is_long = last_close > (u_line[-1] + thresh_val)
             
-            if is_short or is_long:
-                breakout_visuals.append({
-                    'x': x_win,
-                    'upper': u_line,
-                    'lower': l_line,
-                    'thresh': thresh_val,
-                    'type': 'short' if is_short else 'long'
-                })
-                
-                if is_short and potential_short is None:
-                    potential_short = {'type': 'short', 'entry': last_close, 'stop': l_line[-1], 'target': l_line[-1] - dist, 'window': w}
-                if is_long and potential_long is None:
-                    potential_long = {'type': 'long', 'entry': last_close, 'stop': u_line[-1], 'target': u_line[-1] + dist, 'window': w}
+            if is_short and potential_short is None:
+                potential_short = {'type': 'short', 'entry': last_close, 'stop': l_line[-1], 'target': l_line[-1] - dist, 'window': w}
+                breakout_visuals.append({'x': x_win, 'line': l_line, 'thresh': l_line - thresh_val, 'type': 'short'})
+            
+            if is_long and potential_long is None:
+                potential_long = {'type': 'long', 'entry': last_close, 'stop': u_line[-1], 'target': u_line[-1] + dist, 'window': w}
+                breakout_visuals.append({'x': x_win, 'line': u_line, 'thresh': u_line + thresh_val, 'type': 'long'})
 
-    # Position Management
+    # Entry Logic
     if potential_short and not any(t['type'] == 'short' for t in active_trades):
         active_trades.append(potential_short)
     if potential_long and not any(t['type'] == 'long' for t in active_trades):
         active_trades.append(potential_long)
 
-    # Render breakout lines and dotted threshold
+    # Visualization: Only the specific breakout boundary (Solid) and Threshold (Dotted)
     for vis in breakout_visuals:
-        # Show Top and Bottom OLS lines (Solid)
-        plt.plot(vis['x'], vis['upper'], color='red', linewidth=1.2, zorder=1)
-        plt.plot(vis['x'], vis['lower'], color='red', linewidth=1.2, zorder=1)
-        
-        # Show Threshold line (Dotted)
-        if vis['type'] == 'short':
-            plt.plot(vis['x'], vis['lower'] - vis['thresh'], color='red', linestyle=':', linewidth=1.5, zorder=1)
-        else:
-            plt.plot(vis['x'], vis['upper'] + vis['thresh'], color='red', linestyle=':', linewidth=1.5, zorder=1)
+        plt.plot(vis['x'], vis['line'], color='red', linewidth=1.2, zorder=1)
+        plt.plot(vis['x'], vis['thresh'], color='red', linestyle=':', linewidth=1.5, zorder=1)
 
     # Render Candles
     up_c, down_c = df_closed[df_closed.close >= df_closed.open], df_closed[df_closed.close < df_closed.open]
@@ -139,7 +125,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if self.path == '/':
             self.send_response(200); self.send_header('Content-type', 'text/html'); self.end_headers()
             rows = "".join([f"<tr style='color:{'lime' if t['type']=='long' else 'orange'}'><td>{t['type'].upper()}</td><td>{t['window']}</td><td>{t['entry']:.2f}</td><td>{t['stop']:.2f}</td><td>{t['target']:.2f}</td><td><form method='POST' action='/cancel?w={t['window']}&s={t['type']}'><input type='submit' value='Cancel'></form></td></tr>" for t in active_trades])
-            html = f"<html><head><style>body{{background:#000;color:#fff;font-family:monospace;text-align:center}}table{{width:80%;margin:20px auto;border-collapse:collapse}}th,td{{padding:10px;border-bottom:1px solid #333}}img{{width:95%;margin:10px auto}}.box{{margin:20px;padding:15px;border:1px solid #444;background:#111}}input{{background:#222;color:red;border:1px solid red;cursor:pointer;}}</style></head><body><img src='/chart.png?t={int(time.time())}'><br><button onclick='location.reload()'>Refresh Data</button><div class='box'><b>Realized PnL:</b> {sum(trade_pnl_history):.2f} | <b>Unrealized PnL:</b> {current_unrealized_pnl:.2f} | <b>Net:</b> {sum(trade_pnl_history)+current_unrealized_pnl:.2f}</div><table><thead><tr><th>Side</th><th>Window</th><th>Entry</th><th>Stop</th><th>Target</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table></body></html>"
+            html = f"<html><head><style>body{{background:#000;color:#fff;font-family:monospace;text-align:center}}table{{width:80%;margin:20px auto;border-collapse:collapse}}th,td{{padding:10px;border-bottom:1px solid #333}}img{{width:95%;margin:10px auto}}.box{{margin:20px;padding:15px;border:1px solid #444;background:#111}}input{{background:#222;color:red;border:1px solid red;cursor:pointer;}}</style></head><body><img src='/chart.png?t={int(time.time())}'><br><button onclick='location.reload()'>Refresh Data</button><div class='box'><b>Realized:</b> {sum(trade_pnl_history):.2f} | <b>Unrealized:</b> {current_unrealized_pnl:.2f} | <b>Net:</b> {sum(trade_pnl_history)+current_unrealized_pnl:.2f}</div><table><thead><tr><th>Side</th><th>Window</th><th>Entry</th><th>Stop</th><th>Target</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table></body></html>"
             self.wfile.write(html.encode())
         elif self.path.startswith('/chart.png'):
             if current_plot_data:
