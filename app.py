@@ -16,14 +16,14 @@ PORT = 8080
 # Global State
 current_plot_data = None
 trade_pnl_history = []
-active_trades = [] # List of dicts: {'type': 'low_cross', 'entry': price, 'stop': price, 'target': price}
+active_trades = [] # List of dicts: {'type': 'long'|'short', 'entry': price, 'stop': price, 'target': price, 'window': int}
 exchange = ccxt.binance()
 
 def get_data():
     try:
         ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=LIMIT)
-        # Drop the last row (open candle)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        # Ignore the open candle
         return df.iloc[:-1].copy()
     except:
         return pd.DataFrame()
@@ -39,13 +39,19 @@ def process_trades(current_close):
     global trade_pnl_history, active_trades
     remaining_trades = []
     for trade in active_trades:
-        # Exit condition 1: Price touches/re-enters the breakout line (Stop)
-        # Exit condition 2: Price moves the full channel distance (Target)
-        if current_close >= trade['stop']:
-            pnl = trade['entry'] - current_close # Short PnL logic for "low cross"
-            trade_pnl_history.append(pnl)
-        elif current_close <= trade['target']:
-            pnl = trade['entry'] - current_close
+        closed = False
+        pnl = 0
+        
+        if trade['type'] == 'short':
+            if current_close >= trade['stop'] or current_close <= trade['target']:
+                pnl = trade['entry'] - current_close
+                closed = True
+        elif trade['type'] == 'long':
+            if current_close <= trade['stop'] or current_close >= trade['target']:
+                pnl = current_close - trade['entry']
+                closed = True
+        
+        if closed:
             trade_pnl_history.append(pnl)
         else:
             remaining_trades.append(trade)
@@ -59,7 +65,6 @@ def generate_plot(df):
     last_idx = x_full[-1]
     last_close = df['close'].iloc[-1]
     
-    # Update trade tracking with the confirmed closed candle
     process_trades(last_close)
     
     for w in range(10, 101):
@@ -85,29 +90,33 @@ def generate_plot(df):
             u_val = m_u * last_idx + c_u
             l_val = m_l * last_idx + c_l
             dist = u_val - l_val
-            threshold = dist * 0.05
+            # 10% threshold applied here
+            threshold = dist * 0.10
             
-            # Low cross detection: Close is below (lower line - 5% of channel)
+            # Short detection (Low cross)
             if last_close < (l_val - threshold):
                 plt.plot(x_win, y_trend, color='red', linewidth=0.5, zorder=1)
                 plt.plot(x_win, m_u * x_win + c_u, color='red', linewidth=0.5, zorder=1)
                 plt.plot(x_win, m_l * x_win + c_l, color='red', linewidth=0.5, zorder=1)
                 
-                # Initiate trade if not already tracking this specific window breakout
-                # Note: Simplified tracking here; in production, use unique window IDs
-                active_trades.append({
-                    'entry': last_close,
-                    'stop': l_val,
-                    'target': l_val - dist
-                })
+                if not any(t['window'] == w and t['type'] == 'short' for t in active_trades):
+                    active_trades.append({
+                        'type': 'short', 'entry': last_close, 'stop': l_val, 
+                        'target': l_val - dist, 'window': w
+                    })
             
-            # High cross detection (as per previous logic, but now with 5% threshold)
+            # Long detection (High cross)
             elif last_close > (u_val + threshold):
                 plt.plot(x_win, y_trend, color='red', linewidth=0.5, zorder=1)
                 plt.plot(x_win, m_u * x_win + c_u, color='red', linewidth=0.5, zorder=1)
                 plt.plot(x_win, m_l * x_win + c_l, color='red', linewidth=0.5, zorder=1)
 
-    # Render Candles
+                if not any(t['window'] == w and t['type'] == 'long' for t in active_trades):
+                    active_trades.append({
+                        'type': 'long', 'entry': last_close, 'stop': u_val, 
+                        'target': u_val + dist, 'window': w
+                    })
+
     width = .6
     up, down = df[df.close >= df.open], df[df.close < df.open]
     for c, d in [('green', up), ('red', down)]:
@@ -115,7 +124,7 @@ def generate_plot(df):
         plt.bar(d.index, d.high - np.maximum(d.close, d.open), 0.05, bottom=np.maximum(d.close, d.open), color=c, zorder=2)
         plt.bar(d.index, np.minimum(d.close, d.open) - d.low, 0.05, bottom=d.low, color=c, zorder=2)
 
-    plt.title(f"Total PnL Recorded: {sum(trade_pnl_history):.2f} | Active: {len(active_trades)}")
+    plt.title(f"Total PnL: {sum(trade_pnl_history):.2f} | Active Positions: {len(active_trades)}")
     buf = BytesIO()
     plt.savefig(buf, format='png')
     plt.close()
@@ -128,8 +137,41 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
             self.end_headers()
-            html = """<html><head><script>setInterval(()=>document.getElementById('c').src='/chart.png?t='+Date.now(),10000);</script></head>
-            <body style="background:black;margin:0;overflow:hidden"><img id="c" src="/chart.png" style="width:100%"></body></html>"""
+            
+            trades_html = "".join([
+                f"<tr style='color:{'lime' if t['type']=='long' else 'orange'}'>"
+                f"<td>{t['type'].upper()}</td><td>{t['window']}</td><td>{t['entry']:.2f}</td>"
+                f"<td>{t['stop']:.2f}</td><td>{t['target']:.2f}</td>"
+                f"<td><form style='display:inline' method='POST' action='/cancel?w={t['window']}&s={t['type']}'><input type='submit' value='Cancel'></form></td></tr>" 
+                for t in active_trades
+            ])
+            
+            html = f"""
+            <html>
+            <head>
+                <style>
+                    body {{ background: #000; color: #fff; font-family: monospace; margin: 0; display: flex; flex-direction: column; align-items: center; }}
+                    table {{ border-collapse: collapse; width: 80%; margin-top: 20px; text-align: left; }}
+                    th, td {{ padding: 10px; border-bottom: 1px solid #333; }}
+                    img {{ width: 95%; max-width: 1200px; margin-top: 10px; }}
+                    input {{ background: #333; color: red; border: 1px solid red; cursor: pointer; }}
+                </style>
+                <script>
+                    setInterval(() => {{
+                        location.reload();
+                    }}, 10000);
+                </script>
+            </head>
+            <body>
+                <img src="/chart.png?t={int(time.time())}">
+                <table>
+                    <thead><tr><th>Side</th><th>Window</th><th>Entry</th><th>Stop (Line)</th><th>Target (Dist)</th><th>Action</th></tr></thead>
+                    <tbody>{trades_html}</tbody>
+                </table>
+                <div style="margin-top:20px; font-size: 1.2em;">PnL History: {[round(p, 2) for p in trade_pnl_history]}</div>
+            </body>
+            </html>
+            """
             self.wfile.write(html.encode())
         elif self.path.startswith('/chart.png'):
             if current_plot_data:
@@ -138,6 +180,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(current_plot_data.getvalue())
             else: self.send_error(404)
+
+    def do_POST(self):
+        global active_trades
+        if self.path.startswith('/cancel'):
+            from urllib.parse import urlparse, parse_qs
+            query = parse_qs(urlparse(self.path).query)
+            window = int(query.get('w', [0])[0])
+            side = query.get('s', [''])[0]
+            active_trades = [t for t in active_trades if not (t['window'] == window and t['type'] == side)]
+            self.send_response(303)
+            self.send_header('Location', '/')
+            self.end_headers()
 
 def run_server():
     HTTPServer(('', PORT), DashboardHandler).serve_forever()
@@ -148,7 +202,7 @@ def logic_loop():
         df = get_data()
         if not df.empty:
             current_plot_data = generate_plot(df)
-            print(f"Update: {df.iloc[-1]['close']} | PnL History: {len(trade_pnl_history)}")
+            print(f"Tick: {df.iloc[-1]['close']} | PnL Sum: {sum(trade_pnl_history):.2f}")
         time.sleep(10)
 
 if __name__ == "__main__":
