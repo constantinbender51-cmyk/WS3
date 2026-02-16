@@ -7,325 +7,384 @@ import os
 import http.server
 import socketserver
 import time
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
 
-# Configuration
+# --- Configuration ---
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1h'
-LIMIT = 1000 
-LOOKBACK_DAYS = 60 # Reduced to 2 months
+FEES = 0.0004 # 0.04%
 OUTPUT_DIR = 'trade_plots'
+PORT = int(os.environ.get("PORT", 8000))
 
-def fetch_data():
+# --- Data Management ---
+def fetch_data(days, limit=1000):
     exchange = ccxt.binance()
     now = exchange.milliseconds()
-    since = now - (LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
+    since = now - (days * 24 * 60 * 60 * 1000) - (100 * 3600 * 1000) # Buffer for lookback
     all_candles = []
-    
-    print(f"Fetching {LOOKBACK_DAYS} days of {SYMBOL} {TIMEFRAME} data...")
     
     while since < now:
         try:
-            candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since, LIMIT)
-            if not candles:
-                break
-            
+            candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since, limit)
+            if not candles: break
             since = candles[-1][0] + 1
             all_candles += candles
             time.sleep(exchange.rateLimit / 1000)
-        except Exception as e:
-            print(f"Error fetching data: {e}")
-            break
+        except Exception: break
 
     df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    
-    # Drop unfinished candle
-    df = df.iloc[:-1]
-    
-    # Ensure unique index and reset
     df = df.drop_duplicates(subset=['timestamp']).reset_index(drop=True)
+    
+    # Drop the last candle as it is likely unfinished (unless fetched exactly at close, but better safe)
+    if len(df) > 0:
+        df = df.iloc[:-1]
+        
     return df
 
+# --- Strategy Core ---
 def fit_line(x, y):
-    # Add constant for intercept
     X = sm.add_constant(x)
-    model = sm.OLS(y, X)
-    results = model.fit()
-    return results
+    return sm.OLS(y, X).fit()
 
 def get_line_point(results, x_val):
-    # FIXED: Use bracket indexing for numpy array
     return results.params[0] + results.params[1] * x_val
 
-def simulate_trade(df, entry_idx, direction, stop_distance_pct, plot_id=None, context=None):
-    entry_price = df.iloc[entry_idx]['close']
-    current_idx = entry_idx + 1
+def detect_breakout(df, i, window_size):
+    start_idx = i - window_size
+    window_df = df.iloc[start_idx:i]
+    current_candle = df.iloc[i]
     
-    highest_price = entry_price
-    lowest_price = entry_price
+    x = window_df.index.values
+    y = window_df['close'].values
     
-    exit_price = None
-    exit_idx = None
+    # 1. Mid Line
+    mid_model = fit_line(x, y)
+    mid_preds = mid_model.predict(sm.add_constant(x))
     
-    while current_idx < len(df):
-        candle = df.iloc[current_idx]
-        
-        if direction == 'long':
-            # Update high water mark
-            if candle['high'] > highest_price:
-                highest_price = candle['high']
+    # 2. Split
+    upper_mask = y > mid_preds
+    lower_mask = y < mid_preds
+    
+    upper_x, upper_y = x[upper_mask], window_df.iloc[upper_mask]['high'].values
+    lower_x, lower_y = x[lower_mask], window_df.iloc[lower_mask]['low'].values
+    
+    res = {'signal': None, 'stop_dist': 0, 'params': (None, None, mid_model)}
+    
+    # 3. Fit Bounds
+    upper_model = None
+    lower_model = None
+    
+    bullish = False
+    bearish = False
+    
+    if len(upper_x) > 2:
+        upper_model = fit_line(upper_x, upper_y)
+        if current_candle['close'] > get_line_point(upper_model, i):
+            bullish = True
+            res['breakout_level'] = get_line_point(upper_model, i)
             
-            # Check trailing stop
-            stop_price = highest_price * (1 - stop_distance_pct)
-            if candle['low'] <= stop_price:
-                exit_price = stop_price
-                exit_idx = current_idx
-                break
-                
-        elif direction == 'short':
-            # Update low water mark
-            if candle['low'] < lowest_price:
-                lowest_price = candle['low']
-            
-            # Check trailing stop
-            stop_price = lowest_price * (1 + stop_distance_pct)
-            if candle['high'] >= stop_price:
-                exit_price = stop_price
-                exit_idx = current_idx
-                break
+    if len(lower_x) > 2:
+        lower_model = fit_line(lower_x, lower_y)
+        if current_candle['close'] < get_line_point(lower_model, i):
+            bearish = True
+            res['breakout_level'] = get_line_point(lower_model, i)
+    
+    res['params'] = (upper_model, lower_model, mid_model)
+    res['window_df'] = window_df
+    
+    if bullish or bearish:
+        res['signal'] = 'long' if bullish else 'short'
+        entry = current_candle['close']
+        # Dynamic stop distance calculation
+        dist = abs(entry - res['breakout_level']) / entry
+        res['stop_dist'] = max(dist, 0.001) # Min 0.1% stop
         
-        current_idx += 1
-        
-    if exit_idx is None:
-        exit_idx = len(df) - 1
-        exit_price = df.iloc[exit_idx]['close']
+    return res
 
-    # Calculate PnL
-    pnl_pct = (exit_price - entry_price) / entry_price if direction == 'long' else (entry_price - exit_price) / entry_price
-    
-    # Update context with result for plotting
-    if context:
-        context['pnl'] = pnl_pct
-    
-    # Plotting if requested
-    if plot_id is not None and context is not None:
-        plot_trade_setup(df, context, entry_idx, exit_idx, entry_price, exit_price, direction, plot_id)
-        
-    return {
-        'entry_idx': entry_idx,
-        'exit_idx': exit_idx,
-        'entry_price': entry_price,
-        'exit_price': exit_price,
-        'direction': direction,
-        'pnl': pnl_pct,
-        'stop_dist': stop_distance_pct
-    }
-
-def plot_trade_setup(df, context, entry_idx, exit_idx, entry_price, exit_price, direction, plot_id):
-    if not os.path.exists(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR)
-        
-    window_df = context['window_df']
-    upper_params = context['upper_params']
-    lower_params = context['lower_params']
-    mid_params = context['mid_params']
-    
-    # Expand plot range
-    plot_end = min(exit_idx + 15, len(df))
-    plot_start = max(0, window_df.index[0] - 5)
-    plot_data = df.iloc[plot_start:plot_end]
-    
-    plt.figure(figsize=(12, 6))
-    
-    # Plot Candles
-    up = plot_data[plot_data.close >= plot_data.open]
-    down = plot_data[plot_data.close < plot_data.open]
-    
-    col1 = 'green'
-    col2 = 'red'
-    
-    width = .6
-    width2 = .1
-    
-    plt.bar(up.index, up.close-up.open, width, bottom=up.open, color=col1)
-    plt.bar(up.index, up.high-up.close, width2, bottom=up.close, color=col1)
-    plt.bar(up.index, up.low-up.open, width2, bottom=up.open, color=col1)
-    
-    plt.bar(down.index, down.close-down.open, width, bottom=down.open, color=col2)
-    plt.bar(down.index, down.high-down.open, width2, bottom=down.open, color=col2)
-    plt.bar(down.index, down.low-down.close, width2, bottom=down.close, color=col2)
-    
-    # Plot Regression Lines
-    x_range = np.arange(window_df.index[0], entry_idx + 2) 
-    X_range = sm.add_constant(x_range)
-    
-    # Mid Line
-    y_mid = mid_params.predict(X_range)
-    plt.plot(x_range, y_mid, 'b--', alpha=0.5, label='Mid Line')
-    
-    # Upper Line
-    if upper_params:
-        X_upper = sm.add_constant(x_range)
-        y_upper = upper_params.predict(X_upper)
-        plt.plot(x_range, y_upper, 'g-', label='Upper Line')
-        
-    # Lower Line
-    if lower_params:
-        X_lower = sm.add_constant(x_range)
-        y_lower = lower_params.predict(X_lower)
-        plt.plot(x_range, y_lower, 'r-', label='Lower Line')
-        
-    # Markers
-    marker = '^' if direction == 'long' else 'v'
-    plt.scatter(entry_idx, entry_price, marker=marker, color='blue', s=100, zorder=10, label='Entry')
-    plt.scatter(exit_idx, exit_price, marker='x', color='black', s=100, zorder=10, label='Exit')
-    
-    plt.title(f"Trade #{plot_id} - {direction.upper()} - PnL: {context['pnl']:.2%}")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    filename = f"{OUTPUT_DIR}/trade_{plot_id:03d}.png"
-    plt.savefig(filename)
-    plt.close()
-
-def generate_html(trades):
-    if not os.path.exists(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR)
-        
-    html = """
-    <html>
-    <head><title>Strategy Backtest Results</title>
-    <style>body{font-family:monospace; padding:20px;} img{max-width:100%; border:1px solid #ccc; margin-bottom:20px;}</style>
-    </head>
-    <body>
-    <h1>Backtest Results</h1>
-    <p>Total Trades: """ + str(len(trades)) + """</p>
-    """
-    
-    total_pnl = sum([t['pnl'] for t in trades])
-    html += f"<h3>Cumulative PnL (Uncompounded): {total_pnl:.2%}</h3>"
-    html += "<hr>"
-    
-    files = sorted([f for f in os.listdir(OUTPUT_DIR) if f.endswith('.png')])
-    for f in files:
-        html += f"<h3>{f}</h3><img src='{f}' /><br>"
-        
-    html += "</body></html>"
-    
-    with open(f"{OUTPUT_DIR}/index.html", "w") as f:
-        f.write(html)
-
-def run_strategy():
-    df = fetch_data()
-    df = df.reset_index(drop=True)
-    
+# --- Backtesting Engine ---
+def run_simulation(df, stop_config, save_plots=False):
+    # stop_config: 'dynamic', 0.005, 0.01, 0.02
     trades = []
-    i = 100 
+    equity = 100.0
+    equity_curve = [equity]
     
-    print("Starting backtest...")
-    
+    i = 100
     while i < len(df) - 1:
         trade_found = False
         
-        # Shrinking window loop: 100 down to 10
+        # Window shrinking loop 100 -> 10
         for window_size in range(100, 9, -1):
-            start_idx = i - window_size
-            end_idx = i 
+            detection = detect_breakout(df, i, window_size)
             
-            window_df = df.iloc[start_idx:end_idx]
-            current_candle = df.iloc[i]
-            
-            x = window_df.index.values
-            y = window_df['close'].values
-            
-            # 1. Main Trendline
-            mid_model = fit_line(x, y)
-            mid_preds = mid_model.predict(sm.add_constant(x))
-            
-            # 2. Split Sets
-            upper_mask = y > mid_preds
-            lower_mask = y < mid_preds
-            
-            upper_set_x = x[upper_mask]
-            upper_set_y = window_df.iloc[upper_mask]['high'].values 
-            
-            lower_set_x = x[lower_mask]
-            lower_set_y = window_df.iloc[lower_mask]['low'].values 
-            
-            # 3. Fit 2nd and 3rd lines
-            upper_model = None
-            lower_model = None
-            
-            breakout_long = False
-            breakout_short = False
-            upper_val_now = 0
-            lower_val_now = 0
-            
-            if len(upper_set_x) > 2:
-                upper_model = fit_line(upper_set_x, upper_set_y)
-                upper_val_now = get_line_point(upper_model, i)
-                if current_candle['close'] > upper_val_now:
-                    breakout_long = True
-                    
-            if len(lower_set_x) > 2:
-                lower_model = fit_line(lower_set_x, lower_set_y)
-                lower_val_now = get_line_point(lower_model, i)
-                if current_candle['close'] < lower_val_now:
-                    breakout_short = True
-            
-            if breakout_long or breakout_short:
-                direction = 'long' if breakout_long else 'short'
-                breakout_level = upper_val_now if breakout_long else lower_val_now
+            if detection['signal']:
+                direction = detection['signal']
+                entry_price = df.iloc[i]['close']
                 
-                entry_price = current_candle['close']
-                dist_pct = abs(entry_price - breakout_level) / entry_price
+                # Determine Stop Distance
+                if stop_config == 'dynamic':
+                    stop_pct = detection['stop_dist']
+                else:
+                    stop_pct = float(stop_config)
                 
-                if dist_pct <= 0: dist_pct = 0.005
+                # Execute Trade
+                exit_data = simulate_trade_execution(df, i, direction, stop_pct)
                 
-                context = {
-                    'window_df': window_df,
-                    'upper_params': upper_model,
-                    'lower_params': lower_model,
-                    'mid_params': mid_model,
-                    'pnl': 0
+                # Calculate Result (Compounding + Fees)
+                # Entry Fee
+                position_size = equity * (1 - FEES)
+                
+                # Price Movement
+                raw_return = (exit_data['price'] - entry_price) / entry_price
+                if direction == 'short': raw_return *= -1
+                
+                position_val = position_size * (1 + raw_return)
+                
+                # Exit Fee
+                equity = position_val * (1 - FEES)
+                equity_curve.append(equity)
+                
+                trade_record = {
+                    'index': len(trades),
+                    'entry_idx': i,
+                    'exit_idx': exit_data['idx'],
+                    'entry_price': entry_price,
+                    'exit_price': exit_data['price'],
+                    'direction': direction,
+                    'pnl_pct': raw_return,
+                    'equity': equity,
+                    'stop_dist': stop_pct
                 }
+                trades.append(trade_record)
                 
-                plot_id = len(trades) + 1 if len(trades) < 10 else None
-                
-                result = simulate_trade(df, i, direction, dist_pct, plot_id, context)
-                trades.append(result)
-                
-                print(f"Trade {len(trades)}: {direction} | Entry: {entry_price:.2f} | PnL: {result['pnl']:.2%} | Window: {window_size}")
-                
-                i = result['exit_idx'] + 1
+                if save_plots and len(trades) <= 10:
+                    context = {
+                        'window_df': detection['window_df'],
+                        'upper_params': detection['params'][0],
+                        'lower_params': detection['params'][1],
+                        'mid_params': detection['params'][2],
+                        'pnl': raw_return
+                    }
+                    plot_trade(df, context, i, exit_data['idx'], entry_price, exit_data['price'], direction, len(trades))
+
+                i = exit_data['idx'] + 1
                 trade_found = True
-                break 
+                break
         
         if not trade_found:
-            i += 1 
+            i += 1
+            
+    return trades, equity_curve
 
-    generate_html(trades)
-    return trades
+def simulate_trade_execution(df, entry_idx, direction, stop_pct):
+    entry_price = df.iloc[entry_idx]['close']
+    curr = entry_idx + 1
+    
+    highest = entry_price
+    lowest = entry_price
+    
+    while curr < len(df):
+        candle = df.iloc[curr]
+        
+        if direction == 'long':
+            highest = max(highest, candle['high'])
+            stop = highest * (1 - stop_pct)
+            if candle['low'] <= stop:
+                return {'price': stop, 'idx': curr}
+        else:
+            lowest = min(lowest, candle['low'])
+            stop = lowest * (1 + stop_pct)
+            if candle['high'] >= stop:
+                return {'price': stop, 'idx': curr}
+        curr += 1
+        
+    return {'price': df.iloc[-1]['close'], 'idx': len(df)-1}
+
+# --- Plotting ---
+def plot_trade(df, context, entry_idx, exit_idx, entry_price, exit_price, direction, plot_id):
+    if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
+    
+    window_df = context['window_df']
+    x_range = np.arange(window_df.index[0], entry_idx + 5)
+    X_range = sm.add_constant(x_range)
+    
+    plt.figure(figsize=(10, 5))
+    
+    # Plot Candles (Subset)
+    plot_start = max(0, window_df.index[0] - 5)
+    plot_end = min(exit_idx + 10, len(df))
+    sub = df.iloc[plot_start:plot_end]
+    
+    up = sub[sub.close >= sub.open]
+    down = sub[sub.close < sub.open]
+    
+    plt.bar(up.index, up.close-up.open, 0.6, bottom=up.open, color='green')
+    plt.bar(up.index, up.high-up.close, 0.1, bottom=up.close, color='green')
+    plt.bar(up.index, up.low-up.open, 0.1, bottom=up.open, color='green')
+    
+    plt.bar(down.index, down.close-down.open, 0.6, bottom=down.open, color='red')
+    plt.bar(down.index, down.high-down.open, 0.1, bottom=down.open, color='red')
+    plt.bar(down.index, down.low-down.close, 0.1, bottom=down.close, color='red')
+    
+    # Lines
+    mid = context['mid_params'].predict(X_range)
+    plt.plot(x_range, mid, 'b--', alpha=0.5)
+    
+    if context['upper_params']:
+        plt.plot(x_range, context['upper_params'].predict(X_range), 'g-')
+    if context['lower_params']:
+        plt.plot(x_range, context['lower_params'].predict(X_range), 'r-')
+        
+    plt.scatter(entry_idx, entry_price, marker='^', color='blue', s=100, zorder=10)
+    plt.scatter(exit_idx, exit_price, marker='x', color='black', s=100, zorder=10)
+    
+    plt.title(f"Trade {plot_id} ({direction}) PnL: {context['pnl']:.2%}")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(f"{OUTPUT_DIR}/trade_{plot_id}.png")
+    plt.close()
+
+def plot_equity(curve, title="Equity Curve"):
+    if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
+    plt.figure(figsize=(10, 5))
+    plt.plot(curve)
+    plt.title(title)
+    plt.ylabel('Equity ($)')
+    plt.xlabel('Trades')
+    plt.grid(True)
+    plt.savefig(f"{OUTPUT_DIR}/equity_curve.png")
+    plt.close()
+
+def update_html(trades, best_config, is_live=False):
+    html = f"""<html><body>
+    <h1>System Status: {'LIVE' if is_live else 'BACKTEST COMPLETE'}</h1>
+    <h2>Best Config: {best_config}</h2>
+    <h3>Equity Curve</h3>
+    <img src="equity_curve.png" width="800"><br>
+    <h3>Recent Trades</h3>
+    <table border="1">
+    <tr><th>ID</th><th>Dir</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Eq</th></tr>
+    """
+    for t in reversed(trades[-20:]):
+        html += f"<tr><td>{t['index']}</td><td>{t['direction']}</td><td>{t['entry_price']:.2f}</td><td>{t['exit_price']:.2f}</td><td>{t['pnl_pct']:.2%}</td><td>{t['equity']:.2f}</td></tr>"
+    html += "</table><hr><h3>Setup Plots</h3>"
+    
+    images = sorted([f for f in os.listdir(OUTPUT_DIR) if f.startswith('trade_')])
+    for img in images:
+        html += f"<img src='{img}' width='400'>"
+        
+    with open(f"{OUTPUT_DIR}/index.html", "w") as f:
+        f.write(html)
+
+# --- Workflow Control ---
+def optimize_and_run():
+    print("Fetching optimization data (20 days)...")
+    df_opt = fetch_data(20)
+    
+    configs = ['dynamic', 0.005, 0.01, 0.02]
+    results = {}
+    
+    print("Running optimization...")
+    for cfg in configs:
+        _, curve = run_simulation(df_opt, cfg)
+        final_eq = curve[-1]
+        results[cfg] = final_eq
+        print(f"Config {cfg}: ${final_eq:.2f}")
+        
+    best_config = max(results, key=results.get)
+    print(f"Winner: {best_config}")
+    
+    print("Fetching full data (60 days)...")
+    df_full = fetch_data(60)
+    
+    print(f"Running full backtest with {best_config}...")
+    trades, curve = run_simulation(df_full, best_config, save_plots=True)
+    
+    plot_equity(curve, f"Equity Curve ({best_config})")
+    update_html(trades, best_config)
+    
+    return best_config, df_full, trades, curve
+
+# --- Live Loop ---
+def live_trader(best_config, initial_equity):
+    print("Starting Live Trader...")
+    equity = initial_equity
+    trades = [] # Keep local track
+    
+    while True:
+        now = datetime.utcnow()
+        # Sleep until 5s past next hour
+        next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        sleep_sec = (next_hour - now).total_seconds() + 5
+        
+        print(f"Live: Sleeping {sleep_sec:.1f}s until {next_hour.strftime('%H:%M:%S')} + 5s...")
+        time.sleep(sleep_sec)
+        
+        print("Live: Waking up. Fetching data...")
+        # Fetch enough history for 100 candle window
+        df = fetch_data(5) # 5 days is plenty for 100h
+        
+        # Latest completed candle is at index -1
+        i = len(df) - 1
+        current_candle = df.iloc[i]
+        
+        print(f"Live: Analyzing candle {current_candle['timestamp']} Close: {current_candle['close']}")
+        
+        trade_found = False
+        for window_size in range(100, 9, -1):
+            det = detect_breakout(df, i, window_size)
+            if det['signal']:
+                print(f"Live: SIGNAL FOUND! {det['signal']}")
+                
+                # In live mode, we don't have the future, so we can't 'simulate' the exit immediately
+                # We just log the entry signal. 
+                # Real implementation would need a websocket or ticker loop to manage the open trade.
+                # For this scope, we record the signal and hypothetically enter.
+                
+                direction = det['signal']
+                stop_pct = det['stop_dist'] if best_config == 'dynamic' else float(best_config)
+                
+                trade_record = {
+                    'index': len(trades) + 999, # Offset ID
+                    'entry_idx': i,
+                    'exit_idx': -1, # Unknown
+                    'entry_price': current_candle['close'],
+                    'exit_price': 0,
+                    'direction': direction,
+                    'pnl_pct': 0,
+                    'equity': equity,
+                    'stop_dist': stop_pct
+                }
+                trades.append(trade_record)
+                
+                # Append to HTML (simplified)
+                with open(f"{OUTPUT_DIR}/index.html", "a") as f:
+                    f.write(f"<p>LIVE SIGNAL: {direction} @ {current_candle['close']} (Stop: {stop_pct:.2%})</p>")
+                
+                trade_found = True
+                break
+        
+        if not trade_found:
+            print("Live: No signal.")
 
 def start_server():
-    # Switch to output directory
     os.chdir(OUTPUT_DIR)
-    
-    # Railway provides PORT env var, defaults to 8000
-    PORT = int(os.environ.get("PORT", 8000))
-    
     Handler = http.server.SimpleHTTPRequestHandler
-    
-    # Bind to 0.0.0.0 for external access
     with socketserver.TCPServer(("0.0.0.0", PORT), Handler) as httpd:
         print(f"Serving at 0.0.0.0:{PORT}")
         httpd.serve_forever()
 
 if __name__ == "__main__":
-    trades = run_strategy()
+    if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
     
-    if len(trades) > 0:
-        start_server()
-    else:
-        print("No trades found. Exiting.")
+    # 1. Optimize & Backtest
+    best_cfg, _, trades, curve = optimize_and_run()
+    
+    # 2. Start Web Server (Thread)
+    t_server = threading.Thread(target=start_server)
+    t_server.daemon = True
+    t_server.start()
+    
+    # 3. Enter Live Loop
+    # Pass final equity from backtest as starting point
+    live_trader(best_cfg, curve[-1])
