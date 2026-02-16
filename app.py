@@ -13,15 +13,16 @@ from urllib.parse import urlparse, parse_qs
 # =============================================================================
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1h'
-LIMIT = 101                 # Candles to fetch from exchange
+               # Candles to fetch from exchange
 PORT = 8080                 # Web server port
 THRESHOLD_PCT = 0.10        # Breakout distance (10% of channel width)
 UPDATE_INTERVAL = 10        # Seconds between data refreshes
 MIN_WINDOW = 10             # Minimum lookback for OLS
-MAX_WINDOW = 100            # Maximum lookback for OLS
+MAX_WINDOW = 200            # Maximum lookback for OLS
 CHART_SIZE = (15, 9)        # Matplotlib figure size
 CANDLE_WIDTH = 0.6          # Body width
 WICK_WIDTH = 0.05           # Wick width
+LIMIT = MAX_WINDOW+1
 # =============================================================================
 
 # Global State
