@@ -39,7 +39,6 @@ def generate_plot(df):
     last_idx = x_full[-1]
     last_close = df['close'].iloc[-1]
     
-    # 1. Render Lines First (Background)
     for w in range(10, 101):
         if len(df) < w:
             continue
@@ -61,7 +60,6 @@ def generate_plot(df):
         
         line_color = 'cyan'
         
-        # Check condition for the current window's boundary lines
         if m_u is not None and m_l is not None:
             upper_val = m_u * last_idx + c_u
             lower_val = m_l * last_idx + c_l
@@ -74,7 +72,6 @@ def generate_plot(df):
         if m_l is not None:
             plt.plot(x_win, m_l * x_win + c_l, color=line_color, linewidth=0.5, zorder=1)
 
-    # 2. Render Candles Second (Foreground)
     width = .6
     up = df[df.close >= df.open]
     down = df[df.close < df.open]
@@ -99,8 +96,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
             self.end_headers()
-            self.wfile.write(b'<html><body style="background:black;margin:0;padding:0;overflow:hidden"><img src="/chart.png" style="width:100%"></body></html>')
-        elif self.path == '/chart.png':
+            html = """
+            <html>
+            <head>
+                <script>
+                    setInterval(function() {
+                        document.getElementById('chart').src = '/chart.png?t=' + new Date().getTime();
+                    }, 10000);
+                </script>
+            </head>
+            <body style="background:black;margin:0;padding:0;overflow:hidden">
+                <img id="chart" src="/chart.png" style="width:100%">
+            </body>
+            </html>
+            """
+            self.wfile.write(html.encode())
+        elif self.path.startswith('/chart.png'):
             if current_plot_data:
                 self.send_response(200)
                 self.send_header('Content-type', 'image/png')
