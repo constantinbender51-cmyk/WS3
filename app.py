@@ -35,24 +35,16 @@ def fit_ols(x, y):
     return m, c
 
 def process_and_pnl(latest_price):
-    """
-    Updates Unrealized PnL every 10s based on the open candle (latest_price).
-    Also checks for trade exit conditions (Stop/Target) based on the same price.
-    """
     global trade_pnl_history, active_trades, current_unrealized_pnl
     remaining = []
     upnl = 0.0
     for t in active_trades:
         closed = False
-        p = 0
-        if t['type'] == 'short':
-            p = t['entry'] - latest_price
-            if latest_price >= t['stop'] or latest_price <= t['target']:
-                closed = True
-        else: # long
-            p = latest_price - t['entry']
-            if latest_price <= t['stop'] or latest_price >= t['target']:
-                closed = True
+        p = (t['entry'] - latest_price) if t['type'] == 'short' else (latest_price - t['entry'])
+        if t['type'] == 'short' and (latest_price >= t['stop'] or latest_price <= t['target']):
+            closed = True
+        elif t['type'] == 'long' and (latest_price <= t['stop'] or latest_price >= t['target']):
+            closed = True
         
         if closed:
             trade_pnl_history.append(p)
@@ -70,10 +62,12 @@ def generate_plot(df_closed):
     last_idx = x_full[-1]
     last_close = df_closed['close'].iloc[-1]
     
-    has_long = any(t['type'] == 'long' for t in active_trades)
-    has_short = any(t['type'] == 'short' for t in active_trades)
+    # Track potential entries for this tick
+    potential_short = None
+    potential_long = None
     
-    for w in range(10, 101):
+    # Iterate 100 to 10 to find biggest window breakout first
+    for w in range(100, 9, -1):
         if len(df_closed) < w: continue
         x_win = x_full[-w:]
         y_win_close = df_closed['close'].values[-w:]
@@ -84,137 +78,75 @@ def generate_plot(df_closed):
         if m_mid is None: continue
         y_trend = m_mid * x_win + c_mid
         
-        u_mask = y_win_high > y_trend
-        l_mask = y_win_low < y_trend
-        
-        m_u, c_u = fit_ols(x_win[u_mask], y_win_high[u_mask])
-        m_l, c_l = fit_ols(x_win[l_mask], y_win_low[l_mask])
+        m_u, c_u = fit_ols(x_win[y_win_high > y_trend], y_win_high[y_win_high > y_trend])
+        m_l, c_l = fit_ols(x_win[y_win_low < y_trend], y_win_low[y_win_low < y_trend])
         
         if m_u is not None and m_l is not None:
             u_val = m_u * last_idx + c_u
             l_val = m_l * last_idx + c_l
             dist = u_val - l_val
-            threshold = dist * 0.10 # 10% threshold
+            thresh = dist * 0.10
             
-            # Short Entry (only if no active short)
-            if last_close < (l_val - threshold):
+            is_short = last_close < (l_val - thresh)
+            is_long = last_close > (u_val + thresh)
+            
+            if is_short or is_long:
                 plt.plot(x_win, y_trend, color='red', linewidth=0.5, zorder=1)
                 plt.plot(x_win, m_u * x_win + c_u, color='red', linewidth=0.5, zorder=1)
                 plt.plot(x_win, m_l * x_win + c_l, color='red', linewidth=0.5, zorder=1)
-                if not has_short:
-                    active_trades.append({
-                        'type': 'short', 'entry': last_close, 'stop': l_val, 
-                        'target': l_val - dist, 'window': w
-                    })
-                    has_short = True
-            
-            # Long Entry (only if no active long)
-            elif last_close > (u_val + threshold):
-                plt.plot(x_win, y_trend, color='red', linewidth=0.5, zorder=1)
-                plt.plot(x_win, m_u * x_win + c_u, color='red', linewidth=0.5, zorder=1)
-                plt.plot(x_win, m_l * x_win + c_l, color='red', linewidth=0.5, zorder=1)
-                if not has_long:
-                    active_trades.append({
-                        'type': 'long', 'entry': last_close, 'stop': u_val, 
-                        'target': u_val + dist, 'window': w
-                    })
-                    has_long = True
+                
+                if is_short and potential_short is None:
+                    potential_short = {'type': 'short', 'entry': last_close, 'stop': l_val, 'target': l_val - dist, 'window': w}
+                if is_long and potential_long is None:
+                    potential_long = {'type': 'long', 'entry': last_close, 'stop': u_val, 'target': u_val + dist, 'window': w}
 
-    # Render Candles
-    width = .6
+    # Execute entries if slots are open
+    if potential_short and not any(t['type'] == 'short' for t in active_trades):
+        active_trades.append(potential_short)
+    if potential_long and not any(t['type'] == 'long' for t in active_trades):
+        active_trades.append(potential_long)
+
+    # Candles
     up, down = df_closed[df_closed.close >= df_closed.open], df_closed[df_closed.close < df_closed.open]
     for c, d in [('green', up), ('red', down)]:
-        plt.bar(d.index, d.close - d.open, width, bottom=d.open, color=c, zorder=2)
+        plt.bar(d.index, d.close - d.open, 0.6, bottom=d.open, color=c, zorder=2)
         plt.bar(d.index, d.high - np.maximum(d.close, d.open), 0.05, bottom=np.maximum(d.close, d.open), color=c, zorder=2)
         plt.bar(d.index, np.minimum(d.close, d.open) - d.low, 0.05, bottom=d.low, color=c, zorder=2)
 
     buf = BytesIO()
-    plt.savefig(buf, format='png')
-    plt.close()
-    buf.seek(0)
+    plt.savefig(buf, format='png'); plt.close(); buf.seek(0)
     return buf
 
 class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/':
-            self.send_response(200)
-            self.send_header('Content-type', 'text/html')
-            self.end_headers()
-            
-            rows = "".join([
-                f"<tr style='color:{'lime' if t['type']=='long' else 'orange'}'>"
-                f"<td>{t['type'].upper()}</td><td>{t['window']}</td><td>{t['entry']:.2f}</td>"
-                f"<td>{t['stop']:.2f}</td><td>{t['target']:.2f}</td>"
-                f"<td><form style='display:inline' method='POST' action='/cancel?w={t['window']}&s={t['type']}'><input type='submit' value='Cancel'></form></td></tr>" 
-                for t in active_trades
-            ])
-            
-            html = f"""
-            <html>
-            <head>
-                <style>
-                    body {{ background: #000; color: #fff; font-family: monospace; margin: 0; display: flex; flex-direction: column; align-items: center; }}
-                    table {{ border-collapse: collapse; width: 80%; margin-top: 20px; text-align: left; }}
-                    th, td {{ padding: 10px; border-bottom: 1px solid #333; }}
-                    img {{ width: 95%; max-width: 1200px; margin-top: 10px; }}
-                    input {{ background: #333; color: red; border: 1px solid red; cursor: pointer; }}
-                    .pnl-box {{ margin: 20px; padding: 15px; border: 1px solid #444; width: 80%; background: #111; }}
-                </style>
-            </head>
-            <body>
-                <img src="/chart.png?t={int(time.time())}">
-                <button onclick="location.reload()" style="padding:10px; margin:10px;">Refresh Data</button>
-                <div class="pnl-box">
-                    <b>Realized PnL:</b> {sum(trade_pnl_history):.2f} <br>
-                    <b>Unrealized PnL (Open Candle):</b> {current_unrealized_pnl:.2f} <br>
-                    <b>Net PnL:</b> {sum(trade_pnl_history) + current_unrealized_pnl:.2f}
-                </div>
-                <table>
-                    <thead><tr><th>Side</th><th>Window</th><th>Entry</th><th>Stop</th><th>Target</th><th>Action</th></tr></thead>
-                    <tbody>{rows}</tbody>
-                </table>
-                <div style="margin-top:20px;">PnL History: {[round(p, 2) for p in trade_pnl_history]}</div>
-            </body>
-            </html>
-            """
+            self.send_response(200); self.send_header('Content-type', 'text/html'); self.end_headers()
+            rows = "".join([f"<tr style='color:{'lime' if t['type']=='long' else 'orange'}'><td>{t['type'].upper()}</td><td>{t['window']}</td><td>{t['entry']:.2f}</td><td>{t['stop']:.2f}</td><td>{t['target']:.2f}</td><td><form method='POST' action='/cancel?w={t['window']}&s={t['type']}'><input type='submit' value='Cancel'></form></td></tr>" for t in active_trades])
+            html = f"<html><head><style>body{{background:#000;color:#fff;font-family:monospace;text-align:center}}table{{width:80%;margin:20px auto;border-collapse:collapse}}th,td{{padding:10px;border-bottom:1px solid #333}}img{{width:95%;margin:10px auto}}.box{{margin:20px;padding:15px;border:1px solid #444;background:#111}}</style></head><body><img src='/chart.png?t={int(time.time())}'><br><button onclick='location.reload()'>Refresh</button><div class='box'><b>Realized:</b> {sum(trade_pnl_history):.2f} | <b>Unrealized:</b> {current_unrealized_pnl:.2f} | <b>Net:</b> {sum(trade_pnl_history)+current_unrealized_pnl:.2f}</div><table><thead><tr><th>Side</th><th>Window</th><th>Entry</th><th>Stop</th><th>Target</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table></body></html>"
             self.wfile.write(html.encode())
         elif self.path.startswith('/chart.png'):
             if current_plot_data:
-                self.send_response(200)
-                self.send_header('Content-type', 'image/png')
-                self.end_headers()
+                self.send_response(200); self.send_header('Content-type', 'image/png'); self.end_headers()
                 self.wfile.write(current_plot_data.getvalue())
             else: self.send_error(404)
-
     def do_POST(self):
         global active_trades
         if self.path.startswith('/cancel'):
-            query = parse_qs(urlparse(self.path).query)
-            window = int(query.get('w', [0])[0])
-            side = query.get('s', [''])[0]
-            active_trades = [t for t in active_trades if not (t['window'] == window and t['type'] == side)]
-            self.send_response(303)
-            self.send_header('Location', '/')
-            self.end_headers()
-
-def run_server():
-    HTTPServer(('', PORT), DashboardHandler).serve_forever()
+            q = parse_qs(urlparse(self.path).query)
+            w, s = int(q.get('w', [0])[0]), q.get('s', [''])[0]
+            active_trades = [t for t in active_trades if not (t['window'] == w and t['type'] == s)]
+        self.send_response(303); self.send_header('Location', '/'); self.end_headers()
 
 def logic_loop():
     global current_plot_data
     while True:
         full_df = get_full_data()
         if not full_df.empty:
-            # Entry logic uses confirmed data (all rows except the last open one)
-            df_closed = full_df.iloc[:-1].copy()
-            # PnL and Exit tracking uses the latest price from the open candle
-            open_candle_price = full_df.iloc[-1]['close']
-            
-            process_and_pnl(open_candle_price)
+            df_closed, open_price = full_df.iloc[:-1].copy(), full_df.iloc[-1]['close']
+            process_and_pnl(open_price)
             current_plot_data = generate_plot(df_closed)
-            print(f"Update: {open_candle_price} | Unrealized: {current_unrealized_pnl:.2f}")
         time.sleep(10)
 
 if __name__ == "__main__":
-    threading.Thread(target=run_server, daemon=True).start()
+    threading.Thread(target=lambda: HTTPServer(('', PORT), DashboardHandler).serve_forever(), daemon=True).start()
     logic_loop()
