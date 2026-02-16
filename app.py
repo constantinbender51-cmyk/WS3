@@ -2,229 +2,260 @@ import ccxt
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from datetime import datetime
+import base64
+from io import BytesIO
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+import time
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1h'
-OUPUT_TRADES = 3             # How many trades to visualize
 MIN_WINDOW = 10
 MAX_WINDOW = 100
 THRESHOLD_PCT = 0.10
-exchange = ccxt.binance()
+BACKTEST_HOURS = 365 * 24  # 1 Year
+TRADES_TO_SHOW = 3         # Stop after finding this many trades
+PORT = 8080
 
+exchange = ccxt.binance()
+report_html = "<h1>Running 1-Year Backtest... Please Refresh in 30 Seconds.</h1>"
+
+# =============================================================================
+# MATH
+# =============================================================================
 def fit_ols(x, y):
-    """Standard OLS Regression"""
     if len(x) < 2: return None, None
     A = np.vstack([x, np.ones(len(x))]).T
     m, c = np.linalg.lstsq(A, y, rcond=None)[0]
     return m, c
 
 def fetch_data():
-    print(f"Fetching 2000 candles for {SYMBOL}...")
-    ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=1000)
-    # Fetch a bit more to ensure we get trades
-    since = ohlcv[0][0] - (1000 * 60 * 60 * 1000)
-    prev = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since=since, limit=1000)
-    data = prev + ohlcv
-    df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    print(f"Fetching 1 Year of Data for {SYMBOL}...")
+    # Fetch in batches because 8760 > 1000 limit
+    all_ohlcv = []
+    since = exchange.milliseconds() - (BACKTEST_HOURS * 60 * 60 * 1000)
+    
+    while len(all_ohlcv) < BACKTEST_HOURS:
+        try:
+            ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since=since, limit=1000)
+            if not ohlcv: break
+            all_ohlcv.extend(ohlcv)
+            since = ohlcv[-1][0] + 1
+            time.sleep(0.1)
+        except: break
+        
+    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    # Convert timestamp for potential debugging, though we use index for speed
     df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
     return df
 
-def plot_trade_forensics(df, trade, trade_id):
-    """Generates a detailed chart for a specific completed trade"""
-    entry_idx = trade['entry_index']
-    exit_idx = trade['exit_index']
+def plot_to_base64():
+    buf = BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight')
+    plt.close()
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode('utf-8')
+
+def generate_forensic_chart(df, trade, trade_id):
+    entry_idx = trade['entry_idx']
+    exit_idx = trade['exit_idx']
     window = trade['window']
     
-    # Zoom in: Show 50 candles before entry and 20 after exit
+    # Define zoom: Start 20 candles before entry, End 20 candles after exit
     start_plot = max(0, entry_idx - window - 20)
     end_plot = min(len(df), exit_idx + 20)
     df_zoom = df.iloc[start_plot:end_plot].reset_index(drop=True)
     
-    # Re-calculate the specific OLS lines that triggered the ENTRY
-    # Note: We fit on [entry_idx - window - 1 : entry_idx - 1] 
-    # This proves we did NOT use the breakout candle for the fit
-    abs_entry_idx = entry_idx
+    # Calculate relative indices for plotting
+    rel_entry = entry_idx - start_plot
+    rel_exit = exit_idx - start_plot
     
-    fit_slice = slice(abs_entry_idx - window - 1, abs_entry_idx - 1)
-    
-    # We need to map these absolute indices to our zoomed dataframe indices
-    # relative_entry_idx = df_zoom[df_zoom['timestamp'] == df.iloc[entry_idx]['timestamp']].index[0]
-    
-    plt.figure(figsize=(14, 8))
+    plt.figure(figsize=(14, 7))
     plt.style.use('dark_background')
     
-    # 1. Plot Candles
+    # 1. Candles
     up = df_zoom[df_zoom.close >= df_zoom.open]
     down = df_zoom[df_zoom.close < df_zoom.open]
     plt.bar(up.index, up.close - up.open, 0.6, bottom=up.open, color='green', alpha=0.6)
-    plt.bar(up.index, up.high - up.close, 0.1, bottom=up.close, color='green', alpha=0.6)
-    plt.bar(up.index, up.open - up.low, 0.1, bottom=up.low, color='green', alpha=0.6)
-    
     plt.bar(down.index, down.close - down.open, 0.6, bottom=down.open, color='red', alpha=0.6)
-    plt.bar(down.index, down.high - down.open, 0.1, bottom=down.open, color='red', alpha=0.6)
-    plt.bar(down.index, down.close - down.low, 0.1, bottom=down.low, color='red', alpha=0.6)
+    plt.bar(up.index, up.high - up.low, 0.05, bottom=up.low, color='green', alpha=0.6)
+    plt.bar(down.index, down.high - down.low, 0.05, bottom=down.low, color='red', alpha=0.6)
 
-    # 2. Re-Construct the Signal Channel (The "Why we entered" lines)
-    # We fit on the "Lagged" window (Original DF indices)
-    x_fit_abs = np.arange(abs_entry_idx - window - 1, abs_entry_idx - 1)
-    y_fit = df['close'].iloc[fit_slice].values
-    yh_fit = df['high'].iloc[fit_slice].values
-    yl_fit = df['low'].iloc[fit_slice].values
+    # 2. Re-Draw the Signal Channel (Lagged Fit)
+    # We fit on indices [entry - window - 1] to [entry - 1]
+    # This proves we ignored the breakout candle for the math
+    fit_slice = slice(entry_idx - window - 1, entry_idx - 1)
     
-    mm, cm = fit_ols(x_fit_abs, y_fit)
+    # Get the raw values used for the signal
+    yc = df['close'].iloc[fit_slice].values
+    yh = df['high'].iloc[fit_slice].values
+    yl = df['low'].iloc[fit_slice].values
     
-    # Map lines to the Zoomed Plot X-Axis
-    # Find offset between absolute index and zoom index
-    # We need to find where x_fit_abs[0] is in df_zoom
+    # Create X array relative to the Zoomed Plot
+    # The fit data starts at (rel_entry - window - 1)
+    x_fit_rel = np.arange(rel_entry - window - 1, rel_entry - 1)
     
-    # Simplified plotting: We just project the lines based on the visual chart indices
-    # We find the relative index of the entry candle
-    rel_entry = df_zoom[df_zoom.timestamp == df.iloc[entry_idx].timestamp].index[0]
+    mm, cm = fit_ols(x_fit_rel, yc)
     
-    # Create the x-array for the channel relative to the entry
-    x_channel = np.arange(rel_entry - window - 1, rel_entry + 5) # Draw past entry a bit
+    if mm is not None:
+        yt = mm * x_fit_rel + cm
+        mu, cu = fit_ols(x_fit_rel[yh > yt], yh[yh > yt])
+        ml, cl = fit_ols(x_fit_rel[yl < yt], yl[yl < yt])
+        
+        if mu and ml:
+            # Draw lines PAST the entry to show the breakout clearly
+            x_draw = np.arange(rel_entry - window - 1, rel_entry + 5)
+            ul = mu * x_draw + cu
+            ll = ml * x_draw + cl
+            
+            plt.plot(x_draw, ul, color='white', linestyle='--', linewidth=1, label='Upper Band (At Signal)')
+            plt.plot(x_draw, ll, color='white', linestyle='--', linewidth=1, label='Lower Band (At Signal)')
+            
+            # Draw Threshold
+            dist = ul - ll
+            if trade['type'] == 'long':
+                thresh = ul + (dist * THRESHOLD_PCT)
+                plt.plot(x_draw, thresh, color='yellow', linestyle=':', linewidth=2, label='Breakout Threshold')
+            else:
+                thresh = ll - (dist * THRESHOLD_PCT)
+                plt.plot(x_draw, thresh, color='yellow', linestyle=':', linewidth=2, label='Breakout Threshold')
+
+    # 3. Markers
+    plt.plot(rel_entry, trade['entry_price'], marker='^' if trade['type']=='long' else 'v', 
+             color='cyan', markersize=12, label='ENTRY', zorder=10)
+    plt.plot(rel_exit, trade['exit_price'], marker='X', color='orange', markersize=12, label='EXIT', zorder=10)
     
-    # Recalculate coefficients on the zoomed data values (math is invariant to x-shift if slope is preserved)
-    # Actually, simpler to just re-fit on the exact same values using relative X
-    y_vals = df_zoom.loc[rel_entry - window - 1 : rel_entry - 2, 'close'].values
-    h_vals = df_zoom.loc[rel_entry - window - 1 : rel_entry - 2, 'high'].values
-    l_vals = df_zoom.loc[rel_entry - window - 1 : rel_entry - 2, 'low'].values
-    x_vals = np.arange(rel_entry - window - 1, rel_entry - 1)
-    
-    m, c = fit_ols(x_vals, y_vals)
-    yt = m * x_vals + c
-    mu, cu = fit_ols(x_vals[h_vals > yt], h_vals[h_vals > yt])
-    ml, cl = fit_ols(x_vals[l_vals < yt], l_vals[l_vals < yt])
-    
-    # Plot Channel
-    x_proj = np.arange(rel_entry - window - 1, rel_entry + 2)
-    upper_line = mu * x_proj + cu
-    lower_line = ml * x_proj + cl
-    
-    plt.plot(x_proj, upper_line, color='white', linestyle='--', linewidth=1, label="Upper Band (At Entry)")
-    plt.plot(x_proj, lower_line, color='white', linestyle='--', linewidth=1, label="Lower Band (At Entry)")
-    
-    # 3. Plot Thresholds
-    dist = upper_line[-1] - lower_line[-1]
-    thresh = dist * THRESHOLD_PCT
-    
-    # 4. Markers
-    # Entry
-    plt.plot(rel_entry, df.iloc[entry_idx]['close'], marker='^', color='yellow', markersize=12, label='ENTRY')
-    # Exit
-    rel_exit = df_zoom[df_zoom.timestamp == df.iloc[exit_idx].timestamp].index[0]
-    plt.plot(rel_exit, df.iloc[exit_idx]['close'], marker='X', color='orange', markersize=12, label='EXIT')
-    
-    # Annotations
-    pnl = trade['pnl']
-    res = "WIN" if pnl > 0 else "LOSS"
-    plt.title(f"Trade #{trade_id} | {trade['type'].upper()} | PnL: {pnl:.2f} ({res}) | Window: {window}")
+    plt.title(f"Trade #{trade_id} | Type: {trade['type'].upper()} | Window: {window} | PnL: {trade['pnl']:.2f}")
     plt.legend()
-    plt.grid(True, alpha=0.2)
-    
-    # Save or Show
-    plt.show()
+    return plot_to_base64()
 
-def run_forensic_backtest():
+def run_simulation():
+    global report_html
     df = fetch_data()
     print(f"Data Loaded: {len(df)} candles.")
     
     active_trade = None
     completed_trades = []
+    trade_images = []
+    equity = [0]
     
-    # Standard Logic Loop
-    for i in range(MAX_WINDOW + 1, len(df)):
+    # Simulation Loop
+    for i in range(MAX_WINDOW + 2, len(df)):
         price = df.iloc[i]['close']
         
-        # 1. Check Exit
+        # --- EXIT LOGIC ---
         if active_trade:
             t = active_trade
             closed = False
-            pnl = 0
             
-            # Dynamic Stop Calculation (Recalculate band on current window)
+            # Recalculate Dynamic Stop for THIS candle 'i'
             w = t['window']
-            # Fit on [i-w : i] (Lagged fit relative to NOW)
+            fit_slice = slice(i - w, i) # Lagged fit [i-w : i]
             x_fit = np.arange(i - w, i)
-            yc = df['close'].values[i-w:i]; yh = df['high'].values[i-w:i]; yl = df['low'].values[i-w:i]
+            
+            yc = df['close'].values[fit_slice]; yh = df['high'].values[fit_slice]; yl = df['low'].values[fit_slice]
             
             mm, cm = fit_ols(x_fit, yc)
             if mm is not None:
                 yt = mm * x_fit + cm
-                mu, cu = fit_ols(x_fit[yh > yt], yh[yh > yt])
-                ml, cl = fit_ols(x_fit[yl < yt], yl[yl < yt])
-                
+                mu, cu = fit_ols(x_fit[yh > yt], yh[yh > yt]); ml, cl = fit_ols(x_fit[yl < yt], yl[yl < yt])
                 if mu and ml:
-                    # Dynamic Stop Levels
                     stop_long = ml * i + cl
                     stop_short = mu * i + cu
                     
                     if t['type'] == 'long':
                         if price <= stop_long or price >= t['target']:
-                            pnl = price - t['entry']; closed = True
-                    elif t['type'] == 'short':
+                            t['pnl'] = price - t['entry_price']; closed = True
+                    else:
                         if price >= stop_short or price <= t['target']:
-                            pnl = t['entry'] - price; closed = True
+                            t['pnl'] = t['entry_price'] - price; closed = True
             
             if closed:
-                t['exit_index'] = i
+                t['exit_idx'] = i
                 t['exit_price'] = price
-                t['pnl'] = pnl
                 completed_trades.append(t)
+                equity.append(equity[-1] + t['pnl'])
+                
+                # Generate forensic chart for this trade
+                print(f"Generating Chart for Trade #{len(completed_trades)}...")
+                img = generate_forensic_chart(df, t, len(completed_trades))
+                trade_images.append(img)
+                
                 active_trade = None
-                print(f"Trade Closed. PnL: {pnl:.2f}")
-                if len(completed_trades) >= OUPUT_TRADES: break
-            continue # Only 1 trade at a time
-            
-        # 2. Check Entry
-        # Fit on [i-w-1 : i-1] (Exclude current candle i)
-        last_c = df.iloc[i-1]['close'] # The breakout candle
+                if len(completed_trades) >= TRADES_TO_SHOW:
+                    break
+            continue
+
+        # --- ENTRY LOGIC ---
+        last_c = df.iloc[i-1]['close'] # Breakout candle
         
-        # Optimize: Scan largest window first
         for w in range(MAX_WINDOW, MIN_WINDOW - 1, -1):
+            fit_slice = slice(i - w - 1, i - 1)
             x_fit = np.arange(i - w - 1, i - 1)
-            yc = df['close'].values[i-w-1:i-1]
-            yh = df['high'].values[i-w-1:i-1]
-            yl = df['low'].values[i-w-1:i-1]
+            yc = df['close'].values[fit_slice]; yh = df['high'].values[fit_slice]; yl = df['low'].values[fit_slice]
             
             mm, cm = fit_ols(x_fit, yc)
             if mm is None: continue
-            
             yt = mm * x_fit + cm
-            mu, cu = fit_ols(x_fit[yh > yt], yh[yh > yt])
-            ml, cl = fit_ols(x_fit[yl < yt], yl[yl < yt])
+            mu, cu = fit_ols(x_fit[yh > yt], yh[yh > yt]); ml, cl = fit_ols(x_fit[yl < yt], yl[yl < yt])
             
             if mu and ml:
-                # Project to breakout candle (i-1)
                 proj_idx = i - 1
                 proj_u = mu * proj_idx + cu
                 proj_l = ml * proj_idx + cl
-                dist = proj_u - proj_l
-                th = dist * THRESHOLD_PCT
+                dist = proj_u - proj_l; th = dist * THRESHOLD_PCT
                 
-                # Check Breakout
                 if last_c > (proj_u + th):
                     active_trade = {
-                        'type': 'long', 'entry': df.iloc[i]['open'], # Enter on Open of current
-                        'target': proj_u + dist, 'window': w, 'entry_index': i
+                        'type': 'long', 'entry_price': df.iloc[i]['open'], 
+                        'entry_idx': i, 'window': w, 'target': proj_u + dist
                     }
-                    print(f"Long Entry at {active_trade['entry']} (Window {w})")
                     break
                 elif last_c < (proj_l - th):
                     active_trade = {
-                        'type': 'short', 'entry': df.iloc[i]['open'],
-                        'target': proj_l - dist, 'window': w, 'entry_index': i
+                        'type': 'short', 'entry_price': df.iloc[i]['open'], 
+                        'entry_idx': i, 'window': w, 'target': proj_l - dist
                     }
-                    print(f"Short Entry at {active_trade['entry']} (Window {w})")
                     break
 
-    # 3. Visualize
-    for idx, t in enumerate(completed_trades):
-        plot_trade_forensics(df, t, idx+1)
+    # Final Report Generation
+    print("Generating Final HTML Report...")
+    html = """
+    <html><head><style>
+        body { background-color: #1e1e1e; color: #ddd; font-family: sans-serif; text-align: center; }
+        .chart-box { background: #000; padding: 10px; margin: 20px auto; width: 90%; border: 1px solid #444; }
+        h3 { margin-top: 0; color: cyan; }
+    </style></head><body>
+    <h1>Forensic Backtest Analysis (1 Year)</h1>
+    """
+    
+    # Equity Curve
+    plt.figure(figsize=(10, 4))
+    plt.style.use('dark_background')
+    plt.plot(equity, color='cyan', linewidth=2)
+    plt.title("Equity Curve (First 3 Trades)")
+    eq_img = plot_to_base64()
+    
+    html += f"<div class='chart-box'><h3>Equity Curve</h3><img src='data:image/png;base64,{eq_img}'></div>"
+    
+    for idx, img in enumerate(trade_images):
+        html += f"<div class='chart-box'><h3>Trade #{idx+1}</h3><img src='data:image/png;base64,{img}'></div>"
+    
+    html += "</body></html>"
+    report_html = html
+    print("Done.")
+
+class ReportHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        self.wfile.write(report_html.encode())
 
 if __name__ == "__main__":
-    run_forensic_backtest()
+    threading.Thread(target=run_simulation, daemon=True).start()
+    print(f"Server started on port {PORT}. Waiting for results...")
+    HTTPServer(('', PORT), ReportHandler).serve_forever()
