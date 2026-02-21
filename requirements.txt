@@ -1,10 +1,6 @@
-statsmodels 
-requests 
-httpx[http2]
+
 
 ccxt
 pandas
 numpy
 matplotlib
-scikit-learn
-flask
