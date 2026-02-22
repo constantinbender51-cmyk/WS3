@@ -39,6 +39,8 @@ data = requests.get(url, params=params).json()
 prices = [float(x[4]) for x in data]
 times = [datetime.fromtimestamp(x[0]/1000) for x in data]
 
+print(f"✅ Got {len(prices)} candles")
+
 # ========== RUN STRATEGY ==========
 print("🧮 Computing signals...")
 signals = []
@@ -72,12 +74,15 @@ for i in range(10, len(prices)):
     signals.append(1 if model.coef_[0][0] > 0 else -1)
     windows.append(best_w)
 
+print(f"✅ Got {len(signals)} signals")
+
 # ========== CALCULATE RETURNS ==========
 print("📊 Calculating returns...")
 returns = []
-for i in range(min(len(signals), len(prices)-1)):
-    ret = signals[i] * (prices[i+1] - prices[i]) / prices[i] * 100
-    returns.append(ret)
+for i in range(len(signals)):
+    if i < len(prices) - 1:
+        ret = signals[i] * (prices[i+1] - prices[i]) / prices[i] * 100
+        returns.append(ret)
 
 cumulative = []
 total = 0
@@ -93,18 +98,25 @@ win_rate = (winning_trades / len(returns) * 100) if returns else 0
 print("🎨 Creating plot...")
 fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 8))
 
-# Price
-ax1.plot(times[10:], prices[10:], 'k-', alpha=0.5, linewidth=1)
+# Price chart with signals
+price_times = times[10:]  # Start from index 10
+price_values = prices[10:]
+
+ax1.plot(price_times, price_values, 'k-', alpha=0.5, linewidth=1)
+
+# Add signals (shifted by 1 since signal is for next candle)
 for i, s in enumerate(signals):
-    if i < len(times)-11:
+    if i < len(price_times) - 1:  # Make sure we don't go out of bounds
         color = 'g' if s == 1 else 'r'
-        ax1.scatter(times[i+11], prices[i+11], c=color, s=10, alpha=0.5)
+        ax1.scatter(price_times[i+1], price_values[i+1], c=color, s=10, alpha=0.5)
+
 ax1.set_title('BTC Price with Signals')
 ax1.set_ylabel('Price (USDT)')
 ax1.grid(True, alpha=0.3)
 
 # Cumulative returns
-ax2.plot(times[11:len(cumulative)+11], cumulative, 'b-', linewidth=2)
+return_times = times[11:11+len(cumulative)]  # Signals start at index 10, returns start at index 11
+ax2.plot(return_times, cumulative, 'b-', linewidth=2)
 ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
 ax2.set_title(f'Cumulative Returns: {total_return:.1f}%')
 ax2.set_ylabel('Return (%)')
