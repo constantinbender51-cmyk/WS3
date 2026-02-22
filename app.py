@@ -12,6 +12,7 @@ import io
 import base64
 from typing import List, Tuple
 import warnings
+import urllib.parse
 warnings.filterwarnings('ignore')
 
 # Global variables
@@ -19,7 +20,7 @@ prices = None
 timestamps = None
 full_start_date = None
 full_end_date = None
-K = 1.8  # Window exponent
+K = 1.8  # Default window exponent
 
 def fetch_data():
     """Fetch BTC 1h data for last 30 days from Binance"""
@@ -68,7 +69,7 @@ def generate_sample_data():
     
     print(f"⚠️ Generated {n_points} hours of sample data")
 
-def find_best_line(data_prices, data_timestamps, start_idx):
+def find_best_line(data_prices, data_timestamps, start_idx, k_value):
     """Find the best line on the given data segment using error/window^K"""
     best_error = float('inf')
     best_line = None
@@ -78,7 +79,7 @@ def find_best_line(data_prices, data_timestamps, start_idx):
     
     n_points = len(data_prices)
     
-    print(f"\n   Analyzing segment from {start_idx}h ({len(data_prices)} points):")
+    print(f"\n   Analyzing segment from {start_idx}h ({len(data_prices)} points) with K={k_value}:")
     
     # Try all window sizes from 10 to min(100, n_points)
     for window in range(10, min(101, n_points + 1)):
@@ -101,14 +102,14 @@ def find_best_line(data_prices, data_timestamps, start_idx):
         y_pred = model.predict(X_norm)
         
         # Calculate error / window^K
-        error = np.sum(np.abs(y - y_pred)) / (window ** K)
+        error = np.sum(np.abs(y - y_pred)) / (window ** k_value)
         
         # Calculate slope (price change per hour)
         slope = model.coef_[0] / X_std * 3600000
         
         # Print every 10th window for debugging
         if window % 10 == 0 or window == 10:
-            print(f"     win={window:3d}: error/win^{K}={error:10.2f}, slope={slope:8.2f}")
+            print(f"     win={window:3d}: error/win^{k_value}={error:10.2f}, slope={slope:8.2f}")
         
         if error < best_error:
             best_error = error
@@ -127,10 +128,10 @@ def find_best_line(data_prices, data_timestamps, start_idx):
         'n_points': n_points
     }
 
-def find_cascade():
+def find_cascade(k_value):
     """Find cascade of lines, each on the reduced dataset"""
     print("\n" + "=" * 60)
-    print(f"📊 Finding cascade of lines (error/window^{K})...")
+    print(f"📊 Finding cascade of lines (error/window^{k_value})...")
     print("=" * 60)
     
     cascade = []
@@ -141,7 +142,7 @@ def find_cascade():
     
     while len(current_prices) >= 110:  # Need at least 110 points (100 window + 10)
         # Find best line on current data
-        result = find_best_line(current_prices, current_timestamps, current_start)
+        result = find_best_line(current_prices, current_timestamps, current_start, k_value)
         
         if result['window'] == 0:
             break
@@ -156,7 +157,7 @@ def find_cascade():
         print(f"   Window: {window_start}h to {result['end_idx']}h ({result['window']}h)")
         print(f"   Date: {window_start_date} to {end_date}")
         print(f"   Slope: {result['slope']:+.2f} $/h")
-        print(f"   Error/win^{K}: {result['error']:.2f}")
+        print(f"   Error/win^{k_value}: {result['error']:.2f}")
         
         # Remove the window we just used
         # We keep everything before the start of the window
@@ -179,14 +180,53 @@ def find_cascade():
     print(f"\n✅ Found {len(cascade)} cascade lines")
     return cascade
 
-def create_plot(cascade):
+def calculate_returns(cascade):
+    """Calculate total return from following cascade strategy"""
+    if len(cascade) < 2:
+        return 0, 0, 0
+    
+    total_return = 0
+    positive_return = 0
+    negative_return = 0
+    
+    for i in range(len(cascade) - 1):
+        current_line = cascade[i]
+        next_line = cascade[i + 1]
+        
+        # The current line's window start is the boundary
+        boundary = current_line['end_idx'] - current_line['window']
+        
+        # Price at boundary
+        start_price = prices[boundary]
+        
+        # Price at next line's start (which is the end of this region)
+        end_price = prices[next_line['end_idx'] - next_line['window']]
+        
+        # Calculate return
+        region_return = (end_price / start_price - 1) * 100
+        
+        # Add to total with sign based on slope
+        if current_line['slope'] > 0:
+            positive_return += region_return
+            total_return += region_return
+        else:
+            negative_return += region_return
+            total_return -= region_return  # Subtract negative returns (we want to avoid them)
+    
+    return total_return, positive_return, negative_return
+
+def create_plot(cascade, k_value):
     """Create plot with all cascade lines and slope-based backgrounds"""
-    fig, ax = plt.subplots(figsize=(14, 8))
+    fig, ax = plt.subplots(figsize=(14, 10))
     
     # Plot price
     ax.plot(range(len(prices)), prices, 'b-', alpha=0.5, label='BTC Price', linewidth=1)
     
+    # Calculate returns
+    total_return, pos_return, neg_return = calculate_returns(cascade)
+    
     # Add colored backgrounds based on slope
+    regions = []
     for i, line in enumerate(cascade):
         end_idx = line['end_idx']
         window = line['window']
@@ -196,9 +236,11 @@ def create_plot(cascade):
         if line['slope'] > 0:
             color = 'green'
             alpha = 0.15
+            regions.append({'type': 'positive', 'start': line_start, 'end': end_idx, 'slope': line['slope']})
         else:
             color = 'red'
             alpha = 0.15
+            regions.append({'type': 'negative', 'start': line_start, 'end': end_idx, 'slope': line['slope']})
         
         # Add colored background for the window region
         ax.axvspan(line_start, end_idx, alpha=alpha, color=color, zorder=0)
@@ -234,27 +276,40 @@ def create_plot(cascade):
         if i < len(cascade) - 1:
             ax.axvline(x=line_start, color=color, linestyle='--', alpha=0.3)
     
+    # Add return info box
+    return_text = f"""Strategy Returns:
+    Total: {total_return:+.2f}%
+    From Green: +{pos_return:.2f}%
+    From Red (avoided): +{abs(neg_return):.2f}%"""
+    
+    ax.text(0.02, 0.98, return_text, transform=ax.transAxes, 
+            fontsize=10, verticalalignment='top', family='monospace',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='gray'))
+    
     # Add slope legend
     from matplotlib.patches import Patch
-    legend_elements = [Patch(facecolor='green', alpha=0.15, label='Positive slope'),
-                      Patch(facecolor='red', alpha=0.15, label='Negative slope')]
-    ax.legend(handles=legend_elements + [ax.get_legend_handles_labels()[0][0]], 
+    legend_elements = [Patch(facecolor='green', alpha=0.15, label='Positive slope (GO LONG)'),
+                      Patch(facecolor='red', alpha=0.15, label='Negative slope (GO SHORT)')]
+    
+    # Add the first price line to legend
+    price_line = ax.get_legend_handles_labels()[0][0]
+    ax.legend(handles=legend_elements + [price_line], 
               loc='upper left', fontsize=8)
     
-    ax.set_title(f'BTC Price with Cascade Lines (error/window^{K})', fontsize=14)
+    ax.set_title(f'BTC Price with Cascade Lines (error/window^{k_value})', fontsize=14)
     ax.set_xlabel('Hours from Start')
     ax.set_ylabel('Price (USDT)')
     ax.grid(True, alpha=0.2)
     
     # Add K value info
-    ax.text(0.98, 0.02, f'K = {K}', transform=ax.transAxes, 
+    ax.text(0.98, 0.02, f'K = {k_value}', transform=ax.transAxes, 
              fontsize=12, ha='right',
              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     
     # Add slope statistics
     positive_slopes = sum(1 for line in cascade if line['slope'] > 0)
     negative_slopes = sum(1 for line in cascade if line['slope'] < 0)
-    ax.text(0.02, 0.98, f'Positive: {positive_slopes} | Negative: {negative_slopes}', 
+    ax.text(0.02, 0.85, f'Positive: {positive_slopes} | Negative: {negative_slopes}', 
             transform=ax.transAxes, fontsize=10, verticalalignment='top',
             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
     
@@ -270,16 +325,32 @@ def create_plot(cascade):
 
 class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
-        if self.path == '/':
+        global K
+        
+        if self.path.startswith('/?') or self.path == '/':
+            # Parse query parameters
+            parsed = urllib.parse.urlparse(self.path)
+            query = urllib.parse.parse_qs(parsed.query)
+            
+            # Get K value from query, default to stored K
+            try:
+                k_value = float(query.get('k', [K])[0])
+                K = k_value  # Update global K
+            except (ValueError, TypeError):
+                k_value = K
+            
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
             self.end_headers()
             
-            # Find cascade
-            cascade = find_cascade()
+            # Find cascade with current K
+            cascade = find_cascade(k_value)
+            
+            # Calculate returns
+            total_return, pos_return, neg_return = calculate_returns(cascade)
             
             # Create plot
-            image_base64 = create_plot(cascade)
+            image_base64 = create_plot(cascade, k_value)
             
             # Calculate some stats
             avg_window = np.mean([line['window'] for line in cascade]) if cascade else 0
@@ -287,26 +358,41 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             positive_slopes = sum(1 for line in cascade if line['slope'] > 0)
             negative_slopes = sum(1 for line in cascade if line['slope'] < 0)
             
-            # Simple HTML
+            # HTML with input form
             html = f"""
             <!DOCTYPE html>
             <html>
             <head>
-                <title>BTC Cascade Lines K={K}</title>
+                <title>BTC Cascade Lines</title>
                 <style>
                     body {{ margin: 20px; font-family: Arial; background: #f5f5f5; }}
                     .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }}
                     h1 {{ margin: 0 0 10px 0; font-size: 20px; }}
+                    .controls {{ margin: 20px 0; padding: 15px; background: #f0f0f0; border-radius: 4px; display: flex; gap: 20px; align-items: center; }}
                     .stats {{ margin: 10px 0; padding: 10px; background: #f0f0f0; border-radius: 4px; display: flex; gap: 20px; flex-wrap: wrap; }}
                     .stat {{ padding: 5px 10px; background: #fff; border-radius: 4px; }}
-                    .positive {{ background: #d4edda; color: #155724; padding: 2px 8px; border-radius: 4px; }}
-                    .negative {{ background: #f8d7da; color: #721c24; padding: 2px 8px; border-radius: 4px; }}
-                    img {{ width: 100%; }}
+                    .positive {{ background: #d4edda; color: #155724; padding: 5px 10px; border-radius: 4px; }}
+                    .negative {{ background: #f8d7da; color: #721c24; padding: 5px 10px; border-radius: 4px; }}
+                    .returns {{ background: #cce5ff; color: #004085; padding: 5px 10px; border-radius: 4px; }}
+                    input[type=number] {{ padding: 8px; border: 1px solid #ddd; border-radius: 4px; width: 80px; }}
+                    button {{ padding: 8px 16px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }}
+                    button:hover {{ background: #0056b3; }}
+                    img {{ width: 100%; margin-top: 20px; }}
                 </style>
             </head>
             <body>
                 <div class="container">
-                    <h1>📈 BTC Cascade Lines (error/window^{K})</h1>
+                    <h1>📈 BTC Cascade Lines</h1>
+                    
+                    <div class="controls">
+                        <form method="get" style="display: flex; gap: 10px; align-items: center;">
+                            <label for="k">K = </label>
+                            <input type="number" id="k" name="k" step="0.1" min="0.1" max="5" value="{k_value}">
+                            <button type="submit">Update</button>
+                        </form>
+                        <span style="color: #666; font-size: 14px;">Higher K = shorter windows</span>
+                    </div>
+                    
                     <div class="stats">
                         <span class="stat">📊 Lines: {len(cascade)}</span>
                         <span class="stat">📏 Avg window: {avg_window:.1f}h</span>
@@ -314,6 +400,13 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                         <span class="stat positive">🟢 Positive: {positive_slopes}</span>
                         <span class="stat negative">🔴 Negative: {negative_slopes}</span>
                     </div>
+                    
+                    <div class="stats">
+                        <span class="returns">💰 Total Strategy Return: <b>{total_return:+.2f}%</b></span>
+                        <span class="positive">🟢 From Green periods: +{pos_return:.2f}%</span>
+                        <span class="negative">🔴 Avoided Red periods: +{abs(neg_return):.2f}%</span>
+                    </div>
+                    
                     <img src="data:image/png;base64,{image_base64}">
                 </div>
             </body>
@@ -326,10 +419,11 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
 
 def main():
     print("=" * 60)
-    print(f"🚀 BTC Cascade Lines Server (K={K})")
+    print("🚀 BTC Cascade Lines Server")
     print("=" * 60)
-    print(f"   Each line minimizes error/window^{K}")
+    print("   Each line minimizes error/window^K")
     print("   Then removes that window and continues")
+    print("   Green = Long, Red = Short")
     
     # Fetch data on startup
     print("\n📡 Fetching BTC data...")
