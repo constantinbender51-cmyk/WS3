@@ -11,7 +11,6 @@ matplotlib.use('Agg')  # Use non-interactive backend
 import io
 import base64
 from typing import List, Tuple, Dict
-import random
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -20,7 +19,7 @@ class BTCOptimalLookback:
         self.data = None
         self.timestamps = None
         self.prices = None
-        self.scenario_results = []
+        self.all_results = []
         self.full_start_date = None
         self.full_end_date = None
         
@@ -66,10 +65,12 @@ class BTCOptimalLookback:
         base_time = self.full_start_date.timestamp() * 1000
         self.timestamps = np.array([base_time + i * 3600000 for i in range(n_points)]).reshape(-1, 1)
         
-        # Generate synthetic BTC price with trend and noise
+        # Generate synthetic BTC price with trend, cycles, and noise
+        t = np.linspace(0, 4*np.pi, n_points)
         trend = np.linspace(40000, 45000, n_points)
-        noise = np.random.normal(0, 500, n_points)
-        self.prices = trend + noise
+        cycle = 2000 * np.sin(t)
+        noise = np.random.normal(0, 300, n_points)
+        self.prices = trend + cycle + noise
         
         print(f"Generated {n_points} hours of sample data")
         print(f"Period: {self.full_start_date.strftime('%Y-%m-%d')} to {self.full_end_date.strftime('%Y-%m-%d')}")
@@ -104,9 +105,8 @@ class BTCOptimalLookback:
         
         return X.flatten(), y_pred, total_error, avg_error_per_candle, model, (X_mean, X_std)
     
-    def run_analysis(self, prices: np.ndarray, timestamps: np.ndarray, scenario_name: str, 
-                     start_date: datetime, end_date: datetime) -> Dict:
-        """Run OLS analysis on given data and return results"""
+    def run_analysis(self, prices: np.ndarray, timestamps: np.ndarray, end_point_idx: int) -> Dict:
+        """Run OLS analysis on data up to a specific endpoint"""
         best_avg_error = float('inf')
         best_lookback = 10
         best_X = None
@@ -115,31 +115,11 @@ class BTCOptimalLookback:
         best_model = None
         best_normalization_params = None
         
-        results = {
-            'name': scenario_name,
-            'lookbacks': [],
-            'avg_errors': [],
-            'total_errors': [],
-            'best_lookback': None,
-            'best_avg_error': None,
-            'best_total_error': None,
-            'best_X': None,
-            'best_y_pred': None,
-            'best_model': None,
-            'best_normalization_params': None,
-            'data_length': len(prices),
-            'start_date': start_date,
-            'end_date': end_date,
-            'full_prices': prices,
-            'full_timestamps': timestamps
-        }
+        # Only consider lookbacks that fit within the available data
+        max_lookback = min(100, len(prices))
         
-        for lookback in range(10, min(101, len(prices) + 1)):
+        for lookback in range(10, max_lookback + 1):
             X, y_pred, total_error, avg_error, model, norm_params = self.ols(prices, timestamps, lookback)
-            
-            results['lookbacks'].append(lookback)
-            results['avg_errors'].append(avg_error)
-            results['total_errors'].append(total_error)
             
             if avg_error < best_avg_error:
                 best_avg_error = avg_error
@@ -150,106 +130,78 @@ class BTCOptimalLookback:
                 best_model = model
                 best_normalization_params = norm_params
         
-        results['best_lookback'] = best_lookback
-        results['best_avg_error'] = best_avg_error
-        results['best_total_error'] = best_total_error
-        results['best_X'] = best_X
-        results['best_y_pred'] = best_y_pred
-        results['best_model'] = best_model
-        results['best_normalization_params'] = best_normalization_params
-        
-        return results
+        return {
+            'end_point_idx': end_point_idx,
+            'end_date': self.full_start_date + timedelta(hours=end_point_idx),
+            'data_length': len(prices),
+            'best_lookback': best_lookback,
+            'best_avg_error': best_avg_error,
+            'best_total_error': best_total_error,
+            'best_model': best_model,
+            'best_normalization_params': best_normalization_params,
+            'prices': prices,
+            'timestamps': timestamps
+        }
     
-    def iterate(self) -> Tuple[int, np.ndarray, np.ndarray, float, float]:
-        """Iterate through lookback windows from 10 to 100 and find best average error"""
+    def iterate(self):
+        """Move endpoint 100 candles to the left and run analysis until data runs out"""
         print("\n" + "=" * 70)
-        print("📊 MAIN ANALYSIS - Full Dataset (30 days)")
+        print("📊 PROGRESSIVE ANALYSIS - Moving Endpoint 100 Candles Left")
         print("=" * 70)
         
-        # Run main analysis on full dataset
-        main_results = self.run_analysis(
-            self.prices, self.timestamps, 
-            "Main Analysis (Full 30 Days)", 
-            self.full_start_date, 
-            self.full_end_date
-        )
+        self.all_results = []
+        total_points = len(self.prices)
         
-        print(f"\n✅ Best lookback window: {main_results['best_lookback']} hours")
-        print(f"   Total Error: ${main_results['best_total_error']:,.2f}")
-        print(f"   Average Error per Candle: ${main_results['best_avg_error']:,.2f}")
+        # Start from the full dataset and move endpoint left by 100 each iteration
+        current_end = total_points
         
-        # Generate 3 test scenarios with random end points (>100 hours from start)
-        print("\n" + "=" * 70)
-        print("🧪 TEST SCENARIOS - Fixed Start Date, Random End Points")
-        print("=" * 70)
-        
-        self.scenario_results = [main_results]  # Store main results first
-        
-        # Calculate minimum end point (must have at least 100 hours of data)
-        min_hours = 100
-        max_hours = len(self.prices)
-        
-        # Generate 3 random end points between min_hours and max_hours
-        random.seed(42)  # For reproducibility
-        end_points = sorted([random.randint(min_hours, max_hours) for _ in range(3)], reverse=True)
-        
-        for i, hours_to_keep in enumerate(end_points, 1):
-            # Keep data from start up to random end point
-            test_prices = self.prices[:hours_to_keep]
-            test_timestamps = self.timestamps[:hours_to_keep]
+        iteration = 1
+        while current_end >= 200:  # Need at least 200 points for meaningful analysis (100+100)
+            # Slice data from beginning to current endpoint
+            test_prices = self.prices[:current_end]
+            test_timestamps = self.timestamps[:current_end]
             
-            # Calculate the actual end date
-            test_end_date = self.full_start_date + timedelta(hours=hours_to_keep)
+            end_date = self.full_start_date + timedelta(hours=current_end)
             
-            scenario_name = f"Scenario {i}: Keep first {hours_to_keep} hours (cut off last {len(self.prices) - hours_to_keep} hours)"
-            print(f"\n📌 {scenario_name}")
-            print(f"   Period: {self.full_start_date.strftime('%Y-%m-%d')} to {test_end_date.strftime('%Y-%m-%d')}")
+            print(f"\n📌 Iteration {iteration}: Data up to {end_date.strftime('%Y-%m-%d %H:%M')}")
             print(f"   Data points: {len(test_prices)} hours")
             
-            # Run analysis on test data
-            test_results = self.run_analysis(
-                test_prices, test_timestamps, 
-                scenario_name,
-                self.full_start_date,
-                test_end_date
-            )
-            self.scenario_results.append(test_results)
+            # Run analysis on this slice
+            result = self.run_analysis(test_prices, test_timestamps, current_end)
+            self.all_results.append(result)
             
-            print(f"   ✅ Best lookback: {test_results['best_lookback']} hours")
-            print(f"      Avg Error: ${test_results['best_avg_error']:,.2f}")
+            print(f"   ✅ Best lookback: {result['best_lookback']} hours")
+            print(f"      Avg Error: ${result['best_avg_error']:,.2f}")
+            
+            # Move endpoint 100 candles to the left
+            current_end -= 100
+            iteration += 1
         
-        return (main_results['best_lookback'], main_results['best_X'], 
-                main_results['best_y_pred'], main_results['best_total_error'], 
-                main_results['best_avg_error'])
+        print(f"\n✅ Completed {len(self.all_results)} progressive analyses")
+        return self.all_results
     
-    def plot(self, best_lookback: int, best_X: np.ndarray, best_y_pred: np.ndarray, 
-             best_total_error: float, best_avg_error: float) -> str:
-        """Create comprehensive plot with main analysis and 3 test scenarios"""
-        plt.figure(figsize=(16, 16))
+    def plot(self) -> str:
+        """Create plot showing all progressive OLS lines"""
+        plt.figure(figsize=(16, 12))
         
-        # Create 3x2 subplot grid (adding an extra row for the detailed price chart)
-        gs = plt.GridSpec(4, 2, height_ratios=[2.5, 1, 1, 1], hspace=0.3, wspace=0.3)
+        # Create 2x1 subplot grid
+        gs = plt.GridSpec(2, 1, height_ratios=[3, 1], hspace=0.3)
         
-        # Main price chart (top, spanning both columns) - Now with all OLS lines
-        ax_main = plt.subplot(gs[0, :])
+        # Main price chart with all OLS lines
+        ax_main = plt.subplot(gs[0])
         
         # Plot all prices
-        ax_main.plot(range(len(self.prices)), self.prices, 'b-', alpha=0.5, 
+        ax_main.plot(range(len(self.prices)), self.prices, 'b-', alpha=0.3, 
                     label='BTC Price (All Data)', linewidth=1)
         
-        # Define colors for different scenarios
-        colors = ['red', 'purple', 'brown', 'darkgreen']
-        line_styles = ['-', '--', '-.', ':']
+        # Generate a colormap for the progressive lines
+        cmap = plt.cm.viridis
+        colors = [cmap(i / len(self.all_results)) for i in range(len(self.all_results))]
         
-        # Plot OLS lines for each scenario
-        for idx, result in enumerate(self.scenario_results):
+        # Plot OLS lines for each progressive analysis
+        for idx, result in enumerate(reversed(self.all_results)):  # Reverse to show oldest first
             if result['best_model'] is not None:
-                # Get the data range for this scenario
-                start_idx = 0
-                end_idx = result['data_length']
-                data_range = range(start_idx, end_idx)
-                
-                # Get the lookback window for this scenario
+                end_idx = result['end_point_idx']
                 lookback = result['best_lookback']
                 lookback_start = end_idx - lookback
                 lookback_range = range(lookback_start, end_idx)
@@ -263,39 +215,25 @@ class BTCOptimalLookback:
                 X_norm = (X_lookback - X_mean) / X_std
                 y_pred = model.predict(X_norm.reshape(-1, 1))
                 
-                # Plot the OLS line for the lookback window
-                if idx == 0:
-                    label = f'Main OLS (lookback={lookback})'
-                    linewidth = 3
-                else:
-                    label = f'Scenario {idx} OLS (lookback={lookback})'
-                    linewidth = 2
+                # Plot the OLS line
+                alpha = 0.5 + (idx / len(self.all_results)) * 0.5  # Later lines more opaque
+                linewidth = 1.5 + (idx / len(self.all_results)) * 1.5
                 
                 ax_main.plot(lookback_range, y_pred, 
-                           color=colors[idx % len(colors)], 
-                           linestyle=line_styles[idx % len(line_styles)],
+                           color=colors[idx],
                            linewidth=linewidth,
-                           alpha=0.8,
-                           label=label)
+                           alpha=alpha,
+                           label=f'End: {result["end_date"].strftime("%m/%d")} (lookback={lookback})')
                 
-                # Mark the end point for test scenarios
-                if idx > 0:
-                    ax_main.axvline(x=end_idx, color=colors[idx], linestyle=':', alpha=0.5,
-                                   linewidth=1)
-                    # Add scenario label at the top
-                    ax_main.text(end_idx, ax_main.get_ylim()[1] * (0.95 - idx*0.05), 
-                                f'S{idx}', fontsize=8, color=colors[idx],
-                                ha='right', va='top')
+                # Mark the endpoint
+                ax_main.axvline(x=end_idx, color=colors[idx], linestyle=':', alpha=0.3, linewidth=1)
         
-        # Highlight the data points used in main analysis
-        if best_X is not None and best_y_pred is not None:
-            start_idx = len(self.prices) - len(best_X)
-            x_indices = range(start_idx, len(self.prices))
-            ax_main.scatter(x_indices, self.prices[start_idx:], c='orange', s=20, 
-                           alpha=0.5, label='Main Analysis Window')
+        # Mark the starting point
+        ax_main.axvline(x=len(self.prices) - 100, color='red', linestyle='--', alpha=0.5, 
+                       label='First Analysis End', linewidth=1)
         
-        ax_main.set_title(f'BTC Price (1h) - All OLS Lines from Test Scenarios\n'
-                         f'Fixed Start: {self.full_start_date.strftime("%Y-%m-%d")}', 
+        ax_main.set_title(f'BTC Price with Progressive OLS Lines\n'
+                         f'Moving Endpoint 100 Candles Left from {self.full_end_date.strftime("%Y-%m-%d")}', 
                          fontsize=14, fontweight='bold')
         ax_main.set_xlabel('Hours from Start')
         ax_main.set_ylabel('Price (USDT)')
@@ -303,25 +241,43 @@ class BTCOptimalLookback:
         ax_main.grid(True, alpha=0.3)
         
         # Add date range info
-        date_text = f'Full Period: {self.full_start_date.strftime("%Y-%m-%d")} to {self.full_end_date.strftime("%Y-%m-%d")}'
+        date_text = f'Period: {self.full_start_date.strftime("%Y-%m-%d")} to {self.full_end_date.strftime("%Y-%m-%d")}'
         ax_main.text(0.02, 0.98, date_text, transform=ax_main.transAxes, 
                     fontsize=9, verticalalignment='top',
                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
-        # Error analysis subplots for each scenario
-        titles = ["Main Analysis (Full 30 Days)", "Test Scenario 1", "Test Scenario 2", "Test Scenario 3"]
-        axes = [plt.subplot(gs[1, 0]), plt.subplot(gs[1, 1]), 
-                plt.subplot(gs[2, 0]), plt.subplot(gs[2, 1])]
+        # Summary plot (bottom)
+        ax_summary = plt.subplot(gs[1])
         
-        for ax, result, title in zip(axes, self.scenario_results, titles):
-            self.plot_error_comparison(ax, result, title)
+        iterations = range(1, len(self.all_results) + 1)
+        lookbacks = [r['best_lookback'] for r in self.all_results]
+        errors = [r['best_avg_error'] for r in self.all_results]
         
-        # Add a summary subplot at the bottom
-        ax_summary = plt.subplot(gs[3, :])
-        self.plot_summary(ax_summary)
+        # Create twin axes
+        ax_summary.plot(iterations, lookbacks, 'b-o', linewidth=2, markersize=8, label='Best Lookback')
+        ax_summary.set_xlabel('Iteration (Moving Left)')
+        ax_summary.set_ylabel('Lookback Window (hours)', color='b')
+        ax_summary.tick_params(axis='y', labelcolor='b')
+        ax_summary.grid(True, alpha=0.3)
         
-        plt.suptitle('BTC OLS Analysis: Main Results vs 3 Test Scenarios with OLS Lines', 
-                    fontsize=16, fontweight='bold', y=0.98)
+        ax2 = ax_summary.twinx()
+        ax2.plot(iterations, errors, 'r-s', linewidth=2, markersize=8, label='Avg Error')
+        ax2.set_ylabel('Avg Error ($)', color='r')
+        ax2.tick_params(axis='y', labelcolor='r')
+        
+        # Add endpoint dates as x-tick labels
+        dates = [r['end_date'].strftime('%m/%d') for r in self.all_results]
+        ax_summary.set_xticks(iterations)
+        ax_summary.set_xticklabels(dates, rotation=45, ha='right')
+        
+        ax_summary.set_title('Progression of Best Lookback and Error as Endpoint Moves Left', fontsize=12)
+        
+        # Add legend
+        lines1, labels1 = ax_summary.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax_summary.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=9)
+        
+        plt.tight_layout()
         
         # Save plot to bytes buffer
         buf = io.BytesIO()
@@ -332,75 +288,6 @@ class BTCOptimalLookback:
         # Encode as base64
         image_base64 = base64.b64encode(buf.read()).decode('utf-8')
         return image_base64
-    
-    def plot_error_comparison(self, ax, results: Dict, title: str):
-        """Plot error comparison for a single scenario"""
-        # Plot average error
-        ax.plot(results['lookbacks'], results['avg_errors'], 'g-', linewidth=2, 
-                label='Avg Error/Candle')
-        ax.scatter([results['best_lookback']], [results['best_avg_error']], 
-                  c='red', s=100, zorder=5, marker='*',
-                  label=f"Best: {results['best_lookback']}h")
-        
-        # Add a horizontal line at the best error
-        ax.axhline(y=results['best_avg_error'], color='red', linestyle='--', 
-                   alpha=0.3, linewidth=1)
-        
-        # Format date range for title
-        date_range = f"{results['start_date'].strftime('%m/%d')} - {results['end_date'].strftime('%m/%d')}"
-        
-        ax.set_xlabel('Lookback Window (hours)')
-        ax.set_ylabel('Avg Error ($)')
-        ax.set_title(f'{title}\n{date_range} | Best: {results["best_lookback"]}h', 
-                    fontsize=9)
-        ax.legend(fontsize=7, loc='upper right')
-        ax.grid(True, alpha=0.3)
-        
-        # Format y-axis to show dollars
-        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x:,.0f}'))
-    
-    def plot_summary(self, ax):
-        """Plot summary of best lookbacks across scenarios"""
-        scenarios = ['Main', 'Test 1', 'Test 2', 'Test 3']
-        lookbacks = [r['best_lookback'] for r in self.scenario_results]
-        errors = [r['best_avg_error'] for r in self.scenario_results]
-        
-        x = np.arange(len(scenarios))
-        width = 0.35
-        
-        # Create bars
-        bars1 = ax.bar(x - width/2, lookbacks, width, label='Best Lookback', color='steelblue')
-        ax.set_xlabel('Scenario')
-        ax.set_ylabel('Lookback Window (hours)', color='steelblue')
-        ax.tick_params(axis='y', labelcolor='steelblue')
-        
-        # Create second y-axis for errors
-        ax2 = ax.twinx()
-        bars2 = ax2.bar(x + width/2, errors, width, label='Avg Error', color='coral', alpha=0.7)
-        ax2.set_ylabel('Avg Error ($)', color='coral')
-        ax2.tick_params(axis='y', labelcolor='coral')
-        
-        # Add value labels on bars
-        for bar in bars1:
-            height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height,
-                   f'{int(height)}h', ha='center', va='bottom')
-        
-        for bar in bars2:
-            height = bar.get_height()
-            ax2.text(bar.get_x() + bar.get_width()/2., height,
-                   f'${height:,.0f}', ha='center', va='bottom')
-        
-        ax.set_title('Summary: Best Lookback and Error by Scenario', fontsize=12)
-        ax.set_xticks(x)
-        ax.set_xticklabels(scenarios)
-        
-        # Add legend
-        lines1, labels1 = ax.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=8)
-        
-        ax.grid(True, alpha=0.3, axis='y')
 
 class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
     btc_analyzer = None
@@ -412,9 +299,9 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             
             if BTCRequestHandler.btc_analyzer and BTCRequestHandler.btc_analyzer.prices is not None:
-                best_lookback, best_X, best_y_pred, best_total_error, best_avg_error = BTCRequestHandler.btc_analyzer.iterate()
-                image_base64 = BTCRequestHandler.btc_analyzer.plot(best_lookback, best_X, best_y_pred, 
-                                                                  best_total_error, best_avg_error)
+                # Run progressive analysis
+                results = BTCRequestHandler.btc_analyzer.iterate()
+                image_base64 = BTCRequestHandler.btc_analyzer.plot()
                 
                 # Calculate some additional statistics
                 prices = BTCRequestHandler.btc_analyzer.prices
@@ -426,7 +313,7 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                 <!DOCTYPE html>
                 <html>
                 <head>
-                    <title>BTC OLS Analysis - With Test Scenario OLS Lines</title>
+                    <title>BTC Progressive OLS Analysis</title>
                     <style>
                         body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f0f0f0; }}
                         .container {{ max-width: 1400px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
@@ -443,70 +330,62 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                         .stat-sub {{ font-size: 12px; margin-top: 5px; opacity: 0.8; }}
                         img {{ max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 10px; margin-top: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }}
                         .footer {{ margin-top: 30px; color: #666; font-size: 12px; text-align: center; padding-top: 20px; border-top: 1px solid #eee; }}
-                        .error-metric {{ background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 20px 0; }}
-                        .scenario-table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
-                        .scenario-table th {{ background-color: #4CAF50; color: white; padding: 12px; text-align: left; }}
-                        .scenario-table td {{ padding: 10px; border-bottom: 1px solid #ddd; }}
-                        .scenario-table tr:hover {{ background-color: #f5f5f5; }}
-                        .main-row {{ background-color: #e3f2fd; font-weight: bold; }}
-                        .date-range {{ font-family: monospace; }}
-                        .ols-legend {{ display: flex; flex-wrap: wrap; margin: 10px 0; padding: 10px; background-color: #f9f9f9; border-radius: 5px; }}
-                        .legend-item {{ display: flex; align-items: center; margin-right: 20px; }}
-                        .color-box {{ width: 20px; height: 10px; margin-right: 5px; }}
+                        .methodology {{ background-color: #e8f4f8; border-left: 4px solid #2196F3; padding: 15px; margin: 20px 0; }}
+                        .results-table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
+                        .results-table th {{ background-color: #2196F3; color: white; padding: 10px; text-align: left; }}
+                        .results-table td {{ padding: 8px; border-bottom: 1px solid #ddd; }}
+                        .results-table tr:hover {{ background-color: #f5f5f5; }}
                     </style>
                 </head>
                 <body>
                     <div class="container">
-                        <h1>📊 BTC OLS Analysis with Test Scenario OLS Lines</h1>
-                        <p>Fixed Start Date: <strong>{analyzer.full_start_date.strftime('%Y-%m-%d')}</strong> | Random End Points (>100 hours from start)</p>
+                        <h1>📊 BTC Progressive OLS Analysis</h1>
+                        <p>Moving Endpoint 100 Candles Left from <strong>{analyzer.full_end_date.strftime('%Y-%m-%d')}</strong></p>
                         
-                        <div class="error-metric">
-                            <strong>🎯 Testing Methodology:</strong> Keep the same 30-day start date but randomly cut off recent data 
-                            (must keep at least 100 hours). The price chart now shows the OLS lines from each test scenario.
+                        <div class="methodology">
+                            <strong>🔬 Methodology:</strong> Starting from the full dataset, we progressively move the endpoint 
+                            100 candles to the left and run the OLS optimization algorithm at each step. Each colored line on 
+                            the price chart represents the best OLS fit for that endpoint. This shows how the optimal trend 
+                            line evolves as we remove recent data.
                         </div>
                         
                         <div class="info">
-                            <h3>📈 Main Analysis Results (Full 30 Days):</h3>
-                            <p><strong>Period:</strong> {analyzer.full_start_date.strftime('%Y-%m-%d')} to {analyzer.full_end_date.strftime('%Y-%m-%d')}</p>
-                            <p><strong>Optimal Lookback Window:</strong> {best_lookback} hours</p>
-                            <p><strong>Total Error (Sum |price-ols|):</strong> ${best_total_error:,.2f}</p>
-                            <p><strong>Average Error per Candle:</strong> ${best_avg_error:,.2f}</p>
+                            <h3>📈 Analysis Summary:</h3>
+                            <p><strong>Full Period:</strong> {analyzer.full_start_date.strftime('%Y-%m-%d')} to {analyzer.full_end_date.strftime('%Y-%m-%d')}</p>
+                            <p><strong>Total Iterations:</strong> {len(results)}</p>
+                            <p><strong>Step Size:</strong> 100 hours</p>
                             <p><strong>Total Data Points:</strong> {len(prices)} hours</p>
                         </div>
                         
-                        <h3>🧪 Test Scenarios Results (Fixed Start, Random End Points):</h3>
-                        <table class="scenario-table">
+                        <h3>📋 Progressive Results:</h3>
+                        <table class="results-table">
                             <tr>
-                                <th>Scenario</th>
-                                <th>Period</th>
+                                <th>Iteration</th>
+                                <th>End Date</th>
                                 <th>Data Points</th>
-                                <th>Hours Cut</th>
                                 <th>Best Lookback</th>
                                 <th>Avg Error</th>
                                 <th>Change</th>
                             </tr>
                 """
                 
-                # Add scenario rows
-                scenarios = analyzer.scenario_results
-                main_result = scenarios[0]
-                
-                for i, result in enumerate(scenarios[1:], 1):
-                    change = result['best_lookback'] - main_result['best_lookback']
-                    change_str = f"{change:+d} hours" if change != 0 else "No change"
-                    change_color = "green" if change == 0 else "orange" if abs(change) < 20 else "red"
+                # Add result rows
+                for i, result in enumerate(results, 1):
+                    change = ""
+                    if i > 1:
+                        diff = result['best_lookback'] - results[i-2]['best_lookback']
+                        change = f"{diff:+d}" if diff != 0 else "0"
                     
-                    hours_cut = len(analyzer.prices) - result['data_length']
+                    change_color = "green" if change == "0" else "orange" if abs(int(change)) < 20 else "red" if change else "black"
                     
                     html += f"""
                             <tr>
-                                <td><strong>Scenario {i}</strong></td>
-                                <td class="date-range">{result['start_date'].strftime('%m/%d')} - {result['end_date'].strftime('%m/%d')}</td>
+                                <td>{i}</td>
+                                <td>{result['end_date'].strftime('%Y-%m-%d')}</td>
                                 <td>{result['data_length']}</td>
-                                <td>{hours_cut} hrs</td>
                                 <td>{result['best_lookback']} hours</td>
                                 <td>${result['best_avg_error']:,.2f}</td>
-                                <td style="color: {change_color};">{change_str}</td>
+                                <td style="color: {change_color};">{change}</td>
                             </tr>
                     """
                 
@@ -536,13 +415,12 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                             </div>
                         </div>
                         
-                        <img src="data:image/png;base64,{image_base64}" alt="BTC Price and Error Analysis with Test Scenarios">
+                        <img src="data:image/png;base64,{image_base64}" alt="BTC Progressive OLS Analysis">
                         
                         <div class="footer">
                             <p>Data from Binance API | Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-                            <p>Analysis looks for lookback window that minimizes average absolute deviation per candle</p>
-                            <p>Test scenarios keep the same start date but randomly cut off recent data (minimum 100 hours retained)</p>
-                            <p>The price chart shows OLS lines from each scenario with different colors/styles</p>
+                            <p>Progressive analysis moves endpoint 100 candles left at each iteration</p>
+                            <p>Each colored line shows the optimal OLS fit for that endpoint</p>
                         </div>
                     </div>
                 </body>
@@ -558,7 +436,7 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
 def main():
     """Main function to run the analysis and server"""
     print("=" * 70)
-    print("BTC OLS Analysis - With Test Scenario OLS Lines")
+    print("BTC Progressive OLS Analysis - Moving Endpoint 100 Candles Left")
     print("=" * 70)
     
     # Create analyzer instance
