@@ -2,7 +2,6 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from matplotlib.patches import Rectangle
 import http.server
 import socketserver
 import io
@@ -15,6 +14,7 @@ import time
 import threading
 import json
 from pathlib import Path
+import traceback
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -27,7 +27,7 @@ class BTCTrendAnalyzer:
         self.optimized_lines = []
         self.horizontal_lines = []
         self.trades = []
-        self.live_trades = []  # Store live trading results
+        self.live_trades = []
         self.current_position = None
         self.current_signal = None
         self.last_update = None
@@ -40,7 +40,6 @@ class BTCTrendAnalyzer:
         """Fetch price data from Binance"""
         base_url = "https://api.binance.com/api/v3/klines"
         
-        # Calculate start time
         end_time = datetime.now()
         start_time = end_time - timedelta(days=self.days)
         
@@ -57,7 +56,6 @@ class BTCTrendAnalyzer:
             response.raise_for_status()
             data = response.json()
             
-            # Convert to DataFrame
             df = pd.DataFrame(data, columns=[
                 'timestamp', 'open', 'high', 'low', 'close', 'volume',
                 'close_time', 'quote_asset_volume', 'number_of_trades',
@@ -66,23 +64,18 @@ class BTCTrendAnalyzer:
             
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df['close'] = df['close'].astype(float)
-            df['open'] = df['open'].astype(float)
-            df['high'] = df['high'].astype(float)
-            df['low'] = df['low'].astype(float)
             
             self.data = df[['timestamp', 'close']].copy()
             return True
             
         except Exception as e:
             print(f"Error fetching data: {e}")
-            # Generate sample data for testing
             self.generate_sample_data()
             return False
     
     def generate_sample_data(self):
         """Generate sample data for testing"""
         dates = pd.date_range(end=datetime.now(), periods=24*30, freq='1h')
-        # Create a trending price with some noise
         trend = np.linspace(40000, 45000, len(dates))
         noise = np.random.normal(0, 1000, len(dates))
         prices = trend + noise
@@ -93,22 +86,45 @@ class BTCTrendAnalyzer:
         })
         print("Generated sample data for testing")
     
-    def fetch_latest_candles(self, limit=100):
-        """Fetch only the most recent candles for live trading"""
+    def fetch_closed_candles(self, limit=100):
+        """
+        Fetch only closed candles (skip the current open candle)
+        Returns candles ending at the previous full hour
+        """
         base_url = "https://api.binance.com/api/v3/klines"
+        
+        # Get current time and align to hour
+        now = datetime.now()
+        
+        # For 1h interval, we want candles that end at the previous hour mark
+        # If current time is 14:35, we want candles up to 14:00
+        
+        # Calculate end time for the last COMPLETED candle
+        if self.interval == '1h':
+            # Round down to the nearest hour for the last completed candle
+            if now.minute < 1 or now.second < 1:
+                # If we're at the very start of a new candle, go back 1 more hour
+                last_completed_hour = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+            else:
+                last_completed_hour = now.replace(minute=0, second=0, microsecond=0)
+            
+            end_time = last_completed_hour
+            start_time = end_time - timedelta(hours=limit)
         
         params = {
             'symbol': self.symbol,
             'interval': self.interval,
+            'startTime': int(start_time.timestamp() * 1000),
+            'endTime': int(end_time.timestamp() * 1000),
             'limit': limit
         }
         
         try:
+            print(f"Fetching {limit} closed candles ending at {end_time.strftime('%Y-%m-%d %H:00')}")
             response = requests.get(base_url, params=params)
             response.raise_for_status()
             data = response.json()
             
-            # Convert to DataFrame
             df = pd.DataFrame(data, columns=[
                 'timestamp', 'open', 'high', 'low', 'close', 'volume',
                 'close_time', 'quote_asset_volume', 'number_of_trades',
@@ -118,10 +134,12 @@ class BTCTrendAnalyzer:
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df['close'] = df['close'].astype(float)
             
+            print(f"Got {len(df)} candles from {df['timestamp'].iloc[0]} to {df['timestamp'].iloc[-1]}")
+            
             return df[['timestamp', 'close']].copy()
             
         except Exception as e:
-            print(f"Error fetching latest candles: {e}")
+            print(f"Error fetching closed candles: {e}")
             return None
     
     def ols_fit(self, prices):
@@ -162,7 +180,7 @@ class BTCTrendAnalyzer:
         return best_window, best_line, best_slope, best_error, best_model
     
     def analyze_trends(self):
-        """Main analysis function - YOUR ORIGINAL FUNCTION"""
+        """Main analysis function"""
         if self.data is None or len(self.data) < 100:
             print("Insufficient data")
             return
@@ -170,22 +188,18 @@ class BTCTrendAnalyzer:
         prices = self.data['close'].copy()
         timestamps = self.data['timestamp'].copy()
         
-        # Start from the end and work backwards
         current_position = len(prices)
         min_window = 10
         
         while current_position > min_window:
-            # Get prices up to current position
             current_prices = prices.iloc[:current_position]
             
-            # Find optimal window
             window_size, line_values, slope, error, model = self.find_optimal_window(
                 current_prices, 
                 min_window=min_window, 
                 max_window=min(100, current_position)
             )
             
-            # Store the line
             start_idx = current_position - window_size
             end_idx = current_position
             
@@ -203,7 +217,6 @@ class BTCTrendAnalyzer:
             
             self.optimized_lines.append(line_data)
             
-            # Calculate trade return
             start_price = prices.iloc[start_idx]
             end_price = prices.iloc[end_idx-1]
             
@@ -219,37 +232,31 @@ class BTCTrendAnalyzer:
                 'type': 'long' if slope > 0 else 'short'
             })
             
-            # Move position back (remove prices and continue)
             current_position = start_idx
             
-            # Check for color change and mark horizontal line
             if len(self.optimized_lines) >= 2:
                 prev_line = self.optimized_lines[-2]
                 curr_line = self.optimized_lines[-1]
                 
                 if prev_line['color'] != curr_line['color']:
-                    # Mark horizontal line at the transition point
                     self.horizontal_lines.append({
                         'time': timestamps.iloc[start_idx],
                         'price': prices.iloc[start_idx]
                     })
     
     def get_current_signal(self):
-        """Get current trading signal based on latest data"""
+        """Get current trading signal based on latest closed candles"""
         if self.data is None or len(self.data) < 100:
             return None
         
         prices = self.data['close'].copy()
         
-        # Find optimal window for most recent data
         window_size, line_values, slope, error, model = self.find_optimal_window(
             prices, min_window=10, max_window=100
         )
         
-        # Determine signal
         signal = 'long' if slope > 0 else 'short'
         
-        # Get line values for the most recent points
         recent_prices = prices[-window_size:]
         x_recent = np.arange(len(recent_prices)).reshape(-1, 1)
         line_recent = model.predict(x_recent).flatten()
@@ -259,7 +266,7 @@ class BTCTrendAnalyzer:
             'slope': slope,
             'window_size': window_size,
             'error': error,
-            'current_price': prices.iloc[-1],
+            'current_price': prices.iloc[-1],  # This is now the last CLOSED candle
             'line_price': line_recent[-1],
             'timestamp': self.data['timestamp'].iloc[-1],
             'model': model,
@@ -268,13 +275,13 @@ class BTCTrendAnalyzer:
         }
     
     def update_live_data(self):
-        """Fetch latest data and update analysis"""
-        print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Updating live data...")
+        """Fetch latest closed candles and update analysis"""
+        print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Fetching closed candles...")
         
-        # Fetch latest 200 candles
-        new_data = self.fetch_latest_candles(limit=200)
+        # Fetch 100 closed candles (ending at last completed hour)
+        new_data = self.fetch_closed_candles(limit=100)
         
-        if new_data is not None:
+        if new_data is not None and len(new_data) > 0:
             self.data = new_data
             self.last_update = datetime.now()
             
@@ -284,14 +291,13 @@ class BTCTrendAnalyzer:
             self.trades = []
             self.analyze_trends()
             
-            # Get current signal
             signal_info = self.get_current_signal()
             
             if signal_info:
                 self.manage_position(signal_info)
                 
-            print(f"Update complete. Current price: ${signal_info['current_price']:,.2f}")
-            print(f"Signal: {signal_info['signal'].upper()} (slope: {signal_info['slope']:.6f})")
+            print(f"✅ Update complete. Last closed candle: {signal_info['timestamp'].strftime('%Y-%m-%d %H:00')} @ ${signal_info['current_price']:,.2f}")
+            print(f"📊 Signal: {signal_info['signal'].upper()} (slope: {signal_info['slope']:.6f})")
             
             return True
         return False
@@ -302,12 +308,10 @@ class BTCTrendAnalyzer:
         current_price = signal_info['current_price']
         current_time = signal_info['timestamp']
         
-        # If no position, open one
         if self.current_position is None:
             self.open_position(current_signal, current_price, current_time)
             return
         
-        # Check for signal change
         if current_signal != self.current_signal:
             self.close_position(current_price, current_time)
             self.open_position(current_signal, current_price, current_time)
@@ -319,24 +323,20 @@ class BTCTrendAnalyzer:
         self.position_open_time = timestamp
         self.position_open_price = price
         
-        print(f"\n📈 OPENING {signal.upper()} POSITION")
-        print(f"   Time: {timestamp}")
-        print(f"   Price: ${price:,.2f}")
+        print(f"\n📈 OPENING {signal.upper()} @ ${price:,.2f} (Candle: {timestamp.strftime('%Y-%m-%d %H:00')})")
     
     def close_position(self, close_price, close_time):
         """Close current position and calculate PnL"""
         if self.current_position is None:
             return
         
-        # Calculate PnL
         if self.current_position == 'long':
             pnl = (close_price - self.position_open_price) / self.position_open_price * 100
-        else:  # short
+        else:
             pnl = (self.position_open_price - close_price) / self.position_open_price * 100
         
         self.total_pnl += pnl
         
-        # Record trade
         trade = {
             'open_time': self.position_open_time,
             'close_time': close_time,
@@ -349,45 +349,47 @@ class BTCTrendAnalyzer:
         self.live_trades.append(trade)
         self.pnl_history.append(self.total_pnl)
         
-        print(f"\n📉 CLOSING {self.current_position.upper()} POSITION")
-        print(f"   Open Time: {self.position_open_time}")
-        print(f"   Close Time: {close_time}")
-        print(f"   Open Price: ${self.position_open_price:,.2f}")
-        print(f"   Close Price: ${close_price:,.2f}")
-        print(f"   PnL: {pnl:+.2f}%")
-        print(f"   Total PnL: {self.total_pnl:+.2f}%")
+        print(f"\n📉 CLOSING {self.current_position.upper()} @ ${close_price:,.2f}")
+        print(f"   PnL: {pnl:+.2f}% | Total: {self.total_pnl:+.2f}%")
         
-        # Reset position
         self.current_position = None
     
-    def run_live_trading(self, check_interval=3601):  # 1 hour + 1 second
-        """Run live trading loop"""
+    def run_live_trading(self):
+        """Run live trading loop synced to hour + 1 second"""
         print("\n" + "="*60)
-        print("STARTING LIVE TRADING SESSION")
+        print("STARTING LIVE TRADING - SYNCED TO HOUR + 1 SECOND")
         print("="*60)
         
-        # Initial data fetch and analysis
-        print("Fetching initial data...")
+        # Initial data fetch
         self.update_live_data()
         
-        # Main trading loop
         while True:
             try:
-                # Wait for next interval
-                next_check = datetime.now() + timedelta(seconds=check_interval)
-                print(f"\nNext update at: {next_check.strftime('%Y-%m-%d %H:%M:%S')}")
+                # Calculate next run time (top of next hour + 1 second)
+                now = datetime.now()
                 
-                time.sleep(check_interval)
+                # Next hour at 1 second past the hour
+                if now.minute == 0 and now.second >= 1:
+                    # We're in the first minute, schedule for next hour
+                    next_run = (now + timedelta(hours=1)).replace(minute=0, second=1, microsecond=0)
+                else:
+                    # Schedule for next hour at 1 second past
+                    next_run = (now + timedelta(hours=1)).replace(minute=0, second=1, microsecond=0)
+                
+                sleep_seconds = (next_run - now).total_seconds()
+                
+                print(f"\n⏰ Next update at: {next_run.strftime('%Y-%m-%d %H:%M:%S')} (in {sleep_seconds:.0f} seconds)")
+                
+                time.sleep(sleep_seconds)
                 
                 # Update data and manage positions
                 self.update_live_data()
                 
-                # Save trade history periodically
+                # Save trade history
                 self.save_trade_history()
                 
             except KeyboardInterrupt:
-                print("\n\nStopping live trading...")
-                # Close any open position
+                print("\n🛑 Stopping live trading...")
                 if self.current_position is not None:
                     current_price = self.fetch_current_price()
                     if current_price:
@@ -395,11 +397,11 @@ class BTCTrendAnalyzer:
                 self.save_trade_history()
                 break
             except Exception as e:
-                print(f"Error in trading loop: {e}")
-                time.sleep(60)  # Wait a minute before retrying
+                print(f"❌ Error in trading loop: {e}")
+                time.sleep(60)
     
     def fetch_current_price(self):
-        """Fetch current BTC price"""
+        """Fetch current BTC price (for emergency closes only)"""
         try:
             url = "https://api.binance.com/api/v3/ticker/price"
             params = {'symbol': self.symbol}
@@ -408,7 +410,7 @@ class BTCTrendAnalyzer:
             data = response.json()
             return float(data['price'])
         except Exception as e:
-            print(f"Error fetching current price: {e}")
+            print(f"Error fetching price: {e}")
             return None
     
     def save_trade_history(self):
@@ -419,8 +421,8 @@ class BTCTrendAnalyzer:
             'total_pnl': self.total_pnl,
             'trades': [
                 {
-                    'open_time': t['open_time'].isoformat() if isinstance(t['open_time'], datetime) else str(t['open_time']),
-                    'close_time': t['close_time'].isoformat() if isinstance(t['close_time'], datetime) else str(t['close_time']),
+                    'open_time': t['open_time'].isoformat(),
+                    'close_time': t['close_time'].isoformat(),
                     'position': t['position'],
                     'open_price': float(t['open_price']),
                     'close_price': float(t['close_price']),
@@ -429,14 +431,11 @@ class BTCTrendAnalyzer:
                 }
                 for t in self.live_trades
             ],
-            'pnl_history': [float(p) for p in self.pnl_history],
             'last_update': datetime.now().isoformat()
         }
         
         with open(history_file, 'w') as f:
             json.dump(history, f, indent=2)
-        
-        print(f"\nTrade history saved to {history_file}")
     
     def load_trade_history(self):
         """Load trade history from file"""
@@ -446,358 +445,228 @@ class BTCTrendAnalyzer:
                 history = json.load(f)
             
             self.total_pnl = history.get('total_pnl', 0)
-            self.pnl_history = history.get('pnl_history', [])
             
-            # Convert string times back to datetime
-            self.live_trades = []
             for t in history.get('trades', []):
                 t['open_time'] = datetime.fromisoformat(t['open_time'])
                 t['close_time'] = datetime.fromisoformat(t['close_time'])
                 self.live_trades.append(t)
             
-            print(f"Loaded {len(self.live_trades)} previous trades")
-            print(f"Previous total PnL: {self.total_pnl:+.2f}%")
+            print(f"📚 Loaded {len(self.live_trades)} previous trades")
+            print(f"💰 Previous total PnL: {self.total_pnl:+.2f}%")
     
     def plot_results(self):
-        """Plot all results - FIXED VERSION with bounds checking"""
+        """Plot results with bounds checking"""
         if self.data is None or len(self.data) == 0:
-            print("No data to plot")
             return None
         
         try:
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), 
-                                            gridspec_kw={'height_ratios': [3, 1]})
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), gridspec_kw={'height_ratios': [3, 1]})
             
-            # Plot price data
-            ax1.plot(self.data['timestamp'], self.data['close'], 
-                    color='blue', alpha=0.5, linewidth=1, label='BTC Price')
+            # Price line
+            ax1.plot(self.data['timestamp'], self.data['close'], color='blue', alpha=0.5, linewidth=1, label='Price')
             
-            # Plot optimized lines - with bounds checking
-            valid_lines = 0
+            # Trend lines
             for line in self.optimized_lines:
                 try:
-                    # Make sure indices are within current data bounds
-                    start_idx = max(0, min(line['start_idx'], len(self.data) - 1))
-                    end_idx = max(start_idx + 1, min(line['end_idx'], len(self.data)))
-                    
-                    if start_idx < end_idx and start_idx < len(self.data):
-                        x_values = self.data['timestamp'].iloc[start_idx:end_idx]
-                        y_values = line['values']
-                        
-                        # Trim y_values to match x_values length if needed
-                        if len(x_values) < len(y_values):
-                            y_values = y_values[:len(x_values)]
-                        
-                        if len(x_values) > 0 and len(y_values) > 0 and len(x_values) == len(y_values):
-                            ax1.plot(x_values, y_values, 
-                                    color=line['color'], 
-                                    linewidth=2, 
-                                    alpha=0.7)
-                            valid_lines += 1
-                except Exception as e:
-                    print(f"Error plotting line: {e}")
-                    continue
-            
-            print(f"Plotted {valid_lines} optimized lines")
-            
-            # Plot horizontal lines
-            for h_line in self.horizontal_lines:
-                try:
-                    ax1.axhline(y=h_line['price'], 
-                               xmin=0, xmax=1, 
-                               color='black', 
-                               linestyle='--', 
-                               linewidth=1, 
-                               alpha=0.5)
-                    ax1.axvline(x=h_line['time'], 
-                               color='black', 
-                               linestyle='--', 
-                               linewidth=1, 
-                               alpha=0.5)
-                except Exception as e:
-                    print(f"Error plotting horizontal line: {e}")
-                    continue
-            
-            # Formatting
-            ax1.set_title(f'{self.symbol} Price Analysis with OLS Trends', fontsize=16)
-            ax1.set_ylabel('Price (USDT)', fontsize=12)
-            ax1.legend()
-            ax1.grid(True, alpha=0.3)
-            
-            # Format x-axis dates
-            ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
-            ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
-            plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
-            
-            # Plot trade returns
-            if self.trades:
-                trade_colors = ['green' if t['return'] > 0 else 'red' for t in self.trades]
-                trade_returns = [t['return'] * 100 for t in self.trades]
-                
-                bars = ax2.bar(range(len(trade_returns)), trade_returns, color=trade_colors, alpha=0.7)
-                
-                # Add value labels on bars
-                for i, (bar, ret) in enumerate(zip(bars, trade_returns)):
-                    height = bar.get_height()
-                    ax2.text(bar.get_x() + bar.get_width()/2., height,
-                            f'{ret:.1f}%', ha='center', va='bottom' if height > 0 else 'top', fontsize=8)
-            
-            ax2.set_title('Trade Returns (%)', fontsize=16)
-            ax2.set_xlabel('Trade Number', fontsize=12)
-            ax2.set_ylabel('Return (%)', fontsize=12)
-            ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
-            ax2.grid(True, alpha=0.3)
-            
-            plt.tight_layout()
-            return fig
-            
-        except Exception as e:
-            print(f"Error in plot_results: {e}")
-            return None
-    
-    def create_live_plot(self):
-        """Create plot with live trading data"""
-        try:
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), 
-                                            gridspec_kw={'height_ratios': [3, 1]})
-            
-            # Plot price data
-            ax1.plot(self.data['timestamp'], self.data['close'], 
-                    color='blue', alpha=0.3, linewidth=1, label='BTC Price')
-            
-            # Plot optimized lines from original analysis - with bounds checking
-            for line in self.optimized_lines:
-                try:
-                    start_idx = max(0, min(line['start_idx'], len(self.data) - 1))
-                    end_idx = max(start_idx + 1, min(line['end_idx'], len(self.data)))
+                    start_idx = max(0, min(line['start_idx'], len(self.data)-1))
+                    end_idx = max(start_idx+1, min(line['end_idx'], len(self.data)))
                     
                     if start_idx < end_idx:
-                        x_values = self.data['timestamp'].iloc[start_idx:end_idx]
-                        y_values = line['values']
+                        x_vals = self.data['timestamp'].iloc[start_idx:end_idx]
+                        y_vals = line['values'][:len(x_vals)]
                         
-                        if len(x_values) < len(y_values):
-                            y_values = y_values[:len(x_values)]
-                        
-                        if len(x_values) > 0 and len(y_values) > 0 and len(x_values) == len(y_values):
-                            ax1.plot(x_values, y_values, 
-                                    color=line['color'], 
-                                    linewidth=1.5, 
-                                    alpha=0.5)
+                        if len(x_vals) == len(y_vals):
+                            ax1.plot(x_vals, y_vals, color=line['color'], linewidth=2, alpha=0.7)
                 except:
                     continue
             
-            # Plot current optimal line
-            signal_info = self.get_current_signal()
-            if signal_info:
-                # Plot the most recent optimal window
-                recent_times = self.data['timestamp'].iloc[-signal_info['window_size']:]
-                recent_line_values = signal_info['line_values']
-                
-                if len(recent_times) == len(recent_line_values):
-                    ax1.plot(recent_times, recent_line_values, 
-                            color='green' if signal_info['signal'] == 'long' else 'red',
-                            linewidth=3, alpha=0.8, 
-                            label=f"Current {signal_info['signal'].upper()} Signal")
+            # Current signal
+            signal = self.get_current_signal()
+            if signal:
+                recent_times = self.data['timestamp'].iloc[-signal['window_size']:]
+                recent_vals = signal['line_values'][:len(recent_times)]
+                if len(recent_times) == len(recent_vals):
+                    ax1.plot(recent_times, recent_vals, 
+                            color='lime' if signal['signal']=='long' else 'red',
+                            linewidth=3, label=f'Signal: {signal["signal"].upper()}')
             
-            # Plot trade markers from live trading
-            for trade in self.live_trades:
-                try:
-                    # Mark entry
-                    ax1.scatter(trade['open_time'], trade['open_price'], 
-                               color='green' if trade['position'] == 'long' else 'red',
-                               s=100, marker='^', zorder=5)
-                    # Mark exit
-                    ax1.scatter(trade['close_time'], trade['close_price'],
-                               color='red' if trade['position'] == 'long' else 'green',
-                               s=100, marker='v', zorder=5)
-                except:
-                    continue
+            # Mark last closed candle
+            last_time = self.data['timestamp'].iloc[-1]
+            last_price = self.data['close'].iloc[-1]
+            ax1.scatter(last_time, last_price, color='black', s=100, zorder=5, marker='o')
             
-            # Plot current position if open
-            if self.current_position and self.position_open_price:
-                ax1.axhline(y=self.position_open_price, 
-                           color='yellow', linestyle='--', alpha=0.5,
-                           label=f"Open Position @ ${self.position_open_price:,.0f}")
-            
-            ax1.set_title(f'{self.symbol} Live Trading - {self.interval} Interval', fontsize=16)
-            ax1.set_ylabel('Price (USDT)', fontsize=12)
+            ax1.set_title(f'{self.symbol} - {self.interval} (Last Closed: {last_time.strftime("%H:00")})', fontsize=14)
+            ax1.set_ylabel('Price (USDT)')
             ax1.legend(loc='upper left')
             ax1.grid(True, alpha=0.3)
-            
-            # Format x-axis dates
-            ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
-            ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
+            ax1.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
             plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
             
-            # Plot cumulative PnL
+            # PnL chart
             if self.pnl_history:
-                trades_x = list(range(len(self.pnl_history)))
-                ax2.plot(trades_x, self.pnl_history, 
-                        color='blue', linewidth=2, marker='o')
-                ax2.fill_between(trades_x, 0, self.pnl_history,
-                                where=np.array(self.pnl_history) >= 0,
-                                color='green', alpha=0.3)
-                ax2.fill_between(trades_x, 0, self.pnl_history,
-                                where=np.array(self.pnl_history) < 0,
-                                color='red', alpha=0.3)
+                ax2.plot(range(len(self.pnl_history)), self.pnl_history, 'b-', linewidth=2)
+                ax2.fill_between(range(len(self.pnl_history)), 0, self.pnl_history,
+                                where=np.array(self.pnl_history) >= 0, color='green', alpha=0.3)
+                ax2.fill_between(range(len(self.pnl_history)), 0, self.pnl_history,
+                                where=np.array(self.pnl_history) < 0, color='red', alpha=0.3)
             
-            ax2.set_title('Cumulative PnL (%)', fontsize=16)
-            ax2.set_xlabel('Trade Number', fontsize=12)
-            ax2.set_ylabel('PnL (%)', fontsize=12)
-            ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+            ax2.set_ylabel('PnL %')
+            ax2.axhline(y=0, color='black', linewidth=0.5)
             ax2.grid(True, alpha=0.3)
             
             plt.tight_layout()
             return fig
-            
         except Exception as e:
-            print(f"Error in create_live_plot: {e}")
+            print(f"Plot error: {e}")
             return None
     
-    def get_html_plot(self):
-        """Convert plot to HTML image - FIXED VERSION with error handling"""
+    def get_html_dashboard(self):
+        """Generate minimal HTML dashboard"""
         try:
             fig = self.plot_results()
             if fig is None:
-                return "<html><body><h1>No data available or error generating plot</h1></body></html>"
-        except Exception as e:
-            print(f"Error generating plot: {e}")
-            return f"<html><body><h1>Error generating plot</h1><p>{str(e)}</p></body></html>"
-        
-        # Save plot to bytes buffer
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
-        buf.seek(0)
-        
-        # Convert to base64
-        image_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-        plt.close(fig)
-        
-        # Create HTML
-        html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>BTC Trend Analysis</title>
-            <style>
-                body {{
-                    font-family: Arial, sans-serif;
-                    margin: 20px;
-                    background-color: #f5f5f5;
-                }}
-                .container {{
-                    max-width: 1200px;
-                    margin: 0 auto;
-                    background-color: white;
-                    padding: 20px;
-                    border-radius: 10px;
-                    box-shadow: 0 0 10px rgba(0,0,0,0.1);
-                }}
-                h1 {{
-                    color: #333;
-                    text-align: center;
-                }}
-                img {{
-                    width: 100%;
-                    height: auto;
-                    border: 1px solid #ddd;
-                    border-radius: 5px;
-                }}
-                .stats {{
-                    margin-top: 20px;
-                    padding: 15px;
-                    background-color: #f8f9fa;
-                    border-radius: 5px;
-                }}
-                table {{
-                    width: 100%;
-                    border-collapse: collapse;
-                }}
-                th, td {{
-                    padding: 10px;
-                    text-align: left;
-                    border-bottom: 1px solid #ddd;
-                }}
-                th {{
-                    background-color: #4CAF50;
-                    color: white;
-                }}
-                tr:hover {{
-                    background-color: #f5f5f5;
-                }}
-                .positive {{
-                    color: green;
-                    font-weight: bold;
-                }}
-                .negative {{
-                    color: red;
-                    font-weight: bold;
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>BTC Trend Analysis - {self.interval} Interval</h1>
-                <img src="data:image/png;base64,{image_base64}" alt="BTC Trend Analysis">
-                
-                <div class="stats">
-                    <h2>Analysis Statistics</h2>
+                return "<html><body><h3>No data</h3></body></html>"
+            
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=80, bbox_inches='tight')
+            buf.seek(0)
+            img_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+            plt.close(fig)
+            
+            signal = self.get_current_signal()
+            
+            # Get last closed candle time
+            last_candle_time = self.data['timestamp'].iloc[-1].strftime('%Y-%m-%d %H:00') if self.data is not None else 'N/A'
+            
+            # Simple stats
+            total_trades = len(self.live_trades)
+            wins = sum(1 for t in self.live_trades if t['pnl_percent'] > 0) if self.live_trades else 0
+            win_rate = (wins/total_trades*100) if total_trades > 0 else 0
+            
+            # Next update time
+            now = datetime.now()
+            next_update = (now + timedelta(hours=1)).replace(minute=0, second=1, microsecond=0)
+            next_update_str = next_update.strftime('%H:%M:%S')
+            
+            html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>BTC Trader</title>
+                <meta http-equiv="refresh" content="30">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <style>
+                    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+                           margin: 0; padding: 20px; background: #f5f5f5; }}
+                    .container {{ max-width: 1200px; margin: 0 auto; }}
+                    .row {{ display: flex; flex-wrap: wrap; gap: 15px; margin-bottom: 20px; }}
+                    .card {{ background: white; padding: 15px 20px; border-radius: 8px; 
+                            box-shadow: 0 2px 4px rgba(0,0,0,0.1); flex: 1; min-width: 200px; }}
+                    .signal {{ font-size: 24px; font-weight: bold; padding: 10px; border-radius: 6px; 
+                              text-align: center; margin: 10px 0; }}
+                    .long {{ background: #d4edda; color: #155724; }}
+                    .short {{ background: #f8d7da; color: #721c24; }}
+                    .neutral {{ background: #e2e3e5; color: #383d41; }}
+                    .price {{ font-size: 28px; font-weight: bold; text-align: center; margin: 5px 0; }}
+                    .green {{ color: #28a745; }} .red {{ color: #dc3545; }}
+                    .chart {{ background: white; padding: 15px; border-radius: 8px; margin: 20px 0; }}
+                    .chart img {{ width: 100%; height: auto; }}
+                    table {{ width: 100%; border-collapse: collapse; background: white; border-radius: 8px; }}
+                    th {{ background: #333; color: white; padding: 10px; text-align: left; }}
+                    td {{ padding: 10px; border-bottom: 1px solid #ddd; }}
+                    .badge {{ padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }}
+                    .badge-long {{ background: #d4edda; color: #155724; }}
+                    .badge-short {{ background: #f8d7da; color: #721c24; }}
+                    .footer {{ text-align: center; color: #666; font-size: 12px; margin-top: 20px; }}
+                    .info {{ background: #e7f3ff; padding: 10px; border-radius: 6px; margin-bottom: 15px; 
+                            font-size: 14px; border-left: 4px solid #0066cc; }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h2>BTC Live Trading • {self.interval}</h2>
+                    
+                    <div class="info">
+                        ⏰ Last closed candle: {last_candle_time} | Next update: {next_update_str} (hour +1s)
+                    </div>
+                    
+                    <div class="row">
+                        <div class="card">
+                            <div style="font-size: 14px; color: #666;">CURRENT SIGNAL</div>
+                            <div class="signal {signal['signal'] if signal else 'neutral'}">
+                                {signal['signal'].upper() if signal else 'WAITING'}
+                            </div>
+                            <div class="price">${signal['current_price']:,.2f if signal else '---'}</div>
+                            <div style="text-align: center; font-size: 12px; color: #666;">
+                                Last closed candle
+                            </div>
+                        </div>
+                        
+                        <div class="card">
+                            <div style="font-size: 14px; color: #666;">POSITION</div>
+                            <div style="font-size: 20px; margin: 10px 0;">
+                                {self.current_position.upper() if self.current_position else 'NONE'}
+                            </div>
+                            <div>Open: ${self.position_open_price:,.2f if self.position_open_price else '---'}</div>
+                            <div style="font-size: 12px; color: #666;">
+                                {self.position_open_time.strftime('%m-%d %H:00') if self.position_open_time else ''}
+                            </div>
+                        </div>
+                        
+                        <div class="card">
+                            <div style="font-size: 14px; color: #666;">TOTAL P&L</div>
+                            <div style="font-size: 28px; font-weight: bold;" 
+                                 class="{'green' if self.total_pnl >= 0 else 'red'}">
+                                {self.total_pnl:+.2f}%
+                            </div>
+                            <div>Trades: {total_trades} | Win: {win_rate:.0f}%</div>
+                        </div>
+                    </div>
+                    
+                    <div class="chart">
+                        <img src="data:image/png;base64,{img_b64}">
+                    </div>
+                    
+                    <h3>Trade History</h3>
                     <table>
                         <tr>
-                            <th>Parameter</th>
-                            <th>Value</th>
-                        </tr>
-                        <tr>
-                            <td>Data Points</td>
-                            <td>{len(self.data)}</td>
-                        </tr>
-                        <tr>
-                            <td>Optimized Lines</td>
-                            <td>{len(self.optimized_lines)}</td>
-                        </tr>
-                        <tr>
-                            <td>Trend Changes</td>
-                            <td>{len(self.horizontal_lines)}</td>
-                        </tr>
-                        <tr>
-                            <td>Trades Executed</td>
-                            <td>{len(self.trades)}</td>
-                        </tr>
-                    </table>
-                </div>
-                
-                <div class="stats">
-                    <h2>Trade Performance</h2>
-                    <table>
-                        <tr>
-                            <th>Start Time</th>
-                            <th>End Time</th>
+                            <th>Close Time</th>
                             <th>Type</th>
-                            <th>Return</th>
-                        </tr>
-        """
-        
-        # Add trade rows
-        for trade in self.trades[-10:]:  # Show last 10 trades
-            return_class = 'positive' if trade['return'] > 0 else 'negative'
-            html += f"""
-                        <tr>
-                            <td>{trade['start_time']}</td>
-                            <td>{trade['end_time']}</td>
-                            <td>{trade['type'].upper()}</td>
-                            <td class="{return_class}">{trade['return']*100:.2f}%</td>
+                            <th>PnL</th>
+                            <th>Total</th>
                         </tr>
             """
-        
-        html += """
+            
+            for trade in reversed(self.live_trades[-20:]):
+                pnl_class = 'green' if trade['pnl_percent'] >= 0 else 'red'
+                pos_class = 'badge-long' if trade['position'] == 'long' else 'badge-short'
+                html += f"""
+                        <tr>
+                            <td>{trade['close_time'].strftime('%m-%d %H:00')}</td>
+                            <td><span class="badge {pos_class}">{trade['position'].upper()}</span></td>
+                            <td class="{pnl_class}">{trade['pnl_percent']:+.2f}%</td>
+                            <td class="{pnl_class}">{trade['cumulative_pnl']:+.2f}%</td>
+                        </tr>
+                """
+            
+            if not self.live_trades:
+                html += "<tr><td colspan='4' style='text-align:center;padding:20px;'>No trades yet</td></tr>"
+            
+            html += f"""
                     </table>
+                    
+                    <div class="footer">
+                        Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 
+                        Using closed candles only | Next sync: {next_update_str}
+                    </div>
                 </div>
-            </div>
-        </body>
-        </html>
-        """
-        
-        return html
+            </body>
+            </html>
+            """
+            
+            return html
+        except Exception as e:
+            return f"<html><body><h3>Error: {str(e)}</h3></body></html>"
 
 class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     analyzer = None
@@ -806,7 +675,7 @@ class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         if self.path == '/' or self.path == '/index.html':
             if self.analyzer:
                 try:
-                    html = self.analyzer.get_html_plot()
+                    html = self.analyzer.get_html_dashboard()
                     self.send_response(200)
                     self.send_header('Content-type', 'text/html')
                     self.end_headers()
@@ -815,8 +684,7 @@ class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                     self.send_response(500)
                     self.send_header('Content-type', 'text/html')
                     self.end_headers()
-                    error_html = f"<html><body><h1>Server Error</h1><p>{str(e)}</p></body></html>"
-                    self.wfile.write(error_html.encode('utf-8'))
+                    self.wfile.write(f"<html><body><h3>Error</h3><pre>{traceback.format_exc()}</pre></body></html>".encode('utf-8'))
             else:
                 self.send_response(500)
                 self.end_headers()
@@ -824,70 +692,54 @@ class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             super().do_GET()
 
 def main():
-    parser = argparse.ArgumentParser(description='BTC Trend Analysis with OLS')
+    parser = argparse.ArgumentParser(description='BTC Live Trading')
     parser.add_argument('--symbol', type=str, default='BTCUSDT', help='Trading pair')
     parser.add_argument('--interval', type=str, default='1h', help='Time interval')
-    parser.add_argument('--days', type=int, default=30, help='Number of days')
+    parser.add_argument('--days', type=int, default=30, help='Days of history')
     parser.add_argument('--port', type=int, default=8080, help='Server port')
-    parser.add_argument('--host', type=str, default='localhost', help='Host IP address to bind to')
+    parser.add_argument('--host', type=str, default='localhost', help='Host IP')
     parser.add_argument('--live', action='store_true', help='Enable live trading')
-    parser.add_argument('--check-interval', type=int, default=3601, 
-                       help='Seconds between checks (default: 3601 = 1 hour + 1 sec)')
     
     args = parser.parse_args()
     
-    print(f"Starting BTC Trend Analysis for {args.symbol}")
-    print(f"Interval: {args.interval}, Days: {args.days}")
-    print(f"Server will run at http://{args.host}:{args.port}")
-    print(f"Live Trading: {'Enabled' if args.live else 'Disabled'}")
+    print(f"\n{'='*60}")
+    print(f"🚀 BTC Trader - {args.symbol} {args.interval}")
+    print(f"{'='*60}")
+    print(f"📊 Dashboard: http://{args.host}:{args.port}")
+    print(f"🎯 Live Trading: {'ON' if args.live else 'OFF'}")
+    if args.live:
+        print(f"⏰ Sync: Hour + 1 second (using closed candles only)")
     
-    # Create analyzer
     analyzer = BTCTrendAnalyzer(args.symbol, args.interval, args.days)
     
-    # Load previous trade history if live trading
     if args.live:
         analyzer.load_trade_history()
     
-    # Fetch data
-    print("Fetching data from Binance...")
+    print("\n📡 Fetching initial data...")
     success = analyzer.fetch_binance_data()
+    print(f"   {'✅ Success' if success else '⚠️ Using sample data'}")
     
-    if success:
-        print("Data fetched successfully")
-    else:
-        print("Using sample data for demonstration")
-    
-    # Analyze trends (YOUR ORIGINAL ANALYSIS)
-    print("Analyzing trends...")
+    print("📈 Analyzing trends...")
     analyzer.analyze_trends()
+    print(f"   Found {len(analyzer.optimized_lines)} trend lines")
     
-    print(f"Found {len(analyzer.optimized_lines)} optimized lines")
-    print(f"Found {len(analyzer.horizontal_lines)} trend changes")
-    
-    # Start live trading in a separate thread if enabled
     if args.live:
-        trading_thread = threading.Thread(target=analyzer.run_live_trading, 
-                                        args=(args.check_interval,),
-                                        daemon=True)
-        trading_thread.start()
-        print("\n✅ Live trading thread started")
+        thread = threading.Thread(target=analyzer.run_live_trading, daemon=True)
+        thread.start()
+        print("✅ Live trading thread started")
     
-    # Setup HTTP server
     CustomHTTPRequestHandler.analyzer = analyzer
-    handler = CustomHTTPRequestHandler
     
-    # Create server with user-specified host and port
-    with socketserver.TCPServer((args.host, args.port), handler) as httpd:
-        print(f"\nServer running at http://{args.host}:{args.port}")
-        print("Press Ctrl+C to stop")
-        
+    with socketserver.TCPServer((args.host, args.port), CustomHTTPRequestHandler) as httpd:
+        print(f"\n📊 Dashboard active: http://{args.host}:{args.port}")
+        print("Press Ctrl+C to stop\n")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
-            print("\nShutting down server...")
+            print("\n🛑 Shutting down...")
             if args.live:
                 analyzer.save_trade_history()
-            httpd.shutdown()
+                print("💾 Trade history saved")
 
 if __name__ == "__main__":
     main()
