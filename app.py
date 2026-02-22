@@ -86,8 +86,6 @@ def find_best_line_at_position(end_idx, k_value, min_window=10, max_window=100):
     if max_possible_window < min_window:
         return None
     
-    print(f"\n   Analyzing position {end_idx} (trying windows {min_window}-{max_possible_window})")
-    
     # Try different window sizes
     for window in range(min_window, max_possible_window + 1):
         start_idx = end_idx - window + 1
@@ -118,10 +116,6 @@ def find_best_line_at_position(end_idx, k_value, min_window=10, max_window=100):
         # Calculate slope (price change per hour)
         slope = model.coef_[0] / X_std * 3600000
         
-        # Print every 20th window for debugging
-        if window % 20 == 0:
-            print(f"     win={window:3d}: error/win^{k_value}={error:10.2f}, slope={slope:8.2f}")
-        
         if error < best_error:
             best_error = error
             best_window = window
@@ -130,7 +124,6 @@ def find_best_line_at_position(end_idx, k_value, min_window=10, max_window=100):
             best_start_idx = start_idx
     
     if best_window > 0:
-        print(f"   ✅ Selected window={best_window}, slope={best_slope:+.2f}, error={best_error:.2f}")
         return {
             'start_idx': best_start_idx,
             'end_idx': end_idx,
@@ -142,91 +135,73 @@ def find_best_line_at_position(end_idx, k_value, min_window=10, max_window=100):
     
     return None
 
-def find_cascade_right_to_left(k_value):
+def compute_lines_for_each_hour(k_value):
     """
-    Find cascade of lines by moving from rightmost point to left,
-    computing best line at each position
+    For each hour, compute the best line using data up to that hour
     """
     print("\n" + "=" * 60)
-    print(f"📊 Finding cascade right-to-left (error/window^{k_value})...")
+    print(f"📊 Computing lines for each hour (error/window^{k_value})...")
     print("=" * 60)
     
-    cascade = []
+    hourly_lines = []
     total_points = len(prices)
     
-    # Start from the rightmost point and move left
-    current_pos = total_points - 1
-    
-    while current_pos >= 100:  # Need at least 100 points for first line
+    # Start from the first hour that has enough data (minimum 100 points)
+    for current_pos in range(99, total_points):
         # Find best line ending at current_pos
         line = find_best_line_at_position(current_pos, k_value)
         
-        if line is None:
-            print(f"   No valid line found at position {current_pos}")
-            current_pos -= 1
-            continue
-        
-        cascade.append(line)
-        
-        # Calculate dates for display
-        end_date = full_start_date + timedelta(hours=line['end_idx'])
-        start_date = full_start_date + timedelta(hours=line['start_idx'])
-        
-        print(f"\n📌 Line at position {line['end_idx']}:")
-        print(f"   Window: {line['start_idx']}h to {line['end_idx']}h ({line['window']}h)")
-        print(f"   Date: {start_date} to {end_date}")
-        print(f"   Slope: {line['slope']:+.2f} $/h {'🟢' if line['slope'] > 0 else '🔴'}")
-        print(f"   Error/win^{k_value}: {line['error']:.2f}")
-        
-        # Move left by 1 candle (exclude the current end point)
-        current_pos -= 1
-        
-        if len(cascade) >= 50:  # Safety limit
-            print("   Reached iteration limit")
-            break
+        if line is not None:
+            hourly_lines.append(line)
+            
+            if current_pos % 100 == 0:
+                print(f"   Processed hour {current_pos}/{total_points-1}")
     
-    # Reverse to have chronological order (oldest to newest)
-    cascade.reverse()
-    print(f"\n✅ Found {len(cascade)} cascade lines")
-    return cascade
+    print(f"\n✅ Computed {len(hourly_lines)} lines (one for each hour from 99 to {total_points-1})")
+    return hourly_lines
 
-def generate_trades(cascade):
-    """Generate list of trades based on slope changes"""
+def generate_trades_from_hourly_lines(hourly_lines):
+    """
+    Generate trades based on previous hour's slope
+    Trade one candle after the line with that sign
+    """
     trades = []
     
-    if len(cascade) < 2:
+    if len(hourly_lines) < 2:
         return trades
     
-    # Use slope to determine trade direction
-    # Trade starts at the beginning of a line and ends at the beginning of the next line
-    for i in range(len(cascade) - 1):
-        current_line = cascade[i]
-        next_line = cascade[i + 1]
+    # For each hour (starting from the second one), use previous hour's slope to trade
+    for i in range(1, len(hourly_lines)):
+        prev_line = hourly_lines[i-1]  # Line from previous hour
+        current_line = hourly_lines[i]  # Line at current hour
         
-        # Trade entry at start of current line
+        # Entry at current hour's start (using previous hour's slope)
         entry_idx = current_line['start_idx']
         
-        # Trade exit at start of next line
-        exit_idx = next_line['start_idx']
+        # Exit at next hour's start (if available)
+        if i < len(hourly_lines) - 1:
+            next_line = hourly_lines[i + 1]
+            exit_idx = next_line['start_idx']
+        else:
+            # Last trade exits at the end of data
+            exit_idx = len(prices) - 1
         
         # Entry and exit prices
         entry_price = prices[entry_idx]
         exit_price = prices[exit_idx]
         
-        # Determine trade type based on slope of current line
-        if current_line['slope'] > 0:  # Long trade
+        # Determine trade type based on previous line's slope
+        if prev_line['slope'] > 0:  # Long trade
             trade_return = (exit_price / entry_price - 1) * 100
             trade_type = "LONG"
             bg_color = "positive"
             zone_color = 'green'
-            return_explanation = f"Long: ${entry_price:,.2f} → ${exit_price:,.2f}"
         else:  # Short trade
             # For short: profit when price goes down
             trade_return = (entry_price / exit_price - 1) * 100
             trade_type = "SHORT"
             bg_color = "negative"
             zone_color = 'red'
-            return_explanation = f"Short: ${entry_price:,.2f} → ${exit_price:,.2f}"
         
         # Duration in hours
         duration = exit_idx - entry_idx
@@ -239,7 +214,7 @@ def generate_trades(cascade):
         price_change_pct = (exit_price / entry_price - 1) * 100
         
         trades.append({
-            'id': i + 1,
+            'id': i,
             'type': trade_type,
             'bg_color': bg_color,
             'zone_color': zone_color,
@@ -250,44 +225,38 @@ def generate_trades(cascade):
             'entry_price': entry_price,
             'exit_price': exit_price,
             'return': trade_return,
-            'price_change': price_change_pct,  # Actual price change % for verification
-            'explanation': return_explanation,
+            'price_change': price_change_pct,
             'duration': duration,
-            'slope': current_line['slope']
+            'signal_slope': prev_line['slope'],  # Slope that generated the signal
+            'signal_hour': prev_line['end_idx']   # Hour when signal was generated
         })
     
     return trades
 
-def calculate_returns(cascade):
-    """Calculate total return from following cascade strategy"""
-    trades = generate_trades(cascade)
-    
+def calculate_returns(trades):
+    """Calculate total return from trades"""
     total_return = 0
-    positive_return = 0
-    negative_return = 0
+    long_return = 0
+    short_return = 0
     
     for trade in trades:
         total_return += trade['return']
         if trade['type'] == 'LONG':
-            positive_return += trade['return']
+            long_return += trade['return']
         else:
-            negative_return += trade['return']
+            short_return += trade['return']
     
-    return total_return, positive_return, negative_return, trades
+    return total_return, long_return, short_return
 
-def create_plot(cascade, k_value):
-    """Create plot with all cascade lines and slope-based backgrounds matching trades"""
+def create_plot(hourly_lines, trades, k_value):
+    """Create plot with all hourly lines and trades"""
     fig, ax = plt.subplots(figsize=(14, 10))
     
     # Plot price
     ax.plot(range(len(prices)), prices, 'b-', alpha=0.5, label='BTC Price', linewidth=1)
     
-    # Calculate returns and trades
-    total_return, pos_return, neg_return, trades = calculate_returns(cascade)
-    
-    # Add colored backgrounds based on trades (each trade's zone)
+    # Add colored backgrounds based on trade zones
     for trade in trades:
-        # Use the trade's zone color (green for LONG, red for SHORT)
         color = trade['zone_color']
         alpha = 0.15
         
@@ -300,60 +269,68 @@ def create_plot(cascade, k_value):
                 fontsize=8, fontweight='bold', ha='left',
                 bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.7))
     
-    # Plot each cascade line (on top of backgrounds)
-    colors = ['black', 'darkblue', 'purple', 'orange', 'brown', 'pink', 'gray', 'olive', 'cyan', 'magenta']
+    # Plot a subset of hourly lines (every 10th line to avoid clutter)
+    for i, line in enumerate(hourly_lines):
+        if i % 10 == 0:  # Plot every 10th line
+            # Use color based on slope
+            line_color = 'green' if line['slope'] > 0 else 'red'
+            
+            # Plot the line
+            x_range = range(line['start_idx'], line['end_idx'] + 1)
+            ax.plot(x_range, [prices[line['start_idx']]] * len(x_range), 
+                   color=line_color, linewidth=0.5, alpha=0.3)
     
-    for i, line in enumerate(cascade):
-        color = colors[i % len(colors)]
-        
-        # Get the line data
-        X, y_pred, model, norm_params = line['line_data']
-        
-        # Plot the line
+    # Plot the most recent line (last 5 hours) more prominently
+    recent_lines = hourly_lines[-5:] if len(hourly_lines) >= 5 else hourly_lines
+    for line in recent_lines:
+        line_color = 'green' if line['slope'] > 0 else 'red'
         x_range = range(line['start_idx'], line['end_idx'] + 1)
-        ax.plot(x_range, y_pred, color=color, linewidth=1.5, alpha=0.7,
-                label=f'Line {i+1}: win={line["window"]}h, slope={line["slope"]:+.1f}')
+        y_line = np.linspace(prices[line['start_idx']], prices[line['end_idx']], len(x_range))
+        ax.plot(x_range, y_line, color=line_color, linewidth=2, alpha=0.8)
         
-        # Mark the window points
-        ax.scatter(x_range, prices[line['start_idx']:line['end_idx'] + 1], 
-                  c=color, s=10, alpha=0.2)
-        
-        # Add line number at start of line
+        # Add slope indicator
         slope_symbol = '↑' if line['slope'] > 0 else '↓'
-        ax.text(line['start_idx'], prices[line['start_idx']] - 200, f'{i+1}{slope_symbol}', 
-                fontsize=8, ha='center', alpha=0.7)
+        ax.text(line['end_idx'], prices[line['end_idx']], f'{slope_symbol}', 
+                fontsize=12, fontweight='bold', ha='center',
+                bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.7))
     
     # Add trade markers at entry/exit points
     for trade in trades:
         # Mark entry point
         ax.scatter(trade['entry_idx'], trade['entry_price'], 
-                  c='black', marker='^', s=50, zorder=5)
+                  c='black', marker='^', s=50, zorder=5, edgecolors='white', linewidth=1)
         # Mark exit point
         ax.scatter(trade['exit_idx'], trade['exit_price'], 
-                  c='black', marker='s', s=50, zorder=5)
+                  c='black', marker='s', s=50, zorder=5, edgecolors='white', linewidth=1)
+    
+    # Calculate returns
+    total_return, long_return, short_return = calculate_returns(trades)
     
     # Add return info box
     return_text = f"""Strategy Returns:
     Total: {total_return:+.2f}%
-    Long P&L: +{pos_return:.2f}%
-    Short P&L: +{neg_return:.2f}%"""
+    Long P&L: +{long_return:.2f}%
+    Short P&L: +{short_return:.2f}%
+    Trades: {len(trades)}"""
     
     ax.text(0.02, 0.98, return_text, transform=ax.transAxes, 
             fontsize=10, verticalalignment='top', family='monospace',
             bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='gray'))
     
-    # Add legend for trades
+    # Add legend
     from matplotlib.patches import Patch
     legend_elements = [
         Patch(facecolor='green', alpha=0.15, label='LONG zone'),
         Patch(facecolor='red', alpha=0.15, label='SHORT zone'),
+        plt.Line2D([0], [0], color='green', linewidth=2, alpha=0.8, label='Recent +Slope'),
+        plt.Line2D([0], [0], color='red', linewidth=2, alpha=0.8, label='Recent -Slope'),
         plt.Line2D([0], [0], marker='^', color='w', markerfacecolor='black', markersize=8, label='Entry'),
         plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='black', markersize=8, label='Exit')
     ]
     
     ax.legend(handles=legend_elements, loc='upper left', fontsize=8)
     
-    ax.set_title(f'BTC Price with Trades (error/window^{k_value})', fontsize=14)
+    ax.set_title(f'BTC Hourly Lines & Trades (error/window^{k_value})', fontsize=14)
     ax.set_xlabel('Hours from Start')
     ax.set_ylabel('Price (USDT)')
     ax.grid(True, alpha=0.2)
@@ -371,7 +348,7 @@ def create_plot(cascade, k_value):
     plt.close()
     buf.seek(0)
     
-    return base64.b64encode(buf.read()).decode('utf-8'), trades
+    return base64.b64encode(buf.read()).decode('utf-8')
 
 class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
@@ -393,40 +370,43 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Content-type', 'text/html')
             self.end_headers()
             
-            # Find cascade with current K (right to left)
-            cascade = find_cascade_right_to_left(k_value)
+            # Compute lines for each hour
+            hourly_lines = compute_lines_for_each_hour(k_value)
             
-            # Calculate returns and get trades
-            total_return, pos_return, neg_return, trades = calculate_returns(cascade)
+            # Generate trades based on previous hour's slope
+            trades = generate_trades_from_hourly_lines(hourly_lines)
             
-            # Create plot with trades
-            image_base64, trades = create_plot(cascade, k_value)
+            # Calculate returns
+            total_return, long_return, short_return = calculate_returns(trades)
+            
+            # Create plot
+            image_base64 = create_plot(hourly_lines, trades, k_value)
             
             # Calculate some stats
-            avg_window = np.mean([line['window'] for line in cascade]) if cascade else 0
-            avg_slope = np.mean([line['slope'] for line in cascade]) if cascade else 0
-            positive_slopes = sum(1 for line in cascade if line['slope'] > 0)
-            negative_slopes = sum(1 for line in cascade if line['slope'] < 0)
+            avg_window = np.mean([line['window'] for line in hourly_lines]) if hourly_lines else 0
+            avg_slope = np.mean([line['slope'] for line in hourly_lines]) if hourly_lines else 0
+            positive_slopes = sum(1 for line in hourly_lines if line['slope'] > 0)
+            negative_slopes = sum(1 for line in hourly_lines if line['slope'] < 0)
             
             # Generate trades table HTML
             trades_html = ""
             if trades:
                 trades_html = """
                 <div style="margin-top: 30px;">
-                    <h3>📋 Trade History</h3>
+                    <h3>📋 Trade History (Trading 1 hour after signal)</h3>
                     <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
                         <thead>
                             <tr style="background: #333; color: white;">
                                 <th style="padding: 8px;">#</th>
                                 <th style="padding: 8px;">Type</th>
+                                <th style="padding: 8px;">Signal Hour</th>
                                 <th style="padding: 8px;">Entry Date</th>
                                 <th style="padding: 8px;">Exit Date</th>
                                 <th style="padding: 8px;">Duration</th>
                                 <th style="padding: 8px;">Entry Price</th>
                                 <th style="padding: 8px;">Exit Price</th>
                                 <th style="padding: 8px;">Return</th>
-                                <th style="padding: 8px;">Price Change</th>
-                                <th style="padding: 8px;">Slope</th>
+                                <th style="padding: 8px;">Signal Slope</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -434,18 +414,19 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                 
                 for trade in trades:
                     row_color = "#d4edda" if trade['type'] == 'LONG' else "#f8d7da"
+                    signal_date = full_start_date + timedelta(hours=trade['signal_hour'])
                     trades_html += f"""
                         <tr style="background: {row_color}; border-bottom: 1px solid #ddd;">
                             <td style="padding: 8px; text-align: center;">{trade['id']}</td>
                             <td style="padding: 8px; text-align: center; font-weight: bold;">{trade['type']}</td>
+                            <td style="padding: 8px;">{signal_date.strftime('%Y-%m-%d %H:%M')}</td>
                             <td style="padding: 8px;">{trade['entry_date']}</td>
                             <td style="padding: 8px;">{trade['exit_date']}</td>
                             <td style="padding: 8px; text-align: center;">{trade['duration']}h</td>
                             <td style="padding: 8px; text-align: right;">${trade['entry_price']:,.2f}</td>
                             <td style="padding: 8px; text-align: right;">${trade['exit_price']:,.2f}</td>
                             <td style="padding: 8px; text-align: right; font-weight: bold; color: {'green' if trade['return'] > 0 else 'red'};">{trade['return']:+.2f}%</td>
-                            <td style="padding: 8px; text-align: right;">{trade['price_change']:+.2f}%</td>
-                            <td style="padding: 8px; text-align: right;">{trade['slope']:+.1f}</td>
+                            <td style="padding: 8px; text-align: right;">{trade['signal_slope']:+.1f}</td>
                         </tr>
                     """
                 
@@ -460,7 +441,7 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             <!DOCTYPE html>
             <html>
             <head>
-                <title>BTC Cascade Strategy</title>
+                <title>BTC Hourly Lines Strategy</title>
                 <style>
                     body {{ margin: 20px; font-family: Arial; background: #f5f5f5; }}
                     .container {{ max-width: 1400px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }}
@@ -483,8 +464,12 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             </head>
             <body>
                 <div class="container">
-                    <h1>📈 BTC Cascade Strategy</h1>
-                    <p style="color: #666; font-size: 14px;">Green = LONG, Red = SHORT. ▲ Entry, ■ Exit</p>
+                    <h1>📈 BTC Hourly Lines Strategy</h1>
+                    <p style="color: #666; font-size: 14px;">
+                        For each hour: compute best line (10-100h window). 
+                        Trade next hour with previous hour's slope sign. 
+                        Green = LONG, Red = SHORT. ▲ Entry, ■ Exit
+                    </p>
                     
                     <div class="controls">
                         <form method="get" style="display: flex; gap: 10px; align-items: center;">
@@ -496,17 +481,18 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                     </div>
                     
                     <div class="stats">
-                        <span class="stat">📊 Lines: {len(cascade)}</span>
+                        <span class="stat">📊 Hours analyzed: {len(hourly_lines)}</span>
                         <span class="stat">📏 Avg window: {avg_window:.1f}h</span>
                         <span class="stat">📈 Avg slope: {avg_slope:+.1f} $/h</span>
-                        <span class="stat positive">🟢 Long trades: {positive_slopes}</span>
-                        <span class="stat negative">🔴 Short trades: {negative_slopes}</span>
+                        <span class="stat positive">🟢 Positive slopes: {positive_slopes}</span>
+                        <span class="stat negative">🔴 Negative slopes: {negative_slopes}</span>
                     </div>
                     
                     <div class="stats">
                         <span class="returns">💰 Total Strategy Return: <b>{total_return:+.2f}%</b></span>
-                        <span class="positive">🟢 Long P&L: +{pos_return:.2f}%</span>
-                        <span class="negative">🔴 Short P&L: +{neg_return:.2f}%</span>
+                        <span class="positive">🟢 Long P&L: +{long_return:.2f}%</span>
+                        <span class="negative">🔴 Short P&L: +{short_return:.2f}%</span>
+                        <span class="stat">📊 Total Trades: {len(trades)}</span>
                     </div>
                     
                     <img src="data:image/png;base64,{image_base64}">
@@ -523,11 +509,11 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
 
 def main():
     print("=" * 60)
-    print("🚀 BTC Cascade Trading Strategy")
+    print("🚀 BTC Hourly Lines Strategy")
     print("=" * 60)
-    print("   Computing best line at each point")
-    print("   Moving 1 candle left at a time")
-    print("   Background colors match trades: Green = LONG, Red = SHORT")
+    print("   For each hour: compute best line (10-100h window)")
+    print("   Set background based on slope sign")
+    print("   Trade next hour with previous hour's slope sign")
     
     # Fetch data on startup
     print("\n📡 Fetching BTC data...")
