@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-BTC Trading Strategy - Simple Web Server
+BTC Trading Strategy - Web Server Only
 Run: python btc_strategy.py
 """
 
-import pandas as pd
 import numpy as np
 import requests
 from datetime import datetime, timedelta
@@ -44,13 +43,11 @@ def fetch_data():
 # ========== RUN STRATEGY ==========
 def run_strategy():
     """Run the whole thing"""
-    print("Fetching data...")
     times, prices = fetch_data()
     
     signals = []
     windows = []
     
-    print("Processing...")
     for i in range(10, len(prices)):
         # Find best window
         best_w = 10
@@ -148,33 +145,34 @@ def run_strategy():
 # ========== WEB SERVER ==========
 class Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
-        print("Request received, running strategy...")
+        print(f"🔄 Running strategy...")
         img, total_ret, win_rate, avg_window, num_trades = run_strategy()
         
         html = f"""
         <html>
         <head>
-            <title>BTC Strategy</title>
+            <title>BTC Trading Strategy</title>
             <style>
-                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }}
-                .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }}
+                .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); }}
                 .stats {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin: 20px 0; }}
-                .stat {{ background: linear-gradient(135deg, #667eea, #764ba2); color: white; padding: 20px; border-radius: 10px; text-align: center; }}
-                .stat h3 {{ margin: 0; font-size: 14px; opacity: 0.9; }}
-                .stat .value {{ font-size: 28px; font-weight: bold; margin: 10px 0 0; }}
-                .positive {{ color: #4caf50; }}
-                .negative {{ color: #f44336; }}
-                img {{ width: 100%; border-radius: 10px; margin: 20px 0; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-                .refresh {{ background: #667eea; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 16px; }}
+                .stat {{ background: linear-gradient(135deg, #667eea, #764ba2); color: white; padding: 20px; border-radius: 10px; text-align: center; box-shadow: 0 5px 15px rgba(102, 126, 234, 0.3); }}
+                .stat h3 {{ margin: 0; font-size: 14px; opacity: 0.9; text-transform: uppercase; letter-spacing: 1px; }}
+                .stat .value {{ font-size: 32px; font-weight: bold; margin: 10px 0 0; }}
+                .positive {{ color: #4ade80; }}
+                .negative {{ color: #f87171; }}
+                img {{ width: 100%; border-radius: 10px; margin: 20px 0; box-shadow: 0 5px 15px rgba(0,0,0,0.1); }}
+                .refresh {{ background: #667eea; color: white; border: none; padding: 12px 24px; border-radius: 5px; cursor: pointer; font-size: 16px; font-weight: 600; }}
                 .refresh:hover {{ background: #5a67d8; }}
                 .footer {{ text-align: center; color: #666; margin-top: 20px; font-size: 12px; }}
+                h1 {{ color: #333; }}
             </style>
         </head>
         <body>
             <div class="container">
-                <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
                     <h1>🚀 BTC Trading Strategy</h1>
-                    <button class="refresh" onclick="location.reload()">🔄 Refresh</button>
+                    <button class="refresh" onclick="location.reload()">🔄 Refresh Data</button>
                 </div>
                 
                 <div class="stats">
@@ -191,15 +189,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                         <div class="value">{avg_window:.1f}</div>
                     </div>
                     <div class="stat">
-                        <h3>Total Trades</h3>
+                        <h3>Trades</h3>
                         <div class="value">{num_trades}</div>
                     </div>
                 </div>
                 
-                <img src="data:image/png;base64,{img}">
+                <img src="data:image/png;base64,{img}" alt="Strategy Chart">
                 
                 <div class="footer">
-                    k = {K} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                    k = {K} | Data from Binance | Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 </div>
             </div>
         </body>
@@ -208,13 +206,25 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
+        self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Expires', '0')
         self.end_headers()
         self.wfile.write(html.encode())
 
-# ========== MAIN ==========
+# ========== START SERVER ==========
 if __name__ == "__main__":
-    print(f"🚀 Starting server on http://localhost:{PORT}")
-    print("Press Ctrl+C to stop")
+    print("=" * 50)
+    print("🚀 BTC TRADING STRATEGY")
+    print("=" * 50)
+    print(f"📊 Starting web server on port {PORT}")
+    print(f"🌐 Open http://localhost:{PORT} in your browser")
+    print("⏳ Strategy runs on each page refresh")
+    print("⌨️  Press Ctrl+C to stop")
+    print("=" * 50)
     
     with socketserver.TCPServer(("", PORT), Handler) as httpd:
-        httpd.serve_forever()
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\n👋 Server stopped")
