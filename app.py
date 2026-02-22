@@ -105,7 +105,7 @@ class BTCOptimalLookback:
         
         return X.flatten(), y_pred, total_error, avg_error_per_candle, model, (X_mean, X_std)
     
-    def run_analysis(self, prices: np.ndarray, timestamps: np.ndarray, end_point_idx: int) -> Dict:
+    def run_analysis(self, prices: np.ndarray, timestamps: np.ndarray, end_point_idx: int, iteration_num: int) -> Dict:
         """Run OLS analysis on data up to a specific endpoint"""
         best_avg_error = float('inf')
         best_lookback = 10
@@ -130,9 +130,15 @@ class BTCOptimalLookback:
                 best_model = model
                 best_normalization_params = norm_params
         
+        # Calculate the start of the optimal window
+        optimal_window_start = end_point_idx - best_lookback
+        
         return {
+            'iteration': iteration_num,
             'end_point_idx': end_point_idx,
             'end_date': self.full_start_date + timedelta(hours=end_point_idx),
+            'window_start_idx': optimal_window_start,
+            'window_start_date': self.full_start_date + timedelta(hours=optimal_window_start),
             'data_length': len(prices),
             'best_lookback': best_lookback,
             'best_avg_error': best_avg_error,
@@ -144,19 +150,19 @@ class BTCOptimalLookback:
         }
     
     def iterate(self):
-        """Move endpoint 100 candles to the left and run analysis until data runs out"""
+        """Move endpoint to the start of the previous optimal window and run analysis"""
         print("\n" + "=" * 70)
-        print("📊 PROGRESSIVE ANALYSIS - Moving Endpoint 100 Candles Left")
+        print("📊 PROGRESSIVE ANALYSIS - Moving Endpoint to Previous Window Start")
         print("=" * 70)
         
         self.all_results = []
         total_points = len(self.prices)
         
-        # Start from the full dataset and move endpoint left by 100 each iteration
+        # Start from the full dataset
         current_end = total_points
-        
         iteration = 1
-        while current_end >= 200:  # Need at least 200 points for meaningful analysis (100+100)
+        
+        while current_end >= 200:  # Need at least 200 points for meaningful analysis
             # Slice data from beginning to current endpoint
             test_prices = self.prices[:current_end]
             test_timestamps = self.timestamps[:current_end]
@@ -167,14 +173,21 @@ class BTCOptimalLookback:
             print(f"   Data points: {len(test_prices)} hours")
             
             # Run analysis on this slice
-            result = self.run_analysis(test_prices, test_timestamps, current_end)
+            result = self.run_analysis(test_prices, test_timestamps, current_end, iteration)
             self.all_results.append(result)
             
             print(f"   ✅ Best lookback: {result['best_lookback']} hours")
+            print(f"      Window: {result['window_start_date'].strftime('%Y-%m-%d %H:%M')} to {result['end_date'].strftime('%Y-%m-%d %H:%M')}")
             print(f"      Avg Error: ${result['best_avg_error']:,.2f}")
             
-            # Move endpoint 100 candles to the left
-            current_end -= 100
+            # Move endpoint to the start of the current optimal window
+            next_end = result['window_start_idx']
+            print(f"   ➡️  Next endpoint will be: {self.full_start_date + timedelta(hours=next_end)}")
+            
+            if next_end < 200:  # Stop if we don't have enough data for next iteration
+                break
+                
+            current_end = next_end
             iteration += 1
         
         print(f"\n✅ Completed {len(self.all_results)} progressive analyses")
@@ -182,10 +195,10 @@ class BTCOptimalLookback:
     
     def plot(self) -> str:
         """Create plot showing all progressive OLS lines"""
-        plt.figure(figsize=(16, 12))
+        plt.figure(figsize=(16, 14))
         
         # Create 2x1 subplot grid
-        gs = plt.GridSpec(2, 1, height_ratios=[3, 1], hspace=0.3)
+        gs = plt.GridSpec(3, 1, height_ratios=[2.5, 1, 0.8], hspace=0.3)
         
         # Main price chart with all OLS lines
         ax_main = plt.subplot(gs[0])
@@ -199,45 +212,46 @@ class BTCOptimalLookback:
         colors = [cmap(i / len(self.all_results)) for i in range(len(self.all_results))]
         
         # Plot OLS lines for each progressive analysis
-        for idx, result in enumerate(reversed(self.all_results)):  # Reverse to show oldest first
+        for idx, result in enumerate(self.all_results):
             if result['best_model'] is not None:
                 end_idx = result['end_point_idx']
-                lookback = result['best_lookback']
-                lookback_start = end_idx - lookback
-                lookback_range = range(lookback_start, end_idx)
+                start_idx = result['window_start_idx']
+                lookback_range = range(start_idx, end_idx)
                 
                 # Get model and normalization params
                 model = result['best_model']
                 X_mean, X_std = result['best_normalization_params']
                 
                 # Generate predictions for the lookback window
-                X_lookback = self.timestamps[lookback_start:end_idx].flatten()
+                X_lookback = self.timestamps[start_idx:end_idx].flatten()
                 X_norm = (X_lookback - X_mean) / X_std
                 y_pred = model.predict(X_norm.reshape(-1, 1))
                 
                 # Plot the OLS line
-                alpha = 0.5 + (idx / len(self.all_results)) * 0.5  # Later lines more opaque
-                linewidth = 1.5 + (idx / len(self.all_results)) * 1.5
+                alpha = 0.6 + (idx / len(self.all_results)) * 0.4  # Later lines more opaque
+                linewidth = 2 + (idx / len(self.all_results)) * 2
                 
                 ax_main.plot(lookback_range, y_pred, 
                            color=colors[idx],
                            linewidth=linewidth,
                            alpha=alpha,
-                           label=f'End: {result["end_date"].strftime("%m/%d")} (lookback={lookback})')
+                           label=f'Iter {result["iteration"]}: {result["window_start_date"].strftime("%m/%d")} to {result["end_date"].strftime("%m/%d")} (lb={result["best_lookback"]})')
                 
-                # Mark the endpoint
+                # Mark the window boundaries
+                ax_main.axvline(x=start_idx, color=colors[idx], linestyle='--', alpha=0.3, linewidth=1)
                 ax_main.axvline(x=end_idx, color=colors[idx], linestyle=':', alpha=0.3, linewidth=1)
-        
-        # Mark the starting point
-        ax_main.axvline(x=len(self.prices) - 100, color='red', linestyle='--', alpha=0.5, 
-                       label='First Analysis End', linewidth=1)
+                
+                # Add iteration number at the top of the window
+                ax_main.text(end_idx - 10, ax_main.get_ylim()[1] * 0.95, 
+                            f'Iter {result["iteration"]}', fontsize=8, color=colors[idx],
+                            ha='right', va='top')
         
         ax_main.set_title(f'BTC Price with Progressive OLS Lines\n'
-                         f'Moving Endpoint 100 Candles Left from {self.full_end_date.strftime("%Y-%m-%d")}', 
+                         f'Each Iteration Uses Window from Previous Optimal Start', 
                          fontsize=14, fontweight='bold')
         ax_main.set_xlabel('Hours from Start')
         ax_main.set_ylabel('Price (USDT)')
-        ax_main.legend(loc='upper left', fontsize=8, ncol=2)
+        ax_main.legend(loc='upper left', fontsize=7, ncol=2)
         ax_main.grid(True, alpha=0.3)
         
         # Add date range info
@@ -246,16 +260,37 @@ class BTCOptimalLookback:
                     fontsize=9, verticalalignment='top',
                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
-        # Summary plot (bottom)
-        ax_summary = plt.subplot(gs[1])
+        # Window progression plot (middle)
+        ax_windows = plt.subplot(gs[1])
         
-        iterations = range(1, len(self.all_results) + 1)
+        for i, result in enumerate(self.all_results):
+            # Plot each window as a horizontal bar
+            start = result['window_start_idx']
+            end = result['end_point_idx']
+            ax_windows.barh(i, end - start, left=start, height=0.5, 
+                          color=colors[i], alpha=0.7, edgecolor='black', linewidth=0.5)
+            
+            # Add lookback label
+            ax_windows.text(start + (end-start)/2, i, f'{result["best_lookback"]}h', 
+                          ha='center', va='center', fontsize=8, fontweight='bold')
+        
+        ax_windows.set_xlabel('Hours from Start')
+        ax_windows.set_ylabel('Iteration')
+        ax_windows.set_title('Optimal Windows for Each Iteration', fontsize=12)
+        ax_windows.set_yticks(range(len(self.all_results)))
+        ax_windows.set_yticklabels([f'Iter {r["iteration"]}' for r in self.all_results])
+        ax_windows.grid(True, alpha=0.3, axis='x')
+        
+        # Summary plot (bottom)
+        ax_summary = plt.subplot(gs[2])
+        
+        iterations = [r['iteration'] for r in self.all_results]
         lookbacks = [r['best_lookback'] for r in self.all_results]
         errors = [r['best_avg_error'] for r in self.all_results]
         
         # Create twin axes
         ax_summary.plot(iterations, lookbacks, 'b-o', linewidth=2, markersize=8, label='Best Lookback')
-        ax_summary.set_xlabel('Iteration (Moving Left)')
+        ax_summary.set_xlabel('Iteration')
         ax_summary.set_ylabel('Lookback Window (hours)', color='b')
         ax_summary.tick_params(axis='y', labelcolor='b')
         ax_summary.grid(True, alpha=0.3)
@@ -265,17 +300,12 @@ class BTCOptimalLookback:
         ax2.set_ylabel('Avg Error ($)', color='r')
         ax2.tick_params(axis='y', labelcolor='r')
         
-        # Add endpoint dates as x-tick labels
-        dates = [r['end_date'].strftime('%m/%d') for r in self.all_results]
-        ax_summary.set_xticks(iterations)
-        ax_summary.set_xticklabels(dates, rotation=45, ha='right')
-        
-        ax_summary.set_title('Progression of Best Lookback and Error as Endpoint Moves Left', fontsize=12)
+        ax_summary.set_title('Lookback and Error Progression', fontsize=12)
         
         # Add legend
         lines1, labels1 = ax_summary.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
-        ax_summary.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=9)
+        ax_summary.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=8)
         
         plt.tight_layout()
         
@@ -313,7 +343,7 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                 <!DOCTYPE html>
                 <html>
                 <head>
-                    <title>BTC Progressive OLS Analysis</title>
+                    <title>BTC Progressive OLS Analysis - Moving to Window Start</title>
                     <style>
                         body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f0f0f0; }}
                         .container {{ max-width: 1400px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
@@ -340,65 +370,52 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                 <body>
                     <div class="container">
                         <h1>📊 BTC Progressive OLS Analysis</h1>
-                        <p>Moving Endpoint 100 Candles Left from <strong>{analyzer.full_end_date.strftime('%Y-%m-%d')}</strong></p>
+                        <p>Moving Endpoint to Start of Previous Optimal Window</p>
                         
                         <div class="methodology">
-                            <strong>🔬 Methodology:</strong> Starting from the full dataset, we progressively move the endpoint 
-                            100 candles to the left and run the OLS optimization algorithm at each step. Each colored line on 
-                            the price chart represents the best OLS fit for that endpoint. This shows how the optimal trend 
-                            line evolves as we remove recent data.
+                            <strong>🔬 Methodology:</strong> Starting from the full dataset, we find the optimal lookback window.
+                            Then we move the endpoint to the start of that window and repeat the analysis.
+                            This shows how optimal trends cascade backward through time.
                         </div>
                         
                         <div class="info">
                             <h3>📈 Analysis Summary:</h3>
                             <p><strong>Full Period:</strong> {analyzer.full_start_date.strftime('%Y-%m-%d')} to {analyzer.full_end_date.strftime('%Y-%m-%d')}</p>
                             <p><strong>Total Iterations:</strong> {len(results)}</p>
-                            <p><strong>Step Size:</strong> 100 hours</p>
                             <p><strong>Total Data Points:</strong> {len(prices)} hours</p>
                         </div>
                         
                         <h3>📋 Progressive Results:</h3>
                         <table class="results-table">
                             <tr>
-                                <th>Iteration</th>
-                                <th>End Date</th>
-                                <th>Data Points</th>
-                                <th>Best Lookback</th>
+                                <th>Iter</th>
+                                <th>Window Period</th>
+                                <th>Window Size</th>
+                                <th>Lookback</th>
                                 <th>Avg Error</th>
-                                <th>Change</th>
+                                <th>Next Endpoint</th>
                             </tr>
                 """
                 
                 # Add result rows
                 for i, result in enumerate(results, 1):
-                    change = ""
-                    change_color = "black"
+                    window_period = f"{result['window_start_date'].strftime('%m/%d %H:%M')} to {result['end_date'].strftime('%m/%d %H:%M')}"
+                    window_size = result['end_point_idx'] - result['window_start_idx']
                     
-                    if i > 1:
-                        diff = result['best_lookback'] - results[i-2]['best_lookback']
-                        if diff > 0:
-                            change = f"+{diff}"
-                        elif diff < 0:
-                            change = f"{diff}"
-                        else:
-                            change = "0"
-                        
-                        # Determine color based on change magnitude
-                        if diff == 0:
-                            change_color = "green"
-                        elif abs(diff) < 20:
-                            change_color = "orange"
-                        else:
-                            change_color = "red"
+                    next_endpoint = ""
+                    if i < len(results):
+                        next_endpoint = results[i]['window_start_date'].strftime('%m/%d %H:%M')
+                    else:
+                        next_endpoint = "End"
                     
                     html += f"""
                             <tr>
-                                <td>{i}</td>
-                                <td>{result['end_date'].strftime('%Y-%m-%d')}</td>
-                                <td>{result['data_length']}</td>
+                                <td>{result['iteration']}</td>
+                                <td>{window_period}</td>
+                                <td>{window_size} hours</td>
                                 <td>{result['best_lookback']} hours</td>
                                 <td>${result['best_avg_error']:,.2f}</td>
-                                <td style="color: {change_color};">{change}</td>
+                                <td>{next_endpoint}</td>
                             </tr>
                     """
                 
@@ -432,8 +449,8 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                         
                         <div class="footer">
                             <p>Data from Binance API | Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-                            <p>Progressive analysis moves endpoint 100 candles left at each iteration</p>
-                            <p>Each colored line shows the optimal OLS fit for that endpoint</p>
+                            <p>Each iteration's endpoint becomes the start of the previous optimal window</p>
+                            <p>This reveals nested optimal trends within the price data</p>
                         </div>
                     </div>
                 </body>
@@ -449,7 +466,7 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
 def main():
     """Main function to run the analysis and server"""
     print("=" * 70)
-    print("BTC Progressive OLS Analysis - Moving Endpoint 100 Candles Left")
+    print("BTC Progressive OLS Analysis - Moving to Previous Window Start")
     print("=" * 70)
     
     # Create analyzer instance
