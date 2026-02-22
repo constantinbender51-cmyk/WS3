@@ -83,7 +83,7 @@ def generate_sample_data():
 
 def ols(prices_seg: np.ndarray, timestamps_seg: np.ndarray, lookback: int) -> Tuple[float, float]:
     """Perform OLS regression on the last 'lookback' data points
-    Returns: slope only"""
+    Returns: slope, avg_error"""
     if lookback > len(prices_seg):
         lookback = len(prices_seg)
     
@@ -103,7 +103,11 @@ def ols(prices_seg: np.ndarray, timestamps_seg: np.ndarray, lookback: int) -> Tu
     # Get slope (denormalize) - price change per hour
     slope = model.coef_[0] / X_std * 3600000
     
-    return slope
+    # Calculate average error
+    y_pred = model.predict(X_normalized)
+    avg_error = np.sum(np.abs(y - y_pred)) / lookback
+    
+    return slope, avg_error
 
 def find_optimal_lookback(prices_seg: np.ndarray, timestamps_seg: np.ndarray) -> Tuple[int, float]:
     """Find the optimal lookback window that minimizes average error
@@ -115,19 +119,7 @@ def find_optimal_lookback(prices_seg: np.ndarray, timestamps_seg: np.ndarray) ->
     max_lookback = min(100, len(prices_seg))
     
     for lookback in range(10, max_lookback + 1):
-        slope = ols(prices_seg, timestamps_seg, lookback)
-        
-        # Calculate average error
-        X = timestamps_seg[-lookback:]
-        y = prices_seg[-lookback:]
-        X_mean = X.mean()
-        X_std = X.std()
-        X_normalized = (X - X_mean) / X_std
-        
-        model = LinearRegression()
-        model.fit(X_normalized, y)
-        y_pred = model.predict(X_normalized)
-        avg_error = np.sum(np.abs(y - y_pred)) / lookback
+        slope, avg_error = ols(prices_seg, timestamps_seg, lookback)
         
         if avg_error < best_avg_error:
             best_avg_error = avg_error
@@ -178,19 +170,21 @@ def analyze_all_points():
         trade_returns.append(trade_return)
         
         if endpoint % 100 == 0:
-            print(f"   Analyzed {endpoint}/{total_points}...")
+            print(f"   Analyzed {endpoint}/{total_points-1}...")
     
     # Calculate cumulative returns
-    cumulative_returns = np.cumprod(1 + np.array(trade_returns) / 100) - 1
+    returns_array = np.array(trade_returns) / 100  # Convert to decimal
+    cumulative_returns = np.cumprod(1 + returns_array) - 1
     
-    # Calculate buy and hold returns for comparison
-    buy_hold_returns = (prices[min_points:] - prices[min_points-1]) / prices[min_points-1] * 100
+    # Calculate buy and hold returns for comparison (from first trade point)
+    first_price = prices[min_points-1]
+    buy_hold_returns = (prices[min_points:] - first_price) / first_price
     
     print(f"\n✅ Analyzed {len(slope_history)} endpoints")
     print(f"   Slope range: ${min(slope_history):+.2f}/h to ${max(slope_history):+.2f}/h")
     print(f"   Return range: {min(trade_returns):+.2f}% to {max(trade_returns):+.2f}%")
     print(f"   Final cumulative return: {cumulative_returns[-1]*100:+.2f}%")
-    print(f"   Buy & Hold return: {buy_hold_returns[-1]:+.2f}%")
+    print(f"   Buy & Hold return: {buy_hold_returns[-1]*100:+.2f}%")
 
 def create_plot():
     """Create plot with price and trading returns"""
@@ -207,7 +201,12 @@ def create_plot():
     
     # Color background based on slope sign
     for i, endpoint in enumerate(endpoint_indices):
-        color = 'green' if slope_history[i] > 0 else 'red' if slope_history[i] < 0 else 'gray'
+        if slope_history[i] > 0:
+            color = 'green'
+        elif slope_history[i] < 0:
+            color = 'red'
+        else:
+            color = 'gray'
         ax_price.axvspan(endpoint-1, endpoint, facecolor=color, alpha=0.2)
     
     # Add slope line above price (scaled)
@@ -215,13 +214,16 @@ def create_plot():
     slope_offset = np.max(prices) * 1.05
     
     for i in range(len(endpoint_indices)-1):
-        color = 'green' if slope_history[i] > 0 else 'red'
+        if slope_history[i] > 0:
+            color = 'green'
+        else:
+            color = 'red'
         ax_price.plot([endpoint_indices[i], endpoint_indices[i+1]], 
                      [slope_offset + slope_scaled[i], slope_offset + slope_scaled[i+1]], 
                      color=color, linewidth=2, alpha=0.8)
     
     ax_price.axhline(y=slope_offset, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
-    ax_price.text(0, slope_offset, 'Slope', fontsize=8, va='bottom')
+    ax_price.text(5, slope_offset, 'Slope', fontsize=8, va='bottom')
     
     ax_price.set_title('BTC Price with Slope Direction (Green=Long, Red=Short)', fontsize=12)
     ax_price.set_ylabel('Price (USDT)')
@@ -233,7 +235,13 @@ def create_plot():
     
     # Plot individual trade returns as bars
     x = endpoint_indices
-    colors = ['green' if r > 0 else 'red' for r in trade_returns]
+    colors = []
+    for r in trade_returns:
+        if r > 0:
+            colors.append('green')
+        else:
+            colors.append('red')
+    
     ax_returns.bar(x, trade_returns, width=0.8, color=colors, alpha=0.5, label='Trade Returns')
     
     # Plot cumulative returns
@@ -278,7 +286,11 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             image_base64 = create_plot()
             
             # Calculate stats
-            total_return = cumulative_returns[-1] * 100 if cumulative_returns else 0
+            if cumulative_returns.size > 0:  # Check if array has elements
+                total_return = cumulative_returns[-1] * 100
+            else:
+                total_return = 0
+                
             win_rate = sum(1 for r in trade_returns if r > 0) / len(trade_returns) * 100 if trade_returns else 0
             avg_return = np.mean(trade_returns) if trade_returns else 0
             max_win = max(trade_returns) if trade_returns else 0
