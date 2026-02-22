@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simple BTC Trading Strategy Backtest
+BTC Trading Strategy - Simple Web Server
 Run: python btc_strategy.py
 """
 
@@ -9,238 +9,212 @@ import numpy as np
 import requests
 from datetime import datetime, timedelta
 from sklearn.linear_model import LinearRegression
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 import http.server
 import socketserver
 import base64
 from io import BytesIO
-import json
-import argparse
 
 # ========== CONFIG ==========
-SYMBOL = "BTCUSDT"
-INTERVAL = "1h"
-DAYS = 30
-K = 1.8
 PORT = 8000
+K = 1.8
 
-# ========== FETCH ==========
-def fetch():
-    """Fetch BTC data from Binance"""
+# ========== FETCH DATA ==========
+def fetch_data():
+    """Get BTC data from Binance"""
     end = datetime.now()
-    start = end - timedelta(days=DAYS)
+    start = end - timedelta(days=30)
     
     url = "https://api.binance.com/api/v3/klines"
     params = {
-        "symbol": SYMBOL,
-        "interval": INTERVAL,
+        "symbol": "BTCUSDT",
+        "interval": "1h",
         "startTime": int(start.timestamp() * 1000),
         "endTime": int(end.timestamp() * 1000),
         "limit": 1000
     }
     
     data = requests.get(url, params=params).json()
-    df = pd.DataFrame(data, columns=[
-        'timestamp', 'open', 'high', 'low', 'close', 'volume',
-        'close_time', 'quote_asset_volume', 'number_of_trades',
-        'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-    ])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df['close'] = df['close'].astype(float)
-    return df[['timestamp', 'close']]
+    prices = [float(x[4]) for x in data]  # close prices
+    times = [datetime.fromtimestamp(x[0]/1000) for x in data]
+    return times, prices
 
-# ========== FIT & OPTIMIZE ==========
-def fit_and_optimize(prices):
-    """For each point, find best window and get slope"""
+# ========== RUN STRATEGY ==========
+def run_strategy():
+    """Run the whole thing"""
+    print("Fetching data...")
+    times, prices = fetch_data()
+    
     signals = []
     windows = []
     
+    print("Processing...")
     for i in range(10, len(prices)):
-        # Try all windows from 10 to min(100, i)
-        best_window = 10
-        best_error = float('inf')
+        # Find best window
+        best_w = 10
+        best_err = float('inf')
         
         for w in range(10, min(101, i+1)):
-            # Get last w prices
-            y = prices.iloc[i-w:i].values.reshape(-1, 1)
+            y = np.array(prices[i-w:i]).reshape(-1, 1)
             x = np.arange(w).reshape(-1, 1)
             
-            # Fit line
             model = LinearRegression()
             model.fit(x, y)
             pred = model.predict(x).flatten()
             
-            # Calculate error
-            error = np.sum(np.abs(y.flatten() - pred)) / (w ** K)
+            err = np.sum(np.abs(y.flatten() - pred)) / (w ** K)
             
-            if error < best_error:
-                best_error = error
-                best_window = w
+            if err < best_err:
+                best_err = err
+                best_w = w
         
-        # Use best window to get slope
-        y = prices.iloc[i-best_window:i].values.reshape(-1, 1)
-        x = np.arange(best_window).reshape(-1, 1)
+        # Get slope with best window
+        y = np.array(prices[i-best_w:i]).reshape(-1, 1)
+        x = np.arange(best_w).reshape(-1, 1)
         model = LinearRegression()
         model.fit(x, y)
-        slope = model.coef_[0][0]
         
-        signals.append(1 if slope > 0 else -1)
-        windows.append(best_window)
+        signals.append(1 if model.coef_[0][0] > 0 else -1)
+        windows.append(best_w)
     
-    return signals, windows
-
-# ========== BACKTEST ==========
-def backtest(prices, signals):
-    """Run backtest"""
-    equity = [1000]
-    
+    # Calculate returns (%) for each trade
+    returns = []
     for i in range(min(len(signals), len(prices)-1)):
-        ret = signals[i] * (prices.iloc[i+1] - prices.iloc[i]) / prices.iloc[i]
-        equity.append(equity[-1] * (1 + ret))
+        ret = signals[i] * (prices[i+1] - prices[i]) / prices[i] * 100
+        returns.append(ret)
     
-    returns = [(equity[i] - equity[i-1])/equity[i-1] for i in range(1, len(equity))]
-    return equity[1:], returns
-
-# ========== STATS ==========
-def stats(equity, returns, windows):
-    """Calculate statistics"""
-    total = (equity[-1] / 1000 - 1) * 100
-    wins = sum(1 for r in returns if r > 0)
+    # Cumulative returns (%)
+    cumulative = []
+    total = 0
+    for r in returns:
+        total += r
+        cumulative.append(total)
     
-    return {
-        'total_return': round(total, 2),
-        'win_rate': round(wins/len(returns)*100, 1),
-        'num_trades': len(returns),
-        'avg_window': round(np.mean(windows), 1),
-        'min_window': min(windows),
-        'max_window': max(windows),
-        'k': K
-    }
-
-# ========== PLOT ==========
-def plot(prices, equity, signals, windows, stats):
-    """Create plot"""
+    # Stats
+    total_return = sum(returns)
+    winning_trades = sum(1 for r in returns if r > 0)
+    win_rate = (winning_trades / len(returns) * 100) if returns else 0
+    
+    # Create plot
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 8))
     
     # Price
-    ax1.plot(prices.index, prices.values, 'k-', alpha=0.5)
+    ax1.plot(times[10:], prices[10:], 'k-', alpha=0.5, linewidth=1)
     for i, s in enumerate(signals):
-        if i < len(prices)-1:
+        if i < len(times)-11:
             color = 'g' if s == 1 else 'r'
-            ax1.scatter(prices.index[i+1], prices.iloc[i+1], c=color, s=20, alpha=0.5)
-    ax1.set_title('Price with Signals')
+            ax1.scatter(times[i+11], prices[i+11], c=color, s=10, alpha=0.5)
+    ax1.set_title('BTC Price with Signals')
+    ax1.set_ylabel('Price (USDT)')
     ax1.grid(True, alpha=0.3)
     
-    # Equity
-    ax2.plot(prices.index[1:len(equity)+1], equity, 'b-')
-    ax2.axhline(y=1000, color='gray', linestyle='--', alpha=0.5)
-    ax2.set_title(f'Equity (Return: {stats["total_return"]}%)')
+    # Cumulative returns
+    ax2.plot(times[11:len(cumulative)+11], cumulative, 'b-', linewidth=2)
+    ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+    ax2.set_title(f'Cumulative Returns: {total_return:.1f}%')
+    ax2.set_ylabel('Return (%)')
     ax2.grid(True, alpha=0.3)
     
     # Windows
     ax3.hist(windows, bins=20, color='orange', edgecolor='black')
-    ax3.axvline(x=stats['avg_window'], color='r', linestyle='--')
-    ax3.set_title(f'Window Sizes (avg: {stats["avg_window"]})')
+    ax3.axvline(x=np.mean(windows), color='r', linestyle='--', label=f'Avg: {np.mean(windows):.1f}')
+    ax3.set_title('Window Sizes')
+    ax3.set_xlabel('Window')
+    ax3.set_ylabel('Frequency')
+    ax3.legend()
     ax3.grid(True, alpha=0.3)
     
-    # Returns
-    ax4.hist([(equity[i] - equity[i-1]) for i in range(1, len(equity))], 
-             bins=20, color='purple', edgecolor='black')
-    ax4.set_title('Returns Distribution')
+    # Returns distribution
+    ax4.hist(returns, bins=20, color='purple', edgecolor='black')
+    ax4.axvline(x=0, color='r', linestyle='--')
+    ax4.set_title('Trade Returns Distribution')
+    ax4.set_xlabel('Return (%)')
+    ax4.set_ylabel('Frequency')
     ax4.grid(True, alpha=0.3)
     
     plt.tight_layout()
     
     # Convert to base64
     buf = BytesIO()
-    plt.savefig(buf, format='png')
+    plt.savefig(buf, format='png', dpi=100)
     buf.seek(0)
     img = base64.b64encode(buf.getvalue()).decode()
     plt.close()
-    return img
+    
+    return img, total_return, win_rate, np.mean(windows), len(returns)
 
-# ========== SERVE ==========
-def serve(img, stats):
-    """Simple HTTP server"""
-    html = f"""
-    <html>
-    <head><title>BTC Strategy</title>
-    <style>
-        body {{ font-family: Arial; margin: 20px; background: #f0f2f5; }}
-        .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; }}
-        .stats {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 20px 0; }}
-        .stat {{ background: linear-gradient(135deg, #667eea, #764ba2); color: white; padding: 15px; border-radius: 5px; text-align: center; }}
-        img {{ width: 100%; border-radius: 5px; }}
-    </style>
-    </head>
-    <body>
-    <div class="container">
-        <h1>BTC Strategy</h1>
-        <div class="stats">
-            <div class="stat"><h3>Return</h3><p>{stats["total_return"]}%</p></div>
-            <div class="stat"><h3>Win Rate</h3><p>{stats["win_rate"]}%</p></div>
-            <div class="stat"><h3>Trades</h3><p>{stats["num_trades"]}</p></div>
-            <div class="stat"><h3>Avg Window</h3><p>{stats["avg_window"]}</p></div>
-        </div>
-        <img src="data:image/png;base64,{img}">
-        <p style="color: gray; text-align: center;">Generated: {datetime.now()}</p>
-    </div>
-    </body>
-    </html>
-    """
-    
-    class Handler(http.server.SimpleHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header('Content-type', 'text/html')
-            self.end_headers()
-            self.wfile.write(html.encode())
-    
-    with socketserver.TCPServer(("", PORT), Handler) as httpd:
-        print(f"Server at http://localhost:{PORT}")
-        httpd.serve_forever()
+# ========== WEB SERVER ==========
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        print("Request received, running strategy...")
+        img, total_ret, win_rate, avg_window, num_trades = run_strategy()
+        
+        html = f"""
+        <html>
+        <head>
+            <title>BTC Strategy</title>
+            <style>
+                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }}
+                .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+                .stats {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin: 20px 0; }}
+                .stat {{ background: linear-gradient(135deg, #667eea, #764ba2); color: white; padding: 20px; border-radius: 10px; text-align: center; }}
+                .stat h3 {{ margin: 0; font-size: 14px; opacity: 0.9; }}
+                .stat .value {{ font-size: 28px; font-weight: bold; margin: 10px 0 0; }}
+                .positive {{ color: #4caf50; }}
+                .negative {{ color: #f44336; }}
+                img {{ width: 100%; border-radius: 10px; margin: 20px 0; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+                .refresh {{ background: #667eea; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 16px; }}
+                .refresh:hover {{ background: #5a67d8; }}
+                .footer {{ text-align: center; color: #666; margin-top: 20px; font-size: 12px; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <h1>🚀 BTC Trading Strategy</h1>
+                    <button class="refresh" onclick="location.reload()">🔄 Refresh</button>
+                </div>
+                
+                <div class="stats">
+                    <div class="stat">
+                        <h3>Total Return</h3>
+                        <div class="value {'positive' if total_ret > 0 else 'negative'}">{total_ret:.1f}%</div>
+                    </div>
+                    <div class="stat">
+                        <h3>Win Rate</h3>
+                        <div class="value">{win_rate:.1f}%</div>
+                    </div>
+                    <div class="stat">
+                        <h3>Avg Window</h3>
+                        <div class="value">{avg_window:.1f}</div>
+                    </div>
+                    <div class="stat">
+                        <h3>Total Trades</h3>
+                        <div class="value">{num_trades}</div>
+                    </div>
+                </div>
+                
+                <img src="data:image/png;base64,{img}">
+                
+                <div class="footer">
+                    k = {K} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        self.wfile.write(html.encode())
 
 # ========== MAIN ==========
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--serve', action='store_true', help='Run HTTP server')
-    parser.add_argument('--port', type=int, default=PORT)
-    args = parser.parse_args()
-    
-    # Run strategy
-    print("Fetching data...")
-    df = fetch()
-    prices = df['close']
-    
-    print("Fitting and optimizing...")
-    signals, windows = fit_and_optimize(prices)
-    
-    print("Backtesting...")
-    equity, returns = backtest(prices, signals)
-    
-    print("Calculating stats...")
-    s = stats(equity, returns, windows)
-    
-    print("Creating plot...")
-    img = plot(prices, equity, signals, windows, s)
-    
-    if args.serve:
-        print(f"Starting server on port {args.port}...")
-        serve(img, s)
-    else:
-        # Save files
-        with open('report.html', 'w') as f:
-            html = f"""
-            <html><body>
-            <h1>BTC Strategy Results</h1>
-            <pre>{json.dumps(s, indent=2)}</pre>
-            <img src="data:image/png;base64,{img}">
-            </body></html>
-            """
-            f.write(html)
-        print(f"Results: {s}")
-        print("Report saved to report.html")
-
 if __name__ == "__main__":
-    main()
+    print(f"🚀 Starting server on http://localhost:{PORT}")
+    print("Press Ctrl+C to stop")
+    
+    with socketserver.TCPServer(("", PORT), Handler) as httpd:
+        httpd.serve_forever()
