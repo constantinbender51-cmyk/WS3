@@ -10,6 +10,7 @@ import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 import io
 import base64
+from typing import List, Tuple
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -66,27 +67,27 @@ def generate_sample_data():
     
     print(f"⚠️ Generated {n_points} hours of sample data")
 
-def find_best_line():
-    """Find the line (10-100 window) that minimizes error/window²"""
-    print("\n📊 Finding best line...")
-    
+def find_best_line(data_prices, data_timestamps, start_idx):
+    """Find the best line on the given data segment"""
     best_error = float('inf')
     best_line = None
     best_window = 0
     best_slope = 0
+    best_end = 0
     
-    # Try all window sizes from 10 to 100
-    for window in range(10, 101):
-        if window > len(prices):
-            break
-            
-        # Get last 'window' points
-        X = timestamps[-window:]
-        y = prices[-window:]
+    n_points = len(data_prices)
+    
+    # Try all window sizes from 10 to min(100, n_points)
+    for window in range(10, min(101, n_points + 1)):
+        # Get last 'window' points of this segment
+        X = data_timestamps[-window:]
+        y = data_prices[-window:]
         
         # Normalize
         X_mean = X.mean()
         X_std = X.std()
+        if X_std == 0:
+            continue
         X_norm = (X - X_mean) / X_std
         
         # Fit OLS
@@ -102,49 +103,111 @@ def find_best_line():
         # Calculate slope (price change per hour)
         slope = model.coef_[0] / X_std * 3600000
         
-        print(f"   Window {window:3d}: error/win² = {error:10.2f}, slope = {slope:8.2f}")
-        
         if error < best_error:
             best_error = error
             best_window = window
             best_line = (X, y_pred, model, (X_mean, X_std))
             best_slope = slope
+            best_end = start_idx + n_points
     
-    print(f"\n✅ Best window: {best_window} hours")
-    print(f"   Best error/win²: {best_error:.2f}")
-    print(f"   Slope: {best_slope:+.2f} $/h")
-    
-    return best_line, best_window, best_slope
+    return {
+        'start_idx': start_idx,
+        'end_idx': best_end,
+        'window': best_window,
+        'slope': best_slope,
+        'error': best_error,
+        'line_data': best_line,
+        'n_points': n_points
+    }
 
-def create_plot(line_data, window, slope):
-    """Create simple plot with price and best line"""
-    plt.figure(figsize=(12, 6))
+def find_cascade():
+    """Find cascade of lines, each on the reduced dataset"""
+    print("\n" + "=" * 60)
+    print("📊 Finding cascade of lines...")
+    print("=" * 60)
     
-    X, y_pred, model, norm_params = line_data
+    cascade = []
+    current_prices = prices.copy()
+    current_timestamps = timestamps.copy()
+    current_start = 0
+    iteration = 1
     
-    # Plot price (all data)
+    while len(current_prices) >= 110:  # Need at least 110 points (100 window + 10)
+        # Find best line on current data
+        result = find_best_line(current_prices, current_timestamps, current_start)
+        
+        if result['window'] == 0:
+            break
+            
+        cascade.append(result)
+        
+        end_date = full_start_date + timedelta(hours=result['end_idx'])
+        print(f"\n📌 Line {iteration}:")
+        print(f"   Period: {current_start}h to {result['end_idx']}h ({result['window']}h window)")
+        print(f"   Date: {full_start_date + timedelta(hours=current_start)} to {end_date}")
+        print(f"   Slope: {result['slope']:+.2f} $/h")
+        print(f"   Error/win²: {result['error']:.2f}")
+        
+        # Remove the window we just used
+        # We keep everything before the start of the window
+        window_start = result['end_idx'] - result['window']
+        new_end = window_start
+        
+        if new_end <= current_start:
+            break
+            
+        current_prices = prices[current_start:new_end]
+        current_timestamps = timestamps[current_start:new_end]
+        iteration += 1
+        
+        if iteration > 20:  # Safety limit
+            break
+    
+    print(f"\n✅ Found {len(cascade)} cascade lines")
+    return cascade
+
+def create_plot(cascade):
+    """Create plot with all cascade lines"""
+    plt.figure(figsize=(14, 8))
+    
+    # Plot price
     plt.plot(range(len(prices)), prices, 'b-', alpha=0.5, label='BTC Price', linewidth=1)
     
-    # Plot the best line
-    start_idx = len(prices) - window
-    x_range = range(start_idx, len(prices))
-    plt.plot(x_range, y_pred, 'r-', linewidth=2.5, label=f'Best Line (window={window}h)')
+    # Plot each cascade line
+    colors = ['red', 'green', 'purple', 'orange', 'brown', 'pink', 'gray', 'olive', 'cyan', 'magenta']
     
-    # Mark the window points
-    plt.scatter(x_range, prices[start_idx:], c='orange', s=20, alpha=0.5, label='Window Points')
+    for i, line in enumerate(cascade):
+        color = colors[i % len(colors)]
+        start_idx = line['start_idx']
+        end_idx = line['end_idx']
+        window = line['window']
+        line_start = end_idx - window
+        
+        # Get the line data
+        X, y_pred, model, norm_params = line['line_data']
+        
+        # Plot the line
+        x_range = range(line_start, end_idx)
+        plt.plot(x_range, y_pred, color=color, linewidth=2.5, 
+                label=f'Line {i+1}: win={window}h, slope={line["slope"]:+.1f}')
+        
+        # Mark the window
+        plt.scatter(x_range, prices[line_start:end_idx], c=color, s=15, alpha=0.3)
+        
+        # Add line number
+        plt.text(line_start, prices[line_start] - 200, f'{i+1}', 
+                fontsize=10, fontweight='bold', ha='center',
+                bbox=dict(boxstyle='round,pad=0.2', fc='yellow', alpha=0.7))
+        
+        # Mark the boundary
+        if i < len(cascade) - 1:
+            plt.axvline(x=end_idx - window, color=color, linestyle='--', alpha=0.3)
     
-    # Add slope info
-    slope_text = f'Slope: {slope:+.2f} $/h'
-    plt.text(0.02, 0.95, slope_text, transform=plt.gca().transAxes, 
-             fontsize=12, fontweight='bold',
-             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-    
-    # Simple styling
-    plt.title(f'BTC Price with Best OLS Line (minimizing error/window²)', fontsize=14)
+    plt.title(f'BTC Price with Cascade Lines (Each on reduced dataset)', fontsize=14)
     plt.xlabel('Hours from Start')
     plt.ylabel('Price (USDT)')
     plt.grid(True, alpha=0.2)
-    plt.legend()
+    plt.legend(loc='upper left', fontsize=8)
     
     plt.tight_layout()
     
@@ -163,28 +226,32 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Content-type', 'text/html')
             self.end_headers()
             
-            # Find best line
-            line_data, window, slope = find_best_line()
+            # Find cascade
+            cascade = find_cascade()
             
             # Create plot
-            image_base64 = create_plot(line_data, window, slope)
+            image_base64 = create_plot(cascade)
             
-            # Ultra simple HTML
+            # Simple HTML
             html = f"""
             <!DOCTYPE html>
             <html>
             <head>
-                <title>BTC Best Line</title>
+                <title>BTC Cascade Lines</title>
                 <style>
                     body {{ margin: 20px; font-family: Arial; background: #f5f5f5; }}
-                    .container {{ max-width: 1000px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }}
+                    .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }}
                     h1 {{ margin: 0 0 10px 0; font-size: 20px; }}
+                    .stats {{ margin: 10px 0; padding: 10px; background: #f0f0f0; border-radius: 4px; }}
                     img {{ width: 100%; }}
                 </style>
             </head>
             <body>
                 <div class="container">
-                    <h1>📈 BTC Best Line (minimizing error/window²)</h1>
+                    <h1>📈 BTC Cascade Lines (Each ignores previous window)</h1>
+                    <div class="stats">
+                        Found {len(cascade)} lines
+                    </div>
                     <img src="data:image/png;base64,{image_base64}">
                 </div>
             </body>
@@ -196,9 +263,11 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
 
 def main():
-    print("=" * 50)
-    print("🚀 BTC Best Line Server")
-    print("=" * 50)
+    print("=" * 60)
+    print("🚀 BTC Cascade Lines Server")
+    print("=" * 60)
+    print("   Each line finds best window on remaining data")
+    print("   Then removes that window and continues")
     
     # Fetch data on startup
     print("\n📡 Fetching BTC data...")
@@ -208,7 +277,6 @@ def main():
     PORT = 8080
     with socketserver.TCPServer(("", PORT), BTCRequestHandler) as httpd:
         print(f"\n🌐 http://localhost:{PORT}")
-        print("   Finding line that minimizes error/window²")
         print("   Press Ctrl+C to stop\n")
         try:
             httpd.serve_forever()
