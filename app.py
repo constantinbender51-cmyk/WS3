@@ -309,123 +309,136 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                 analyzer = BTCRequestHandler.btc_analyzer
                 
                 # Create HTML page
-                html = f"""
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <title>BTC Progressive OLS Analysis</title>
-                    <style>
-                        body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f0f0f0; }}
-                        .container {{ max-width: 1400px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
-                        h1 {{ color: #333; }}
-                        h2 {{ color: #666; }}
-                        .info {{ background-color: #e8f4f8; padding: 15px; border-radius: 5px; margin: 20px 0; }}
-                        .stats {{ display: flex; justify-content: space-between; flex-wrap: wrap; }}
-                        .stat-box {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 10px; flex: 1; margin: 10px; min-width: 200px; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
-                        .stat-box:nth-child(2) {{ background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); }}
-                        .stat-box:nth-child(3) {{ background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); }}
-                        .stat-box:nth-child(4) {{ background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%); }}
-                        .stat-value {{ font-size: 28px; font-weight: bold; margin: 10px 0; }}
-                        .stat-label {{ font-size: 14px; opacity: 0.9; }}
-                        .stat-sub {{ font-size: 12px; margin-top: 5px; opacity: 0.8; }}
-                        img {{ max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 10px; margin-top: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }}
-                        .footer {{ margin-top: 30px; color: #666; font-size: 12px; text-align: center; padding-top: 20px; border-top: 1px solid #eee; }}
-                        .methodology {{ background-color: #e8f4f8; border-left: 4px solid #2196F3; padding: 15px; margin: 20px 0; }}
-                        .results-table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
-                        .results-table th {{ background-color: #2196F3; color: white; padding: 10px; text-align: left; }}
-                        .results-table td {{ padding: 8px; border-bottom: 1px solid #ddd; }}
-                        .results-table tr:hover {{ background-color: #f5f5f5; }}
-                    </style>
-                </head>
-                <body>
-                    <div class="container">
-                        <h1>📊 BTC Progressive OLS Analysis</h1>
-                        <p>Moving Endpoint 100 Candles Left from <strong>{analyzer.full_end_date.strftime('%Y-%m-%d')}</strong></p>
-                        
-                        <div class="methodology">
-                            <strong>🔬 Methodology:</strong> Starting from the full dataset, we progressively move the endpoint 
-                            100 candles to the left and run the OLS optimization algorithm at each step. Each colored line on 
-                            the price chart represents the best OLS fit for that endpoint. This shows how the optimal trend 
-                            line evolves as we remove recent data.
-                        </div>
-                        
-                        <div class="info">
-                            <h3>📈 Analysis Summary:</h3>
-                            <p><strong>Full Period:</strong> {analyzer.full_start_date.strftime('%Y-%m-%d')} to {analyzer.full_end_date.strftime('%Y-%m-%d')}</p>
-                            <p><strong>Total Iterations:</strong> {len(results)}</p>
-                            <p><strong>Step Size:</strong> 100 hours</p>
-                            <p><strong>Total Data Points:</strong> {len(prices)} hours</p>
-                        </div>
-                        
-                        <h3>📋 Progressive Results:</h3>
-                        <table class="results-table">
-                            <tr>
-                                <th>Iteration</th>
-                                <th>End Date</th>
-                                <th>Data Points</th>
-                                <th>Best Lookback</th>
-                                <th>Avg Error</th>
-                                <th>Change</th>
-                            </tr>
-                """
-                
-                # Add result rows
-                for i, result in enumerate(results, 1):
-                    change = ""
-                    if i > 1:
-                        diff = result['best_lookback'] - results[i-2]['best_lookback']
-                        change = f"{diff:+d}" if diff != 0 else "0"
-                    
-                    change_color = "green" if change == "0" else "orange" if abs(int(change)) < 20 else "red" if change else "black"
-                    
-                    html += f"""
-                            <tr>
-                                <td>{i}</td>
-                                <td>{result['end_date'].strftime('%Y-%m-%d')}</td>
-                                <td>{result['data_length']}</td>
-                                <td>{result['best_lookback']} hours</td>
-                                <td>${result['best_avg_error']:,.2f}</td>
-                                <td style="color: {change_color};">{change}</td>
-                            </tr>
-                    """
-                
-                html += f"""
-                        </table>
-                        
-                        <div class="stats">
-                            <div class="stat-box">
-                                <div class="stat-label">Current BTC Price</div>
-                                <div class="stat-value">${prices[-1]:,.2f}</div>
-                                <div class="stat-sub">as of now</div>
-                            </div>
-                            <div class="stat-box">
-                                <div class="stat-label">24h Volatility (Std)</div>
-                                <div class="stat-value">${volatility:,.2f}</div>
-                                <div class="stat-sub">price fluctuation</div>
-                            </div>
-                            <div class="stat-box">
-                                <div class="stat-label">30d Min</div>
-                                <div class="stat-value">${np.min(prices):,.2f}</div>
-                                <div class="stat-sub">lowest price</div>
-                            </div>
-                            <div class="stat-box">
-                                <div class="stat-label">30d Max</div>
-                                <div class="stat-value">${np.max(prices):,.2f}</div>
-                                <div class="stat-sub">highest price</div>
-                            </div>
-                        </div>
-                        
-                        <img src="data:image/png;base64,{image_base64}" alt="BTC Progressive OLS Analysis">
-                        
-                        <div class="footer">
-                            <p>Data from Binance API | Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-                            <p>Progressive analysis moves endpoint 100 candles left at each iteration</p>
-                            <p>Each colored line shows the optimal OLS fit for that endpoint</p>
-                        </div>
-                    </div>
-                </body>
-                </html>
-                """
+html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>BTC Progressive OLS Analysis</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f0f0f0; }}
+        .container {{ max-width: 1400px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
+        h1 {{ color: #333; }}
+        h2 {{ color: #666; }}
+        .info {{ background-color: #e8f4f8; padding: 15px; border-radius: 5px; margin: 20px 0; }}
+        .stats {{ display: flex; justify-content: space-between; flex-wrap: wrap; }}
+        .stat-box {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 10px; flex: 1; margin: 10px; min-width: 200px; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+        .stat-box:nth-child(2) {{ background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); }}
+        .stat-box:nth-child(3) {{ background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); }}
+        .stat-box:nth-child(4) {{ background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%); }}
+        .stat-value {{ font-size: 28px; font-weight: bold; margin: 10px 0; }}
+        .stat-label {{ font-size: 14px; opacity: 0.9; }}
+        .stat-sub {{ font-size: 12px; margin-top: 5px; opacity: 0.8; }}
+        img {{ max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 10px; margin-top: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }}
+        .footer {{ margin-top: 30px; color: #666; font-size: 12px; text-align: center; padding-top: 20px; border-top: 1px solid #eee; }}
+        .methodology {{ background-color: #e8f4f8; border-left: 4px solid #2196F3; padding: 15px; margin: 20px 0; }}
+        .results-table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
+        .results-table th {{ background-color: #2196F3; color: white; padding: 10px; text-align: left; }}
+        .results-table td {{ padding: 8px; border-bottom: 1px solid #ddd; }}
+        .results-table tr:hover {{ background-color: #f5f5f5; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📊 BTC Progressive OLS Analysis</h1>
+        <p>Moving Endpoint 100 Candles Left from <strong>{analyzer.full_end_date.strftime('%Y-%m-%d')}</strong></p>
+        
+        <div class="methodology">
+            <strong>🔬 Methodology:</strong> Starting from the full dataset, we progressively move the endpoint 
+            100 candles to the left and run the OLS optimization algorithm at each step. Each colored line on 
+            the price chart represents the best OLS fit for that endpoint. This shows how the optimal trend 
+            line evolves as we remove recent data.
+        </div>
+        
+        <div class="info">
+            <h3>📈 Analysis Summary:</h3>
+            <p><strong>Full Period:</strong> {analyzer.full_start_date.strftime('%Y-%m-%d')} to {analyzer.full_end_date.strftime('%Y-%m-%d')}</p>
+            <p><strong>Total Iterations:</strong> {len(results)}</p>
+            <p><strong>Step Size:</strong> 100 hours</p>
+            <p><strong>Total Data Points:</strong> {len(prices)} hours</p>
+        </div>
+        
+        <h3>📋 Progressive Results:</h3>
+        <table class="results-table">
+            <tr>
+                <th>Iteration</th>
+                <th>End Date</th>
+                <th>Data Points</th>
+                <th>Best Lookback</th>
+                <th>Avg Error</th>
+                <th>Change</th>
+            </tr>
+"""
+
+# Add result rows
+for i, result in enumerate(results, 1):
+    change = ""
+    change_color = "black"
+    
+    if i > 1:
+        diff = result['best_lookback'] - results[i-2]['best_lookback']
+        if diff > 0:
+            change = f"+{diff}"
+        elif diff < 0:
+            change = f"{diff}"
+        else:
+            change = "0"
+        
+        # Determine color based on change magnitude
+        if diff == 0:
+            change_color = "green"
+        elif abs(diff) < 20:
+            change_color = "orange"
+        else:
+            change_color = "red"
+    
+    html += f"""
+            <tr>
+                <td>{i}</td>
+                <td>{result['end_date'].strftime('%Y-%m-%d')}</td>
+                <td>{result['data_length']}</td>
+                <td>{result['best_lookback']} hours</td>
+                <td>${result['best_avg_error']:,.2f}</td>
+                <td style="color: {change_color};">{change}</td>
+            </tr>
+    """
+
+html += f"""
+        </table>
+        
+        <div class="stats">
+            <div class="stat-box">
+                <div class="stat-label">Current BTC Price</div>
+                <div class="stat-value">${prices[-1]:,.2f}</div>
+                <div class="stat-sub">as of now</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">24h Volatility (Std)</div>
+                <div class="stat-value">${volatility:,.2f}</div>
+                <div class="stat-sub">price fluctuation</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">30d Min</div>
+                <div class="stat-value">${np.min(prices):,.2f}</div>
+                <div class="stat-sub">lowest price</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">30d Max</div>
+                <div class="stat-value">${np.max(prices):,.2f}</div>
+                <div class="stat-sub">highest price</div>
+            </div>
+        </div>
+        
+        <img src="data:image/png;base64,{image_base64}" alt="BTC Progressive OLS Analysis">
+        
+        <div class="footer">
+            <p>Data from Binance API | Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+            <p>Progressive analysis moves endpoint 100 candles left at each iteration</p>
+            <p>Each colored line shows the optimal OLS fit for that endpoint</p>
+        </div>
+    </div>
+</body>
+</html>
+"""
                 self.wfile.write(html.encode())
             else:
                 self.wfile.write(b"<html><body><h1>Error: No data available</h1></body></html>")
