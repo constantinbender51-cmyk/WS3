@@ -10,7 +10,7 @@ import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 import io
 import base64
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 import warnings
 import urllib.parse
 warnings.filterwarnings('ignore')
@@ -180,40 +180,75 @@ def find_cascade(k_value):
     print(f"\n✅ Found {len(cascade)} cascade lines")
     return cascade
 
-def calculate_returns(cascade):
-    """Calculate total return from following cascade strategy"""
-    if len(cascade) < 2:
-        return 0, 0, 0
+def generate_trades(cascade):
+    """Generate list of trades with entry/exit prices and returns"""
+    trades = []
     
-    total_return = 0
-    positive_return = 0
-    negative_return = 0
+    if len(cascade) < 2:
+        return trades
     
     for i in range(len(cascade) - 1):
         current_line = cascade[i]
         next_line = cascade[i + 1]
         
-        # The current line's window start is the boundary
-        boundary = current_line['end_idx'] - current_line['window']
+        # Trade boundaries
+        entry_idx = current_line['end_idx'] - current_line['window']
+        exit_idx = next_line['end_idx'] - next_line['window']
         
-        # Price at boundary
-        start_price = prices[boundary]
-        
-        # Price at next line's start (which is the end of this region)
-        end_price = prices[next_line['end_idx'] - next_line['window']]
+        # Entry and exit prices
+        entry_price = prices[entry_idx]
+        exit_price = prices[exit_idx]
         
         # Calculate return
-        region_return = (end_price / start_price - 1) * 100
+        if current_line['slope'] > 0:  # Long trade
+            trade_return = (exit_price / entry_price - 1) * 100
+            trade_type = "LONG"
+            bg_color = "positive"
+        else:  # Short trade
+            trade_return = (1 - exit_price / entry_price) * 100  # Profit from price drop
+            trade_type = "SHORT"
+            bg_color = "negative"
         
-        # Add to total with sign based on slope
-        if current_line['slope'] > 0:
-            positive_return += region_return
-            total_return += region_return
-        else:
-            negative_return += region_return
-            total_return -= region_return  # Subtract negative returns (we want to avoid them)
+        # Duration in hours
+        duration = exit_idx - entry_idx
+        
+        # Convert indices to datetime
+        entry_date = full_start_date + timedelta(hours=entry_idx)
+        exit_date = full_start_date + timedelta(hours=exit_idx)
+        
+        trades.append({
+            'id': i + 1,
+            'type': trade_type,
+            'bg_color': bg_color,
+            'entry_idx': entry_idx,
+            'exit_idx': exit_idx,
+            'entry_date': entry_date.strftime('%Y-%m-%d %H:%M'),
+            'exit_date': exit_date.strftime('%Y-%m-%d %H:%M'),
+            'entry_price': entry_price,
+            'exit_price': exit_price,
+            'return': trade_return,
+            'duration': duration,
+            'slope': current_line['slope']
+        })
     
-    return total_return, positive_return, negative_return
+    return trades
+
+def calculate_returns(cascade):
+    """Calculate total return from following cascade strategy"""
+    trades = generate_trades(cascade)
+    
+    total_return = 0
+    positive_return = 0
+    negative_return = 0
+    
+    for trade in trades:
+        total_return += trade['return']
+        if trade['type'] == 'LONG':
+            positive_return += trade['return']
+        else:
+            negative_return += trade['return']
+    
+    return total_return, positive_return, negative_return, trades
 
 def create_plot(cascade, k_value):
     """Create plot with all cascade lines and slope-based backgrounds"""
@@ -222,11 +257,10 @@ def create_plot(cascade, k_value):
     # Plot price
     ax.plot(range(len(prices)), prices, 'b-', alpha=0.5, label='BTC Price', linewidth=1)
     
-    # Calculate returns
-    total_return, pos_return, neg_return = calculate_returns(cascade)
+    # Calculate returns and trades
+    total_return, pos_return, neg_return, trades = calculate_returns(cascade)
     
     # Add colored backgrounds based on slope
-    regions = []
     for i, line in enumerate(cascade):
         end_idx = line['end_idx']
         window = line['window']
@@ -236,11 +270,9 @@ def create_plot(cascade, k_value):
         if line['slope'] > 0:
             color = 'green'
             alpha = 0.15
-            regions.append({'type': 'positive', 'start': line_start, 'end': end_idx, 'slope': line['slope']})
         else:
             color = 'red'
             alpha = 0.15
-            regions.append({'type': 'negative', 'start': line_start, 'end': end_idx, 'slope': line['slope']})
         
         # Add colored background for the window region
         ax.axvspan(line_start, end_idx, alpha=alpha, color=color, zorder=0)
@@ -279,8 +311,8 @@ def create_plot(cascade, k_value):
     # Add return info box
     return_text = f"""Strategy Returns:
     Total: {total_return:+.2f}%
-    From Green: +{pos_return:.2f}%
-    From Red (avoided): +{abs(neg_return):.2f}%"""
+    From Long: +{pos_return:.2f}%
+    From Short: +{neg_return:.2f}%"""
     
     ax.text(0.02, 0.98, return_text, transform=ax.transAxes, 
             fontsize=10, verticalalignment='top', family='monospace',
@@ -288,8 +320,8 @@ def create_plot(cascade, k_value):
     
     # Add slope legend
     from matplotlib.patches import Patch
-    legend_elements = [Patch(facecolor='green', alpha=0.15, label='Positive slope (GO LONG)'),
-                      Patch(facecolor='red', alpha=0.15, label='Negative slope (GO SHORT)')]
+    legend_elements = [Patch(facecolor='green', alpha=0.15, label='Long zone'),
+                      Patch(facecolor='red', alpha=0.15, label='Short zone')]
     
     # Add the first price line to legend
     price_line = ax.get_legend_handles_labels()[0][0]
@@ -309,7 +341,7 @@ def create_plot(cascade, k_value):
     # Add slope statistics
     positive_slopes = sum(1 for line in cascade if line['slope'] > 0)
     negative_slopes = sum(1 for line in cascade if line['slope'] < 0)
-    ax.text(0.02, 0.85, f'Positive: {positive_slopes} | Negative: {negative_slopes}', 
+    ax.text(0.02, 0.85, f'Long: {positive_slopes} | Short: {negative_slopes}', 
             transform=ax.transAxes, fontsize=10, verticalalignment='top',
             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
     
@@ -321,7 +353,7 @@ def create_plot(cascade, k_value):
     plt.close()
     buf.seek(0)
     
-    return base64.b64encode(buf.read()).decode('utf-8')
+    return base64.b64encode(buf.read()).decode('utf-8'), trades
 
 class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
@@ -346,11 +378,11 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             # Find cascade with current K
             cascade = find_cascade(k_value)
             
-            # Calculate returns
-            total_return, pos_return, neg_return = calculate_returns(cascade)
+            # Calculate returns and get trades
+            total_return, pos_return, neg_return, trades = calculate_returns(cascade)
             
-            # Create plot
-            image_base64 = create_plot(cascade, k_value)
+            # Create plot with trades
+            image_base64, trades = create_plot(cascade, k_value)
             
             # Calculate some stats
             avg_window = np.mean([line['window'] for line in cascade]) if cascade else 0
@@ -358,7 +390,52 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             positive_slopes = sum(1 for line in cascade if line['slope'] > 0)
             negative_slopes = sum(1 for line in cascade if line['slope'] < 0)
             
-            # HTML with input form
+            # Generate trades table HTML
+            trades_html = ""
+            if trades:
+                trades_html = """
+                <div style="margin-top: 30px;">
+                    <h3>📋 Trade History</h3>
+                    <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
+                        <thead>
+                            <tr style="background: #333; color: white;">
+                                <th style="padding: 8px;">#</th>
+                                <th style="padding: 8px;">Type</th>
+                                <th style="padding: 8px;">Entry Date</th>
+                                <th style="padding: 8px;">Exit Date</th>
+                                <th style="padding: 8px;">Duration</th>
+                                <th style="padding: 8px;">Entry Price</th>
+                                <th style="padding: 8px;">Exit Price</th>
+                                <th style="padding: 8px;">Return</th>
+                                <th style="padding: 8px;">Slope</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                """
+                
+                for trade in trades:
+                    row_color = "#d4edda" if trade['type'] == 'LONG' else "#f8d7da"
+                    trades_html += f"""
+                        <tr style="background: {row_color}; border-bottom: 1px solid #ddd;">
+                            <td style="padding: 8px; text-align: center;">{trade['id']}</td>
+                            <td style="padding: 8px; text-align: center; font-weight: bold;">{trade['type']}</td>
+                            <td style="padding: 8px;">{trade['entry_date']}</td>
+                            <td style="padding: 8px;">{trade['exit_date']}</td>
+                            <td style="padding: 8px; text-align: center;">{trade['duration']}h</td>
+                            <td style="padding: 8px; text-align: right;">${trade['entry_price']:,.2f}</td>
+                            <td style="padding: 8px; text-align: right;">${trade['exit_price']:,.2f}</td>
+                            <td style="padding: 8px; text-align: right; font-weight: bold; color: {'green' if trade['return'] > 0 else 'red'};">{trade['return']:+.2f}%</td>
+                            <td style="padding: 8px; text-align: right;">{trade['slope']:+.1f}</td>
+                        </tr>
+                    """
+                
+                trades_html += """
+                        </tbody>
+                    </table>
+                </div>
+                """
+            
+            # HTML with input form and trades table
             html = f"""
             <!DOCTYPE html>
             <html>
@@ -366,8 +443,9 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                 <title>BTC Cascade Lines</title>
                 <style>
                     body {{ margin: 20px; font-family: Arial; background: #f5f5f5; }}
-                    .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }}
-                    h1 {{ margin: 0 0 10px 0; font-size: 20px; }}
+                    .container {{ max-width: 1400px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }}
+                    h1 {{ margin: 0 0 10px 0; font-size: 24px; }}
+                    h3 {{ margin: 20px 0 10px 0; }}
                     .controls {{ margin: 20px 0; padding: 15px; background: #f0f0f0; border-radius: 4px; display: flex; gap: 20px; align-items: center; }}
                     .stats {{ margin: 10px 0; padding: 10px; background: #f0f0f0; border-radius: 4px; display: flex; gap: 20px; flex-wrap: wrap; }}
                     .stat {{ padding: 5px 10px; background: #fff; border-radius: 4px; }}
@@ -378,17 +456,20 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                     button {{ padding: 8px 16px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }}
                     button:hover {{ background: #0056b3; }}
                     img {{ width: 100%; margin-top: 20px; }}
+                    table {{ margin-top: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+                    th {{ background: #333; color: white; position: sticky; top: 0; }}
+                    tr:hover {{ opacity: 0.9; }}
                 </style>
             </head>
             <body>
                 <div class="container">
-                    <h1>📈 BTC Cascade Lines</h1>
+                    <h1>📈 BTC Cascade Trading Strategy</h1>
                     
                     <div class="controls">
                         <form method="get" style="display: flex; gap: 10px; align-items: center;">
-                            <label for="k">K = </label>
+                            <label for="k"><b>K Parameter:</b></label>
                             <input type="number" id="k" name="k" step="0.1" min="0.1" max="5" value="{k_value}">
-                            <button type="submit">Update</button>
+                            <button type="submit">Update Strategy</button>
                         </form>
                         <span style="color: #666; font-size: 14px;">Higher K = shorter windows</span>
                     </div>
@@ -397,17 +478,19 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                         <span class="stat">📊 Lines: {len(cascade)}</span>
                         <span class="stat">📏 Avg window: {avg_window:.1f}h</span>
                         <span class="stat">📈 Avg slope: {avg_slope:+.1f} $/h</span>
-                        <span class="stat positive">🟢 Positive: {positive_slopes}</span>
-                        <span class="stat negative">🔴 Negative: {negative_slopes}</span>
+                        <span class="stat positive">🟢 Long: {positive_slopes}</span>
+                        <span class="stat negative">🔴 Short: {negative_slopes}</span>
                     </div>
                     
                     <div class="stats">
                         <span class="returns">💰 Total Strategy Return: <b>{total_return:+.2f}%</b></span>
-                        <span class="positive">🟢 From Green periods: +{pos_return:.2f}%</span>
-                        <span class="negative">🔴 Avoided Red periods: +{abs(neg_return):.2f}%</span>
+                        <span class="positive">🟢 Long P&L: +{pos_return:.2f}%</span>
+                        <span class="negative">🔴 Short P&L: +{neg_return:.2f}%</span>
                     </div>
                     
                     <img src="data:image/png;base64,{image_base64}">
+                    
+                    {trades_html}
                 </div>
             </body>
             </html>
@@ -419,7 +502,7 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
 
 def main():
     print("=" * 60)
-    print("🚀 BTC Cascade Lines Server")
+    print("🚀 BTC Cascade Trading Strategy Server")
     print("=" * 60)
     print("   Each line minimizes error/window^K")
     print("   Then removes that window and continues")
