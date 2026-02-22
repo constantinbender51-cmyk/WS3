@@ -20,8 +20,6 @@ timestamps = None
 full_start_date = None
 full_end_date = None
 K = 1.8  # Window exponent
-positions = []  # Store trading positions (1 = long, -1 = short, 0 = flat)
-position_dates = []  # Store corresponding indices
 
 def fetch_data():
     """Fetch BTC 1h data for last 30 days from Binance"""
@@ -70,27 +68,23 @@ def generate_sample_data():
     
     print(f"⚠️ Generated {n_points} hours of sample data")
 
-def find_best_line(data_prices, data_timestamps, end_pos):
-    """Find the best line ending at end_pos using error/window^K"""
+def find_best_line(data_prices, data_timestamps, start_idx):
+    """Find the best line on the given data segment using error/window^K"""
     best_error = float('inf')
     best_line = None
     best_window = 0
     best_slope = 0
-    best_start = 0
+    best_end = 0
     
-    min_start = max(0, end_pos - 100)  # Can't go more than 100 back
+    n_points = len(data_prices)
     
-    print(f"\n   Analyzing window ending at {end_pos}h:")
+    print(f"\n   Analyzing segment from {start_idx}h ({len(data_prices)} points):")
     
-    # Try all window sizes from 10 to 100 (or until start of data)
-    for window in range(10, 101):
-        start_pos = end_pos - window
-        if start_pos < 0:
-            break
-            
-        # Get window points
-        X = timestamps[start_pos:end_pos]
-        y = prices[start_pos:end_pos]
+    # Try all window sizes from 10 to min(100, n_points)
+    for window in range(10, min(101, n_points + 1)):
+        # Get last 'window' points of this segment
+        X = data_timestamps[-window:]
+        y = data_prices[-window:]
         
         # Normalize
         X_mean = X.mean()
@@ -113,7 +107,7 @@ def find_best_line(data_prices, data_timestamps, end_pos):
         slope = model.coef_[0] / X_std * 3600000
         
         # Print every 10th window for debugging
-        if window % 10 == 0:
+        if window % 10 == 0 or window == 10:
             print(f"     win={window:3d}: error/win^{K}={error:10.2f}, slope={slope:8.2f}")
         
         if error < best_error:
@@ -121,123 +115,116 @@ def find_best_line(data_prices, data_timestamps, end_pos):
             best_window = window
             best_line = (X, y_pred, model, (X_mean, X_std))
             best_slope = slope
-            best_start = start_pos
+            best_end = start_idx + n_points
     
     return {
-        'start_idx': best_start,
-        'end_idx': end_pos,
+        'start_idx': start_idx,
+        'end_idx': best_end,
         'window': best_window,
         'slope': best_slope,
         'error': best_error,
-        'line_data': best_line
+        'line_data': best_line,
+        'n_points': n_points
     }
 
-def calculate_positions():
-    """Calculate trading positions by moving backwards through time"""
-    global positions, position_dates
-    
+def find_cascade():
+    """Find cascade of lines, each on the reduced dataset"""
     print("\n" + "=" * 60)
-    print(f"📊 Calculating trading positions (error/window^{K})...")
+    print(f"📊 Finding cascade of lines (error/window^{K})...")
     print("=" * 60)
     
-    positions = []
-    position_dates = []
-    
-    # Start from the end and move backwards
-    current_end = len(prices)
+    cascade = []
+    current_prices = prices.copy()
+    current_timestamps = timestamps.copy()
+    current_start = 0
     iteration = 1
     
-    while current_end > 100:  # Need at least 100 points
-        # Find best line ending at current_end
-        result = find_best_line(prices, timestamps, current_end)
+    while len(current_prices) >= 110:  # Need at least 110 points (100 window + 10)
+        # Find best line on current data
+        result = find_best_line(current_prices, current_timestamps, current_start)
         
         if result['window'] == 0:
             break
+            
+        cascade.append(result)
         
-        start_date = full_start_date + timedelta(hours=result['start_idx'])
-        end_date = full_start_date + timedelta(hours=current_end)
+        end_date = full_start_date + timedelta(hours=result['end_idx'])
+        window_start = result['end_idx'] - result['window']
+        window_start_date = full_start_date + timedelta(hours=window_start)
         
-        # Determine position based on slope
-        position = 1 if result['slope'] > 0 else -1  # Long if slope positive, short if negative
-        
-        print(f"\n📌 Position {iteration}:")
-        print(f"   Period: {result['start_idx']}h to {current_end}h ({result['window']}h window)")
-        print(f"   Date: {start_date} to {end_date}")
-        print(f"   Slope: {result['slope']:+.2f} $/h → {'LONG' if position == 1 else 'SHORT'}")
+        print(f"\n📌 Line {iteration}:")
+        print(f"   Window: {window_start}h to {result['end_idx']}h ({result['window']}h)")
+        print(f"   Date: {window_start_date} to {end_date}")
+        print(f"   Slope: {result['slope']:+.2f} $/h")
         print(f"   Error/win^{K}: {result['error']:.2f}")
         
-        # Store position for every point in this window
-        for idx in range(result['start_idx'], current_end):
-            positions.append(position)
-            position_dates.append(idx)
+        # Remove the window we just used
+        # We keep everything before the start of the window
+        new_end = window_start
         
-        # Move back to the start of this window
-        current_end = result['start_idx']
+        if new_end <= current_start:
+            print(f"   Cannot go further (new end {new_end} <= current start {current_start})")
+            break
+            
+        current_prices = prices[current_start:new_end]
+        current_timestamps = timestamps[current_start:new_end]
+        print(f"   Remaining data: {current_start}h to {new_end}h ({len(current_prices)} points)")
+        
         iteration += 1
         
-        if iteration > 50:  # Safety limit
+        if iteration > 20:  # Safety limit
             print("   Reached iteration limit")
             break
     
-    print(f"\n✅ Calculated {len(positions)} position points")
-    print(f"   Long positions: {positions.count(1)}")
-    print(f"   Short positions: {positions.count(-1)}")
+    print(f"\n✅ Found {len(cascade)} cascade lines")
+    return cascade
 
-def create_plot():
-    """Create plot with price and trading positions"""
-    plt.figure(figsize=(14, 10))
-    
-    # Create 2x1 subplot grid
-    gs = plt.GridSpec(2, 1, height_ratios=[2, 1], hspace=0.3)
-    
-    # Top plot: Price with position-colored background
-    ax_price = plt.subplot(gs[0])
+def create_plot(cascade):
+    """Create plot with all cascade lines"""
+    plt.figure(figsize=(14, 8))
     
     # Plot price
-    ax_price.plot(range(len(prices)), prices, 'b-', alpha=0.7, label='BTC Price', linewidth=1.5)
+    plt.plot(range(len(prices)), prices, 'b-', alpha=0.5, label='BTC Price', linewidth=1)
     
-    # Color background based on position
-    if positions and position_dates:
-        # Group consecutive positions
-        current_pos = positions[0]
-        start_idx = position_dates[0]
+    # Plot each cascade line
+    colors = ['red', 'green', 'purple', 'orange', 'brown', 'pink', 'gray', 'olive', 'cyan', 'magenta']
+    
+    for i, line in enumerate(cascade):
+        color = colors[i % len(colors)]
+        end_idx = line['end_idx']
+        window = line['window']
+        line_start = end_idx - window
         
-        for i in range(1, len(position_dates)):
-            if positions[i] != current_pos or i == len(position_dates) - 1:
-                end_idx = position_dates[i]
-                color = 'green' if current_pos == 1 else 'red'
-                ax_price.axvspan(start_idx, end_idx, facecolor=color, alpha=0.2)
-                current_pos = positions[i]
-                start_idx = position_dates[i]
+        # Get the line data
+        X, y_pred, model, norm_params = line['line_data']
+        
+        # Plot the line
+        x_range = range(line_start, end_idx)
+        plt.plot(x_range, y_pred, color=color, linewidth=2.5, 
+                label=f'Line {i+1}: win={window}h, slope={line["slope"]:+.1f}')
+        
+        # Mark the window points
+        plt.scatter(x_range, prices[line_start:end_idx], c=color, s=15, alpha=0.3)
+        
+        # Add line number
+        plt.text(line_start, prices[line_start] - 200, f'{i+1}', 
+                fontsize=10, fontweight='bold', ha='center',
+                bbox=dict(boxstyle='round,pad=0.2', fc='yellow', alpha=0.7))
+        
+        # Mark the boundary
+        if i < len(cascade) - 1:
+            plt.axvline(x=line_start, color=color, linestyle='--', alpha=0.3)
     
-    ax_price.set_title('BTC Price with Trading Positions (Green=Long, Red=Short)', fontsize=12)
-    ax_price.set_ylabel('Price (USDT)')
-    ax_price.grid(True, alpha=0.2)
-    ax_price.legend(loc='upper left')
+    plt.title(f'BTC Price with Cascade Lines (error/window^{K})', fontsize=14)
+    plt.xlabel('Hours from Start')
+    plt.ylabel('Price (USDT)')
+    plt.grid(True, alpha=0.2)
+    plt.legend(loc='upper left', fontsize=8)
     
     # Add K value info
-    ax_price.text(0.98, 0.02, f'K = {K}', transform=ax_price.transAxes, 
-                  fontsize=10, ha='right',
-                  bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    
-    # Bottom plot: Position over time
-    ax_pos = plt.subplot(gs[1])
-    
-    if positions and position_dates:
-        # Plot position as step function
-        ax_pos.step(position_dates, positions, where='post', color='purple', linewidth=2)
-        ax_pos.fill_between(position_dates, 0, positions, where=np.array(positions) > 0, 
-                            color='green', alpha=0.3, step='post')
-        ax_pos.fill_between(position_dates, 0, positions, where=np.array(positions) < 0, 
-                            color='red', alpha=0.3, step='post')
-    
-    ax_pos.set_ylim(-1.5, 1.5)
-    ax_pos.set_yticks([-1, 0, 1])
-    ax_pos.set_yticklabels(['SHORT', 'FLAT', 'LONG'])
-    ax_pos.set_xlabel('Hour')
-    ax_pos.set_ylabel('Position')
-    ax_pos.grid(True, alpha=0.2)
-    ax_pos.set_title('Trading Position Over Time')
+    plt.text(0.98, 0.02, f'K = {K}', transform=plt.gca().transAxes, 
+             fontsize=12, ha='right',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     
     plt.tight_layout()
     
@@ -256,40 +243,38 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Content-type', 'text/html')
             self.end_headers()
             
-            # Calculate positions
-            calculate_positions()
+            # Find cascade
+            cascade = find_cascade()
             
             # Create plot
-            image_base64 = create_plot()
+            image_base64 = create_plot(cascade)
             
             # Calculate some stats
-            long_pct = positions.count(1) / len(positions) * 100 if positions else 0
-            short_pct = positions.count(-1) / len(positions) * 100 if positions else 0
+            avg_window = np.mean([line['window'] for line in cascade]) if cascade else 0
+            avg_slope = np.mean([line['slope'] for line in cascade]) if cascade else 0
             
             # Simple HTML
             html = f"""
             <!DOCTYPE html>
             <html>
             <head>
-                <title>BTC Trading Positions K={K}</title>
+                <title>BTC Cascade Lines K={K}</title>
                 <style>
                     body {{ margin: 20px; font-family: Arial; background: #f5f5f5; }}
                     .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }}
                     h1 {{ margin: 0 0 10px 0; font-size: 20px; }}
                     .stats {{ margin: 10px 0; padding: 10px; background: #f0f0f0; border-radius: 4px; display: flex; gap: 20px; }}
                     .stat {{ padding: 5px 10px; background: #fff; border-radius: 4px; }}
-                    .long {{ color: green; font-weight: bold; }}
-                    .short {{ color: red; font-weight: bold; }}
                     img {{ width: 100%; }}
                 </style>
             </head>
             <body>
                 <div class="container">
-                    <h1>📈 BTC Trading Positions (error/window^{K})</h1>
+                    <h1>📈 BTC Cascade Lines (error/window^{K})</h1>
                     <div class="stats">
-                        <span class="stat">📊 Points: {len(positions)}</span>
-                        <span class="stat long">🟢 Long: {long_pct:.1f}%</span>
-                        <span class="stat short">🔴 Short: {short_pct:.1f}%</span>
+                        <span class="stat">📊 Lines: {len(cascade)}</span>
+                        <span class="stat">📏 Avg window: {avg_window:.1f}h</span>
+                        <span class="stat">📈 Avg slope: {avg_slope:+.1f} $/h</span>
                     </div>
                     <img src="data:image/png;base64,{image_base64}">
                 </div>
@@ -303,11 +288,10 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
 
 def main():
     print("=" * 60)
-    print(f"🚀 BTC Trading Positions Server (K={K})")
+    print(f"🚀 BTC Cascade Lines Server (K={K})")
     print("=" * 60)
-    print(f"   Moving backwards through time")
     print(f"   Each line minimizes error/window^{K}")
-    print(f"   Position = LONG if slope > 0, SHORT if slope < 0")
+    print("   Then removes that window and continues")
     
     # Fetch data on startup
     print("\n📡 Fetching BTC data...")
