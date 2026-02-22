@@ -639,7 +639,7 @@ def main():
     parser.add_argument('--interval', type=str, default='1h', help='Time interval')
     parser.add_argument('--days', type=int, default=30, help='Historical days for initial data')
     parser.add_argument('--port', type=int, default=8080, help='Dashboard port')
-    parser.add_argument('--host', type=str, default='localhost', help='Host IP address')
+    parser.add_argument('--host', type=str, default='0.0.0.0', help='Host IP address')
     parser.add_argument('--live', action='store_true', help='Enable live trading')
     parser.add_argument('--check-interval', type=int, default=3601, 
                        help='Seconds between checks (default: 3601 = 1 hour + 1 sec)')
