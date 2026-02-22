@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-BTC Trading Strategy Backtest - Optimized per line with fixed k
-Run with: python btc_strategy.py
+BTC Trading Strategy Backtest - With HTTP Server Option
+Run with: python btc_strategy.py --serve
 """
 
 import pandas as pd
@@ -12,6 +12,7 @@ from sklearn.linear_model import LinearRegression
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import json
 import os
 import argparse
@@ -19,6 +20,12 @@ from typing import Tuple, Dict, List, Optional
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
+import http.server
+import socketserver
+import threading
+import base64
+from io import BytesIO
+import urllib.parse
 warnings.filterwarnings('ignore')
 
 # Configure logging
@@ -33,6 +40,11 @@ SYMBOL = "BTCUSDT"
 INTERVAL = "1h"
 DAYS = 30
 K_FIXED = 1.8  # Fixed k value as specified
+PORT = 8000
+
+# Global variable to cache results for HTTP server
+cached_results = None
+cached_html = None
 
 def fetch_binance_data(symbol: str = "BTCUSDT", interval: str = "1h", days: int = 30) -> pd.DataFrame:
     """Fetch historical data from Binance"""
@@ -304,10 +316,10 @@ def calculate_statistics(equity_curve: List[float], returns: List[float],
         'k_fixed': k_fixed
     }
 
-def generate_plot(prices: pd.Series, equity_curve: List[float], 
-                 signals: List[int], optimal_windows: List[int], 
-                 stats: Dict, output_file: str = 'strategy_plot.png'):
-    """Generate and save matplotlib plot"""
+def generate_plot_base64(prices: pd.Series, equity_curve: List[float], 
+                        signals: List[int], optimal_windows: List[int], 
+                        stats: Dict) -> str:
+    """Generate plot and return as base64 string"""
     try:
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14, 10))
         
@@ -336,6 +348,7 @@ def generate_plot(prices: pd.Series, equity_curve: List[float],
         ax1.set_ylabel('Price (USDT)')
         ax1.legend(loc='upper left')
         ax1.grid(True, alpha=0.3)
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
         
         # Equity curve
         equity_dates = prices.index[1:len(equity_curve)+1]
@@ -345,6 +358,7 @@ def generate_plot(prices: pd.Series, equity_curve: List[float],
         ax2.grid(True, alpha=0.3)
         ax2.axhline(y=1000, color='gray', linestyle='--', alpha=0.5, label='Initial Capital')
         ax2.legend(loc='upper left')
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
         
         # Optimal windows distribution
         if optimal_windows:
@@ -364,29 +378,460 @@ def generate_plot(prices: pd.Series, equity_curve: List[float],
         ax4.set_ylabel('Frequency')
         ax4.grid(True, alpha=0.3)
         
-        # Add statistics text
-        stats_text = (
-            f"Total Return: {stats['total_return']}%\n"
-            f"Sharpe: {stats['sharpe_ratio']}\n"
-            f"Win Rate: {stats['win_rate']}%\n"
-            f"k fixed: {stats['k_fixed']}"
-        )
-        ax2.text(0.02, 0.85, stats_text, transform=ax2.transAxes, 
-                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
-                fontsize=9)
-        
         plt.tight_layout()
-        plt.savefig(output_file, dpi=100, bbox_inches='tight')
+        
+        # Convert to base64
+        buffer = BytesIO()
+        plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight')
+        buffer.seek(0)
+        image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
         plt.close()
         
-        logger.info(f"Plot saved to {output_file}")
+        return image_base64
         
     except Exception as e:
         logger.error(f"Error generating plot: {e}")
+        return ""
 
-def save_results(stats: Dict, signals: List[int], optimal_windows: List[int], 
-                slopes: List[float], output_dir: str = 'results'):
-    """Save results to JSON file"""
+def generate_html_report(prices: pd.Series, equity_curve: List[float], 
+                        signals: List[int], optimal_windows: List[int], 
+                        stats: Dict, image_base64: str) -> str:
+    """Generate HTML report"""
+    
+    # Calculate some additional metrics for display
+    total_candles = len(prices)
+    trading_days = len(prices) * (1 if INTERVAL.endswith('h') else 24) / 24
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>BTC Trading Strategy Report</title>
+        <style>
+            * {{
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }}
+            
+            body {{
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                padding: 20px;
+            }}
+            
+            .container {{
+                max-width: 1400px;
+                margin: 0 auto;
+                background-color: rgba(255, 255, 255, 0.95);
+                border-radius: 20px;
+                padding: 30px;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                backdrop-filter: blur(10px);
+            }}
+            
+            h1 {{
+                color: #333;
+                margin-bottom: 20px;
+                font-size: 2.5em;
+                border-bottom: 3px solid #667eea;
+                padding-bottom: 10px;
+            }}
+            
+            h2 {{
+                color: #555;
+                margin: 20px 0 15px 0;
+                font-size: 1.5em;
+            }}
+            
+            .stats-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                gap: 20px;
+                margin-bottom: 30px;
+            }}
+            
+            .stat-card {{
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 25px;
+                border-radius: 15px;
+                text-align: center;
+                transition: transform 0.3s ease;
+                box-shadow: 0 10px 30px rgba(102, 126, 234, 0.3);
+            }}
+            
+            .stat-card:hover {{
+                transform: translateY(-5px);
+            }}
+            
+            .stat-card h3 {{
+                font-size: 16px;
+                font-weight: 400;
+                margin-bottom: 10px;
+                opacity: 0.9;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+            }}
+            
+            .stat-card p {{
+                font-size: 32px;
+                font-weight: 700;
+                margin: 0;
+            }}
+            
+            .stat-card.positive p {{ color: #4ade80; }}
+            .stat-card.negative p {{ color: #f87171; }}
+            
+            .plot-container {{
+                background: white;
+                border-radius: 15px;
+                padding: 20px;
+                margin: 30px 0;
+                box-shadow: 0 5px 20px rgba(0,0,0,0.1);
+            }}
+            
+            .plot-container img {{
+                width: 100%;
+                height: auto;
+                border-radius: 10px;
+            }}
+            
+            .info-panel {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+                gap: 20px;
+                margin-top: 30px;
+            }}
+            
+            .info-card {{
+                background: #f8f9fa;
+                border-radius: 15px;
+                padding: 20px;
+                box-shadow: 0 5px 15px rgba(0,0,0,0.05);
+            }}
+            
+            .info-card h3 {{
+                color: #667eea;
+                margin-bottom: 15px;
+                font-size: 1.2em;
+            }}
+            
+            .info-item {{
+                display: flex;
+                justify-content: space-between;
+                padding: 10px 0;
+                border-bottom: 1px solid #e9ecef;
+            }}
+            
+            .info-item:last-child {{
+                border-bottom: none;
+            }}
+            
+            .info-label {{
+                color: #6c757d;
+                font-weight: 500;
+            }}
+            
+            .info-value {{
+                color: #333;
+                font-weight: 600;
+            }}
+            
+            .footer {{
+                text-align: center;
+                margin-top: 30px;
+                padding-top: 20px;
+                border-top: 1px solid #e9ecef;
+                color: #6c757d;
+            }}
+            
+            .badge {{
+                display: inline-block;
+                padding: 5px 10px;
+                border-radius: 20px;
+                font-size: 12px;
+                font-weight: 600;
+                margin-left: 10px;
+            }}
+            
+            .badge.success {{
+                background: #4ade80;
+                color: white;
+            }}
+            
+            .badge.warning {{
+                background: #fbbf24;
+                color: white;
+            }}
+            
+            .refresh-btn {{
+                background: #667eea;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 10px;
+                cursor: pointer;
+                font-size: 16px;
+                font-weight: 600;
+                transition: background 0.3s ease;
+                margin-bottom: 20px;
+            }}
+            
+            .refresh-btn:hover {{
+                background: #5a67d8;
+            }}
+            
+            @media (max-width: 768px) {{
+                .container {{
+                    padding: 15px;
+                }}
+                
+                h1 {{
+                    font-size: 2em;
+                }}
+                
+                .stat-card p {{
+                    font-size: 24px;
+                }}
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h1>🚀 BTC Trading Strategy Report</h1>
+                <button class="refresh-btn" onclick="location.reload()">🔄 Refresh Data</button>
+            </div>
+            
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <h3>Total Return</h3>
+                    <p class="{'positive' if stats['total_return'] > 0 else 'negative'}">{stats['total_return']}%</p>
+                </div>
+                
+                <div class="stat-card">
+                    <h3>Sharpe Ratio</h3>
+                    <p>{stats['sharpe_ratio']}</p>
+                </div>
+                
+                <div class="stat-card">
+                    <h3>Win Rate</h3>
+                    <p>{stats['win_rate']}%</p>
+                </div>
+                
+                <div class="stat-card">
+                    <h3>Max Drawdown</h3>
+                    <p class="negative">{stats['max_drawdown']}%</p>
+                </div>
+                
+                <div class="stat-card">
+                    <h3>Profit Factor</h3>
+                    <p>{stats['profit_factor']}</p>
+                </div>
+                
+                <div class="stat-card">
+                    <h3>Total Trades</h3>
+                    <p>{stats['num_trades']}</p>
+                </div>
+            </div>
+            
+            <div class="plot-container">
+                <img src="data:image/png;base64,{image_base64}" alt="Strategy Performance">
+            </div>
+            
+            <div class="info-panel">
+                <div class="info-card">
+                    <h3>📊 Strategy Parameters</h3>
+                    <div class="info-item">
+                        <span class="info-label">Fixed k value:</span>
+                        <span class="info-value">{stats['k_fixed']}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Window range:</span>
+                        <span class="info-value">10-100</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Symbol:</span>
+                        <span class="info-value">{SYMBOL}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Interval:</span>
+                        <span class="info-value">{INTERVAL}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Period:</span>
+                        <span class="info-value">{DAYS} days</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Data points:</span>
+                        <span class="info-value">{total_candles}</span>
+                    </div>
+                </div>
+                
+                <div class="info-card">
+                    <h3>📈 Window Optimization</h3>
+                    <div class="info-item">
+                        <span class="info-label">Average window:</span>
+                        <span class="info-value">{stats['avg_optimal_window']}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Min window:</span>
+                        <span class="info-value">{stats['min_optimal_window']}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Max window:</span>
+                        <span class="info-value">{stats['max_optimal_window']}</span>
+                    </div>
+                </div>
+                
+                <div class="info-card">
+                    <h3>💰 Performance Details</h3>
+                    <div class="info-item">
+                        <span class="info-label">Annual Return:</span>
+                        <span class="info-value">{stats['annual_return']}%</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Final Equity:</span>
+                        <span class="info-value">${equity_curve[-1]:.2f}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Best Trade:</span>
+                        <span class="info-value positive">+{max([r for r in returns if r > 0] or [0])*100:.2f}%</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Worst Trade:</span>
+                        <span class="info-value negative">{min([r for r in returns if r < 0] or [0])*100:.2f}%</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="footer">
+                <p>Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC</p>
+                <p style="font-size: 12px; margin-top: 10px;">Data source: Binance API</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return html
+
+def run_strategy(k_value: float = K_FIXED, min_window: int = 10, max_window: int = 100) -> Dict:
+    """Run the complete strategy and return results"""
+    global cached_results, cached_html
+    
+    # Fetch data
+    df = fetch_binance_data(SYMBOL, INTERVAL, DAYS)
+    prices = df['close']
+    
+    logger.info(f"Loaded {len(prices)} price points")
+    
+    # Calculate signals with optimal windows for each line
+    logger.info(f"Calculating signals with fixed k={k_value}...")
+    signals, optimal_windows, slopes = calculate_signals_with_optimal_windows(
+        prices, 
+        min_window=min_window,
+        max_window=max_window,
+        k=k_value,
+        parallel=True
+    )
+    
+    # Backtest
+    logger.info("Running backtest...")
+    returns, equity_curve = backtest_strategy(prices, signals)
+    
+    # Calculate statistics
+    stats = calculate_statistics(equity_curve, returns, optimal_windows, k_value)
+    
+    # Generate plot
+    image_base64 = generate_plot_base64(prices, equity_curve, signals, optimal_windows, stats)
+    
+    # Generate HTML
+    html = generate_html_report(prices, equity_curve, signals, optimal_windows, stats, image_base64)
+    
+    # Cache results
+    cached_results = {
+        'prices': prices,
+        'equity_curve': equity_curve,
+        'signals': signals,
+        'optimal_windows': optimal_windows,
+        'stats': stats,
+        'slopes': slopes,
+        'image_base64': image_base64
+    }
+    cached_html = html
+    
+    return cached_results
+
+class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        global cached_html
+        
+        parsed_path = urllib.parse.urlparse(self.path)
+        
+        if parsed_path.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            
+            if cached_html is None:
+                # Run strategy if not cached
+                run_strategy()
+            
+            self.wfile.write(cached_html.encode())
+            
+        elif parsed_path.path == '/api/stats':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            
+            if cached_results is None:
+                run_strategy()
+            
+            # Convert numpy types to Python types for JSON
+            stats_json = json.dumps(cached_results['stats'], default=lambda x: float(x) if isinstance(x, np.floating) else x)
+            self.wfile.write(stats_json.encode())
+            
+        elif parsed_path.path == '/api/refresh':
+            # Force refresh
+            run_strategy()
+            self.send_response(302)
+            self.send_header('Location', '/')
+            self.end_headers()
+            
+        else:
+            self.send_response(404)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b'<h1>404 Not Found</h1>')
+    
+    def log_message(self, format, *args):
+        # Suppress HTTP server logs
+        pass
+
+def run_http_server(port: int = PORT):
+    """Run HTTP server"""
+    handler = CustomHTTPRequestHandler
+    
+    # Run strategy once at startup
+    logger.info("Pre-calculating strategy results...")
+    run_strategy()
+    
+    with socketserver.TCPServer(("", port), handler) as httpd:
+        logger.info(f"🌐 HTTP Server running at http://localhost:{port}")
+        logger.info("Press Ctrl+C to stop")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            logger.info("Server stopped")
+
+def save_results_to_file(stats: Dict, signals: List[int], optimal_windows: List[int], 
+                        slopes: List[float], image_base64: str, output_dir: str = 'results'):
+    """Save results to files"""
     os.makedirs(output_dir, exist_ok=True)
     
     # Save complete results
@@ -394,7 +839,7 @@ def save_results(stats: Dict, signals: List[int], optimal_windows: List[int],
         'statistics': stats,
         'signals': signals,
         'optimal_windows': optimal_windows,
-        'slopes': [float(s) for s in slopes],  # Convert numpy floats to Python floats
+        'slopes': [float(s) for s in slopes],
         'generated_at': datetime.now().isoformat(),
         'parameters': {
             'symbol': SYMBOL,
@@ -408,6 +853,29 @@ def save_results(stats: Dict, signals: List[int], optimal_windows: List[int],
     results_file = os.path.join(output_dir, 'results.json')
     with open(results_file, 'w') as f:
         json.dump(results, f, indent=2)
+    
+    # Save HTML report
+    html_file = os.path.join(output_dir, 'report.html')
+    
+    # We need to recreate the HTML with the image embedded
+    # For file saving, we can use the base64 image directly
+    html_content = generate_html_report(
+        pd.Series(dtype=float),  # Dummy, not used in HTML generation
+        [],  # Dummy
+        [],  # Dummy
+        [],  # Dummy
+        stats,
+        image_base64
+    )
+    
+    with open(html_file, 'w') as f:
+        f.write(html_content)
+    
+    # Save plot as PNG
+    if image_base64:
+        plot_file = os.path.join(output_dir, 'strategy_plot.png')
+        with open(plot_file, 'wb') as f:
+            f.write(base64.b64decode(image_base64))
     
     # Save summary text
     summary_file = os.path.join(output_dir, 'summary.txt')
@@ -448,64 +916,64 @@ def main():
     parser.add_argument('--output-dir', type=str, default='results', help='Output directory')
     parser.add_argument('--no-plot', action='store_true', help='Skip generating plot')
     parser.add_argument('--sequential', action='store_true', help='Use sequential processing (no parallel)')
+    parser.add_argument('--serve', action='store_true', help='Run HTTP server instead of CLI')
+    parser.add_argument('--port', type=int, default=PORT, help='HTTP server port (default: 8000)')
     
     args = parser.parse_args()
     
-    try:
-        # Use the k value from command line or default
-        k_value = args.k
-        
-        # Fetch data
-        df = fetch_binance_data(args.symbol, args.interval, args.days)
-        prices = df['close']
-        
-        logger.info(f"Loaded {len(prices)} price points")
-        
-        # Calculate signals with optimal windows for each line
-        logger.info(f"Calculating signals with fixed k={k_value}...")
-        signals, optimal_windows, slopes = calculate_signals_with_optimal_windows(
-            prices, 
-            min_window=args.min_window,
-            max_window=args.max_window,
-            k=k_value,
-            parallel=not args.sequential
-        )
-        
-        # Backtest
-        logger.info("Running backtest...")
-        returns, equity_curve = backtest_strategy(prices, signals)
-        
-        # Calculate statistics
-        stats = calculate_statistics(equity_curve, returns, optimal_windows, k_value)
-        
-        # Generate plot (if not disabled)
-        if not args.no_plot:
-            plot_file = os.path.join(args.output_dir, 'strategy_plot.png')
-            generate_plot(prices, equity_curve, signals, optimal_windows, stats, plot_file)
-        
-        # Save results
-        save_results(stats, signals, optimal_windows, slopes, args.output_dir)
-        
-        # Print summary to console
-        print("\n" + "="*60)
-        print("BACKTEST SUMMARY")
-        print("="*60)
-        print(f"k (fixed): {k_value}")
-        print(f"Average Optimal Window: {stats['avg_optimal_window']}")
-        print(f"Min/Max Window: {stats['min_optimal_window']}/{stats['max_optimal_window']}")
-        print("-" * 40)
-        print(f"Total Return: {stats['total_return']}%")
-        print(f"Annual Return: {stats['annual_return']}%")
-        print(f"Sharpe Ratio: {stats['sharpe_ratio']}")
-        print(f"Max Drawdown: {stats['max_drawdown']}%")
-        print(f"Win Rate: {stats['win_rate']}%")
-        print(f"Profit Factor: {stats['profit_factor']}")
-        print(f"Number of Trades: {stats['num_trades']}")
-        print("="*60)
-        
-    except Exception as e:
-        logger.error(f"Error in main execution: {e}")
-        raise
+    # Update global config
+    global SYMBOL, INTERVAL, DAYS, K_FIXED, PORT
+    SYMBOL = args.symbol
+    INTERVAL = args.interval
+    DAYS = args.days
+    K_FIXED = args.k
+    PORT = args.port
+    
+    if args.serve:
+        # Run HTTP server
+        run_http_server(args.port)
+    else:
+        # Run CLI version
+        try:
+            # Run strategy
+            results = run_strategy(args.k, args.min_window, args.max_window)
+            
+            # Save results
+            if not args.no_plot:
+                save_results_to_file(
+                    results['stats'], 
+                    results['signals'], 
+                    results['optimal_windows'], 
+                    results['slopes'],
+                    results['image_base64'],
+                    args.output_dir
+                )
+            
+            # Print summary to console
+            stats = results['stats']
+            print("\n" + "="*60)
+            print("BACKTEST SUMMARY")
+            print("="*60)
+            print(f"k (fixed): {stats['k_fixed']}")
+            print(f"Average Optimal Window: {stats['avg_optimal_window']}")
+            print(f"Min/Max Window: {stats['min_optimal_window']}/{stats['max_optimal_window']}")
+            print("-" * 40)
+            print(f"Total Return: {stats['total_return']}%")
+            print(f"Annual Return: {stats['annual_return']}%")
+            print(f"Sharpe Ratio: {stats['sharpe_ratio']}")
+            print(f"Max Drawdown: {stats['max_drawdown']}%")
+            print(f"Win Rate: {stats['win_rate']}%")
+            print(f"Profit Factor: {stats['profit_factor']}")
+            print(f"Number of Trades: {stats['num_trades']}")
+            print("="*60)
+            
+            if not args.no_plot:
+                print(f"\n📊 Report saved to: {args.output_dir}/report.html")
+                print(f"📈 Plot saved to: {args.output_dir}/strategy_plot.png")
+            
+        except Exception as e:
+            logger.error(f"Error in main execution: {e}")
+            raise
 
 if __name__ == "__main__":
     main()
