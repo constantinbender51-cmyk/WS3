@@ -1,1 +1,1 @@
-web: python app.py --live
+web: python app.py --live --host 0.0.0.0
