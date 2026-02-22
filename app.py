@@ -15,16 +15,19 @@ import warnings
 warnings.filterwarnings('ignore')
 
 class BTCOptimalLookback:
-    def __init__(self):
+    def __init__(self, length_reward: float = 0.1):
         self.data = None
         self.timestamps = None
         self.prices = None
         self.slope_history = []
         self.lookback_history = []
         self.error_history = []
+        self.raw_error_history = []  # Store raw error without reward
+        self.rewarded_error_history = []  # Store error with reward
         self.endpoint_indices = []  # Store the indices we analyzed
         self.full_start_date = None
         self.full_end_date = None
+        self.length_reward = length_reward  # Reward factor for longer windows
         
     def fetch(self) -> bool:
         """Fetch BTC 1h data for last 30 days from Binance"""
@@ -109,35 +112,57 @@ class BTCOptimalLookback:
         
         return slope, total_error, avg_error_per_candle
     
-    def find_optimal_lookback(self, prices: np.ndarray, timestamps: np.ndarray) -> Tuple[int, float, float, float]:
-        """Find the optimal lookback window that minimizes average error"""
-        best_avg_error = float('inf')
+    def find_optimal_lookback(self, prices: np.ndarray, timestamps: np.ndarray) -> Tuple[int, float, float, float, float]:
+        """Find the optimal lookback window that minimizes rewarded error"""
+        best_rewarded_error = float('inf')
         best_lookback = 10
         best_slope = 0
         best_total_error = 0
+        best_raw_error = 0
         
         max_lookback = min(100, len(prices))
+        
+        # Store all errors for analysis
+        lookback_errors = []
         
         for lookback in range(10, max_lookback + 1):
             slope, total_error, avg_error = self.ols(prices, timestamps, lookback)
             
-            if avg_error < best_avg_error:
-                best_avg_error = avg_error
+            # Apply length reward (longer windows get lower error)
+            # Reward factor: reduce error by length_reward * (lookback - 10)
+            # This means longer windows are favored if their raw error is similar
+            length_bonus = self.length_reward * (lookback - 10)
+            rewarded_error = avg_error * (1 - length_bonus / 100)  # Convert to percentage reduction
+            
+            lookback_errors.append((lookback, avg_error, rewarded_error))
+            
+            if rewarded_error < best_rewarded_error:
+                best_rewarded_error = rewarded_error
                 best_lookback = lookback
                 best_slope = slope
                 best_total_error = total_error
+                best_raw_error = avg_error
         
-        return best_lookback, best_slope, best_total_error, best_avg_error
+        # Print debug info for first few points
+        if len(self.endpoint_indices) < 3:
+            print(f"\n   Debug - Lookback errors for point {len(self.endpoint_indices)+1}:")
+            for lb, raw, rew in lookback_errors[::10]:  # Print every 10th
+                print(f"     lb={lb:3d}: raw=${raw:6.2f}, rew=${rew:6.2f}, bonus={(self.length_reward*(lb-10)):.1f}%")
+        
+        return best_lookback, best_slope, best_total_error, best_raw_error, best_rewarded_error
     
     def analyze_all_points(self):
         """Analyze every possible endpoint from min_points to the end"""
         print("\n" + "=" * 70)
         print("📊 POINT-BY-POINT ANALYSIS - Calculating Optimal Slope for Each Hour")
         print("=" * 70)
+        print(f"Length Reward Factor: {self.length_reward} ({(self.length_reward*90):.1f}% max bonus for 100-period)")
         
         self.slope_history = []
         self.lookback_history = []
         self.error_history = []
+        self.raw_error_history = []
+        self.rewarded_error_history = []
         self.endpoint_indices = []
         
         min_points = 110  # Need at least 100 lookback + 10 minimum
@@ -151,16 +176,21 @@ class BTCOptimalLookback:
             test_timestamps = self.timestamps[:endpoint]
             
             # Find optimal lookback for this endpoint
-            lookback, slope, total_error, avg_error = self.find_optimal_lookback(test_prices, test_timestamps)
+            lookback, slope, total_error, raw_error, rewarded_error = self.find_optimal_lookback(test_prices, test_timestamps)
             
             self.slope_history.append(slope)
             self.lookback_history.append(lookback)
-            self.error_history.append(avg_error)
+            self.error_history.append(raw_error)  # Store raw error for backward compatibility
+            self.raw_error_history.append(raw_error)
+            self.rewarded_error_history.append(rewarded_error)
             self.endpoint_indices.append(endpoint)  # Store the endpoint index
             
             if endpoint % 100 == 0 or endpoint == total_points:
                 end_date = self.full_start_date + timedelta(hours=endpoint)
-                print(f"   📍 {endpoint}: {end_date.strftime('%Y-%m-%d %H:%M')} - Lookback={lookback}, Slope=${slope:+.2f}/h, Error=${avg_error:.2f}")
+                bonus = self.length_reward * (lookback - 10)
+                print(f"   📍 {endpoint}: {end_date.strftime('%Y-%m-%d %H:%M')} - "
+                      f"Lookback={lookback}, Slope=${slope:+.2f}/h, "
+                      f"Raw=${raw_error:.2f}, Rewarded=${rewarded_error:.2f}, Bonus={bonus:.1f}%")
         
         print(f"\n✅ Completed analysis of {len(self.slope_history)} endpoints")
         print(f"   Endpoint indices range: {self.endpoint_indices[0]} to {self.endpoint_indices[-1]}")
@@ -174,13 +204,20 @@ class BTCOptimalLookback:
         print(f"   Negative trends: {negative_slopes} ({negative_slopes/len(self.slope_history)*100:.1f}%)")
         print(f"   Avg slope: ${np.mean(self.slope_history):+.2f}/h")
         print(f"   Slope volatility: ${np.std(self.slope_history):.2f}/h")
+        
+        # Lookback statistics
+        print(f"\n📊 Lookback Statistics:")
+        print(f"   Avg lookback: {np.mean(self.lookback_history):.1f} hours")
+        print(f"   Median lookback: {np.median(self.lookback_history):.1f} hours")
+        print(f"   Min lookback: {np.min(self.lookback_history)} hours")
+        print(f"   Max lookback: {np.max(self.lookback_history)} hours")
     
     def plot(self) -> str:
         """Create plot showing price with slope heatmap and analysis"""
-        plt.figure(figsize=(16, 12))
+        plt.figure(figsize=(16, 14))
         
-        # Create 3x1 subplot grid
-        gs = plt.GridSpec(3, 1, height_ratios=[2.5, 1, 1], hspace=0.3)
+        # Create 4x1 subplot grid (added one more for reward analysis)
+        gs = plt.GridSpec(4, 1, height_ratios=[2, 1, 1, 1], hspace=0.3)
         
         # Main price chart with slope coloring
         ax_main = plt.subplot(gs[0])
@@ -218,7 +255,9 @@ class BTCOptimalLookback:
         ]
         ax_main.legend(handles=legend_elements, loc='upper left', fontsize=8, title='Slope Strength')
         
+        # Add reward info to title
         ax_main.set_title(f'BTC Price with Slope Heatmap\n'
+                         f'Length Reward: {self.length_reward} ({(self.length_reward*90):.1f}% max bonus)\n'
                          f'Green = Positive Trend, Red = Negative Trend (Intensity = Slope Magnitude)', 
                          fontsize=14, fontweight='bold')
         ax_main.set_xlabel('Hours from Start')
@@ -231,7 +270,7 @@ class BTCOptimalLookback:
                     fontsize=9, verticalalignment='top',
                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
-        # Slope chart (middle)
+        # Slope chart (second)
         ax_slope = plt.subplot(gs[1])
         
         # Color-code the slope line itself
@@ -260,26 +299,26 @@ class BTCOptimalLookback:
         ax_slope.set_ylabel('Slope ($/h)')
         ax_slope.grid(True, alpha=0.3)
         
-        # Lookback and Error chart (bottom)
-        ax_bottom = plt.subplot(gs[2])
+        # Lookback chart (third)
+        ax_lookback = plt.subplot(gs[2])
         
-        ax_bottom.plot(self.endpoint_indices, self.lookback_history, 'b-', linewidth=1.5, alpha=0.7, label='Optimal Lookback')
-        ax_bottom.set_xlabel('Hours from Start')
-        ax_bottom.set_ylabel('Lookback (hours)', color='b')
-        ax_bottom.tick_params(axis='y', labelcolor='b')
-        ax_bottom.grid(True, alpha=0.3)
+        ax_lookback.plot(self.endpoint_indices, self.lookback_history, 'b-', linewidth=1.5, alpha=0.7, label='Optimal Lookback')
+        ax_lookback.set_xlabel('Hours from Start')
+        ax_lookback.set_ylabel('Lookback (hours)', color='b')
+        ax_lookback.tick_params(axis='y', labelcolor='b')
+        ax_lookback.grid(True, alpha=0.3)
+        ax_lookback.set_title('Optimal Lookback Window with Length Reward', fontsize=12)
         
-        ax2 = ax_bottom.twinx()
-        ax2.plot(self.endpoint_indices, self.error_history, 'orange', linewidth=1, alpha=0.7, label='Avg Error')
-        ax2.set_ylabel('Avg Error ($)', color='orange')
-        ax2.tick_params(axis='y', labelcolor='orange')
+        # Error comparison chart (fourth)
+        ax_error = plt.subplot(gs[3])
         
-        ax_bottom.set_title('Optimal Lookback Window and Average Error', fontsize=12)
-        
-        # Add legend
-        lines1, labels1 = ax_bottom.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax_bottom.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=8)
+        ax_error.plot(self.endpoint_indices, self.raw_error_history, 'gray', linewidth=1, alpha=0.5, label='Raw Error')
+        ax_error.plot(self.endpoint_indices, self.rewarded_error_history, 'orange', linewidth=1.5, alpha=0.8, label='Rewarded Error')
+        ax_error.set_xlabel('Hours from Start')
+        ax_error.set_ylabel('Error ($)')
+        ax_error.grid(True, alpha=0.3)
+        ax_error.set_title(f'Raw vs Rewarded Error (Length Reward: {self.length_reward})', fontsize=12)
+        ax_error.legend(loc='upper right', fontsize=8)
         
         plt.tight_layout()
         
@@ -336,7 +375,7 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                 <!DOCTYPE html>
                 <html>
                 <head>
-                    <title>BTC Point-by-Point OLS Slope Analysis</title>
+                    <title>BTC Point-by-Point OLS Slope Analysis with Length Reward</title>
                     <style>
                         body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f0f0f0; }}
                         .container {{ max-width: 1400px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
@@ -355,18 +394,23 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                         .footer {{ margin-top: 30px; color: #666; font-size: 12px; text-align: center; padding-top: 20px; border-top: 1px solid #eee; }}
                         .methodology {{ background-color: #e8f4f8; border-left: 4px solid #2196F3; padding: 15px; margin: 20px 0; }}
                         .trend-indicator {{ font-size: 24px; text-align: center; padding: 20px; background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%); border-radius: 10px; margin: 20px 0; }}
+                        .reward-info {{ background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 20px 0; }}
                     </style>
                 </head>
                 <body>
                     <div class="container">
-                        <h1>📊 BTC Point-by-Point OLS Slope Analysis</h1>
-                        <p>Calculating optimal trend for every hour</p>
+                        <h1>📊 BTC Point-by-Point OLS Slope Analysis with Length Reward</h1>
+                        <p>Calculating optimal trend for every hour with preference for longer windows</p>
+                        
+                        <div class="reward-info">
+                            <strong>🎯 Length Reward: {analyzer.length_reward}</strong> - Each additional hour of lookback reduces the error by {analyzer.length_reward}% 
+                            (max {(analyzer.length_reward*90):.1f}% bonus for 100-period). This favors longer, more stable trends when fit quality is similar.
+                        </div>
                         
                         <div class="methodology">
                             <strong>🔬 Methodology:</strong> For every possible endpoint (starting from hour 110), 
-                            we find the lookback window (10-100 hours) that minimizes average absolute error. 
-                            The slope of that optimal line is then plotted on the price chart as a color-coded 
-                            background (green = positive, red = negative, intensity = magnitude).
+                            we find the lookback window (10-100 hours) that minimizes <strong>rewarded error</strong> = raw_error * (1 - length_reward * (lookback-10)/100).
+                            The slope of that optimal line is then plotted on the price chart as a color-coded background.
                         </div>
                         
                         <div class="trend-indicator">
@@ -380,7 +424,7 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                             <p><strong>Positive Slopes:</strong> {sum(1 for s in analyzer.slope_history if s > 0)} ({sum(1 for s in analyzer.slope_history if s > 0)/len(analyzer.slope_history)*100:.1f}%)</p>
                             <p><strong>Negative Slopes:</strong> {sum(1 for s in analyzer.slope_history if s < 0)} ({sum(1 for s in analyzer.slope_history if s < 0)/len(analyzer.slope_history)*100:.1f}%)</p>
                             <p><strong>Average Slope:</strong> ${np.mean(analyzer.slope_history):+.2f}/h</p>
-                            <p><strong>Slope Volatility:</strong> ${np.std(analyzer.slope_history):.2f}/h</p>
+                            <p><strong>Avg Lookback:</strong> {np.mean(analyzer.lookback_history):.1f} hours</p>
                         </div>
                         
                         <div class="stats">
@@ -406,12 +450,13 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                             </div>
                         </div>
                         
-                        <img src="data:image/png;base64,{image_base64}" alt="BTC Slope Analysis">
+                        <img src="data:image/png;base64,{image_base64}" alt="BTC Slope Analysis with Length Reward">
                         
                         <div class="footer">
                             <p>Data from Binance API | Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
                             <p>Each point's background color shows the optimal trend slope at that time</p>
                             <p>Green = positive slope (uptrend), Red = negative slope (downtrend)</p>
+                            <p>Length reward favors longer windows when fit quality is similar</p>
                         </div>
                     </div>
                 </body>
@@ -427,11 +472,15 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
 def main():
     """Main function to run the analysis and server"""
     print("=" * 70)
-    print("BTC Point-by-Point OLS Slope Analysis")
+    print("BTC Point-by-Point OLS Slope Analysis with Length Reward")
     print("=" * 70)
     
-    # Create analyzer instance
-    analyzer = BTCOptimalLookback()
+    # Length reward parameter - can be adjusted
+    # 0.1 means each additional hour gives 0.1% error reduction (max 9% for 100-period)
+    LENGTH_REWARD = 0.1
+    
+    # Create analyzer instance with length reward
+    analyzer = BTCOptimalLookback(length_reward=LENGTH_REWARD)
     
     # Fetch data
     print("\n📡 Fetching BTC data from Binance...")
