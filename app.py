@@ -1,299 +1,473 @@
-#!/usr/bin/env python3
-"""
-BTC Trading Strategy - Hold Until Signal Changes
-Run: python btc_strategy.py
-"""
-
 import numpy as np
-import requests
-from datetime import datetime, timedelta
-from sklearn.linear_model import LinearRegression
-import matplotlib
-matplotlib.use('Agg')
+import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.patches import Rectangle
 import http.server
 import socketserver
+import io
 import base64
-from io import BytesIO
+from datetime import datetime, timedelta
+import requests
+import argparse
+from sklearn.linear_model import LinearRegression
+import warnings
+warnings.filterwarnings('ignore')
 
-# ========== CONFIG ==========
-PORT = 8000
-K = 1.6
-
-# ========== FETCH DATA ==========
-print("📥 Fetching BTC data...")
-end = datetime.now()
-start = end - timedelta(days=30)
-
-url = "https://api.binance.com/api/v3/klines"
-params = {
-    "symbol": "BTCUSDT",
-    "interval": "1h",
-    "startTime": int(start.timestamp() * 1000),
-    "endTime": int(end.timestamp() * 1000),
-    "limit": 1000
-}
-
-data = requests.get(url, params=params).json()
-prices = [float(x[4]) for x in data]
-times = [datetime.fromtimestamp(x[0]/1000) for x in data]
-
-print(f"✅ Got {len(prices)} candles")
-
-# ========== RUN STRATEGY ==========
-print("🧮 Computing signals and optimized lines...")
-raw_signals = []  # Signal at each hour (before position holding)
-windows = []
-line_prices = []
-
-for i in range(10, len(prices)):
-    # Find best window
-    best_w = 10
-    best_err = float('inf')
-    best_model = None
+class BTCTrendAnalyzer:
+    def __init__(self, symbol='BTCUSDT', interval='1h', days=30):
+        self.symbol = symbol
+        self.interval = interval
+        self.days = days
+        self.data = None
+        self.optimized_lines = []
+        self.horizontal_lines = []
+        self.trades = []
+        
+    def fetch_binance_data(self):
+        """Fetch price data from Binance"""
+        base_url = "https://api.binance.com/api/v3/klines"
+        
+        # Calculate start time
+        end_time = datetime.now()
+        start_time = end_time - timedelta(days=self.days)
+        
+        # Convert interval to milliseconds
+        interval_map = {
+            '1h': 60 * 60 * 1000,
+            '4h': 4 * 60 * 60 * 1000,
+            '1d': 24 * 60 * 60 * 1000
+        }
+        
+        params = {
+            'symbol': self.symbol,
+            'interval': self.interval,
+            'startTime': int(start_time.timestamp() * 1000),
+            'endTime': int(end_time.timestamp() * 1000),
+            'limit': 1000
+        }
+        
+        try:
+            response = requests.get(base_url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(data, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_asset_volume', 'number_of_trades',
+                'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+            ])
+            
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df['close'] = df['close'].astype(float)
+            df['open'] = df['open'].astype(float)
+            df['high'] = df['high'].astype(float)
+            df['low'] = df['low'].astype(float)
+            
+            self.data = df[['timestamp', 'close']].copy()
+            return True
+            
+        except Exception as e:
+            print(f"Error fetching data: {e}")
+            # Generate sample data for testing
+            self.generate_sample_data()
+            return False
     
-    for w in range(10, min(101, i+1)):
-        y = np.array(prices[i-w:i]).reshape(-1, 1)
-        x = np.arange(w).reshape(-1, 1)
+    def generate_sample_data(self):
+        """Generate sample data for testing"""
+        dates = pd.date_range(end=datetime.now(), periods=24*30, freq='1h')
+        # Create a trending price with some noise
+        trend = np.linspace(40000, 45000, len(dates))
+        noise = np.random.normal(0, 1000, len(dates))
+        prices = trend + noise
+        
+        self.data = pd.DataFrame({
+            'timestamp': dates,
+            'close': prices
+        })
+        print("Generated sample data for testing")
+    
+    def ols_fit(self, prices):
+        """Fit OLS line to price data"""
+        x = np.arange(len(prices)).reshape(-1, 1)
+        y = prices.values.reshape(-1, 1)
         
         model = LinearRegression()
         model.fit(x, y)
-        pred = model.predict(x).flatten()
         
-        err = np.sum(np.abs(y.flatten() - pred)) / (w ** K)
-        
-        if err < best_err:
-            best_err = err
-            best_w = w
-            best_model = model
+        return model, model.predict(x)
     
-    raw_signals.append(1 if best_model.coef_[0][0] > 0 else -1)
-    windows.append(best_w)
+    def calculate_error(self, prices, predicted_prices):
+        """Calculate error term: sum(|line-price| / prices^2)"""
+        errors = np.abs(predicted_prices.flatten() - prices.values) / (prices.values ** 2)
+        return np.sum(errors)
     
-    # Store line for visualization
-    x_line = np.arange(best_w).reshape(-1, 1)
-    y_line = best_model.predict(x_line).flatten()
-    line_prices.append({
-        'times': times[i-best_w:i],
-        'prices': y_line,
-        'slope': best_model.coef_[0][0],
-        'time': times[i]
-    })
-
-print(f"✅ Got {len(raw_signals)} raw signals")
-
-# ========== APPLY POSITION HOLDING ==========
-print("🔄 Applying position holding...")
-positions = []  # Actual positions (hold until signal changes)
-current_position = raw_signals[0]
-position_changes = []  # Store when position changes
-
-for i, signal in enumerate(raw_signals):
-    if signal != current_position:
-        # Position changes
-        position_changes.append({
-            'from': current_position,
-            'to': signal,
-            'time': times[10 + i],  # Adjust for starting index
-            'index': 10 + i
-        })
-        current_position = signal
-    positions.append(current_position)
-
-print(f"✅ Position changes: {len(position_changes)}")
-
-# ========== CALCULATE RETURNS ==========
-print("📊 Calculating returns...")
-returns = []
-trade_times = []
-position_start_idx = 10  # First signal at index 10
-current_pos = positions[0]
-entry_price = prices[10]
-
-for i in range(1, len(positions)):
-    current_idx = 10 + i
-    if current_idx >= len(prices):
-        break
+    def find_optimal_window(self, prices, min_window=10, max_window=100):
+        """Find optimal number of prices for OLS fit"""
+        best_error = float('inf')
+        best_window = min_window
+        best_line = None
+        best_slope = 0
         
-    if positions[i] != positions[i-1] or i == len(positions)-1:
-        # Position changed or end of data - close trade
-        exit_price = prices[current_idx]
-        
-        if positions[i-1] == 1:  # Long
-            ret = (exit_price - entry_price) / entry_price * 100
-        else:  # Short
-            ret = (entry_price - exit_price) / entry_price * 100
+        for window in range(min_window, min(max_window, len(prices)) + 1):
+            window_prices = prices[-window:]
+            model, predicted = self.ols_fit(window_prices)
+            error = self.calculate_error(window_prices, predicted)
             
-        returns.append(ret)
-        trade_times.append(times[current_idx])
+            if error < best_error:
+                best_error = error
+                best_window = window
+                best_line = predicted
+                best_slope = model.coef_[0][0]
         
-        # Start new position
-        entry_price = prices[current_idx]
-        current_pos = positions[i]
-
-# Calculate cumulative returns
-cumulative = []
-total = 0
-for r in returns:
-    total += r
-    cumulative.append(total)
-
-total_return = sum(returns)
-winning_trades = sum(1 for r in returns if r > 0)
-win_rate = (winning_trades / len(returns) * 100) if returns else 0
-
-# ========== CREATE PLOT ==========
-print("🎨 Creating plot...")
-fig = plt.figure(figsize=(16, 10))
-
-# Price with positions
-ax1 = plt.subplot(3, 2, 1)
-ax1.plot(times[10:], prices[10:], 'k-', alpha=0.7, linewidth=1, label='Price')
-
-# Color price based on position
-for i in range(len(positions)-1):
-    start_idx = 10 + i
-    end_idx = 10 + i + 1
-    color = 'g' if positions[i] == 1 else 'r'
-    ax1.axvspan(times[start_idx], times[end_idx], alpha=0.1, color=color)
-
-# Mark position changes
-for change in position_changes:
-    marker = '^' if change['to'] == 1 else 'v'
-    ax1.scatter(change['time'], prices[change['index']], 
-               c='blue', s=50, marker=marker, zorder=5)
-
-ax1.set_title('Price with Positions (Green=Long, Red=Short, ▲/▼=Signal Change)')
-ax1.set_ylabel('Price (USDT)')
-ax1.grid(True, alpha=0.3)
-
-# Sample optimized lines
-ax2 = plt.subplot(3, 2, 2)
-ax2.plot(times[10:], prices[10:], 'k-', alpha=0.3, linewidth=1)
-for idx, line in enumerate(line_prices[::10]):
-    if idx < len(line_prices[::10]):
-        color = 'g' if line['slope'] > 0 else 'r'
-        ax2.plot(line['times'], line['prices'], color=color, alpha=0.2, linewidth=1)
-ax2.set_title('Sample Optimized Lines')
-ax2.set_ylabel('Price (USDT)')
-ax2.grid(True, alpha=0.3)
-
-# Position history
-ax3 = plt.subplot(3, 2, 3)
-pos_times = times[10:10+len(positions)]
-ax3.plot(pos_times, positions, 'b-', linewidth=2)
-ax3.set_ylim(-1.5, 1.5)
-ax3.set_yticks([-1, 1])
-ax3.set_yticklabels(['Short', 'Long'])
-ax3.set_title('Position Over Time')
-ax3.grid(True, alpha=0.3)
-
-# Cumulative returns
-ax4 = plt.subplot(3, 2, 4)
-if len(cumulative) > 0:
-    ax4.plot(trade_times, cumulative, 'b-', linewidth=2)
-ax4.axhline(y=0, color='gray', linestyle='--')
-ax4.set_title(f'Cumulative Returns: {total_return:.1f}%')
-ax4.set_ylabel('Return (%)')
-ax4.grid(True, alpha=0.3)
-
-# Trade returns
-ax5 = plt.subplot(3, 2, 5)
-ax5.bar(range(len(returns)), returns, color=['g' if r>0 else 'r' for r in returns])
-ax5.axhline(y=0, color='black', linewidth=1)
-ax5.set_title(f'Trade Returns (Win Rate: {win_rate:.1f}%)')
-ax5.set_xlabel('Trade #')
-ax5.set_ylabel('Return (%)')
-ax5.grid(True, alpha=0.3)
-
-# Returns distribution
-ax6 = plt.subplot(3, 2, 6)
-ax6.hist(returns, bins=15, color='purple', edgecolor='black', alpha=0.7)
-ax6.axvline(x=0, color='r', linestyle='--')
-ax6.set_title('Returns Distribution')
-ax6.set_xlabel('Return (%)')
-ax6.set_ylabel('Frequency')
-ax6.grid(True, alpha=0.3)
-
-plt.tight_layout()
-
-# Convert to base64
-buf = BytesIO()
-plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
-buf.seek(0)
-img = base64.b64encode(buf.getvalue()).decode()
-plt.close()
-
-# ========== CREATE HTML ==========
-html = f"""
-<html>
-<head>
-    <title>BTC Strategy - Hold Until Signal Changes</title>
-    <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }}
-        .container {{ max-width: 1400px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-        .stats {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin: 20px 0; }}
-        .stat {{ background: linear-gradient(135deg, #667eea, #764ba2); color: white; padding: 20px; border-radius: 10px; text-align: center; }}
-        .stat h3 {{ margin: 0; font-size: 14px; opacity: 0.9; }}
-        .stat .value {{ font-size: 28px; font-weight: bold; margin: 10px 0 0; }}
-        .positive {{ color: #4caf50; }}
-        .negative {{ color: #f44336; }}
-        img {{ width: 100%; border-radius: 10px; margin: 20px 0; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-        .footer {{ text-align: center; color: #666; margin-top: 20px; font-size: 12px; }}
-        .info {{ background: #e3f2fd; padding: 15px; border-radius: 5px; margin: 10px 0; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🚀 BTC Strategy - Hold Until Signal Changes</h1>
-        
-        <div class="stats">
-            <div class="stat">
-                <h3>Total Return</h3>
-                <div class="value {'positive' if total_return > 0 else 'negative'}">{total_return:.1f}%</div>
-            </div>
-            <div class="stat">
-                <h3>Win Rate</h3>
-                <div class="value">{win_rate:.1f}%</div>
-            </div>
-            <div class="stat">
-                <h3>Total Trades</h3>
-                <div class="value">{len(returns)}</div>
-            </div>
-            <div class="stat">
-                <h3>Avg Window</h3>
-                <div class="value">{np.mean(windows):.1f}</div>
-            </div>
-        </div>
-        
-        <div class="info">
-            <strong>Strategy:</strong> Enter position when signal changes. Hold until next signal change.<br>
-            Green = Long, Red = Short, Blue ▲/▼ = Signal change points
-        </div>
-        
-        <img src="data:image/png;base64,{img}">
-        
-        <div class="footer">
-            k = {K} | Position changes: {len(position_changes)} | Computed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-# ========== WEB SERVER ==========
-class Handler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html')
-        self.end_headers()
-        self.wfile.write(html.encode())
-
-# ========== MAIN ==========
-if __name__ == "__main__":
-    print(f"✅ Computation complete!")
-    print(f"🌐 Starting server on http://localhost:{PORT}")
-    print("Press Ctrl+C to stop")
+        return best_window, best_line, best_slope, best_error
     
-    with socketserver.TCPServer(("", PORT), Handler) as httpd:
-        httpd.serve_forever()
+    def analyze_trends(self):
+        """Main analysis function"""
+        if self.data is None or len(self.data) < 100:
+            print("Insufficient data")
+            return
+        
+        prices = self.data['close'].copy()
+        timestamps = self.data['timestamp'].copy()
+        
+        # Start from the end and work backwards
+        current_position = len(prices)
+        min_window = 10
+        
+        while current_position > min_window:
+            # Get prices up to current position
+            current_prices = prices.iloc[:current_position]
+            
+            # Find optimal window
+            window_size, line_values, slope, error = self.find_optimal_window(
+                current_prices, 
+                min_window=min_window, 
+                max_window=min(100, current_position)
+            )
+            
+            # Store the line
+            start_idx = current_position - window_size
+            end_idx = current_position
+            
+            line_data = {
+                'start_idx': start_idx,
+                'end_idx': end_idx,
+                'start_time': timestamps.iloc[start_idx],
+                'end_time': timestamps.iloc[end_idx-1],
+                'values': line_values.flatten(),
+                'slope': slope,
+                'color': 'green' if slope > 0 else 'red',
+                'window_size': window_size,
+                'error': error
+            }
+            
+            self.optimized_lines.append(line_data)
+            
+            # Calculate trade return
+            start_price = prices.iloc[start_idx]
+            end_price = prices.iloc[end_idx-1]
+            
+            if slope > 0:
+                trade_return = (end_price - start_price) / start_price
+            else:
+                trade_return = -1 * ((end_price - start_price) / start_price)
+            
+            self.trades.append({
+                'start_time': timestamps.iloc[start_idx],
+                'end_time': timestamps.iloc[end_idx-1],
+                'return': trade_return,
+                'type': 'long' if slope > 0 else 'short'
+            })
+            
+            # Move position back (remove prices and continue)
+            current_position = start_idx
+            
+            # Check for color change and mark horizontal line
+            if len(self.optimized_lines) >= 2:
+                prev_line = self.optimized_lines[-2]
+                curr_line = self.optimized_lines[-1]
+                
+                if prev_line['color'] != curr_line['color']:
+                    # Mark horizontal line at the transition point
+                    self.horizontal_lines.append({
+                        'time': timestamps.iloc[start_idx],
+                        'price': prices.iloc[start_idx]
+                    })
+    
+    def plot_results(self):
+        """Plot all results"""
+        if self.data is None:
+            print("No data to plot")
+            return None
+        
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), 
+                                        gridspec_kw={'height_ratios': [3, 1]})
+        
+        # Plot price data
+        ax1.plot(self.data['timestamp'], self.data['close'], 
+                color='blue', alpha=0.5, linewidth=1, label='BTC Price')
+        
+        # Plot optimized lines
+        for line in self.optimized_lines:
+            x_values = self.data['timestamp'].iloc[line['start_idx']:line['end_idx']]
+            y_values = line['values']
+            
+            ax1.plot(x_values, y_values, 
+                    color=line['color'], 
+                    linewidth=2, 
+                    alpha=0.7)
+        
+        # Plot horizontal lines
+        for h_line in self.horizontal_lines:
+            ax1.axhline(y=h_line['price'], 
+                       xmin=0, xmax=1, 
+                       color='black', 
+                       linestyle='--', 
+                       linewidth=1, 
+                       alpha=0.5)
+            ax1.axvline(x=h_line['time'], 
+                       color='black', 
+                       linestyle='--', 
+                       linewidth=1, 
+                       alpha=0.5)
+        
+        # Formatting
+        ax1.set_title(f'{self.symbol} Price Analysis with OLS Trends', fontsize=16)
+        ax1.set_ylabel('Price (USDT)', fontsize=12)
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Format x-axis dates
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+        ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
+        plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
+        
+        # Plot trade returns
+        trade_colors = ['green' if t['return'] > 0 else 'red' for t in self.trades]
+        trade_returns = [t['return'] * 100 for t in self.trades]
+        trade_times = [t['start_time'] for t in self.trades]
+        
+        bars = ax2.bar(range(len(trade_returns)), trade_returns, color=trade_colors, alpha=0.7)
+        ax2.set_title('Trade Returns (%)', fontsize=16)
+        ax2.set_xlabel('Trade Number', fontsize=12)
+        ax2.set_ylabel('Return (%)', fontsize=12)
+        ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+        ax2.grid(True, alpha=0.3)
+        
+        # Add value labels on bars
+        for i, (bar, ret) in enumerate(zip(bars, trade_returns)):
+            height = bar.get_height()
+            ax2.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{ret:.1f}%', ha='center', va='bottom' if height > 0 else 'top')
+        
+        plt.tight_layout()
+        return fig
+    
+    def get_html_plot(self):
+        """Convert plot to HTML image"""
+        fig = self.plot_results()
+        if fig is None:
+            return "<html><body><h1>No data available</h1></body></html>"
+        
+        # Save plot to bytes buffer
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        buf.seek(0)
+        
+        # Convert to base64
+        image_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+        plt.close(fig)
+        
+        # Create HTML
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>BTC Trend Analysis</title>
+            <style>
+                body {{
+                    font-family: Arial, sans-serif;
+                    margin: 20px;
+                    background-color: #f5f5f5;
+                }}
+                .container {{
+                    max-width: 1200px;
+                    margin: 0 auto;
+                    background-color: white;
+                    padding: 20px;
+                    border-radius: 10px;
+                    box-shadow: 0 0 10px rgba(0,0,0,0.1);
+                }}
+                h1 {{
+                    color: #333;
+                    text-align: center;
+                }}
+                img {{
+                    width: 100%;
+                    height: auto;
+                    border: 1px solid #ddd;
+                    border-radius: 5px;
+                }}
+                .stats {{
+                    margin-top: 20px;
+                    padding: 15px;
+                    background-color: #f8f9fa;
+                    border-radius: 5px;
+                }}
+                table {{
+                    width: 100%;
+                    border-collapse: collapse;
+                }}
+                th, td {{
+                    padding: 10px;
+                    text-align: left;
+                    border-bottom: 1px solid #ddd;
+                }}
+                th {{
+                    background-color: #4CAF50;
+                    color: white;
+                }}
+                tr:hover {{
+                    background-color: #f5f5f5;
+                }}
+                .positive {{
+                    color: green;
+                    font-weight: bold;
+                }}
+                .negative {{
+                    color: red;
+                    font-weight: bold;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>BTC Trend Analysis - {self.interval} Interval</h1>
+                <img src="data:image/png;base64,{image_base64}" alt="BTC Trend Analysis">
+                
+                <div class="stats">
+                    <h2>Analysis Statistics</h2>
+                    <table>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Value</th>
+                        </tr>
+                        <tr>
+                            <td>Data Points</td>
+                            <td>{len(self.data)}</td>
+                        </tr>
+                        <tr>
+                            <td>Optimized Lines</td>
+                            <td>{len(self.optimized_lines)}</td>
+                        </tr>
+                        <tr>
+                            <td>Trend Changes</td>
+                            <td>{len(self.horizontal_lines)}</td>
+                        </tr>
+                        <tr>
+                            <td>Trades Executed</td>
+                            <td>{len(self.trades)}</td>
+                        </tr>
+                    </table>
+                </div>
+                
+                <div class="stats">
+                    <h2>Trade Performance</h2>
+                    <table>
+                        <tr>
+                            <th>Start Time</th>
+                            <th>End Time</th>
+                            <th>Type</th>
+                            <th>Return</th>
+                        </tr>
+        """
+        
+        # Add trade rows
+        for trade in self.trades[-10:]:  # Show last 10 trades
+            return_class = 'positive' if trade['return'] > 0 else 'negative'
+            html += f"""
+                        <tr>
+                            <td>{trade['start_time']}</td>
+                            <td>{trade['end_time']}</td>
+                            <td>{trade['type'].upper()}</td>
+                            <td class="{return_class}">{trade['return']*100:.2f}%</td>
+                        </tr>
+            """
+        
+        html += """
+                    </table>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        return html
+
+class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+    analyzer = None
+    
+    def do_GET(self):
+        if self.path == '/' or self.path == '/index.html':
+            if self.analyzer:
+                html = self.analyzer.get_html_plot()
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html')
+                self.end_headers()
+                self.wfile.write(html.encode('utf-8'))
+            else:
+                self.send_response(500)
+                self.end_headers()
+        else:
+            super().do_GET()
+
+def main():
+    parser = argparse.ArgumentParser(description='BTC Trend Analysis with OLS')
+    parser.add_argument('--symbol', type=str, default='BTCUSDT', help='Trading pair')
+    parser.add_argument('--interval', type=str, default='1h', help='Time interval')
+    parser.add_argument('--days', type=int, default=30, help='Number of days')
+    parser.add_argument('--port', type=int, default=8080, help='Server port')
+    
+    args = parser.parse_args()
+    
+    print(f"Starting BTC Trend Analysis for {args.symbol}")
+    print(f"Interval: {args.interval}, Days: {args.days}")
+    
+    # Create analyzer
+    analyzer = BTCTrendAnalyzer(args.symbol, args.interval, args.days)
+    
+    # Fetch data
+    print("Fetching data from Binance...")
+    success = analyzer.fetch_binance_data()
+    
+    if success:
+        print("Data fetched successfully")
+    else:
+        print("Using sample data for demonstration")
+    
+    # Analyze trends
+    print("Analyzing trends...")
+    analyzer.analyze_trends()
+    
+    print(f"Found {len(analyzer.optimized_lines)} optimized lines")
+    print(f"Found {len(analyzer.horizontal_lines)} trend changes")
+    
+    # Setup HTTP server
+    CustomHTTPRequestHandler.analyzer = analyzer
+    handler = CustomHTTPRequestHandler
+    
+    # Create server
+    with socketserver.TCPServer(("", args.port), handler) as httpd:
+        print(f"\nServer running at http://localhost:{args.port}")
+        print("Press Ctrl+C to stop")
+        
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nShutting down server...")
+            httpd.shutdown()
+
+if __name__ == "__main__":
+    main()
