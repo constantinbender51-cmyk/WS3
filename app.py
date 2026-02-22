@@ -4,7 +4,6 @@ BTC Trading Strategy - Simple Web Server
 Run: python btc_strategy.py
 """
 
-import pandas as pd
 import numpy as np
 import requests
 from datetime import datetime, timedelta
@@ -101,21 +100,20 @@ fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 8))
 # Price chart with signals
 price_times = times[10:]  # Start from index 10
 price_values = prices[10:]
-
 ax1.plot(price_times, price_values, 'k-', alpha=0.5, linewidth=1)
 
-# Add signals (shifted by 1 since signal is for next candle)
-for i, s in enumerate(signals):
-    if i < len(price_times) - 1:  # Make sure we don't go out of bounds
-        color = 'g' if s == 1 else 'r'
-        ax1.scatter(price_times[i+1], price_values[i+1], c=color, s=10, alpha=0.5)
+# Add signals (signal for NEXT candle)
+for i in range(min(len(signals), len(price_times)-1)):
+    color = 'g' if signals[i] == 1 else 'r'
+    ax1.scatter(price_times[i+1], price_values[i+1], c=color, s=10, alpha=0.5)
 
 ax1.set_title('BTC Price with Signals')
 ax1.set_ylabel('Price (USDT)')
 ax1.grid(True, alpha=0.3)
 
 # Cumulative returns
-return_times = times[11:11+len(cumulative)]  # Signals start at index 10, returns start at index 11
+# Returns start from index 11 (first signal at 10, first return at 11)
+return_times = times[11:11+len(cumulative)]
 ax2.plot(return_times, cumulative, 'b-', linewidth=2)
 ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
 ax2.set_title(f'Cumulative Returns: {total_return:.1f}%')
@@ -192,7 +190,7 @@ html = f"""
         <img src="data:image/png;base64,{img}">
         
         <div class="footer">
-            k = {K} | Computed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+            k = {K} | Computed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Data: {len(prices)} candles
         </div>
     </div>
 </body>
