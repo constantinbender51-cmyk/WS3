@@ -13,6 +13,8 @@ import base64
 from typing import List, Tuple, Dict
 import warnings
 import urllib.parse
+import threading
+import time
 warnings.filterwarnings('ignore')
 
 # Global variables
@@ -21,6 +23,11 @@ timestamps = None
 full_start_date = None
 full_end_date = None
 K = 1.8  # Default window exponent
+
+# Precomputed data
+hourly_lines_cache = {}  # Cache for different K values
+last_update = None
+update_lock = threading.Lock()
 
 def fetch_data():
     """Fetch BTC 1h data for last 30 days from Binance"""
@@ -119,7 +126,7 @@ def find_best_line_at_position(end_idx, k_value, min_window=10, max_window=100):
         if error < best_error:
             best_error = error
             best_window = window
-            best_line = (X, y_pred, model, (X_mean, X_std))
+            best_line = (X.tolist(), y_pred.tolist(), None, (float(X_mean), float(X_std)))
             best_slope = slope
             best_start_idx = start_idx
     
@@ -139,9 +146,7 @@ def compute_lines_for_each_hour(k_value):
     """
     For each hour, compute the best line using data up to that hour
     """
-    print("\n" + "=" * 60)
-    print(f"📊 Computing lines for each hour (error/window^{k_value})...")
-    print("=" * 60)
+    print(f"\n📊 Computing lines for K={k_value} (error/window^{k_value})...")
     
     hourly_lines = []
     total_points = len(prices)
@@ -154,11 +159,28 @@ def compute_lines_for_each_hour(k_value):
         if line is not None:
             hourly_lines.append(line)
             
-            if current_pos % 100 == 0:
-                print(f"   Processed hour {current_pos}/{total_points-1}")
+        if current_pos % 200 == 0:
+            print(f"   Progress: {current_pos-98}/{total_points-100} hours")
     
-    print(f"\n✅ Computed {len(hourly_lines)} lines (one for each hour from 99 to {total_points-1})")
+    print(f"✅ Completed K={k_value}: {len(hourly_lines)} lines")
     return hourly_lines
+
+def precompute_all_k_values():
+    """Precompute lines for a range of K values"""
+    global hourly_lines_cache, last_update
+    
+    k_values = [0.5, 0.8, 1.0, 1.2, 1.5, 1.8, 2.0, 2.2, 2.5, 3.0]
+    
+    print("\n" + "=" * 60)
+    print("🚀 Precomputing lines for multiple K values...")
+    print("=" * 60)
+    
+    for k in k_values:
+        with update_lock:
+            hourly_lines_cache[k] = compute_lines_for_each_hour(k)
+    
+    last_update = datetime.now()
+    print("\n✅ All K values precomputed!")
 
 def generate_trades_from_hourly_lines(hourly_lines):
     """
@@ -209,6 +231,7 @@ def generate_trades_from_hourly_lines(hourly_lines):
         # Convert indices to datetime
         entry_date = full_start_date + timedelta(hours=entry_idx)
         exit_date = full_start_date + timedelta(hours=exit_idx)
+        signal_date = full_start_date + timedelta(hours=prev_line['end_idx'])
         
         # Calculate price change for verification
         price_change_pct = (exit_price / entry_price - 1) * 100
@@ -222,13 +245,14 @@ def generate_trades_from_hourly_lines(hourly_lines):
             'exit_idx': exit_idx,
             'entry_date': entry_date.strftime('%Y-%m-%d %H:%M'),
             'exit_date': exit_date.strftime('%Y-%m-%d %H:%M'),
-            'entry_price': entry_price,
-            'exit_price': exit_price,
-            'return': trade_return,
-            'price_change': price_change_pct,
+            'signal_date': signal_date.strftime('%Y-%m-%d %H:%M'),
+            'entry_price': float(entry_price),
+            'exit_price': float(exit_price),
+            'return': float(trade_return),
+            'price_change': float(price_change_pct),
             'duration': duration,
-            'signal_slope': prev_line['slope'],  # Slope that generated the signal
-            'signal_hour': prev_line['end_idx']   # Hour when signal was generated
+            'signal_slope': float(prev_line['slope']),
+            'signal_hour': prev_line['end_idx']
         })
     
     return trades
@@ -269,16 +293,17 @@ def create_plot(hourly_lines, trades, k_value):
                 fontsize=8, fontweight='bold', ha='left',
                 bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.7))
     
-    # Plot a subset of hourly lines (every 10th line to avoid clutter)
+    # Plot a subset of hourly lines (every 20th line to avoid clutter)
     for i, line in enumerate(hourly_lines):
-        if i % 10 == 0:  # Plot every 10th line
+        if i % 20 == 0:  # Plot every 20th line
             # Use color based on slope
             line_color = 'green' if line['slope'] > 0 else 'red'
+            alpha = 0.2
             
             # Plot the line
             x_range = range(line['start_idx'], line['end_idx'] + 1)
-            ax.plot(x_range, [prices[line['start_idx']]] * len(x_range), 
-                   color=line_color, linewidth=0.5, alpha=0.3)
+            y_line = np.linspace(prices[line['start_idx']], prices[line['end_idx']], len(x_range))
+            ax.plot(x_range, y_line, color=line_color, linewidth=0.5, alpha=alpha)
     
     # Plot the most recent line (last 5 hours) more prominently
     recent_lines = hourly_lines[-5:] if len(hourly_lines) >= 5 else hourly_lines
@@ -286,28 +311,28 @@ def create_plot(hourly_lines, trades, k_value):
         line_color = 'green' if line['slope'] > 0 else 'red'
         x_range = range(line['start_idx'], line['end_idx'] + 1)
         y_line = np.linspace(prices[line['start_idx']], prices[line['end_idx']], len(x_range))
-        ax.plot(x_range, y_line, color=line_color, linewidth=2, alpha=0.8)
+        ax.plot(x_range, y_line, color=line_color, linewidth=2.5, alpha=0.9)
         
         # Add slope indicator
         slope_symbol = '↑' if line['slope'] > 0 else '↓'
         ax.text(line['end_idx'], prices[line['end_idx']], f'{slope_symbol}', 
-                fontsize=12, fontweight='bold', ha='center',
-                bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.7))
+                fontsize=14, fontweight='bold', ha='center',
+                bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.9))
     
     # Add trade markers at entry/exit points
     for trade in trades:
         # Mark entry point
         ax.scatter(trade['entry_idx'], trade['entry_price'], 
-                  c='black', marker='^', s=50, zorder=5, edgecolors='white', linewidth=1)
+                  c='black', marker='^', s=60, zorder=5, edgecolors='white', linewidth=1.5)
         # Mark exit point
         ax.scatter(trade['exit_idx'], trade['exit_price'], 
-                  c='black', marker='s', s=50, zorder=5, edgecolors='white', linewidth=1)
+                  c='black', marker='s', s=60, zorder=5, edgecolors='white', linewidth=1.5)
     
     # Calculate returns
     total_return, long_return, short_return = calculate_returns(trades)
     
     # Add return info box
-    return_text = f"""Strategy Returns:
+    return_text = f"""Strategy Returns (K={k_value}):
     Total: {total_return:+.2f}%
     Long P&L: +{long_return:.2f}%
     Short P&L: +{short_return:.2f}%
@@ -330,15 +355,16 @@ def create_plot(hourly_lines, trades, k_value):
     
     ax.legend(handles=legend_elements, loc='upper left', fontsize=8)
     
-    ax.set_title(f'BTC Hourly Lines & Trades (error/window^{k_value})', fontsize=14)
+    ax.set_title(f'BTC Hourly Lines & Trades (Precomputed)', fontsize=14)
     ax.set_xlabel('Hours from Start')
     ax.set_ylabel('Price (USDT)')
     ax.grid(True, alpha=0.2)
     
-    # Add K value info
-    ax.text(0.98, 0.02, f'K = {k_value}', transform=ax.transAxes, 
-             fontsize=12, ha='right',
-             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    # Add last update time
+    if last_update:
+        ax.text(0.98, 0.02, f'Updated: {last_update.strftime("%H:%M")}', 
+                transform=ax.transAxes, fontsize=10, ha='right',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     
     plt.tight_layout()
     
@@ -349,6 +375,14 @@ def create_plot(hourly_lines, trades, k_value):
     buf.seek(0)
     
     return base64.b64encode(buf.read()).decode('utf-8')
+
+def background_updater():
+    """Background thread to periodically update data"""
+    while True:
+        time.sleep(300)  # Update every 5 minutes
+        print("\n🔄 Background update: Fetching new data...")
+        fetch_data()
+        precompute_all_k_values()
 
 class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
@@ -362,7 +396,9 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             # Get K value from query, default to stored K
             try:
                 k_value = float(query.get('k', [K])[0])
-                K = k_value  # Update global K
+                # Round to nearest 0.1 for cache lookup
+                k_value = round(k_value * 2) / 2
+                K = k_value
             except (ValueError, TypeError):
                 k_value = K
             
@@ -370,8 +406,15 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Content-type', 'text/html')
             self.end_headers()
             
-            # Compute lines for each hour
-            hourly_lines = compute_lines_for_each_hour(k_value)
+            # Get precomputed lines for this K value
+            with update_lock:
+                if k_value in hourly_lines_cache:
+                    hourly_lines = hourly_lines_cache[k_value]
+                else:
+                    # Find closest K value
+                    available_k = min(hourly_lines_cache.keys(), key=lambda x: abs(x - k_value))
+                    hourly_lines = hourly_lines_cache[available_k]
+                    k_value = available_k
             
             # Generate trades based on previous hour's slope
             trades = generate_trades_from_hourly_lines(hourly_lines)
@@ -392,41 +435,38 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             trades_html = ""
             if trades:
                 trades_html = """
-                <div style="margin-top: 30px;">
+                <div style="margin-top: 30px; max-height: 400px; overflow-y: auto;">
                     <h3>📋 Trade History (Trading 1 hour after signal)</h3>
                     <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
                         <thead>
-                            <tr style="background: #333; color: white;">
+                            <tr style="background: #333; color: white; position: sticky; top: 0;">
                                 <th style="padding: 8px;">#</th>
                                 <th style="padding: 8px;">Type</th>
-                                <th style="padding: 8px;">Signal Hour</th>
-                                <th style="padding: 8px;">Entry Date</th>
-                                <th style="padding: 8px;">Exit Date</th>
+                                <th style="padding: 8px;">Signal Time</th>
+                                <th style="padding: 8px;">Entry Time</th>
+                                <th style="padding: 8px;">Exit Time</th>
                                 <th style="padding: 8px;">Duration</th>
                                 <th style="padding: 8px;">Entry Price</th>
                                 <th style="padding: 8px;">Exit Price</th>
                                 <th style="padding: 8px;">Return</th>
-                                <th style="padding: 8px;">Signal Slope</th>
                             </tr>
                         </thead>
                         <tbody>
                 """
                 
-                for trade in trades:
+                for trade in trades[-20:]:  # Show last 20 trades
                     row_color = "#d4edda" if trade['type'] == 'LONG' else "#f8d7da"
-                    signal_date = full_start_date + timedelta(hours=trade['signal_hour'])
                     trades_html += f"""
                         <tr style="background: {row_color}; border-bottom: 1px solid #ddd;">
                             <td style="padding: 8px; text-align: center;">{trade['id']}</td>
                             <td style="padding: 8px; text-align: center; font-weight: bold;">{trade['type']}</td>
-                            <td style="padding: 8px;">{signal_date.strftime('%Y-%m-%d %H:%M')}</td>
+                            <td style="padding: 8px;">{trade['signal_date']}</td>
                             <td style="padding: 8px;">{trade['entry_date']}</td>
                             <td style="padding: 8px;">{trade['exit_date']}</td>
                             <td style="padding: 8px; text-align: center;">{trade['duration']}h</td>
                             <td style="padding: 8px; text-align: right;">${trade['entry_price']:,.2f}</td>
                             <td style="padding: 8px; text-align: right;">${trade['exit_price']:,.2f}</td>
                             <td style="padding: 8px; text-align: right; font-weight: bold; color: {'green' if trade['return'] > 0 else 'red'};">{trade['return']:+.2f}%</td>
-                            <td style="padding: 8px; text-align: right;">{trade['signal_slope']:+.1f}</td>
                         </tr>
                     """
                 
@@ -435,6 +475,10 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                     </table>
                 </div>
                 """
+            
+            # Available K values for dropdown
+            k_options = ''.join([f'<option value="{k}" {"selected" if k == k_value else ""}>K={k}</option>' 
+                                for k in sorted(hourly_lines_cache.keys())])
             
             # HTML with input form and trades table
             html = f"""
@@ -447,57 +491,64 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                     .container {{ max-width: 1400px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }}
                     h1 {{ margin: 0 0 10px 0; font-size: 24px; }}
                     h3 {{ margin: 20px 0 10px 0; }}
-                    .controls {{ margin: 20px 0; padding: 15px; background: #f0f0f0; border-radius: 4px; display: flex; gap: 20px; align-items: center; }}
+                    .controls {{ margin: 20px 0; padding: 15px; background: #f0f0f0; border-radius: 4px; display: flex; gap: 20px; align-items: center; flex-wrap: wrap; }}
                     .stats {{ margin: 10px 0; padding: 10px; background: #f0f0f0; border-radius: 4px; display: flex; gap: 20px; flex-wrap: wrap; }}
                     .stat {{ padding: 5px 10px; background: #fff; border-radius: 4px; }}
                     .positive {{ background: #d4edda; color: #155724; padding: 5px 10px; border-radius: 4px; }}
                     .negative {{ background: #f8d7da; color: #721c24; padding: 5px 10px; border-radius: 4px; }}
                     .returns {{ background: #cce5ff; color: #004085; padding: 5px 10px; border-radius: 4px; }}
-                    input[type=number] {{ padding: 8px; border: 1px solid #ddd; border-radius: 4px; width: 80px; }}
+                    select {{ padding: 8px; border: 1px solid #ddd; border-radius: 4px; }}
                     button {{ padding: 8px 16px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }}
                     button:hover {{ background: #0056b3; }}
                     img {{ width: 100%; margin-top: 20px; border: 1px solid #ddd; }}
-                    table {{ margin-top: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-                    th {{ background: #333; color: white; position: sticky; top: 0; }}
+                    table {{ width: 100%; border-collapse: collapse; }}
+                    th {{ background: #333; color: white; }}
                     tr:hover {{ opacity: 0.9; }}
+                    .info {{ color: #666; font-size: 12px; margin-top: 5px; }}
                 </style>
             </head>
             <body>
                 <div class="container">
-                    <h1>📈 BTC Hourly Lines Strategy</h1>
+                    <h1>📈 BTC Hourly Lines Strategy (Precomputed)</h1>
                     <p style="color: #666; font-size: 14px;">
-                        For each hour: compute best line (10-100h window). 
-                        Trade next hour with previous hour's slope sign. 
+                        For each hour: best line (10-100h window) precomputed. 
+                        Trade next hour with previous hour's slope. 
                         Green = LONG, Red = SHORT. ▲ Entry, ■ Exit
                     </p>
                     
                     <div class="controls">
                         <form method="get" style="display: flex; gap: 10px; align-items: center;">
                             <label for="k"><b>K Parameter:</b></label>
-                            <input type="number" id="k" name="k" step="0.1" min="0.1" max="5" value="{k_value}">
-                            <button type="submit">Update Strategy</button>
+                            <select id="k" name="k">
+                                {k_options}
+                            </select>
+                            <button type="submit">View Strategy</button>
                         </form>
-                        <span style="color: #666; font-size: 14px;">Higher K = shorter windows</span>
+                        <span class="info">⚡ Precomputed - Instant loading</span>
                     </div>
                     
                     <div class="stats">
-                        <span class="stat">📊 Hours analyzed: {len(hourly_lines)}</span>
+                        <span class="stat">📊 Hours: {len(hourly_lines)}</span>
                         <span class="stat">📏 Avg window: {avg_window:.1f}h</span>
-                        <span class="stat">📈 Avg slope: {avg_slope:+.1f} $/h</span>
-                        <span class="stat positive">🟢 Positive slopes: {positive_slopes}</span>
-                        <span class="stat negative">🔴 Negative slopes: {negative_slopes}</span>
+                        <span class="stat">📈 Avg slope: {avg_slope:+.1f}</span>
+                        <span class="stat positive">🟢 +Slope: {positive_slopes}</span>
+                        <span class="stat negative">🔴 -Slope: {negative_slopes}</span>
                     </div>
                     
                     <div class="stats">
-                        <span class="returns">💰 Total Strategy Return: <b>{total_return:+.2f}%</b></span>
-                        <span class="positive">🟢 Long P&L: +{long_return:.2f}%</span>
-                        <span class="negative">🔴 Short P&L: +{short_return:.2f}%</span>
-                        <span class="stat">📊 Total Trades: {len(trades)}</span>
+                        <span class="returns">💰 Total Return: <b>{total_return:+.2f}%</b></span>
+                        <span class="positive">🟢 Long: +{long_return:.2f}%</span>
+                        <span class="negative">🔴 Short: +{short_return:.2f}%</span>
+                        <span class="stat">📊 Trades: {len(trades)}</span>
                     </div>
                     
                     <img src="data:image/png;base64,{image_base64}">
                     
                     {trades_html}
+                    
+                    <div class="info">
+                        Last data update: {last_update.strftime('%Y-%m-%d %H:%M:%S') if last_update else 'Never'}
+                    </div>
                 </div>
             </body>
             </html>
@@ -509,15 +560,21 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
 
 def main():
     print("=" * 60)
-    print("🚀 BTC Hourly Lines Strategy")
+    print("🚀 BTC Hourly Lines Strategy (Precomputed)")
     print("=" * 60)
-    print("   For each hour: compute best line (10-100h window)")
-    print("   Set background based on slope sign")
-    print("   Trade next hour with previous hour's slope sign")
+    print("   Precomputing lines for multiple K values...")
+    print("   This may take a moment...")
     
-    # Fetch data on startup
+    # Fetch data
     print("\n📡 Fetching BTC data...")
     fetch_data()
+    
+    # Precompute all K values
+    precompute_all_k_values()
+    
+    # Start background updater thread
+    updater_thread = threading.Thread(target=background_updater, daemon=True)
+    updater_thread.start()
     
     # Start server
     PORT = 8080
