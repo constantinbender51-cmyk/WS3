@@ -19,7 +19,9 @@ class BTCOptimalLookback:
         self.data = None
         self.timestamps = None
         self.prices = None
-        self.all_results = []
+        self.slope_history = []
+        self.lookback_history = []
+        self.error_history = []
         self.full_start_date = None
         self.full_end_date = None
         
@@ -75,9 +77,9 @@ class BTCOptimalLookback:
         print(f"Generated {n_points} hours of sample data")
         print(f"Period: {self.full_start_date.strftime('%Y-%m-%d')} to {self.full_end_date.strftime('%Y-%m-%d')}")
     
-    def ols(self, prices: np.ndarray, timestamps: np.ndarray, lookback: int) -> Tuple[np.ndarray, np.ndarray, float, float, object]:
+    def ols(self, prices: np.ndarray, timestamps: np.ndarray, lookback: int) -> Tuple[float, float, float]:
         """Perform OLS regression on the last 'lookback' data points
-        Returns: X, y_pred, total_error, avg_error_per_candle, model"""
+        Returns: slope, total_error, avg_error_per_candle"""
         if lookback > len(prices):
             lookback = len(prices)
         
@@ -86,172 +88,140 @@ class BTCOptimalLookback:
         y = prices[-lookback:]
         
         # Normalize timestamps to avoid numerical issues
-        X_mean = X.mean()
-        X_std = X.std()
-        X_normalized = (X - X_mean) / X_std
+        X_normalized = (X - X.mean()) / X.std()
         
         # Fit OLS
         model = LinearRegression()
         model.fit(X_normalized, y)
         
-        # Predict
-        y_pred = model.predict(X_normalized)
+        # Get slope (need to denormalize)
+        # slope = model.coef_[0] / X.std()  # Denormalize the slope
+        slope = model.coef_[0] / X.std() * 3600000  # Convert to price change per hour
         
         # Calculate total error (sum of absolute differences)
-        total_error = np.sum(np.abs(y - y_pred))
+        total_error = np.sum(np.abs(y - model.predict(X_normalized)))
         
         # Calculate average error per candle
         avg_error_per_candle = total_error / lookback
         
-        return X.flatten(), y_pred, total_error, avg_error_per_candle, model, (X_mean, X_std)
+        return slope, total_error, avg_error_per_candle
     
-    def run_analysis(self, prices: np.ndarray, timestamps: np.ndarray, end_point_idx: int, iteration_num: int) -> Dict:
-        """Run OLS analysis on data up to a specific endpoint"""
+    def find_optimal_lookback(self, prices: np.ndarray, timestamps: np.ndarray) -> Tuple[int, float, float, float]:
+        """Find the optimal lookback window that minimizes average error"""
         best_avg_error = float('inf')
         best_lookback = 10
-        best_X = None
-        best_y_pred = None
-        best_total_error = None
-        best_model = None
-        best_normalization_params = None
+        best_slope = 0
+        best_total_error = 0
         
-        # Only consider lookbacks that fit within the available data
         max_lookback = min(100, len(prices))
         
         for lookback in range(10, max_lookback + 1):
-            X, y_pred, total_error, avg_error, model, norm_params = self.ols(prices, timestamps, lookback)
+            slope, total_error, avg_error = self.ols(prices, timestamps, lookback)
             
             if avg_error < best_avg_error:
                 best_avg_error = avg_error
                 best_lookback = lookback
-                best_X = X
-                best_y_pred = y_pred
+                best_slope = slope
                 best_total_error = total_error
-                best_model = model
-                best_normalization_params = norm_params
         
-        # Calculate the start of the optimal window
-        optimal_window_start = end_point_idx - best_lookback
-        
-        return {
-            'iteration': iteration_num,
-            'end_point_idx': end_point_idx,
-            'end_date': self.full_start_date + timedelta(hours=end_point_idx),
-            'window_start_idx': optimal_window_start,
-            'window_start_date': self.full_start_date + timedelta(hours=optimal_window_start),
-            'data_length': len(prices),
-            'best_lookback': best_lookback,
-            'best_avg_error': best_avg_error,
-            'best_total_error': best_total_error,
-            'best_model': best_model,
-            'best_normalization_params': best_normalization_params,
-            'prices': prices,
-            'timestamps': timestamps
-        }
+        return best_lookback, best_slope, best_total_error, best_avg_error
     
-    def iterate(self):
-        """Move endpoint to the start of the previous optimal window and run analysis"""
+    def analyze_all_points(self):
+        """Analyze every possible endpoint from min_points to the end"""
         print("\n" + "=" * 70)
-        print("📊 PROGRESSIVE ANALYSIS - Moving Endpoint to Previous Window Start")
+        print("📊 POINT-BY-POINT ANALYSIS - Calculating Optimal Slope for Each Hour")
         print("=" * 70)
         
-        self.all_results = []
+        self.slope_history = []
+        self.lookback_history = []
+        self.error_history = []
+        
+        min_points = 110  # Need at least 100 lookback + 10 minimum
+        
         total_points = len(self.prices)
         
-        # Start from the full dataset
-        current_end = total_points
-        iteration = 1
+        for endpoint in range(min_points, total_points + 1):
+            # Get data up to current endpoint
+            test_prices = self.prices[:endpoint]
+            test_timestamps = self.timestamps[:endpoint]
+            
+            # Find optimal lookback for this endpoint
+            lookback, slope, total_error, avg_error = self.find_optimal_lookback(test_prices, test_timestamps)
+            
+            self.slope_history.append(slope)
+            self.lookback_history.append(lookback)
+            self.error_history.append(avg_error)
+            
+            if endpoint % 100 == 0 or endpoint == total_points:
+                end_date = self.full_start_date + timedelta(hours=endpoint)
+                print(f"   📍 {endpoint}: {end_date.strftime('%Y-%m-%d %H:%M')} - Lookback={lookback}, Slope=${slope:+.2f}/h, Error=${avg_error:.2f}")
         
-        while current_end >= 200:  # Need at least 200 points for meaningful analysis
-            # Slice data from beginning to current endpoint
-            test_prices = self.prices[:current_end]
-            test_timestamps = self.timestamps[:current_end]
-            
-            end_date = self.full_start_date + timedelta(hours=current_end)
-            
-            print(f"\n📌 Iteration {iteration}: Data up to {end_date.strftime('%Y-%m-%d %H:%M')}")
-            print(f"   Data points: {len(test_prices)} hours")
-            
-            # Run analysis on this slice
-            result = self.run_analysis(test_prices, test_timestamps, current_end, iteration)
-            self.all_results.append(result)
-            
-            print(f"   ✅ Best lookback: {result['best_lookback']} hours")
-            print(f"      Window: {result['window_start_date'].strftime('%Y-%m-%d %H:%M')} to {result['end_date'].strftime('%Y-%m-%d %H:%M')}")
-            print(f"      Avg Error: ${result['best_avg_error']:,.2f}")
-            
-            # Move endpoint to the start of the current optimal window
-            next_end = result['window_start_idx']
-            print(f"   ➡️  Next endpoint will be: {self.full_start_date + timedelta(hours=next_end)}")
-            
-            if next_end < 200:  # Stop if we don't have enough data for next iteration
-                break
-                
-            current_end = next_end
-            iteration += 1
+        print(f"\n✅ Completed analysis of {len(self.slope_history)} endpoints")
         
-        print(f"\n✅ Completed {len(self.all_results)} progressive analyses")
-        return self.all_results
+        # Calculate statistics
+        positive_slopes = sum(1 for s in self.slope_history if s > 0)
+        negative_slopes = sum(1 for s in self.slope_history if s < 0)
+        
+        print(f"\n📈 Slope Statistics:")
+        print(f"   Positive trends: {positive_slopes} ({positive_slopes/len(self.slope_history)*100:.1f}%)")
+        print(f"   Negative trends: {negative_slopes} ({negative_slopes/len(self.slope_history)*100:.1f}%)")
+        print(f"   Avg slope: ${np.mean(self.slope_history):+.2f}/h")
+        print(f"   Slope volatility: ${np.std(self.slope_history):.2f}/h")
     
     def plot(self) -> str:
-        """Create plot showing all progressive OLS lines"""
-        plt.figure(figsize=(16, 14))
+        """Create plot showing price with slope heatmap and analysis"""
+        plt.figure(figsize=(16, 12))
         
-        # Create 2x1 subplot grid
-        gs = plt.GridSpec(3, 1, height_ratios=[2.5, 1, 0.8], hspace=0.3)
+        # Create 3x1 subplot grid
+        gs = plt.GridSpec(3, 1, height_ratios=[2.5, 1, 1], hspace=0.3)
         
-        # Main price chart with all OLS lines
+        # Main price chart with slope coloring
         ax_main = plt.subplot(gs[0])
         
-        # Plot all prices
-        ax_main.plot(range(len(self.prices)), self.prices, 'b-', alpha=0.3, 
-                    label='BTC Price (All Data)', linewidth=1)
+        # Plot price line
+        ax_main.plot(range(len(self.prices)), self.prices, 'b-', alpha=0.5, 
+                    label='BTC Price', linewidth=1)
         
-        # Generate a colormap for the progressive lines
-        cmap = plt.cm.viridis
-        colors = [cmap(i / len(self.all_results)) for i in range(len(self.all_results))]
+        # Create a color-coded background based on slope
+        # We need to align the slope history with the price indices
+        slope_start_idx = 110  # First endpoint we analyzed
+        slope_indices = range(slope_start_idx, len(self.prices))
         
-        # Plot OLS lines for each progressive analysis
-        for idx, result in enumerate(self.all_results):
-            if result['best_model'] is not None:
-                end_idx = result['end_point_idx']
-                start_idx = result['window_start_idx']
-                lookback_range = range(start_idx, end_idx)
-                
-                # Get model and normalization params
-                model = result['best_model']
-                X_mean, X_std = result['best_normalization_params']
-                
-                # Generate predictions for the lookback window
-                X_lookback = self.timestamps[start_idx:end_idx].flatten()
-                X_norm = (X_lookback - X_mean) / X_std
-                y_pred = model.predict(X_norm.reshape(-1, 1))
-                
-                # Plot the OLS line
-                alpha = 0.6 + (idx / len(self.all_results)) * 0.4  # Later lines more opaque
-                linewidth = 2 + (idx / len(self.all_results)) * 2
-                
-                ax_main.plot(lookback_range, y_pred, 
-                           color=colors[idx],
-                           linewidth=linewidth,
-                           alpha=alpha,
-                           label=f'Iter {result["iteration"]}: {result["window_start_date"].strftime("%m/%d")} to {result["end_date"].strftime("%m/%d")} (lb={result["best_lookback"]})')
-                
-                # Mark the window boundaries
-                ax_main.axvline(x=start_idx, color=colors[idx], linestyle='--', alpha=0.3, linewidth=1)
-                ax_main.axvline(x=end_idx, color=colors[idx], linestyle=':', alpha=0.3, linewidth=1)
-                
-                # Add iteration number at the top of the window
-                ax_main.text(end_idx - 10, ax_main.get_ylim()[1] * 0.95, 
-                            f'Iter {result["iteration"]}', fontsize=8, color=colors[idx],
-                            ha='right', va='top')
+        # Create a color map for slopes
+        max_abs_slope = max(abs(np.min(self.slope_history)), abs(np.max(self.slope_history)))
         
-        ax_main.set_title(f'BTC Price with Progressive OLS Lines\n'
-                         f'Each Iteration Uses Window from Previous Optimal Start', 
+        for i, idx in enumerate(slope_indices):
+            slope = self.slope_history[i]
+            if slope > 0:
+                # Green for positive slope, intensity based on magnitude
+                intensity = min(1.0, slope / max_abs_slope)
+                color = (0, intensity, 0, 0.2)  # RGBA with alpha
+            else:
+                # Red for negative slope, intensity based on magnitude
+                intensity = min(1.0, abs(slope) / max_abs_slope)
+                color = (intensity, 0, 0, 0.2)
+            
+            # Color the background of this point
+            ax_main.axvspan(idx-0.5, idx+0.5, facecolor=color)
+        
+        # Add a colorbar legend
+        from matplotlib.patches import Rectangle
+        from matplotlib.collections import PatchCollection
+        
+        # Create custom legend for slope
+        legend_elements = [
+            Rectangle((0, 0), 1, 1, facecolor=(0, 0.8, 0, 0.3), label='Strong Positive'),
+            Rectangle((0, 0), 1, 1, facecolor=(0, 0.3, 0, 0.3), label='Weak Positive'),
+            Rectangle((0, 0), 1, 1, facecolor=(0.3, 0, 0, 0.3), label='Weak Negative'),
+            Rectangle((0, 0), 1, 1, facecolor=(0.8, 0, 0, 0.3), label='Strong Negative')
+        ]
+        ax_main.legend(handles=legend_elements, loc='upper left', fontsize=8, title='Slope Strength')
+        
+        ax_main.set_title(f'BTC Price with Slope Heatmap\n'
+                         f'Green = Positive Trend, Red = Negative Trend (Intensity = Slope Magnitude)', 
                          fontsize=14, fontweight='bold')
         ax_main.set_xlabel('Hours from Start')
         ax_main.set_ylabel('Price (USDT)')
-        ax_main.legend(loc='upper left', fontsize=7, ncol=2)
         ax_main.grid(True, alpha=0.3)
         
         # Add date range info
@@ -260,52 +230,57 @@ class BTCOptimalLookback:
                     fontsize=9, verticalalignment='top',
                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
-        # Window progression plot (middle)
-        ax_windows = plt.subplot(gs[1])
+        # Slope chart (middle)
+        ax_slope = plt.subplot(gs[1])
         
-        for i, result in enumerate(self.all_results):
-            # Plot each window as a horizontal bar
-            start = result['window_start_idx']
-            end = result['end_point_idx']
-            ax_windows.barh(i, end - start, left=start, height=0.5, 
-                          color=colors[i], alpha=0.7, edgecolor='black', linewidth=0.5)
-            
-            # Add lookback label
-            ax_windows.text(start + (end-start)/2, i, f'{result["best_lookback"]}h', 
-                          ha='center', va='center', fontsize=8, fontweight='bold')
+        slope_x = range(slope_start_idx, len(self.prices))
         
-        ax_windows.set_xlabel('Hours from Start')
-        ax_windows.set_ylabel('Iteration')
-        ax_windows.set_title('Optimal Windows for Each Iteration', fontsize=12)
-        ax_windows.set_yticks(range(len(self.all_results)))
-        ax_windows.set_yticklabels([f'Iter {r["iteration"]}' for r in self.all_results])
-        ax_windows.grid(True, alpha=0.3, axis='x')
+        # Color-code the slope line itself
+        for i in range(len(slope_x)-1):
+            if self.slope_history[i] > 0:
+                ax_slope.plot([slope_x[i], slope_x[i+1]], 
+                            [self.slope_history[i], self.slope_history[i+1]], 
+                            'g-', linewidth=1, alpha=0.7)
+            else:
+                ax_slope.plot([slope_x[i], slope_x[i+1]], 
+                            [self.slope_history[i], self.slope_history[i+1]], 
+                            'r-', linewidth=1, alpha=0.7)
         
-        # Summary plot (bottom)
-        ax_summary = plt.subplot(gs[2])
+        # Add zero line
+        ax_slope.axhline(y=0, color='black', linestyle='-', alpha=0.3, linewidth=0.5)
         
-        iterations = [r['iteration'] for r in self.all_results]
-        lookbacks = [r['best_lookback'] for r in self.all_results]
-        errors = [r['best_avg_error'] for r in self.all_results]
+        ax_slope.fill_between(slope_x, 0, self.slope_history, 
+                              where=np.array(self.slope_history) > 0, 
+                              color='green', alpha=0.3, interpolate=True)
+        ax_slope.fill_between(slope_x, 0, self.slope_history, 
+                              where=np.array(self.slope_history) < 0, 
+                              color='red', alpha=0.3, interpolate=True)
         
-        # Create twin axes
-        ax_summary.plot(iterations, lookbacks, 'b-o', linewidth=2, markersize=8, label='Best Lookback')
-        ax_summary.set_xlabel('Iteration')
-        ax_summary.set_ylabel('Lookback Window (hours)', color='b')
-        ax_summary.tick_params(axis='y', labelcolor='b')
-        ax_summary.grid(True, alpha=0.3)
+        ax_slope.set_title('Optimal Slope at Each Point ($/hour)', fontsize=12)
+        ax_slope.set_xlabel('Hours from Start')
+        ax_slope.set_ylabel('Slope ($/h)')
+        ax_slope.grid(True, alpha=0.3)
         
-        ax2 = ax_summary.twinx()
-        ax2.plot(iterations, errors, 'r-s', linewidth=2, markersize=8, label='Avg Error')
-        ax2.set_ylabel('Avg Error ($)', color='r')
-        ax2.tick_params(axis='y', labelcolor='r')
+        # Lookback and Error chart (bottom)
+        ax_bottom = plt.subplot(gs[2])
         
-        ax_summary.set_title('Lookback and Error Progression', fontsize=12)
+        ax_bottom.plot(slope_x, self.lookback_history, 'b-', linewidth=1.5, alpha=0.7, label='Optimal Lookback')
+        ax_bottom.set_xlabel('Hours from Start')
+        ax_bottom.set_ylabel('Lookback (hours)', color='b')
+        ax_bottom.tick_params(axis='y', labelcolor='b')
+        ax_bottom.grid(True, alpha=0.3)
+        
+        ax2 = ax_bottom.twinx()
+        ax2.plot(slope_x, self.error_history, 'orange', linewidth=1, alpha=0.7, label='Avg Error')
+        ax2.set_ylabel('Avg Error ($)', color='orange')
+        ax2.tick_params(axis='y', labelcolor='orange')
+        
+        ax_bottom.set_title('Optimal Lookback Window and Average Error', fontsize=12)
         
         # Add legend
-        lines1, labels1 = ax_summary.get_legend_handles_labels()
+        lines1, labels1 = ax_bottom.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
-        ax_summary.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=8)
+        ax_bottom.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=8)
         
         plt.tight_layout()
         
@@ -329,8 +304,8 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             
             if BTCRequestHandler.btc_analyzer and BTCRequestHandler.btc_analyzer.prices is not None:
-                # Run progressive analysis
-                results = BTCRequestHandler.btc_analyzer.iterate()
+                # Run point-by-point analysis
+                BTCRequestHandler.btc_analyzer.analyze_all_points()
                 image_base64 = BTCRequestHandler.btc_analyzer.plot()
                 
                 # Calculate some additional statistics
@@ -338,12 +313,17 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                 volatility = np.std(prices[-24:])  # 24h volatility
                 analyzer = BTCRequestHandler.btc_analyzer
                 
+                # Get recent slope (last 24 hours)
+                recent_slopes = analyzer.slope_history[-24:] if len(analyzer.slope_history) >= 24 else analyzer.slope_history
+                avg_recent_slope = np.mean(recent_slopes)
+                trend_direction = "🟢 BULLISH" if avg_recent_slope > 0 else "🔴 BEARISH" if avg_recent_slope < 0 else "⚪ NEUTRAL"
+                
                 # Create HTML page
                 html = f"""
                 <!DOCTYPE html>
                 <html>
                 <head>
-                    <title>BTC Progressive OLS Analysis - Moving to Window Start</title>
+                    <title>BTC Point-by-Point OLS Slope Analysis</title>
                     <style>
                         body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f0f0f0; }}
                         .container {{ max-width: 1400px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
@@ -361,66 +341,34 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                         img {{ max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 10px; margin-top: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }}
                         .footer {{ margin-top: 30px; color: #666; font-size: 12px; text-align: center; padding-top: 20px; border-top: 1px solid #eee; }}
                         .methodology {{ background-color: #e8f4f8; border-left: 4px solid #2196F3; padding: 15px; margin: 20px 0; }}
-                        .results-table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
-                        .results-table th {{ background-color: #2196F3; color: white; padding: 10px; text-align: left; }}
-                        .results-table td {{ padding: 8px; border-bottom: 1px solid #ddd; }}
-                        .results-table tr:hover {{ background-color: #f5f5f5; }}
+                        .trend-indicator {{ font-size: 24px; text-align: center; padding: 20px; background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%); border-radius: 10px; margin: 20px 0; }}
                     </style>
                 </head>
                 <body>
                     <div class="container">
-                        <h1>📊 BTC Progressive OLS Analysis</h1>
-                        <p>Moving Endpoint to Start of Previous Optimal Window</p>
+                        <h1>📊 BTC Point-by-Point OLS Slope Analysis</h1>
+                        <p>Calculating optimal trend for every hour</p>
                         
                         <div class="methodology">
-                            <strong>🔬 Methodology:</strong> Starting from the full dataset, we find the optimal lookback window.
-                            Then we move the endpoint to the start of that window and repeat the analysis.
-                            This shows how optimal trends cascade backward through time.
+                            <strong>🔬 Methodology:</strong> For every possible endpoint (starting from hour 110), 
+                            we find the lookback window (10-100 hours) that minimizes average absolute error. 
+                            The slope of that optimal line is then plotted on the price chart as a color-coded 
+                            background (green = positive, red = negative, intensity = magnitude).
+                        </div>
+                        
+                        <div class="trend-indicator">
+                            <strong>Current 24h Trend:</strong> {trend_direction} (${avg_recent_slope:+.2f}/h)
                         </div>
                         
                         <div class="info">
                             <h3>📈 Analysis Summary:</h3>
-                            <p><strong>Full Period:</strong> {analyzer.full_start_date.strftime('%Y-%m-%d')} to {analyzer.full_end_date.strftime('%Y-%m-%d')}</p>
-                            <p><strong>Total Iterations:</strong> {len(results)}</p>
-                            <p><strong>Total Data Points:</strong> {len(prices)} hours</p>
+                            <p><strong>Period:</strong> {analyzer.full_start_date.strftime('%Y-%m-%d')} to {analyzer.full_end_date.strftime('%Y-%m-%d')}</p>
+                            <p><strong>Total Points Analyzed:</strong> {len(analyzer.slope_history)}</p>
+                            <p><strong>Positive Slopes:</strong> {sum(1 for s in analyzer.slope_history if s > 0)} ({sum(1 for s in analyzer.slope_history if s > 0)/len(analyzer.slope_history)*100:.1f}%)</p>
+                            <p><strong>Negative Slopes:</strong> {sum(1 for s in analyzer.slope_history if s < 0)} ({sum(1 for s in analyzer.slope_history if s < 0)/len(analyzer.slope_history)*100:.1f}%)</p>
+                            <p><strong>Average Slope:</strong> ${np.mean(analyzer.slope_history):+.2f}/h</p>
+                            <p><strong>Slope Volatility:</strong> ${np.std(analyzer.slope_history):.2f}/h</p>
                         </div>
-                        
-                        <h3>📋 Progressive Results:</h3>
-                        <table class="results-table">
-                            <tr>
-                                <th>Iter</th>
-                                <th>Window Period</th>
-                                <th>Window Size</th>
-                                <th>Lookback</th>
-                                <th>Avg Error</th>
-                                <th>Next Endpoint</th>
-                            </tr>
-                """
-                
-                # Add result rows
-                for i, result in enumerate(results, 1):
-                    window_period = f"{result['window_start_date'].strftime('%m/%d %H:%M')} to {result['end_date'].strftime('%m/%d %H:%M')}"
-                    window_size = result['end_point_idx'] - result['window_start_idx']
-                    
-                    next_endpoint = ""
-                    if i < len(results):
-                        next_endpoint = results[i]['window_start_date'].strftime('%m/%d %H:%M')
-                    else:
-                        next_endpoint = "End"
-                    
-                    html += f"""
-                            <tr>
-                                <td>{result['iteration']}</td>
-                                <td>{window_period}</td>
-                                <td>{window_size} hours</td>
-                                <td>{result['best_lookback']} hours</td>
-                                <td>${result['best_avg_error']:,.2f}</td>
-                                <td>{next_endpoint}</td>
-                            </tr>
-                    """
-                
-                html += f"""
-                        </table>
                         
                         <div class="stats">
                             <div class="stat-box">
@@ -429,28 +377,28 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                                 <div class="stat-sub">as of now</div>
                             </div>
                             <div class="stat-box">
-                                <div class="stat-label">24h Volatility (Std)</div>
+                                <div class="stat-label">24h Volatility</div>
                                 <div class="stat-value">${volatility:,.2f}</div>
                                 <div class="stat-sub">price fluctuation</div>
                             </div>
                             <div class="stat-box">
-                                <div class="stat-label">30d Min</div>
-                                <div class="stat-value">${np.min(prices):,.2f}</div>
-                                <div class="stat-sub">lowest price</div>
+                                <div class="stat-label">Current Slope</div>
+                                <div class="stat-value">${analyzer.slope_history[-1]:+.2f}/h</div>
+                                <div class="stat-sub">optimal trend</div>
                             </div>
                             <div class="stat-box">
-                                <div class="stat-label">30d Max</div>
-                                <div class="stat-value">${np.max(prices):,.2f}</div>
-                                <div class="stat-sub">highest price</div>
+                                <div class="stat-label">Current Lookback</div>
+                                <div class="stat-value">{analyzer.lookback_history[-1]}h</div>
+                                <div class="stat-sub">optimal window</div>
                             </div>
                         </div>
                         
-                        <img src="data:image/png;base64,{image_base64}" alt="BTC Progressive OLS Analysis">
+                        <img src="data:image/png;base64,{image_base64}" alt="BTC Slope Analysis">
                         
                         <div class="footer">
                             <p>Data from Binance API | Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-                            <p>Each iteration's endpoint becomes the start of the previous optimal window</p>
-                            <p>This reveals nested optimal trends within the price data</p>
+                            <p>Each point's background color shows the optimal trend slope at that time</p>
+                            <p>Green = positive slope (uptrend), Red = negative slope (downtrend)</p>
                         </div>
                     </div>
                 </body>
@@ -466,7 +414,7 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
 def main():
     """Main function to run the analysis and server"""
     print("=" * 70)
-    print("BTC Progressive OLS Analysis - Moving to Previous Window Start")
+    print("BTC Point-by-Point OLS Slope Analysis")
     print("=" * 70)
     
     # Create analyzer instance
