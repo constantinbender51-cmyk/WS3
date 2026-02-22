@@ -111,10 +111,14 @@ ax1.set_title('BTC Price with Signals')
 ax1.set_ylabel('Price (USDT)')
 ax1.grid(True, alpha=0.3)
 
-# Cumulative returns
+# Cumulative returns - FIXED
 if len(cumulative) > 0:
-    return_times = times[11:11+len(cumulative)]
-    ax2.plot(return_times, cumulative, 'b-', linewidth=2)
+    # Make sure lengths match
+    max_len = min(len(times[11:]), len(cumulative))
+    return_times = times[11:11+max_len]
+    returns_to_plot = cumulative[:max_len]
+    ax2.plot(return_times, returns_to_plot, 'b-', linewidth=2)
+    
 ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
 ax2.set_title(f'Cumulative Returns: {total_return:.1f}%')
 ax2.set_ylabel('Return (%)')
