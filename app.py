@@ -477,7 +477,7 @@ def main():
     
     # Length reward parameter - can be adjusted
     # 0.1 means each additional hour gives 0.1% error reduction (max 9% for 100-period)
-    LENGTH_REWARD = 0.1
+    LENGTH_REWARD = 0.5
     
     # Create analyzer instance with length reward
     analyzer = BTCOptimalLookback(length_reward=LENGTH_REWARD)
