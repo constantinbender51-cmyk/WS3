@@ -623,7 +623,7 @@ class TradingServer:
         class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             def do_GET(self):
                 if self.path == '/' or self.path == '/index.html':
-                    html = server.get_html_dashboard()
+                    html = self.server.get_html_dashboard()
                     self.send_response(200)
                     self.send_header('Content-type', 'text/html')
                     self.end_headers()
