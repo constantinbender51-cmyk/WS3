@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import json
 import os
 import argparse
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Optional
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -75,7 +75,7 @@ def fetch_binance_data(symbol: str = "BTCUSDT", interval: str = "1h", days: int 
         logger.error(f"Error fetching data from Binance: {e}")
         raise
 
-def find_optimal_window_for_line(prices: pd.Series, window_range: range = range(10, 101), k: float = K_FIXED) -> Tuple[int, float]:
+def find_optimal_window_for_line(prices: pd.Series, window_range: range = range(10, 101), k: float = 1.8) -> Tuple[int, float]:
     """
     Find the optimal window size for a single line that minimizes the error term
     Returns: (optimal_window, min_error)
@@ -106,7 +106,7 @@ def find_optimal_window_for_line(prices: pd.Series, window_range: range = range(
     
     return best_window, min_error
 
-def process_single_window(args: Tuple) -> Tuple[int, float, float]:
+def process_single_window(args: Tuple) -> Tuple[int, float, int]:
     """
     Process a single window to find optimal line and slope
     Returns: (index, slope, optimal_window)
@@ -128,7 +128,7 @@ def process_single_window(args: Tuple) -> Tuple[int, float, float]:
 
 def calculate_signals_with_optimal_windows(prices: pd.Series, 
                                           window_range: range = range(10, 101),
-                                          k: float = K_FIXED,
+                                          k: float = 1.8,
                                           parallel: bool = True) -> Tuple[List[int], List[int], List[float]]:
     """
     For each line, find optimal window size and calculate slope
@@ -146,7 +146,8 @@ def calculate_signals_with_optimal_windows(prices: pd.Series,
         args_list = []
         for i in range(len(prices) - min(window_range)):
             # Use all available prices up to the current point for optimization
-            window_prices = prices.iloc[:i + min(window_range)]
+            end_idx = i + min(window_range)
+            window_prices = prices.iloc[:end_idx]
             if len(window_prices) >= min(window_range):
                 args_list.append((i, window_prices, window_range, k))
         
@@ -170,7 +171,8 @@ def calculate_signals_with_optimal_windows(prices: pd.Series,
     else:  # Sequential processing
         for i in range(len(prices) - min(window_range)):
             # Use all available prices up to the current point for optimization
-            window_prices = prices.iloc[:i + min(window_range)]
+            end_idx = i + min(window_range)
+            window_prices = prices.iloc[:end_idx]
             
             if len(window_prices) >= min(window_range):
                 # Find optimal window for this line
@@ -189,7 +191,8 @@ def calculate_signals_with_optimal_windows(prices: pd.Series,
                 signals.append(1 if slope > 0 else -1)
     
     logger.info(f"Generated {len(signals)} signals")
-    logger.info(f"Optimal windows range: {min(optimal_windows)}-{max(optimal_windows)}")
+    if optimal_windows:
+        logger.info(f"Optimal windows range: {min(optimal_windows)}-{max(optimal_windows)}")
     
     return signals, optimal_windows, slopes
 
@@ -213,9 +216,9 @@ def backtest_strategy(prices: pd.Series, signals: List[int]) -> Tuple[List[float
     return returns, equity_curve[1:]
 
 def calculate_statistics(equity_curve: List[float], returns: List[float], 
-                        optimal_windows: List[int]) -> Dict:
+                        optimal_windows: List[int], k_fixed: float) -> Dict:
     """Calculate performance statistics"""
-    if not equity_curve or not returns:
+    if not equity_curve or not returns or not optimal_windows:
         return {
             'total_return': 0.0,
             'annual_return': 0.0,
@@ -227,7 +230,7 @@ def calculate_statistics(equity_curve: List[float], returns: List[float],
             'avg_optimal_window': 0,
             'min_optimal_window': 0,
             'max_optimal_window': 0,
-            'k_fixed': K_FIXED
+            'k_fixed': k_fixed
         }
     
     total_return = (equity_curve[-1] / 1000 - 1) * 100
@@ -270,7 +273,7 @@ def calculate_statistics(equity_curve: List[float], returns: List[float],
         'avg_optimal_window': round(np.mean(optimal_windows), 1),
         'min_optimal_window': min(optimal_windows),
         'max_optimal_window': max(optimal_windows),
-        'k_fixed': K_FIXED
+        'k_fixed': k_fixed
     }
 
 def generate_plot(prices: pd.Series, equity_curve: List[float], 
@@ -301,7 +304,7 @@ def generate_plot(prices: pd.Series, equity_curve: List[float],
         if sell_dates:
             ax1.scatter(sell_dates, sell_prices, color='red', marker='v', s=50, label='Sell Signal', zorder=5, alpha=0.7)
         
-        ax1.set_title(f'BTC Price with Trading Signals (k={K_FIXED})')
+        ax1.set_title(f'BTC Price with Trading Signals (k={stats["k_fixed"]})')
         ax1.set_ylabel('Price (USDT)')
         ax1.legend(loc='upper left')
         ax1.grid(True, alpha=0.3)
@@ -368,7 +371,7 @@ def save_results(stats: Dict, signals: List[int], optimal_windows: List[int],
             'symbol': SYMBOL,
             'interval': INTERVAL,
             'days': DAYS,
-            'k_fixed': K_FIXED,
+            'k_fixed': stats['k_fixed'],
             'window_range': '10-100'
         }
     }
@@ -388,7 +391,7 @@ def save_results(stats: Dict, signals: List[int], optimal_windows: List[int],
         f.write(f"Interval: {INTERVAL}\n")
         f.write(f"Period: {DAYS} days\n\n")
         f.write("STRATEGY PARAMETERS:\n")
-        f.write(f"  k (fixed): {K_FIXED}\n")
+        f.write(f"  k (fixed): {stats['k_fixed']}\n")
         f.write(f"  Window range: 10-100\n\n")
         f.write("OPTIMIZATION RESULTS:\n")
         f.write(f"  Average Optimal Window: {stats['avg_optimal_window']}\n")
@@ -418,20 +421,19 @@ def main():
     args = parser.parse_args()
     
     try:
-        # Update global K_FIXED if provided
-        global K_FIXED
-        K_FIXED = args.k
+        # Use the k value from command line or default
+        k_value = args.k
         
         # Fetch data
         df = fetch_binance_data(args.symbol, args.interval, args.days)
         prices = df['close']
         
         # Calculate signals with optimal windows for each line
-        logger.info(f"Calculating signals with fixed k={K_FIXED}...")
+        logger.info(f"Calculating signals with fixed k={k_value}...")
         signals, optimal_windows, slopes = calculate_signals_with_optimal_windows(
             prices, 
             window_range=range(10, 101),
-            k=K_FIXED,
+            k=k_value,
             parallel=not args.sequential
         )
         
@@ -440,7 +442,7 @@ def main():
         returns, equity_curve = backtest_strategy(prices, signals)
         
         # Calculate statistics
-        stats = calculate_statistics(equity_curve, returns, optimal_windows)
+        stats = calculate_statistics(equity_curve, returns, optimal_windows, k_value)
         
         # Generate plot (if not disabled)
         if not args.no_plot:
@@ -454,7 +456,7 @@ def main():
         print("\n" + "="*60)
         print("BACKTEST SUMMARY")
         print("="*60)
-        print(f"k (fixed): {K_FIXED}")
+        print(f"k (fixed): {k_value}")
         print(f"Average Optimal Window: {stats['avg_optimal_window']}")
         print(f"Min/Max Window: {stats['min_optimal_window']}/{stats['max_optimal_window']}")
         print("-" * 40)
