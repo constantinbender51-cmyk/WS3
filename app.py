@@ -63,8 +63,9 @@ class BTCOptimalLookback:
         
         print(f"Generated {n_points} hours of sample data")
     
-    def ols(self, lookback: int) -> Tuple[np.ndarray, np.ndarray, float]:
-        """Perform OLS regression on the last 'lookback' data points"""
+    def ols(self, lookback: int) -> Tuple[np.ndarray, np.ndarray, float, float]:
+        """Perform OLS regression on the last 'lookback' data points
+        Returns: X, y_pred, total_error, avg_error_per_candle"""
         if lookback > len(self.prices):
             lookback = len(self.prices)
         
@@ -72,61 +73,81 @@ class BTCOptimalLookback:
         X = self.timestamps[-lookback:]
         y = self.prices[-lookback:]
         
-        # Reshape X for sklearn
-        X_reshaped = X.reshape(-1, 1)
+        # Normalize timestamps to avoid numerical issues
+        X_normalized = (X - X.mean()) / X.std()
         
         # Fit OLS
         model = LinearRegression()
-        model.fit(X_reshaped, y)
+        model.fit(X_normalized, y)
         
         # Predict
-        y_pred = model.predict(X_reshaped)
+        y_pred = model.predict(X_normalized)
         
-        # Calculate error (sum of absolute differences)
-        error = np.sum(np.abs(y - y_pred))
+        # Calculate total error (sum of absolute differences)
+        total_error = np.sum(np.abs(y - y_pred))
         
-        return X.flatten(), y_pred, error
+        # Calculate average error per candle
+        avg_error_per_candle = total_error / lookback
+        
+        return X.flatten(), y_pred, total_error, avg_error_per_candle
     
-    def iterate(self) -> Tuple[int, np.ndarray, np.ndarray, float]:
-        """Iterate through lookback windows from 10 to 100 and find best error"""
-        best_error = float('inf')
+    def iterate(self) -> Tuple[int, np.ndarray, np.ndarray, float, float]:
+        """Iterate through lookback windows from 10 to 100 and find best average error"""
+        best_avg_error = float('inf')
         best_lookback = 10
         best_X = None
         best_y_pred = None
+        best_total_error = None
         
-        errors = []
+        errors = []  # Store (lookback, total_error, avg_error)
         
         print("Calculating OLS for lookback windows 10-100...")
+        print("-" * 60)
+        print(f"{'Lookback':^10} | {'Total Error':^15} | {'Avg Error/Candle':^18}")
+        print("-" * 60)
         
         for lookback in range(10, 101):
             if lookback > len(self.prices):
                 break
                 
-            X, y_pred, error = self.ols(lookback)
-            errors.append((lookback, error))
+            X, y_pred, total_error, avg_error = self.ols(lookback)
+            errors.append((lookback, total_error, avg_error))
             
-            if error < best_error:
-                best_error = error
+            print(f"{lookback:^10} | ${total_error:>13,.2f} | ${avg_error:>16,.2f}")
+            
+            if avg_error < best_avg_error:
+                best_avg_error = avg_error
                 best_lookback = lookback
                 best_X = X
                 best_y_pred = y_pred
+                best_total_error = total_error
         
-        print(f"Best lookback window: {best_lookback} with error: {best_error:.2f}")
+        print("-" * 60)
+        print(f"\n✅ Best lookback window: {best_lookback} hours")
+        print(f"   Total Error: ${best_total_error:,.2f}")
+        print(f"   Average Error per Candle: ${best_avg_error:,.2f}")
         
-        # Print top 5 lookback windows
-        sorted_errors = sorted(errors, key=lambda x: x[1])[:5]
-        print("\nTop 5 lookback windows:")
-        for lb, err in sorted_errors:
-            print(f"  Lookback {lb}: error = {err:.2f}")
+        # Print top 5 lookback windows by average error
+        sorted_errors = sorted(errors, key=lambda x: x[2])[:5]
+        print("\n🏆 Top 5 lookback windows (by average error per candle):")
+        print(f"{'Rank':^6} | {'Lookback':^10} | {'Total Error':^15} | {'Avg Error/Candle':^18}")
+        print("-" * 60)
+        for rank, (lb, total_err, avg_err) in enumerate(sorted_errors, 1):
+            print(f"{rank:^6} | {lb:^10} | ${total_err:>13,.2f} | ${avg_err:>16,.2f}")
         
-        return best_lookback, best_X, best_y_pred, best_error
+        return best_lookback, best_X, best_y_pred, best_total_error, best_avg_error
     
-    def plot(self, best_lookback: int, best_X: np.ndarray, best_y_pred: np.ndarray) -> str:
+    def plot(self, best_lookback: int, best_X: np.ndarray, best_y_pred: np.ndarray, 
+             best_total_error: float, best_avg_error: float) -> str:
         """Create plot and return as base64 encoded string"""
-        plt.figure(figsize=(14, 8))
+        plt.figure(figsize=(14, 10))
+        
+        # Create subplot for price chart
+        ax1 = plt.subplot(2, 1, 1)
         
         # Plot all prices
-        plt.plot(range(len(self.prices)), self.prices, 'b-', alpha=0.5, label='BTC Price (All Data)', linewidth=1)
+        ax1.plot(range(len(self.prices)), self.prices, 'b-', alpha=0.5, 
+                label='BTC Price (All Data)', linewidth=1)
         
         # Highlight the best OLS segment
         if best_X is not None and best_y_pred is not None:
@@ -134,28 +155,55 @@ class BTCOptimalLookback:
             start_idx = len(self.prices) - len(best_X)
             x_indices = range(start_idx, len(self.prices))
             
-            plt.plot(x_indices, best_y_pred, 'r-', linewidth=3, 
+            ax1.plot(x_indices, best_y_pred, 'r-', linewidth=3, 
                     label=f'Best OLS Line (lookback={best_lookback})')
             
             # Highlight the data points used
-            plt.scatter(x_indices, self.prices[start_idx:], c='orange', s=30, 
+            ax1.scatter(x_indices, self.prices[start_idx:], c='orange', s=30, 
                        alpha=0.7, label='Data Points in Best Window')
         
-        plt.title(f'BTC Price (1h) - Last 30 Days\nBest OLS Lookback: {best_lookback} hours')
-        plt.xlabel('Time (hours from now)')
-        plt.ylabel('Price (USDT)')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
+        ax1.set_title(f'BTC Price (1h) - Last 30 Days\nBest OLS Lookback: {best_lookback} hours')
+        ax1.set_xlabel('Time (hours from now)')
+        ax1.set_ylabel('Price (USDT)')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
         
         # Add price statistics
         if len(self.prices) > 0:
             current_price = self.prices[-1]
             min_price = np.min(self.prices)
             max_price = np.max(self.prices)
-            stats_text = f'Current: ${current_price:.2f}\nMin: ${min_price:.2f}\nMax: ${max_price:.2f}'
-            plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes, 
+            stats_text = f'Current: ${current_price:,.2f}\nMin: ${min_price:,.2f}\nMax: ${max_price:,.2f}'
+            ax1.text(0.02, 0.98, stats_text, transform=ax1.transAxes, 
                     fontsize=10, verticalalignment='top',
                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        
+        # Create subplot for error analysis
+        ax2 = plt.subplot(2, 1, 2)
+        
+        # Calculate errors for all lookback windows
+        lookbacks = []
+        avg_errors = []
+        total_errors = []
+        
+        for lookback in range(10, min(101, len(self.prices) + 1)):
+            _, _, total_error, avg_error = self.ols(lookback)
+            lookbacks.append(lookback)
+            avg_errors.append(avg_error)
+            total_errors.append(total_error)
+        
+        # Plot average error
+        ax2.plot(lookbacks, avg_errors, 'g-', linewidth=2, label='Avg Error per Candle')
+        ax2.scatter([best_lookback], [best_avg_error], c='red', s=100, zorder=5, 
+                   label=f'Best: {best_lookback} (${best_avg_error:,.2f})')
+        
+        ax2.set_xlabel('Lookback Window (hours)')
+        ax2.set_ylabel('Average Error per Candle ($)')
+        ax2.set_title('Error Analysis: Average Absolute Deviation per Candle')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
         
         # Save plot to bytes buffer
         buf = io.BytesIO()
@@ -177,59 +225,85 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             
             if BTCRequestHandler.btc_analyzer and BTCRequestHandler.btc_analyzer.prices is not None:
-                best_lookback, best_X, best_y_pred, best_error = BTCRequestHandler.btc_analyzer.iterate()
-                image_base64 = BTCRequestHandler.btc_analyzer.plot(best_lookback, best_X, best_y_pred)
+                best_lookback, best_X, best_y_pred, best_total_error, best_avg_error = BTCRequestHandler.btc_analyzer.iterate()
+                image_base64 = BTCRequestHandler.btc_analyzer.plot(best_lookback, best_X, best_y_pred, 
+                                                                  best_total_error, best_avg_error)
+                
+                # Calculate some additional statistics
+                prices = BTCRequestHandler.btc_analyzer.prices
+                volatility = np.std(prices[-24:])  # 24h volatility
                 
                 # Create HTML page
                 html = f"""
                 <!DOCTYPE html>
                 <html>
                 <head>
-                    <title>BTC OLS Analysis</title>
+                    <title>BTC OLS Analysis - Average Error per Candle</title>
                     <style>
                         body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f0f0f0; }}
                         .container {{ max-width: 1200px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
                         h1 {{ color: #333; }}
+                        h2 {{ color: #666; }}
                         .info {{ background-color: #e8f4f8; padding: 15px; border-radius: 5px; margin: 20px 0; }}
-                        .stats {{ display: flex; justify-content: space-between; }}
-                        .stat-box {{ background-color: #4CAF50; color: white; padding: 15px; border-radius: 5px; flex: 1; margin: 0 10px; text-align: center; }}
-                        .stat-box:first-child {{ margin-left: 0; }}
-                        .stat-box:last-child {{ margin-right: 0; }}
-                        .stat-value {{ font-size: 24px; font-weight: bold; }}
-                        .stat-label {{ font-size: 14px; margin-top: 5px; }}
-                        img {{ max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 5px; margin-top: 20px; }}
-                        .footer {{ margin-top: 20px; color: #666; font-size: 12px; text-align: center; }}
+                        .stats {{ display: flex; justify-content: space-between; flex-wrap: wrap; }}
+                        .stat-box {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 10px; flex: 1; margin: 10px; min-width: 200px; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+                        .stat-box:nth-child(2) {{ background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); }}
+                        .stat-box:nth-child(3) {{ background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); }}
+                        .stat-box:nth-child(4) {{ background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%); }}
+                        .stat-value {{ font-size: 28px; font-weight: bold; margin: 10px 0; }}
+                        .stat-label {{ font-size: 14px; opacity: 0.9; }}
+                        .stat-sub {{ font-size: 12px; margin-top: 5px; opacity: 0.8; }}
+                        img {{ max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 10px; margin-top: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }}
+                        .footer {{ margin-top: 30px; color: #666; font-size: 12px; text-align: center; padding-top: 20px; border-top: 1px solid #eee; }}
+                        .error-metric {{ background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 20px 0; }}
                     </style>
                 </head>
                 <body>
                     <div class="container">
-                        <h1>📈 BTC OLS Analysis - 30 Days 1-Hour Data</h1>
+                        <h1>📊 BTC OLS Analysis - Average Error per Candle</h1>
+                        <p>30 Days of 1-Hour Data | Optimizing for minimum average absolute deviation</p>
+                        
+                        <div class="error-metric">
+                            <strong>🎯 Optimization Metric:</strong> Using <strong>Average Error per Candle</strong> (Total Error / Lookback Period) 
+                            to fairly compare different lookback windows regardless of their length.
+                        </div>
+                        
                         <div class="info">
-                            <h3>Analysis Results:</h3>
-                            <p><strong>Best Lookback Window:</strong> {best_lookback} hours</p>
-                            <p><strong>Best Error (Sum |price-ols|):</strong> ${best_error:.2f}</p>
-                            <p><strong>Total Data Points:</strong> {len(BTCRequestHandler.btc_analyzer.prices)} hours</p>
+                            <h3>📈 Best Result:</h3>
+                            <p><strong>Optimal Lookback Window:</strong> {best_lookback} hours</p>
+                            <p><strong>Total Error (Sum |price-ols|):</strong> ${best_total_error:,.2f}</p>
+                            <p><strong>Average Error per Candle:</strong> ${best_avg_error:,.2f}</p>
+                            <p><strong>Total Data Points:</strong> {len(prices)} hours</p>
                         </div>
                         
                         <div class="stats">
                             <div class="stat-box">
-                                <div class="stat-value">${BTCRequestHandler.btc_analyzer.prices[-1]:.2f}</div>
-                                <div class="stat-label">Current Price</div>
+                                <div class="stat-label">Current BTC Price</div>
+                                <div class="stat-value">${prices[-1]:,.2f}</div>
+                                <div class="stat-sub">as of now</div>
                             </div>
                             <div class="stat-box">
-                                <div class="stat-value">${np.min(BTCRequestHandler.btc_analyzer.prices):.2f}</div>
-                                <div class="stat-label">Min Price (30d)</div>
+                                <div class="stat-label">24h Volatility (Std)</div>
+                                <div class="stat-value">${volatility:,.2f}</div>
+                                <div class="stat-sub">price fluctuation</div>
                             </div>
                             <div class="stat-box">
-                                <div class="stat-value">${np.max(BTCRequestHandler.btc_analyzer.prices):.2f}</div>
-                                <div class="stat-label">Max Price (30d)</div>
+                                <div class="stat-label">30d Min</div>
+                                <div class="stat-value">${np.min(prices):,.2f}</div>
+                                <div class="stat-sub">lowest price</div>
+                            </div>
+                            <div class="stat-box">
+                                <div class="stat-label">30d Max</div>
+                                <div class="stat-value">${np.max(prices):,.2f}</div>
+                                <div class="stat-sub">highest price</div>
                             </div>
                         </div>
                         
-                        <img src="data:image/png;base64,{image_base64}" alt="BTC Price Chart">
+                        <img src="data:image/png;base64,{image_base64}" alt="BTC Price and Error Analysis">
                         
                         <div class="footer">
                             <p>Data from Binance API | Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+                            <p>Analysis looks for lookback window that minimizes average absolute deviation per candle</p>
                         </div>
                     </div>
                 </body>
@@ -244,9 +318,9 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
 
 def main():
     """Main function to run the analysis and server"""
-    print("=" * 60)
-    print("BTC OLS Analysis - Fetching data and finding optimal lookback window")
-    print("=" * 60)
+    print("=" * 70)
+    print("BTC OLS Analysis - Finding optimal lookback window (avg error per candle)")
+    print("=" * 70)
     
     # Create analyzer instance
     analyzer = BTCOptimalLookback()
