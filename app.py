@@ -18,7 +18,7 @@ from io import BytesIO
 
 # ========== CONFIG ==========
 PORT = 8000
-K = 1.8
+K = 1
 
 # ========== FETCH DATA ==========
 print("📥 Fetching BTC data...")
