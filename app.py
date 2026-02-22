@@ -180,14 +180,31 @@ def find_cascade():
     return cascade
 
 def create_plot(cascade):
-    """Create plot with all cascade lines"""
-    plt.figure(figsize=(14, 8))
+    """Create plot with all cascade lines and slope-based backgrounds"""
+    fig, ax = plt.subplots(figsize=(14, 8))
     
     # Plot price
-    plt.plot(range(len(prices)), prices, 'b-', alpha=0.5, label='BTC Price', linewidth=1)
+    ax.plot(range(len(prices)), prices, 'b-', alpha=0.5, label='BTC Price', linewidth=1)
     
-    # Plot each cascade line
-    colors = ['red', 'green', 'purple', 'orange', 'brown', 'pink', 'gray', 'olive', 'cyan', 'magenta']
+    # Add colored backgrounds based on slope
+    for i, line in enumerate(cascade):
+        end_idx = line['end_idx']
+        window = line['window']
+        line_start = end_idx - window
+        
+        # Choose background color based on slope
+        if line['slope'] > 0:
+            color = 'green'
+            alpha = 0.15
+        else:
+            color = 'red'
+            alpha = 0.15
+        
+        # Add colored background for the window region
+        ax.axvspan(line_start, end_idx, alpha=alpha, color=color, zorder=0)
+    
+    # Plot each cascade line (on top of backgrounds)
+    colors = ['black', 'darkblue', 'purple', 'orange', 'brown', 'pink', 'gray', 'olive', 'cyan', 'magenta']
     
     for i, line in enumerate(cascade):
         color = colors[i % len(colors)]
@@ -200,31 +217,46 @@ def create_plot(cascade):
         
         # Plot the line
         x_range = range(line_start, end_idx)
-        plt.plot(x_range, y_pred, color=color, linewidth=2.5, 
+        ax.plot(x_range, y_pred, color=color, linewidth=2.5, 
                 label=f'Line {i+1}: win={window}h, slope={line["slope"]:+.1f}')
         
         # Mark the window points
-        plt.scatter(x_range, prices[line_start:end_idx], c=color, s=15, alpha=0.3)
+        ax.scatter(x_range, prices[line_start:end_idx], c=color, s=15, alpha=0.3)
         
-        # Add line number
-        plt.text(line_start, prices[line_start] - 200, f'{i+1}', 
+        # Add line number with slope-based background
+        slope_symbol = '↑' if line['slope'] > 0 else '↓'
+        bg_color = 'lightgreen' if line['slope'] > 0 else 'lightcoral'
+        ax.text(line_start, prices[line_start] - 200, f'{i+1}{slope_symbol}', 
                 fontsize=10, fontweight='bold', ha='center',
-                bbox=dict(boxstyle='round,pad=0.2', fc='yellow', alpha=0.7))
+                bbox=dict(boxstyle='round,pad=0.2', fc=bg_color, alpha=0.7))
         
         # Mark the boundary
         if i < len(cascade) - 1:
-            plt.axvline(x=line_start, color=color, linestyle='--', alpha=0.3)
+            ax.axvline(x=line_start, color=color, linestyle='--', alpha=0.3)
     
-    plt.title(f'BTC Price with Cascade Lines (error/window^{K})', fontsize=14)
-    plt.xlabel('Hours from Start')
-    plt.ylabel('Price (USDT)')
-    plt.grid(True, alpha=0.2)
-    plt.legend(loc='upper left', fontsize=8)
+    # Add slope legend
+    from matplotlib.patches import Patch
+    legend_elements = [Patch(facecolor='green', alpha=0.15, label='Positive slope'),
+                      Patch(facecolor='red', alpha=0.15, label='Negative slope')]
+    ax.legend(handles=legend_elements + [ax.get_legend_handles_labels()[0][0]], 
+              loc='upper left', fontsize=8)
+    
+    ax.set_title(f'BTC Price with Cascade Lines (error/window^{K})', fontsize=14)
+    ax.set_xlabel('Hours from Start')
+    ax.set_ylabel('Price (USDT)')
+    ax.grid(True, alpha=0.2)
     
     # Add K value info
-    plt.text(0.98, 0.02, f'K = {K}', transform=plt.gca().transAxes, 
+    ax.text(0.98, 0.02, f'K = {K}', transform=ax.transAxes, 
              fontsize=12, ha='right',
              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    # Add slope statistics
+    positive_slopes = sum(1 for line in cascade if line['slope'] > 0)
+    negative_slopes = sum(1 for line in cascade if line['slope'] < 0)
+    ax.text(0.02, 0.98, f'Positive: {positive_slopes} | Negative: {negative_slopes}', 
+            transform=ax.transAxes, fontsize=10, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
     
     plt.tight_layout()
     
@@ -252,6 +284,8 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             # Calculate some stats
             avg_window = np.mean([line['window'] for line in cascade]) if cascade else 0
             avg_slope = np.mean([line['slope'] for line in cascade]) if cascade else 0
+            positive_slopes = sum(1 for line in cascade if line['slope'] > 0)
+            negative_slopes = sum(1 for line in cascade if line['slope'] < 0)
             
             # Simple HTML
             html = f"""
@@ -263,8 +297,10 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                     body {{ margin: 20px; font-family: Arial; background: #f5f5f5; }}
                     .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }}
                     h1 {{ margin: 0 0 10px 0; font-size: 20px; }}
-                    .stats {{ margin: 10px 0; padding: 10px; background: #f0f0f0; border-radius: 4px; display: flex; gap: 20px; }}
+                    .stats {{ margin: 10px 0; padding: 10px; background: #f0f0f0; border-radius: 4px; display: flex; gap: 20px; flex-wrap: wrap; }}
                     .stat {{ padding: 5px 10px; background: #fff; border-radius: 4px; }}
+                    .positive {{ background: #d4edda; color: #155724; padding: 2px 8px; border-radius: 4px; }}
+                    .negative {{ background: #f8d7da; color: #721c24; padding: 2px 8px; border-radius: 4px; }}
                     img {{ width: 100%; }}
                 </style>
             </head>
@@ -275,6 +311,8 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                         <span class="stat">📊 Lines: {len(cascade)}</span>
                         <span class="stat">📏 Avg window: {avg_window:.1f}h</span>
                         <span class="stat">📈 Avg slope: {avg_slope:+.1f} $/h</span>
+                        <span class="stat positive">🟢 Positive: {positive_slopes}</span>
+                        <span class="stat negative">🔴 Negative: {negative_slopes}</span>
                     </div>
                     <img src="data:image/png;base64,{image_base64}">
                 </div>
