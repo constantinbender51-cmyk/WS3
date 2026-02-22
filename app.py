@@ -18,6 +18,8 @@ import argparse
 from typing import Tuple, Dict, List, Optional
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import warnings
+warnings.filterwarnings('ignore')
 
 # Configure logging
 logging.basicConfig(
@@ -83,26 +85,38 @@ def find_optimal_window_for_line(prices: pd.Series, window_range: range = range(
     best_window = 10
     min_error = float('inf')
     
+    # Ensure we have enough data points
+    max_window = min(max(window_range), len(prices))
+    if max_window < min(window_range):
+        return min(window_range), float('inf')
+    
     for window in window_range:
-        if len(prices) < window:
+        if window > len(prices):
             continue
             
+        # Use the last 'window' data points
+        recent_prices = prices.iloc[-window:].values
+        
         x = np.arange(window).reshape(-1, 1)
-        y = prices.values.reshape(-1, 1)
+        y = recent_prices.reshape(-1, 1)
         
-        # Fit OLS line
-        model = LinearRegression()
-        model.fit(x, y)
-        
-        # Calculate predictions
-        predictions = model.predict(x).flatten()
-        
-        # Calculate error term: sum(|actual - predicted|) / window^k
-        error = np.sum(np.abs(prices.values - predictions)) / (window ** k)
-        
-        if error < min_error:
-            min_error = error
-            best_window = window
+        try:
+            # Fit OLS line
+            model = LinearRegression()
+            model.fit(x, y)
+            
+            # Calculate predictions
+            predictions = model.predict(x).flatten()
+            
+            # Calculate error term: sum(|actual - predicted|) / window^k
+            error = np.sum(np.abs(recent_prices - predictions)) / (window ** k)
+            
+            if error < min_error:
+                min_error = error
+                best_window = window
+        except Exception as e:
+            logger.debug(f"Error fitting line with window {window}: {e}")
+            continue
     
     return best_window, min_error
 
@@ -111,14 +125,25 @@ def process_single_window(args: Tuple) -> Tuple[int, float, int]:
     Process a single window to find optimal line and slope
     Returns: (index, slope, optimal_window)
     """
-    i, window_prices, window_range, k = args
+    i, all_prices, min_window, max_window, k = args
     
-    # Find optimal window size for this specific line
-    optimal_window, min_error = find_optimal_window_for_line(window_prices, window_range, k)
+    # Get prices up to current point
+    current_prices = all_prices.iloc[:i + min_window]
     
-    # Fit line with optimal window
+    if len(current_prices) < min_window:
+        return i, 0, min_window
+    
+    # Create window range for this specific point
+    max_possible_window = min(max_window, len(current_prices))
+    window_range = range(min_window, max_possible_window + 1)
+    
+    # Find optimal window for this line
+    optimal_window, _ = find_optimal_window_for_line(current_prices, window_range, k)
+    
+    # Use the optimal window to fit the line on the most recent data
+    recent_prices = current_prices.iloc[-optimal_window:].values
     x = np.arange(optimal_window).reshape(-1, 1)
-    y = window_prices.values.reshape(-1, 1)
+    y = recent_prices.reshape(-1, 1)
     
     model = LinearRegression()
     model.fit(x, y)
@@ -127,7 +152,8 @@ def process_single_window(args: Tuple) -> Tuple[int, float, int]:
     return i, slope, optimal_window
 
 def calculate_signals_with_optimal_windows(prices: pd.Series, 
-                                          window_range: range = range(10, 101),
+                                          min_window: int = 10,
+                                          max_window: int = 100,
                                           k: float = 1.8,
                                           parallel: bool = True) -> Tuple[List[int], List[int], List[float]]:
     """
@@ -138,18 +164,14 @@ def calculate_signals_with_optimal_windows(prices: pd.Series,
     optimal_windows = []
     slopes = []
     
-    total_windows = len(prices) - min(window_range)
+    total_windows = len(prices) - min_window
     logger.info(f"Processing {total_windows} windows...")
     
     if parallel and total_windows > 50:  # Use parallel processing for larger datasets
         # Prepare arguments for parallel processing
         args_list = []
-        for i in range(len(prices) - min(window_range)):
-            # Use all available prices up to the current point for optimization
-            end_idx = i + min(window_range)
-            window_prices = prices.iloc[:end_idx]
-            if len(window_prices) >= min(window_range):
-                args_list.append((i, window_prices, window_range, k))
+        for i in range(total_windows):
+            args_list.append((i, prices, min_window, max_window, k))
         
         # Process in parallel
         results = [None] * len(args_list)
@@ -169,26 +191,32 @@ def calculate_signals_with_optimal_windows(prices: pd.Series,
                 signals.append(1 if slope > 0 else -1)
     
     else:  # Sequential processing
-        for i in range(len(prices) - min(window_range)):
-            # Use all available prices up to the current point for optimization
-            end_idx = i + min(window_range)
-            window_prices = prices.iloc[:end_idx]
+        for i in range(total_windows):
+            # Get prices up to current point
+            current_prices = prices.iloc[:i + min_window]
             
-            if len(window_prices) >= min(window_range):
-                # Find optimal window for this line
-                optimal_window, _ = find_optimal_window_for_line(window_prices, window_range, k)
-                
-                # Fit line with optimal window
-                x = np.arange(optimal_window).reshape(-1, 1)
-                y = window_prices.values.reshape(-1, 1)
-                
-                model = LinearRegression()
-                model.fit(x, y)
-                slope = model.coef_[0][0]
-                
-                slopes.append(slope)
-                optimal_windows.append(optimal_window)
-                signals.append(1 if slope > 0 else -1)
+            if len(current_prices) < min_window:
+                continue
+            
+            # Determine max possible window for this point
+            max_possible_window = min(max_window, len(current_prices))
+            window_range = range(min_window, max_possible_window + 1)
+            
+            # Find optimal window for this line
+            optimal_window, _ = find_optimal_window_for_line(current_prices, window_range, k)
+            
+            # Use the optimal window to fit the line on the most recent data
+            recent_prices = current_prices.iloc[-optimal_window:].values
+            x = np.arange(optimal_window).reshape(-1, 1)
+            y = recent_prices.reshape(-1, 1)
+            
+            model = LinearRegression()
+            model.fit(x, y)
+            slope = model.coef_[0][0]
+            
+            slopes.append(slope)
+            optimal_windows.append(optimal_window)
+            signals.append(1 if slope > 0 else -1)
     
     logger.info(f"Generated {len(signals)} signals")
     if optimal_windows:
@@ -319,13 +347,14 @@ def generate_plot(prices: pd.Series, equity_curve: List[float],
         ax2.legend(loc='upper left')
         
         # Optimal windows distribution
-        ax3.hist(optimal_windows, bins=20, color='orange', alpha=0.7, edgecolor='black')
-        ax3.set_title('Optimal Window Size Distribution')
-        ax3.set_xlabel('Window Size')
-        ax3.set_ylabel('Frequency')
-        ax3.axvline(x=stats['avg_optimal_window'], color='red', linestyle='--', label=f"Avg: {stats['avg_optimal_window']}")
-        ax3.legend()
-        ax3.grid(True, alpha=0.3)
+        if optimal_windows:
+            ax3.hist(optimal_windows, bins=20, color='orange', alpha=0.7, edgecolor='black')
+            ax3.set_title('Optimal Window Size Distribution')
+            ax3.set_xlabel('Window Size')
+            ax3.set_ylabel('Frequency')
+            ax3.axvline(x=stats['avg_optimal_window'], color='red', linestyle='--', label=f"Avg: {stats['avg_optimal_window']}")
+            ax3.legend()
+            ax3.grid(True, alpha=0.3)
         
         # Returns histogram
         returns = [equity_curve[i] - equity_curve[i-1] for i in range(1, len(equity_curve))]
@@ -414,6 +443,8 @@ def main():
     parser.add_argument('--interval', type=str, default=INTERVAL, help='Candle interval')
     parser.add_argument('--days', type=int, default=DAYS, help='Days of historical data')
     parser.add_argument('--k', type=float, default=K_FIXED, help='Fixed k value (default: 1.8)')
+    parser.add_argument('--min-window', type=int, default=10, help='Minimum window size')
+    parser.add_argument('--max-window', type=int, default=100, help='Maximum window size')
     parser.add_argument('--output-dir', type=str, default='results', help='Output directory')
     parser.add_argument('--no-plot', action='store_true', help='Skip generating plot')
     parser.add_argument('--sequential', action='store_true', help='Use sequential processing (no parallel)')
@@ -428,11 +459,14 @@ def main():
         df = fetch_binance_data(args.symbol, args.interval, args.days)
         prices = df['close']
         
+        logger.info(f"Loaded {len(prices)} price points")
+        
         # Calculate signals with optimal windows for each line
         logger.info(f"Calculating signals with fixed k={k_value}...")
         signals, optimal_windows, slopes = calculate_signals_with_optimal_windows(
             prices, 
-            window_range=range(10, 101),
+            min_window=args.min_window,
+            max_window=args.max_window,
             k=k_value,
             parallel=not args.sequential
         )
