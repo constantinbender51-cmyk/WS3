@@ -10,21 +10,19 @@ import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 import io
 import base64
-import random
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 import warnings
 warnings.filterwarnings('ignore')
 
 # Global variables to store pre-calculated data
-btc_data = None
-slope_history = []
-lookback_history = []
-endpoint_indices = []
-sample_lines = []  # Store random sample OLS lines
 prices = None
 timestamps = None
 full_start_date = None
 full_end_date = None
+merged_lines = []  # Store merged OLS lines by sign
+slope_history = []
+lookback_history = []
+endpoint_indices = []
 
 def fetch_data():
     """Fetch BTC 1h data for last 30 days from Binance"""
@@ -140,8 +138,8 @@ def find_optimal_lookback(prices_seg: np.ndarray, timestamps_seg: np.ndarray) ->
     return best_lookback, best_slope, best_X, best_y_pred, best_model, best_norm_params
 
 def analyze_all_points():
-    """Analyze every possible endpoint and collect random samples"""
-    global slope_history, lookback_history, endpoint_indices, sample_lines, prices, timestamps
+    """Analyze every possible endpoint and merge same-sign lines"""
+    global slope_history, lookback_history, endpoint_indices, merged_lines, prices, timestamps
     
     print("\n" + "=" * 60)
     print("📊 ANALYZING all endpoints...")
@@ -150,13 +148,10 @@ def analyze_all_points():
     slope_history = []
     lookback_history = []
     endpoint_indices = []
-    sample_lines = []
+    all_results = []  # Store all results with their endpoints
     
     min_points = 110  # Need at least 100 lookback + 10 minimum
     total_points = len(prices)
-    
-    # Store all OLS results for random sampling
-    all_ols_results = []
     
     for endpoint in range(min_points, total_points + 1):
         # Get data up to current endpoint
@@ -170,8 +165,8 @@ def analyze_all_points():
         lookback_history.append(lookback)
         endpoint_indices.append(endpoint)
         
-        # Store for potential random sampling
-        all_ols_results.append({
+        # Store full result
+        all_results.append({
             'endpoint': endpoint,
             'lookback': lookback,
             'slope': slope,
@@ -184,47 +179,120 @@ def analyze_all_points():
         if endpoint % 100 == 0:
             print(f"   Analyzed {endpoint}/{total_points}...")
     
-    # Select 10 random samples
-    random.seed(42)
-    sample_indices = random.sample(range(len(all_ols_results)), min(10, len(all_ols_results)))
-    sample_lines = [all_ols_results[i] for i in sample_indices]
+    # Merge consecutive same-sign results
+    merged_lines = []
+    current_group = []
+    current_sign = None
+    
+    for result in all_results:
+        sign = np.sign(result['slope'])
+        
+        if current_sign is None:
+            # First result
+            current_sign = sign
+            current_group = [result]
+        elif sign == current_sign:
+            # Same sign, add to current group
+            current_group.append(result)
+        else:
+            # Sign changed, merge the previous group
+            if current_group:
+                merged = merge_line_group(current_group)
+                merged_lines.append(merged)
+            
+            # Start new group
+            current_sign = sign
+            current_group = [result]
+    
+    # Don't forget the last group
+    if current_group:
+        merged = merge_line_group(current_group)
+        merged_lines.append(merged)
     
     print(f"\n✅ Analyzed {len(slope_history)} endpoints")
-    print(f"   Selected {len(sample_lines)} random OLS lines for display")
+    print(f"   Merged into {len(merged_lines)} lines by sign")
     print(f"   Slope range: ${min(slope_history):+.2f}/h to ${max(slope_history):+.2f}/h")
+    
+    # Print merged line info
+    for i, line in enumerate(merged_lines):
+        sign_str = "🟢 UPTREND" if line['slope'] > 0 else "🔴 DOWNTREND"
+        print(f"   Line {i+1}: {sign_str} | Period: {line['start_idx']}-{line['end_idx']} | Lookback: {line['avg_lookback']:.0f}h | Slope: ${line['slope']:+.2f}/h")
+
+def merge_line_group(group: List[Dict]) -> Dict:
+    """Merge a group of same-sign OLS results into a single representative line"""
+    if not group:
+        return None
+    
+    # Use the middle result as representative
+    mid_idx = len(group) // 2
+    representative = group[mid_idx]
+    
+    # Calculate average lookback and slope
+    avg_lookback = np.mean([r['lookback'] for r in group])
+    avg_slope = np.mean([r['slope'] for r in group])
+    
+    # Get the full range this group covers
+    start_idx = group[0]['endpoint'] - group[0]['lookback']
+    end_idx = group[-1]['endpoint']
+    
+    return {
+        'start_idx': start_idx,
+        'end_idx': end_idx,
+        'lookback': representative['lookback'],
+        'avg_lookback': avg_lookback,
+        'slope': avg_slope,
+        'model': representative['model'],
+        'norm_params': representative['norm_params'],
+        'representative_endpoint': representative['endpoint'],
+        'num_merged': len(group)
+    }
 
 def create_plot():
-    """Create minimal plot with price, slope line, and 10 random OLS lines"""
+    """Create plot with price, slope line, and merged OLS lines by sign"""
     plt.figure(figsize=(14, 8))
     
     # Plot price
     plt.plot(range(len(prices)), prices, 'b-', alpha=0.7, label='BTC Price', linewidth=1.5)
     
-    # Plot 10 random OLS lines
-    colors = plt.cm.rainbow(np.linspace(0, 1, len(sample_lines)))
-    for i, sample in enumerate(sample_lines):
-        endpoint = sample['endpoint']
-        lookback = sample['lookback']
-        start_idx = endpoint - lookback
+    # Plot merged OLS lines with different colors for each sign
+    colors = {'uptrend': 'green', 'downtrend': 'red'}
+    
+    for i, line in enumerate(merged_lines):
+        start_idx = line['start_idx']
+        end_idx = line['end_idx']
         
-        # Get the data for this window
-        X_window = timestamps[start_idx:endpoint].flatten()
-        model = sample['model']
-        X_mean, X_std = sample['norm_params']
+        # Get the data for this merged line's representative window
+        rep_endpoint = line['representative_endpoint']
+        lookback = line['lookback']
+        rep_start = rep_endpoint - lookback
         
-        # Generate predictions
-        X_norm = (X_window - X_mean) / X_std
+        # Use the representative model to generate the line
+        model = line['model']
+        X_mean, X_std = line['norm_params']
+        
+        # Generate predictions for the entire merged range
+        # We'll extend the representative line across the merged range
+        X_range = timestamps[start_idx:end_idx].flatten()
+        X_norm = (X_range - X_mean) / X_std
         y_pred = model.predict(X_norm.reshape(-1, 1))
         
-        # Plot the OLS line
-        plt.plot(range(start_idx, endpoint), y_pred, 
-                color=colors[i], linewidth=2, alpha=0.6,
-                label=f'lb={lookback}' if i == 0 else "")
+        # Determine color based on slope sign
+        color = colors['uptrend'] if line['slope'] > 0 else colors['downtrend']
+        
+        # Plot the merged line
+        plt.plot(range(start_idx, end_idx), y_pred, 
+                color=color, linewidth=2.5, alpha=0.8,
+                label=f"{'Uptrend' if line['slope'] > 0 else 'Downtrend'} (n={line['num_merged']})" if i < 2 else "")
+        
+        # Add small markers at the endpoints
+        plt.plot(start_idx, prices[start_idx] if start_idx < len(prices) else prices[-1], 
+                'o', color=color, markersize=4, alpha=0.5)
+        plt.plot(end_idx-1, prices[end_idx-1] if end_idx-1 < len(prices) else prices[-1], 
+                's', color=color, markersize=4, alpha=0.5)
     
     # Create slope line (above 0 green, below 0 red)
-    # We need to map slope values to a visible range on the price chart
     # Scale slopes to be visible but not overwhelm the price
-    slope_scaled = np.array(slope_history) * 10  # Scale factor to make slope visible
+    slope_scaled = np.array(slope_history) * 8  # Scale factor to make slope visible
     slope_offset = np.max(prices) * 1.1  # Position slope line above price
     
     # Plot slope line with color based on sign
@@ -235,27 +303,35 @@ def create_plot():
         color = 'green' if slope_history[i] > 0 else 'red'
         plt.plot([slope_line_x[i], slope_line_x[i+1]], 
                 [slope_line_y[i], slope_line_y[i+1]], 
-                color=color, linewidth=2, alpha=0.8)
+                color=color, linewidth=2, alpha=0.9)
     
     # Add zero line for slope reference
     plt.axhline(y=slope_offset, color='gray', linestyle='-', linewidth=0.5, alpha=0.5)
     
-    # Add slope value labels at key points
-    for i in range(0, len(slope_line_x), max(1, len(slope_line_x)//10)):
-        plt.text(slope_line_x[i], slope_line_y[i] + 100, 
-                f'{slope_history[i]:+.1f}', fontsize=8, ha='center',
-                color='green' if slope_history[i] > 0 else 'red')
+    # Add slope value labels at trend change points
+    last_sign = None
+    for i in range(0, len(slope_line_x), max(1, len(slope_line_x)//15)):
+        current_sign = np.sign(slope_history[i])
+        if current_sign != last_sign:
+            plt.text(slope_line_x[i], slope_line_y[i] + 80, 
+                    f'{slope_history[i]:+.1f}', fontsize=8, ha='center',
+                    color='green' if slope_history[i] > 0 else 'red',
+                    bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.7, ec='none'))
+            last_sign = current_sign
     
     # Minimal styling
-    plt.title('BTC Price with Optimal Slope and 10 Random OLS Lines', fontsize=14)
+    plt.title('BTC Price with Merged Trend Lines (Same Sign = Same Color)', fontsize=14)
     plt.xlabel('Hours from Start')
     plt.ylabel('Price (USDT)')
     plt.grid(True, alpha=0.2)
     plt.legend(loc='upper left', fontsize=8)
     
-    # Add a note about the slope line
-    plt.text(0.02, 0.95, 'Green/Red line = Optimal slope (scaled above price)', 
-            transform=plt.gca().transAxes, fontsize=9,
+    # Add info about merged lines
+    uptrend_count = sum(1 for line in merged_lines if line['slope'] > 0)
+    downtrend_count = sum(1 for line in merged_lines if line['slope'] < 0)
+    
+    info_text = f'🟢 {uptrend_count} uptrend segments | 🔴 {downtrend_count} downtrend segments | Total: {len(merged_lines)} lines'
+    plt.text(0.02, 0.95, info_text, transform=plt.gca().transAxes, fontsize=9,
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     
     plt.tight_layout()
@@ -284,29 +360,26 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             <!DOCTYPE html>
             <html>
             <head>
-                <title>BTC OLS Analysis</title>
+                <title>BTC Merged Trend Lines</title>
                 <style>
                     body {{ margin: 0; padding: 20px; font-family: Arial, sans-serif; background-color: #f5f5f5; }}
                     .container {{ max-width: 1200px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
                     h1 {{ margin: 0 0 10px 0; color: #333; font-size: 20px; }}
                     .plot {{ width: 100%; height: auto; }}
-                    .info {{ margin: 10px 0; padding: 8px; background-color: #f8f9fa; border-radius: 4px; font-size: 12px; color: #666; }}
-                    .stats {{ display: flex; gap: 20px; flex-wrap: wrap; }}
-                    .stat {{ background-color: #e9ecef; padding: 5px 10px; border-radius: 4px; }}
+                    .info {{ margin: 10px 0; padding: 8px; background-color: #f8f9fa; border-radius: 4px; font-size: 12px; color: #666; display: flex; gap: 20px; }}
+                    .stat {{ background-color: #e9ecef; padding: 2px 8px; border-radius: 12px; }}
                 </style>
             </head>
             <body>
                 <div class="container">
-                    <h1>📈 BTC OLS Analysis</h1>
-                    <div class="stats">
-                        <span class="stat">📊 {len(slope_history)} points</span>
-                        <span class="stat">📏 Lookback: 10-100h</span>
-                        <span class="stat">🎲 10 random lines</span>
-                    </div>
+                    <h1>📈 BTC Merged Trend Lines</h1>
                     <div class="info">
-                        <span>Green/Red line = Optimal slope (scaled above price) | Numbers = slope in $/h</span>
+                        <span class="stat">📊 {len(slope_history)} points</span>
+                        <span class="stat">🟢 {sum(1 for s in slope_history if s > 0)} positive</span>
+                        <span class="stat">🔴 {sum(1 for s in slope_history if s < 0)} negative</span>
+                        <span class="stat">📏 {len(merged_lines)} merged lines</span>
                     </div>
-                    <img class="plot" src="data:image/png;base64,{image_base64}" alt="BTC Analysis">
+                    <img class="plot" src="data:image/png;base64,{image_base64}" alt="BTC Merged Trend Lines">
                 </div>
             </body>
             </html>
@@ -319,7 +392,7 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
 def main():
     """Main function - fetches data and starts server"""
     print("=" * 60)
-    print("🚀 BTC OLS Analysis Server")
+    print("🚀 BTC Merged Trend Lines Server")
     print("=" * 60)
     
     # Fetch data on startup
@@ -335,7 +408,7 @@ def main():
     
     with socketserver.TCPServer(("", PORT), handler) as httpd:
         print(f"\n🌐 Server running at http://localhost:{PORT}")
-        print("   Page shows: price + slope line + 10 random OLS lines")
+        print("   Page shows: price + slope line + merged trend lines by sign")
         print("   Press Ctrl+C to stop\n")
         try:
             httpd.serve_forever()
