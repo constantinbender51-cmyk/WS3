@@ -19,11 +19,10 @@ prices = None
 timestamps = None
 full_start_date = None
 full_end_date = None
-slope_history = []
-lookback_history = []
-endpoint_indices = []
-trade_returns = []  # Store returns from trading based on slope direction
-cumulative_returns = []  # Store cumulative returns
+all_lines = []  # Store all lines from each beginning
+trade_returns = []
+cumulative_returns = []
+line_endpoints = []
 
 def fetch_data():
     """Fetch BTC 1h data for last 30 days from Binance"""
@@ -81,17 +80,15 @@ def generate_sample_data():
     print(f"⚠️ Generated {n_points} hours of sample data")
     print(f"   Period: {full_start_date.strftime('%Y-%m-%d')} to {full_end_date.strftime('%Y-%m-%d')}")
 
-def ols(prices_seg: np.ndarray, timestamps_seg: np.ndarray, lookback: int) -> Tuple[float, float]:
-    """Perform OLS regression on the last 'lookback' data points
-    Returns: slope, avg_error"""
-    if lookback > len(prices_seg):
-        lookback = len(prices_seg)
+def calculate_line(start_idx: int, end_idx: int):
+    """Calculate OLS line from start_idx to end_idx"""
+    if end_idx - start_idx < 10:  # Minimum window size
+        return None
     
-    # Get last 'lookback' data points
-    X = timestamps_seg[-lookback:]
-    y = prices_seg[-lookback:]
+    X = timestamps[start_idx:end_idx]
+    y = prices[start_idx:end_idx]
     
-    # Normalize timestamps to avoid numerical issues
+    # Normalize timestamps
     X_mean = X.mean()
     X_std = X.std()
     X_normalized = (X - X_mean) / X_std
@@ -103,166 +100,164 @@ def ols(prices_seg: np.ndarray, timestamps_seg: np.ndarray, lookback: int) -> Tu
     # Get slope (denormalize) - price change per hour
     slope = model.coef_[0] / X_std * 3600000
     
-    # Calculate average error
+    # Calculate error normalized by window^2
     y_pred = model.predict(X_normalized)
-    avg_error = np.sum(np.abs(y - y_pred)) / lookback
+    window_size = end_idx - start_idx
+    error = np.sum(np.abs(y - y_pred)) / (window_size * window_size)  # Divide by window^2
     
-    return slope, avg_error
+    # Predict for all points
+    all_X = timestamps[start_idx:end_idx].flatten()
+    all_X_norm = (all_X - X_mean) / X_std
+    all_y_pred = model.predict(all_X_norm.reshape(-1, 1))
+    
+    return {
+        'start_idx': start_idx,
+        'end_idx': end_idx,
+        'slope': slope,
+        'error': error,
+        'model': model,
+        'norm_params': (X_mean, X_std),
+        'y_pred': all_y_pred,
+        'window_size': window_size
+    }
 
-def find_optimal_lookback(prices_seg: np.ndarray, timestamps_seg: np.ndarray) -> Tuple[int, float]:
-    """Find the optimal lookback window that minimizes average error
-    Returns: lookback, slope"""
-    best_avg_error = float('inf')
-    best_lookback = 10
-    best_slope = 0
-    
-    max_lookback = min(100, len(prices_seg))
-    
-    for lookback in range(10, max_lookback + 1):
-        slope, avg_error = ols(prices_seg, timestamps_seg, lookback)
-        
-        if avg_error < best_avg_error:
-            best_avg_error = avg_error
-            best_lookback = lookback
-            best_slope = slope
-    
-    return best_lookback, best_slope
-
-def analyze_all_points():
-    """Analyze every possible endpoint and calculate trading returns"""
-    global slope_history, lookback_history, endpoint_indices, trade_returns, cumulative_returns, prices
+def analyze_all_lines():
+    """Calculate lines from each possible beginning to each possible end"""
+    global all_lines, trade_returns, cumulative_returns, line_endpoints
     
     print("\n" + "=" * 60)
-    print("📊 ANALYZING all endpoints and calculating returns...")
+    print("📊 CALCULATING lines from each beginning...")
     print("=" * 60)
     
-    slope_history = []
-    lookback_history = []
-    endpoint_indices = []
-    trade_returns = []
-    
-    min_points = 110  # Need at least 100 lookback + 10 minimum
+    all_lines = []
     total_points = len(prices)
     
-    # We need to stop one short because we need next candle's return
-    for endpoint in range(min_points, total_points):
-        # Get data up to current endpoint
-        test_prices = prices[:endpoint]
-        test_timestamps = timestamps[:endpoint]
+    # For each possible start point
+    for start_idx in range(0, total_points - 10):  # Need at least 10 points
+        # For each possible end point after start
+        max_end = min(start_idx + 100, total_points)  # Max 100-hour window
+        best_line = None
+        best_error = float('inf')
         
-        # Find optimal lookback for this endpoint
-        lookback, slope = find_optimal_lookback(test_prices, test_timestamps)
+        for end_idx in range(start_idx + 10, max_end + 1):
+            line = calculate_line(start_idx, end_idx)
+            if line and line['error'] < best_error:
+                best_error = line['error']
+                best_line = line
         
-        slope_history.append(slope)
-        lookback_history.append(lookback)
-        endpoint_indices.append(endpoint)
+        if best_line:
+            all_lines.append(best_line)
         
-        # Calculate return for next candle based on slope direction
-        next_candle_return = (prices[endpoint] - prices[endpoint-1]) / prices[endpoint-1] * 100
+        if start_idx % 100 == 0:
+            print(f"   Processed start {start_idx}/{total_points-10}...")
+    
+    print(f"\n✅ Calculated {len(all_lines)} optimal lines")
+    
+    # Now calculate trading returns using these lines
+    print("\n📈 Calculating trading returns...")
+    trade_returns = []
+    line_endpoints = []
+    
+    min_start = 10  # Need at least 10 points before we can have a line
+    
+    for current_idx in range(min_start, total_points - 1):
+        # Find the best line that ends at or before current_idx
+        best_line_at_point = None
+        best_error_at_point = float('inf')
         
-        # If slope is positive (uptrend), we go long -> return is actual return
-        # If slope is negative (downtrend), we go short -> return is negative of actual return
-        if slope > 0:
-            trade_return = next_candle_return
-        else:
-            trade_return = -next_candle_return
+        for line in all_lines:
+            if line['end_idx'] <= current_idx:
+                if line['error'] < best_error_at_point:
+                    best_error_at_point = line['error']
+                    best_line_at_point = line
         
-        trade_returns.append(trade_return)
-        
-        if endpoint % 100 == 0:
-            print(f"   Analyzed {endpoint}/{total_points-1}...")
+        if best_line_at_point:
+            # Use this line's slope for trading decision
+            slope = best_line_at_point['slope']
+            
+            # Calculate return for next candle
+            next_return = (prices[current_idx + 1] - prices[current_idx]) / prices[current_idx] * 100
+            
+            # Trade based on slope direction
+            if slope > 0:
+                trade_return = next_return
+            else:
+                trade_return = -next_return
+            
+            trade_returns.append(trade_return)
+            line_endpoints.append(current_idx)
     
     # Calculate cumulative returns
-    returns_array = np.array(trade_returns) / 100  # Convert to decimal
+    returns_array = np.array(trade_returns) / 100
     cumulative_returns = np.cumprod(1 + returns_array) - 1
     
-    # Calculate buy and hold returns for comparison (from first trade point)
-    first_price = prices[min_points-1]
-    buy_hold_returns = (prices[min_points:] - first_price) / first_price
-    
-    print(f"\n✅ Analyzed {len(slope_history)} endpoints")
-    print(f"   Slope range: ${min(slope_history):+.2f}/h to ${max(slope_history):+.2f}/h")
+    print(f"   Generated {len(trade_returns)} trades")
     print(f"   Return range: {min(trade_returns):+.2f}% to {max(trade_returns):+.2f}%")
     print(f"   Final cumulative return: {cumulative_returns[-1]*100:+.2f}%")
-    print(f"   Buy & Hold return: {buy_hold_returns[-1]*100:+.2f}%")
 
 def create_plot():
-    """Create plot with price and trading returns"""
-    plt.figure(figsize=(14, 10))
+    """Create plot showing lines and trading returns"""
+    plt.figure(figsize=(14, 12))
     
-    # Create 2x1 subplot grid
-    gs = plt.GridSpec(2, 1, height_ratios=[1.5, 1], hspace=0.3)
+    # Create 3x1 subplot grid
+    gs = plt.GridSpec(3, 1, height_ratios=[2, 1, 1], hspace=0.3)
     
-    # Top plot: Price with slope-colored regions
-    ax_price = plt.subplot(gs[0])
+    # Top plot: Price with all optimal lines
+    ax_lines = plt.subplot(gs[0])
     
     # Plot price
-    ax_price.plot(range(len(prices)), prices, 'b-', alpha=0.7, label='BTC Price', linewidth=1.5)
+    ax_lines.plot(range(len(prices)), prices, 'b-', alpha=0.7, label='BTC Price', linewidth=1.5)
     
-    # Color background based on slope sign
-    for i, endpoint in enumerate(endpoint_indices):
-        if slope_history[i] > 0:
-            color = 'green'
-        elif slope_history[i] < 0:
-            color = 'red'
-        else:
-            color = 'gray'
-        ax_price.axvspan(endpoint-1, endpoint, facecolor=color, alpha=0.2)
+    # Plot a sample of lines (show every 10th line to avoid overcrowding)
+    colors = plt.cm.viridis(np.linspace(0, 1, len(all_lines)))
+    for i, line in enumerate(all_lines[::10]):  # Plot every 10th line
+        start = line['start_idx']
+        end = line['end_idx']
+        x_range = range(start, end)
+        color = 'green' if line['slope'] > 0 else 'red'
+        alpha = 0.1 + (line['window_size'] / 100) * 0.2  # Longer windows more opaque
+        ax_lines.plot(x_range, line['y_pred'], color=color, linewidth=1, alpha=alpha)
     
-    # Add slope line above price (scaled)
-    slope_scaled = np.array(slope_history) * 5
-    slope_offset = np.max(prices) * 1.05
+    ax_lines.set_title(f'BTC Price with Optimal Lines from Each Beginning (n={len(all_lines)})', fontsize=12)
+    ax_lines.set_ylabel('Price (USDT)')
+    ax_lines.grid(True, alpha=0.2)
+    ax_lines.legend(['BTC Price'], loc='upper left')
     
-    for i in range(len(endpoint_indices)-1):
-        if slope_history[i] > 0:
-            color = 'green'
-        else:
-            color = 'red'
-        ax_price.plot([endpoint_indices[i], endpoint_indices[i+1]], 
-                     [slope_offset + slope_scaled[i], slope_offset + slope_scaled[i+1]], 
-                     color=color, linewidth=2, alpha=0.8)
-    
-    ax_price.axhline(y=slope_offset, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
-    ax_price.text(5, slope_offset, 'Slope', fontsize=8, va='bottom')
-    
-    ax_price.set_title('BTC Price with Slope Direction (Green=Long, Red=Short)', fontsize=12)
-    ax_price.set_ylabel('Price (USDT)')
-    ax_price.grid(True, alpha=0.2)
-    ax_price.legend(loc='upper left')
-    
-    # Bottom plot: Returns
+    # Middle plot: Trade returns
     ax_returns = plt.subplot(gs[1])
     
     # Plot individual trade returns as bars
-    x = endpoint_indices
-    colors = []
-    for r in trade_returns:
-        if r > 0:
-            colors.append('green')
-        else:
-            colors.append('red')
-    
+    x = line_endpoints
+    colors = ['green' if r > 0 else 'red' for r in trade_returns]
     ax_returns.bar(x, trade_returns, width=0.8, color=colors, alpha=0.5, label='Trade Returns')
-    
-    # Plot cumulative returns
-    ax_cumul = ax_returns.twinx()
-    ax_cumul.plot(x, cumulative_returns * 100, 'b-', linewidth=2, label='Cumulative Return')
     
     # Add zero line
     ax_returns.axhline(y=0, color='black', linestyle='-', linewidth=0.5, alpha=0.3)
     
-    ax_returns.set_xlabel('Hour')
-    ax_returns.set_ylabel('Return per Trade (%)', color='gray')
-    ax_returns.tick_params(axis='y', labelcolor='gray')
+    ax_returns.set_ylabel('Return per Trade (%)')
     ax_returns.grid(True, alpha=0.2)
+    ax_returns.set_title('Individual Trade Returns')
     
-    ax_cumul.set_ylabel('Cumulative Return (%)', color='blue')
-    ax_cumul.tick_params(axis='y', labelcolor='blue')
+    # Bottom plot: Cumulative returns
+    ax_cumul = plt.subplot(gs[2])
+    
+    ax_cumul.plot(line_endpoints, cumulative_returns * 100, 'b-', linewidth=2, label='Strategy')
+    
+    # Add buy and hold for comparison
+    first_price = prices[min(line_endpoints)] if line_endpoints else prices[0]
+    buy_hold = (prices[line_endpoints] - first_price) / first_price * 100 if line_endpoints else []
+    if len(buy_hold) == len(line_endpoints):
+        ax_cumul.plot(line_endpoints, buy_hold, 'gray', linewidth=1.5, alpha=0.7, label='Buy & Hold')
+    
+    ax_cumul.set_xlabel('Hour')
+    ax_cumul.set_ylabel('Cumulative Return (%)')
+    ax_cumul.grid(True, alpha=0.2)
+    ax_cumul.legend(loc='upper left')
     
     # Add title with stats
-    total_return = cumulative_returns[-1] * 100
-    win_rate = sum(1 for r in trade_returns if r > 0) / len(trade_returns) * 100
-    ax_returns.set_title(f'Trading Returns: {total_return:+.2f}% cumulative | Win Rate: {win_rate:.1f}%', fontsize=12)
+    total_return = cumulative_returns[-1] * 100 if cumulative_returns.size > 0 else 0
+    win_rate = sum(1 for r in trade_returns if r > 0) / len(trade_returns) * 100 if trade_returns else 0
+    ax_cumul.set_title(f'Cumulative Returns: {total_return:+.2f}% | Win Rate: {win_rate:.1f}%', fontsize=12)
     
     plt.tight_layout()
     
@@ -286,7 +281,7 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             image_base64 = create_plot()
             
             # Calculate stats
-            if cumulative_returns.size > 0:  # Check if array has elements
+            if cumulative_returns.size > 0:
                 total_return = cumulative_returns[-1] * 100
             else:
                 total_return = 0
@@ -296,12 +291,15 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             max_win = max(trade_returns) if trade_returns else 0
             max_loss = min(trade_returns) if trade_returns else 0
             
-            # Minimal HTML page
+            # Calculate average window size
+            avg_window = np.mean([line['window_size'] for line in all_lines]) if all_lines else 0
+            
+            # HTML page
             html = f"""
             <!DOCTYPE html>
             <html>
             <head>
-                <title>BTC Slope-Based Trading</title>
+                <title>BTC Multi-Beginning Lines Analysis</title>
                 <style>
                     body {{ margin: 0; padding: 20px; font-family: Arial, sans-serif; background-color: #f5f5f5; }}
                     .container {{ max-width: 1200px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
@@ -316,16 +314,17 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             </head>
             <body>
                 <div class="container">
-                    <h1>📈 BTC Slope-Based Trading Strategy</h1>
+                    <h1>📈 BTC Multi-Beginning Lines Analysis (Error/Window²)</h1>
                     <div class="stats">
-                        <span class="stat neutral">📊 {len(trade_returns)} trades</span>
+                        <span class="stat neutral">📊 {len(all_lines)} lines</span>
+                        <span class="stat neutral">📏 Avg window: {avg_window:.1f}h</span>
+                        <span class="stat neutral">🎯 {len(trade_returns)} trades</span>
                         <span class="stat positive">📈 Win rate: {win_rate:.1f}%</span>
                         <span class="stat {"positive" if total_return > 0 else "negative"}">💰 Total: {total_return:+.2f}%</span>
                         <span class="stat positive">🏆 Max win: {max_win:+.2f}%</span>
                         <span class="stat negative">📉 Max loss: {max_loss:+.2f}%</span>
-                        <span class="stat neutral">📏 Avg: {avg_return:+.2f}%</span>
                     </div>
-                    <img class="plot" src="data:image/png;base64,{image_base64}" alt="BTC Trading Strategy">
+                    <img class="plot" src="data:image/png;base64,{image_base64}" alt="BTC Multi-Beginning Analysis">
                 </div>
             </body>
             </html>
@@ -338,15 +337,16 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
 def main():
     """Main function - fetches data and starts server"""
     print("=" * 60)
-    print("🚀 BTC Slope-Based Trading Strategy Server")
+    print("🚀 BTC Multi-Beginning Lines Analysis Server")
     print("=" * 60)
+    print("   Using error/Window² normalization")
     
     # Fetch data on startup
     print("\n📡 Fetching BTC data...")
     fetch_data()
     
     # Run analysis on startup
-    analyze_all_points()
+    analyze_all_lines()
     
     # Start server
     PORT = 8080
@@ -354,8 +354,8 @@ def main():
     
     with socketserver.TCPServer(("", PORT), handler) as httpd:
         print(f"\n🌐 Server running at http://localhost:{PORT}")
-        print("   Strategy: Long when slope > 0, Short when slope < 0")
-        print("   Returns calculated on next candle")
+        print("   Lines from each beginning, normalized by window²")
+        print("   Green lines = positive slope, Red lines = negative slope")
         print("   Press Ctrl+C to stop\n")
         try:
             httpd.serve_forever()
