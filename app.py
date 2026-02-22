@@ -44,13 +44,6 @@ class BTCTrendAnalyzer:
         end_time = datetime.now()
         start_time = end_time - timedelta(days=self.days)
         
-        # Convert interval to milliseconds
-        interval_map = {
-            '1h': 60 * 60 * 1000,
-            '4h': 4 * 60 * 60 * 1000,
-            '1d': 24 * 60 * 60 * 1000
-        }
-        
         params = {
             'symbol': self.symbol,
             'interval': self.interval,
@@ -285,6 +278,12 @@ class BTCTrendAnalyzer:
             self.data = new_data
             self.last_update = datetime.now()
             
+            # Re-run analysis on new data
+            self.optimized_lines = []
+            self.horizontal_lines = []
+            self.trades = []
+            self.analyze_trends()
+            
             # Get current signal
             signal_info = self.get_current_signal()
             
@@ -367,7 +366,7 @@ class BTCTrendAnalyzer:
         print("STARTING LIVE TRADING SESSION")
         print("="*60)
         
-        # Initial data fetch
+        # Initial data fetch and analysis
         print("Fetching initial data...")
         self.update_live_data()
         
@@ -460,155 +459,210 @@ class BTCTrendAnalyzer:
             print(f"Previous total PnL: {self.total_pnl:+.2f}%")
     
     def plot_results(self):
-        """Plot all results - YOUR ORIGINAL FUNCTION"""
-        if self.data is None:
+        """Plot all results - FIXED VERSION with bounds checking"""
+        if self.data is None or len(self.data) == 0:
             print("No data to plot")
             return None
         
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), 
-                                        gridspec_kw={'height_ratios': [3, 1]})
-        
-        # Plot price data
-        ax1.plot(self.data['timestamp'], self.data['close'], 
-                color='blue', alpha=0.5, linewidth=1, label='BTC Price')
-        
-        # Plot optimized lines
-        for line in self.optimized_lines:
-            x_values = self.data['timestamp'].iloc[line['start_idx']:line['end_idx']]
-            y_values = line['values']
+        try:
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), 
+                                            gridspec_kw={'height_ratios': [3, 1]})
             
-            ax1.plot(x_values, y_values, 
-                    color=line['color'], 
-                    linewidth=2, 
-                    alpha=0.7)
-        
-        # Plot horizontal lines
-        for h_line in self.horizontal_lines:
-            ax1.axhline(y=h_line['price'], 
-                       xmin=0, xmax=1, 
-                       color='black', 
-                       linestyle='--', 
-                       linewidth=1, 
-                       alpha=0.5)
-            ax1.axvline(x=h_line['time'], 
-                       color='black', 
-                       linestyle='--', 
-                       linewidth=1, 
-                       alpha=0.5)
-        
-        # Formatting
-        ax1.set_title(f'{self.symbol} Price Analysis with OLS Trends', fontsize=16)
-        ax1.set_ylabel('Price (USDT)', fontsize=12)
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-        
-        # Format x-axis dates
-        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
-        ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
-        plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
-        
-        # Plot trade returns
-        trade_colors = ['green' if t['return'] > 0 else 'red' for t in self.trades]
-        trade_returns = [t['return'] * 100 for t in self.trades]
-        trade_times = [t['start_time'] for t in self.trades]
-        
-        bars = ax2.bar(range(len(trade_returns)), trade_returns, color=trade_colors, alpha=0.7)
-        ax2.set_title('Trade Returns (%)', fontsize=16)
-        ax2.set_xlabel('Trade Number', fontsize=12)
-        ax2.set_ylabel('Return (%)', fontsize=12)
-        ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
-        ax2.grid(True, alpha=0.3)
-        
-        # Add value labels on bars
-        for i, (bar, ret) in enumerate(zip(bars, trade_returns)):
-            height = bar.get_height()
-            ax2.text(bar.get_x() + bar.get_width()/2., height,
-                    f'{ret:.1f}%', ha='center', va='bottom' if height > 0 else 'top')
-        
-        plt.tight_layout()
-        return fig
+            # Plot price data
+            ax1.plot(self.data['timestamp'], self.data['close'], 
+                    color='blue', alpha=0.5, linewidth=1, label='BTC Price')
+            
+            # Plot optimized lines - with bounds checking
+            valid_lines = 0
+            for line in self.optimized_lines:
+                try:
+                    # Make sure indices are within current data bounds
+                    start_idx = max(0, min(line['start_idx'], len(self.data) - 1))
+                    end_idx = max(start_idx + 1, min(line['end_idx'], len(self.data)))
+                    
+                    if start_idx < end_idx and start_idx < len(self.data):
+                        x_values = self.data['timestamp'].iloc[start_idx:end_idx]
+                        y_values = line['values']
+                        
+                        # Trim y_values to match x_values length if needed
+                        if len(x_values) < len(y_values):
+                            y_values = y_values[:len(x_values)]
+                        
+                        if len(x_values) > 0 and len(y_values) > 0 and len(x_values) == len(y_values):
+                            ax1.plot(x_values, y_values, 
+                                    color=line['color'], 
+                                    linewidth=2, 
+                                    alpha=0.7)
+                            valid_lines += 1
+                except Exception as e:
+                    print(f"Error plotting line: {e}")
+                    continue
+            
+            print(f"Plotted {valid_lines} optimized lines")
+            
+            # Plot horizontal lines
+            for h_line in self.horizontal_lines:
+                try:
+                    ax1.axhline(y=h_line['price'], 
+                               xmin=0, xmax=1, 
+                               color='black', 
+                               linestyle='--', 
+                               linewidth=1, 
+                               alpha=0.5)
+                    ax1.axvline(x=h_line['time'], 
+                               color='black', 
+                               linestyle='--', 
+                               linewidth=1, 
+                               alpha=0.5)
+                except Exception as e:
+                    print(f"Error plotting horizontal line: {e}")
+                    continue
+            
+            # Formatting
+            ax1.set_title(f'{self.symbol} Price Analysis with OLS Trends', fontsize=16)
+            ax1.set_ylabel('Price (USDT)', fontsize=12)
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            
+            # Format x-axis dates
+            ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+            ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
+            plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
+            
+            # Plot trade returns
+            if self.trades:
+                trade_colors = ['green' if t['return'] > 0 else 'red' for t in self.trades]
+                trade_returns = [t['return'] * 100 for t in self.trades]
+                
+                bars = ax2.bar(range(len(trade_returns)), trade_returns, color=trade_colors, alpha=0.7)
+                
+                # Add value labels on bars
+                for i, (bar, ret) in enumerate(zip(bars, trade_returns)):
+                    height = bar.get_height()
+                    ax2.text(bar.get_x() + bar.get_width()/2., height,
+                            f'{ret:.1f}%', ha='center', va='bottom' if height > 0 else 'top', fontsize=8)
+            
+            ax2.set_title('Trade Returns (%)', fontsize=16)
+            ax2.set_xlabel('Trade Number', fontsize=12)
+            ax2.set_ylabel('Return (%)', fontsize=12)
+            ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            return fig
+            
+        except Exception as e:
+            print(f"Error in plot_results: {e}")
+            return None
     
     def create_live_plot(self):
         """Create plot with live trading data"""
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), 
-                                        gridspec_kw={'height_ratios': [3, 1]})
-        
-        # Plot price data
-        ax1.plot(self.data['timestamp'], self.data['close'], 
-                color='blue', alpha=0.3, linewidth=1, label='BTC Price')
-        
-        # Plot optimized lines from original analysis
-        for line in self.optimized_lines:
-            x_values = self.data['timestamp'].iloc[line['start_idx']:line['end_idx']]
-            y_values = line['values']
-            ax1.plot(x_values, y_values, 
-                    color=line['color'], 
-                    linewidth=1.5, 
-                    alpha=0.5)
-        
-        # Plot current optimal line
-        signal_info = self.get_current_signal()
-        if signal_info:
-            # Plot the most recent optimal window
-            recent_times = self.data['timestamp'].iloc[-signal_info['window_size']:]
-            ax1.plot(recent_times, signal_info['line_values'], 
-                    color='green' if signal_info['signal'] == 'long' else 'red',
-                    linewidth=3, alpha=0.8, 
-                    label=f"Current {signal_info['signal'].upper()} Signal")
-        
-        # Plot trade markers from live trading
-        for trade in self.live_trades:
-            # Mark entry
-            ax1.scatter(trade['open_time'], trade['open_price'], 
-                       color='green' if trade['position'] == 'long' else 'red',
-                       s=100, marker='^', zorder=5)
-            # Mark exit
-            ax1.scatter(trade['close_time'], trade['close_price'],
-                       color='red' if trade['position'] == 'long' else 'green',
-                       s=100, marker='v', zorder=5)
-        
-        # Plot current position if open
-        if self.current_position:
-            ax1.axhline(y=self.position_open_price, 
-                       color='yellow', linestyle='--', alpha=0.5,
-                       label=f"Open Position @ ${self.position_open_price:,.0f}")
-        
-        ax1.set_title(f'{self.symbol} Live Trading - {self.interval} Interval', fontsize=16)
-        ax1.set_ylabel('Price (USDT)', fontsize=12)
-        ax1.legend(loc='upper left')
-        ax1.grid(True, alpha=0.3)
-        
-        # Format x-axis dates
-        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
-        ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
-        plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
-        
-        # Plot cumulative PnL
-        if self.pnl_history:
-            trades_x = list(range(len(self.pnl_history)))
-            ax2.plot(trades_x, self.pnl_history, 
-                    color='blue', linewidth=2, marker='o')
-            ax2.fill_between(trades_x, 0, self.pnl_history,
-                            where=np.array(self.pnl_history) >= 0,
-                            color='green', alpha=0.3)
-            ax2.fill_between(trades_x, 0, self.pnl_history,
-                            where=np.array(self.pnl_history) < 0,
-                            color='red', alpha=0.3)
-        
-        ax2.set_title('Cumulative PnL (%)', fontsize=16)
-        ax2.set_xlabel('Trade Number', fontsize=12)
-        ax2.set_ylabel('PnL (%)', fontsize=12)
-        ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
-        ax2.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        return fig
+        try:
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), 
+                                            gridspec_kw={'height_ratios': [3, 1]})
+            
+            # Plot price data
+            ax1.plot(self.data['timestamp'], self.data['close'], 
+                    color='blue', alpha=0.3, linewidth=1, label='BTC Price')
+            
+            # Plot optimized lines from original analysis - with bounds checking
+            for line in self.optimized_lines:
+                try:
+                    start_idx = max(0, min(line['start_idx'], len(self.data) - 1))
+                    end_idx = max(start_idx + 1, min(line['end_idx'], len(self.data)))
+                    
+                    if start_idx < end_idx:
+                        x_values = self.data['timestamp'].iloc[start_idx:end_idx]
+                        y_values = line['values']
+                        
+                        if len(x_values) < len(y_values):
+                            y_values = y_values[:len(x_values)]
+                        
+                        if len(x_values) > 0 and len(y_values) > 0 and len(x_values) == len(y_values):
+                            ax1.plot(x_values, y_values, 
+                                    color=line['color'], 
+                                    linewidth=1.5, 
+                                    alpha=0.5)
+                except:
+                    continue
+            
+            # Plot current optimal line
+            signal_info = self.get_current_signal()
+            if signal_info:
+                # Plot the most recent optimal window
+                recent_times = self.data['timestamp'].iloc[-signal_info['window_size']:]
+                recent_line_values = signal_info['line_values']
+                
+                if len(recent_times) == len(recent_line_values):
+                    ax1.plot(recent_times, recent_line_values, 
+                            color='green' if signal_info['signal'] == 'long' else 'red',
+                            linewidth=3, alpha=0.8, 
+                            label=f"Current {signal_info['signal'].upper()} Signal")
+            
+            # Plot trade markers from live trading
+            for trade in self.live_trades:
+                try:
+                    # Mark entry
+                    ax1.scatter(trade['open_time'], trade['open_price'], 
+                               color='green' if trade['position'] == 'long' else 'red',
+                               s=100, marker='^', zorder=5)
+                    # Mark exit
+                    ax1.scatter(trade['close_time'], trade['close_price'],
+                               color='red' if trade['position'] == 'long' else 'green',
+                               s=100, marker='v', zorder=5)
+                except:
+                    continue
+            
+            # Plot current position if open
+            if self.current_position and self.position_open_price:
+                ax1.axhline(y=self.position_open_price, 
+                           color='yellow', linestyle='--', alpha=0.5,
+                           label=f"Open Position @ ${self.position_open_price:,.0f}")
+            
+            ax1.set_title(f'{self.symbol} Live Trading - {self.interval} Interval', fontsize=16)
+            ax1.set_ylabel('Price (USDT)', fontsize=12)
+            ax1.legend(loc='upper left')
+            ax1.grid(True, alpha=0.3)
+            
+            # Format x-axis dates
+            ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+            ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
+            plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
+            
+            # Plot cumulative PnL
+            if self.pnl_history:
+                trades_x = list(range(len(self.pnl_history)))
+                ax2.plot(trades_x, self.pnl_history, 
+                        color='blue', linewidth=2, marker='o')
+                ax2.fill_between(trades_x, 0, self.pnl_history,
+                                where=np.array(self.pnl_history) >= 0,
+                                color='green', alpha=0.3)
+                ax2.fill_between(trades_x, 0, self.pnl_history,
+                                where=np.array(self.pnl_history) < 0,
+                                color='red', alpha=0.3)
+            
+            ax2.set_title('Cumulative PnL (%)', fontsize=16)
+            ax2.set_xlabel('Trade Number', fontsize=12)
+            ax2.set_ylabel('PnL (%)', fontsize=12)
+            ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            return fig
+            
+        except Exception as e:
+            print(f"Error in create_live_plot: {e}")
+            return None
     
     def get_html_plot(self):
-        """Convert plot to HTML image - YOUR ORIGINAL FUNCTION"""
-        fig = self.plot_results()
-        if fig is None:
-            return "<html><body><h1>No data available</h1></body></html>"
+        """Convert plot to HTML image - FIXED VERSION with error handling"""
+        try:
+            fig = self.plot_results()
+            if fig is None:
+                return "<html><body><h1>No data available or error generating plot</h1></body></html>"
+        except Exception as e:
+            print(f"Error generating plot: {e}")
+            return f"<html><body><h1>Error generating plot</h1><p>{str(e)}</p></body></html>"
         
         # Save plot to bytes buffer
         buf = io.BytesIO()
@@ -751,11 +805,18 @@ class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/' or self.path == '/index.html':
             if self.analyzer:
-                html = self.analyzer.get_html_plot()
-                self.send_response(200)
-                self.send_header('Content-type', 'text/html')
-                self.end_headers()
-                self.wfile.write(html.encode('utf-8'))
+                try:
+                    html = self.analyzer.get_html_plot()
+                    self.send_response(200)
+                    self.send_header('Content-type', 'text/html')
+                    self.end_headers()
+                    self.wfile.write(html.encode('utf-8'))
+                except Exception as e:
+                    self.send_response(500)
+                    self.send_header('Content-type', 'text/html')
+                    self.end_headers()
+                    error_html = f"<html><body><h1>Server Error</h1><p>{str(e)}</p></body></html>"
+                    self.wfile.write(error_html.encode('utf-8'))
             else:
                 self.send_response(500)
                 self.end_headers()
@@ -768,7 +829,7 @@ def main():
     parser.add_argument('--interval', type=str, default='1h', help='Time interval')
     parser.add_argument('--days', type=int, default=30, help='Number of days')
     parser.add_argument('--port', type=int, default=8080, help='Server port')
-    parser.add_argument('--host', type=str, default='0.0.0.0', help='Host IP address to bind to')
+    parser.add_argument('--host', type=str, default='localhost', help='Host IP address to bind to')
     parser.add_argument('--live', action='store_true', help='Enable live trading')
     parser.add_argument('--check-interval', type=int, default=3601, 
                        help='Seconds between checks (default: 3601 = 1 hour + 1 sec)')
