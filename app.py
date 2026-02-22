@@ -548,6 +548,28 @@ class BTCTrendAnalyzer:
             next_update = (now + timedelta(hours=1)).replace(minute=0, second=1, microsecond=0)
             next_update_str = next_update.strftime('%H:%M:%S')
             
+            # Format values safely
+            signal_class = 'neutral'
+            signal_text = 'WAITING'
+            current_price_display = '---'
+            signal_slope = '---'
+            current_position_display = 'NONE'
+            position_price_display = '---'
+            position_time_display = ''
+            
+            if signal:
+                signal_class = signal['signal']
+                signal_text = signal['signal'].upper()
+                current_price_display = f"${signal['current_price']:,.2f}"
+                signal_slope = f"{signal['slope']:.6f}"
+            
+            if self.current_position:
+                current_position_display = self.current_position.upper()
+                if self.position_open_price:
+                    position_price_display = f"${self.position_open_price:,.2f}"
+                if self.position_open_time:
+                    position_time_display = self.position_open_time.strftime('%m-%d %H:00')
+            
             html = f"""
             <!DOCTYPE html>
             <html>
@@ -593,10 +615,10 @@ class BTCTrendAnalyzer:
                     <div class="row">
                         <div class="card">
                             <div style="font-size: 14px; color: #666;">CURRENT SIGNAL</div>
-                            <div class="signal {signal['signal'] if signal else 'neutral'}">
-                                {signal['signal'].upper() if signal else 'WAITING'}
+                            <div class="signal {signal_class}">
+                                {signal_text}
                             </div>
-                            <div class="price">${signal['current_price']:,.2f if signal else '---'}</div>
+                            <div class="price">{current_price_display}</div>
                             <div style="text-align: center; font-size: 12px; color: #666;">
                                 Last closed candle
                             </div>
@@ -605,11 +627,11 @@ class BTCTrendAnalyzer:
                         <div class="card">
                             <div style="font-size: 14px; color: #666;">POSITION</div>
                             <div style="font-size: 20px; margin: 10px 0;">
-                                {self.current_position.upper() if self.current_position else 'NONE'}
+                                {current_position_display}
                             </div>
-                            <div>Open: ${self.position_open_price:,.2f if self.position_open_price else '---'}</div>
+                            <div>Open: {position_price_display}</div>
                             <div style="font-size: 12px; color: #666;">
-                                {self.position_open_time.strftime('%m-%d %H:00') if self.position_open_time else ''}
+                                {position_time_display}
                             </div>
                         </div>
                         
@@ -666,7 +688,7 @@ class BTCTrendAnalyzer:
             
             return html
         except Exception as e:
-            return f"<html><body><h3>Error: {str(e)}</h3></body></html>"
+            return f"<html><body><h3>Error: {str(e)}</h3><pre>{traceback.format_exc()}</pre></body></html>"
 
 class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     analyzer = None
