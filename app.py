@@ -112,9 +112,9 @@ ax1.set_ylabel('Price (USDT)')
 ax1.grid(True, alpha=0.3)
 
 # Cumulative returns
-# Returns start from index 11 (first signal at 10, first return at 11)
-return_times = times[11:11+len(cumulative)]
-ax2.plot(return_times, cumulative, 'b-', linewidth=2)
+if len(cumulative) > 0:
+    return_times = times[11:11+len(cumulative)]
+    ax2.plot(return_times, cumulative, 'b-', linewidth=2)
 ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
 ax2.set_title(f'Cumulative Returns: {total_return:.1f}%')
 ax2.set_ylabel('Return (%)')
