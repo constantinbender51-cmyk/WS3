@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from matplotlib.patches import Rectangle
 import http.server
 import socketserver
 import io
@@ -35,18 +36,28 @@ class BTCTrendAnalyzer:
         self.pnl_history = []
         self.total_pnl = 0
         
-    def fetch_binance_data(self, limit=1000, start_time=None):
+    def fetch_binance_data(self):
         """Fetch price data from Binance"""
         base_url = "https://api.binance.com/api/v3/klines"
+        
+        # Calculate start time
+        end_time = datetime.now()
+        start_time = end_time - timedelta(days=self.days)
+        
+        # Convert interval to milliseconds
+        interval_map = {
+            '1h': 60 * 60 * 1000,
+            '4h': 4 * 60 * 60 * 1000,
+            '1d': 24 * 60 * 60 * 1000
+        }
         
         params = {
             'symbol': self.symbol,
             'interval': self.interval,
-            'limit': limit
+            'startTime': int(start_time.timestamp() * 1000),
+            'endTime': int(end_time.timestamp() * 1000),
+            'limit': 1000
         }
-        
-        if start_time:
-            params['startTime'] = int(start_time.timestamp() * 1000)
         
         try:
             response = requests.get(base_url, params=params)
@@ -66,23 +77,58 @@ class BTCTrendAnalyzer:
             df['high'] = df['high'].astype(float)
             df['low'] = df['low'].astype(float)
             
-            return df[['timestamp', 'close']].copy()
+            self.data = df[['timestamp', 'close']].copy()
+            return True
             
         except Exception as e:
             print(f"Error fetching data: {e}")
-            return None
+            # Generate sample data for testing
+            self.generate_sample_data()
+            return False
     
-    def fetch_current_price(self):
-        """Fetch current BTC price"""
+    def generate_sample_data(self):
+        """Generate sample data for testing"""
+        dates = pd.date_range(end=datetime.now(), periods=24*30, freq='1h')
+        # Create a trending price with some noise
+        trend = np.linspace(40000, 45000, len(dates))
+        noise = np.random.normal(0, 1000, len(dates))
+        prices = trend + noise
+        
+        self.data = pd.DataFrame({
+            'timestamp': dates,
+            'close': prices
+        })
+        print("Generated sample data for testing")
+    
+    def fetch_latest_candles(self, limit=100):
+        """Fetch only the most recent candles for live trading"""
+        base_url = "https://api.binance.com/api/v3/klines"
+        
+        params = {
+            'symbol': self.symbol,
+            'interval': self.interval,
+            'limit': limit
+        }
+        
         try:
-            url = "https://api.binance.com/api/v3/ticker/price"
-            params = {'symbol': self.symbol}
-            response = requests.get(url, params=params)
+            response = requests.get(base_url, params=params)
             response.raise_for_status()
             data = response.json()
-            return float(data['price'])
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(data, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_asset_volume', 'number_of_trades',
+                'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+            ])
+            
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df['close'] = df['close'].astype(float)
+            
+            return df[['timestamp', 'close']].copy()
+            
         except Exception as e:
-            print(f"Error fetching current price: {e}")
+            print(f"Error fetching latest candles: {e}")
             return None
     
     def ols_fit(self, prices):
@@ -122,6 +168,79 @@ class BTCTrendAnalyzer:
         
         return best_window, best_line, best_slope, best_error, best_model
     
+    def analyze_trends(self):
+        """Main analysis function - YOUR ORIGINAL FUNCTION"""
+        if self.data is None or len(self.data) < 100:
+            print("Insufficient data")
+            return
+        
+        prices = self.data['close'].copy()
+        timestamps = self.data['timestamp'].copy()
+        
+        # Start from the end and work backwards
+        current_position = len(prices)
+        min_window = 10
+        
+        while current_position > min_window:
+            # Get prices up to current position
+            current_prices = prices.iloc[:current_position]
+            
+            # Find optimal window
+            window_size, line_values, slope, error, model = self.find_optimal_window(
+                current_prices, 
+                min_window=min_window, 
+                max_window=min(100, current_position)
+            )
+            
+            # Store the line
+            start_idx = current_position - window_size
+            end_idx = current_position
+            
+            line_data = {
+                'start_idx': start_idx,
+                'end_idx': end_idx,
+                'start_time': timestamps.iloc[start_idx],
+                'end_time': timestamps.iloc[end_idx-1],
+                'values': line_values.flatten(),
+                'slope': slope,
+                'color': 'green' if slope > 0 else 'red',
+                'window_size': window_size,
+                'error': error
+            }
+            
+            self.optimized_lines.append(line_data)
+            
+            # Calculate trade return
+            start_price = prices.iloc[start_idx]
+            end_price = prices.iloc[end_idx-1]
+            
+            if slope > 0:
+                trade_return = (end_price - start_price) / start_price
+            else:
+                trade_return = -1 * ((end_price - start_price) / start_price)
+            
+            self.trades.append({
+                'start_time': timestamps.iloc[start_idx],
+                'end_time': timestamps.iloc[end_idx-1],
+                'return': trade_return,
+                'type': 'long' if slope > 0 else 'short'
+            })
+            
+            # Move position back (remove prices and continue)
+            current_position = start_idx
+            
+            # Check for color change and mark horizontal line
+            if len(self.optimized_lines) >= 2:
+                prev_line = self.optimized_lines[-2]
+                curr_line = self.optimized_lines[-1]
+                
+                if prev_line['color'] != curr_line['color']:
+                    # Mark horizontal line at the transition point
+                    self.horizontal_lines.append({
+                        'time': timestamps.iloc[start_idx],
+                        'price': prices.iloc[start_idx]
+                    })
+    
     def get_current_signal(self):
         """Get current trading signal based on latest data"""
         if self.data is None or len(self.data) < 100:
@@ -160,7 +279,7 @@ class BTCTrendAnalyzer:
         print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Updating live data...")
         
         # Fetch latest 200 candles
-        new_data = self.fetch_binance_data(limit=200)
+        new_data = self.fetch_latest_candles(limit=200)
         
         if new_data is not None:
             self.data = new_data
@@ -280,6 +399,19 @@ class BTCTrendAnalyzer:
                 print(f"Error in trading loop: {e}")
                 time.sleep(60)  # Wait a minute before retrying
     
+    def fetch_current_price(self):
+        """Fetch current BTC price"""
+        try:
+            url = "https://api.binance.com/api/v3/ticker/price"
+            params = {'symbol': self.symbol}
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            return float(data['price'])
+        except Exception as e:
+            print(f"Error fetching current price: {e}")
+            return None
+    
     def save_trade_history(self):
         """Save trade history to file"""
         history_file = Path('trade_history.json')
@@ -326,218 +458,75 @@ class BTCTrendAnalyzer:
             
             print(f"Loaded {len(self.live_trades)} previous trades")
             print(f"Previous total PnL: {self.total_pnl:+.2f}%")
-
-class TradingServer:
-    def __init__(self, analyzer, port=8080, host='localhost'):
-        self.analyzer = analyzer
-        self.port = port
-        self.host = host
-        self.server = None
     
-    def get_html_dashboard(self):
-        """Generate HTML dashboard with live trading data"""
-        if self.analyzer.data is None:
-            return "<html><body><h1>No data available</h1></body></html>"
+    def plot_results(self):
+        """Plot all results - YOUR ORIGINAL FUNCTION"""
+        if self.data is None:
+            print("No data to plot")
+            return None
         
-        # Create plot
-        fig = self.create_live_plot()
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), 
+                                        gridspec_kw={'height_ratios': [3, 1]})
         
-        # Save plot to bytes buffer
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
-        buf.seek(0)
+        # Plot price data
+        ax1.plot(self.data['timestamp'], self.data['close'], 
+                color='blue', alpha=0.5, linewidth=1, label='BTC Price')
         
-        # Convert to base64
-        image_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-        plt.close(fig)
+        # Plot optimized lines
+        for line in self.optimized_lines:
+            x_values = self.data['timestamp'].iloc[line['start_idx']:line['end_idx']]
+            y_values = line['values']
+            
+            ax1.plot(x_values, y_values, 
+                    color=line['color'], 
+                    linewidth=2, 
+                    alpha=0.7)
         
-        # Get current signal
-        signal_info = self.analyzer.get_current_signal()
+        # Plot horizontal lines
+        for h_line in self.horizontal_lines:
+            ax1.axhline(y=h_line['price'], 
+                       xmin=0, xmax=1, 
+                       color='black', 
+                       linestyle='--', 
+                       linewidth=1, 
+                       alpha=0.5)
+            ax1.axvline(x=h_line['time'], 
+                       color='black', 
+                       linestyle='--', 
+                       linewidth=1, 
+                       alpha=0.5)
         
-        # Create HTML
-        html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>BTC Live Trading Dashboard</title>
-            <meta http-equiv="refresh" content="60">
-            <style>
-                body {{
-                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                    margin: 20px;
-                    background-color: #f0f2f5;
-                }}
-                .container {{
-                    max-width: 1400px;
-                    margin: 0 auto;
-                }}
-                .header {{
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    color: white;
-                    padding: 20px;
-                    border-radius: 10px;
-                    margin-bottom: 20px;
-                    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-                }}
-                .dashboard-grid {{
-                    display: grid;
-                    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-                    gap: 20px;
-                    margin-bottom: 20px;
-                }}
-                .card {{
-                    background: white;
-                    padding: 20px;
-                    border-radius: 10px;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                }}
-                .signal-box {{
-                    padding: 15px;
-                    border-radius: 8px;
-                    text-align: center;
-                    font-size: 24px;
-                    font-weight: bold;
-                }}
-                .long {{
-                    background-color: #d4edda;
-                    color: #155724;
-                    border: 2px solid #28a745;
-                }}
-                .short {{
-                    background-color: #f8d7da;
-                    color: #721c24;
-                    border: 2px solid #dc3545;
-                }}
-                .price {{
-                    font-size: 36px;
-                    font-weight: bold;
-                    text-align: center;
-                    margin: 10px 0;
-                }}
-                .pnl-positive {{
-                    color: #28a745;
-                    font-weight: bold;
-                }}
-                .pnl-negative {{
-                    color: #dc3545;
-                    font-weight: bold;
-                }}
-                .chart-container {{
-                    background: white;
-                    padding: 20px;
-                    border-radius: 10px;
-                    margin-bottom: 20px;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                }}
-                table {{
-                    width: 100%;
-                    border-collapse: collapse;
-                    background: white;
-                    border-radius: 10px;
-                    overflow: hidden;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                }}
-                th {{
-                    background-color: #343a40;
-                    color: white;
-                    padding: 12px;
-                    text-align: left;
-                }}
-                td {{
-                    padding: 12px;
-                    border-bottom: 1px solid #dee2e6;
-                }}
-                tr:hover {{
-                    background-color: #f8f9fa;
-                }}
-                .last-updated {{
-                    text-align: right;
-                    color: #6c757d;
-                    font-size: 14px;
-                    margin-top: 10px;
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <div class="header">
-                    <h1>🚀 BTC Live Trading Dashboard</h1>
-                    <p>Real-time trend analysis and automated trading</p>
-                </div>
-                
-                <div class="dashboard-grid">
-                    <div class="card">
-                        <h3>Current Signal</h3>
-                        <div class="signal-box {signal_info['signal']}">
-                            {signal_info['signal'].upper()}
-                        </div>
-                        <div class="price">${signal_info['current_price']:,.2f}</div>
-                        <p>Slope: {signal_info['slope']:.6f}</p>
-                        <p>Window Size: {signal_info['window_size']}</p>
-                    </div>
-                    
-                    <div class="card">
-                        <h3>Position Status</h3>
-                        <p>Current Position: <strong>{self.analyzer.current_position or 'None'}</strong></p>
-                        <p>Open Price: ${self.analyzer.position_open_price:,.2f if self.analyzer.position_open_price else 'N/A'}</p>
-                        <p>Open Time: {self.analyzer.position_open_time.strftime('%Y-%m-%d %H:%M') if self.analyzer.position_open_time else 'N/A'}</p>
-                    </div>
-                    
-                    <div class="card">
-                        <h3>Performance</h3>
-                        <p>Total PnL: <span class="{'pnl-positive' if self.analyzer.total_pnl >= 0 else 'pnl-negative'}">
-                            {self.analyzer.total_pnl:+.2f}%
-                        </span></p>
-                        <p>Trades Closed: {len(self.analyzer.live_trades)}</p>
-                        <p>Last Update: {self.analyzer.last_update.strftime('%H:%M:%S') if self.analyzer.last_update else 'Never'}</p>
-                    </div>
-                </div>
-                
-                <div class="chart-container">
-                    <img src="data:image/png;base64,{image_base64}" alt="BTC Chart" style="width: 100%;">
-                </div>
-                
-                <h2>Trade History</h2>
-                <table>
-                    <tr>
-                        <th>Open Time</th>
-                        <th>Close Time</th>
-                        <th>Position</th>
-                        <th>Open Price</th>
-                        <th>Close Price</th>
-                        <th>PnL %</th>
-                        <th>Cumulative PnL</th>
-                    </tr>
-        """
+        # Formatting
+        ax1.set_title(f'{self.symbol} Price Analysis with OLS Trends', fontsize=16)
+        ax1.set_ylabel('Price (USDT)', fontsize=12)
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
         
-        # Add trade rows
-        for trade in reversed(self.analyzer.live_trades[-20:]):  # Show last 20 trades
-            pnl_class = 'pnl-positive' if trade['pnl_percent'] >= 0 else 'pnl-negative'
-            html += f"""
-                    <tr>
-                        <td>{trade['open_time'].strftime('%Y-%m-%d %H:%M')}</td>
-                        <td>{trade['close_time'].strftime('%Y-%m-%d %H:%M')}</td>
-                        <td>{trade['position'].upper()}</td>
-                        <td>${trade['open_price']:,.2f}</td>
-                        <td>${trade['close_price']:,.2f}</td>
-                        <td class="{pnl_class}">{trade['pnl_percent']:+.2f}%</td>
-                        <td class="{pnl_class}">{trade['cumulative_pnl']:+.2f}%</td>
-                    </tr>
-            """
+        # Format x-axis dates
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+        ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
+        plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
         
-        html += f"""
-                </table>
-                
-                <div class="last-updated">
-                    Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-                    | Auto-refresh every 60 seconds
-                </div>
-            </div>
-        </body>
-        </html>
-        """
+        # Plot trade returns
+        trade_colors = ['green' if t['return'] > 0 else 'red' for t in self.trades]
+        trade_returns = [t['return'] * 100 for t in self.trades]
+        trade_times = [t['start_time'] for t in self.trades]
         
-        return html
+        bars = ax2.bar(range(len(trade_returns)), trade_returns, color=trade_colors, alpha=0.7)
+        ax2.set_title('Trade Returns (%)', fontsize=16)
+        ax2.set_xlabel('Trade Number', fontsize=12)
+        ax2.set_ylabel('Return (%)', fontsize=12)
+        ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+        ax2.grid(True, alpha=0.3)
+        
+        # Add value labels on bars
+        for i, (bar, ret) in enumerate(zip(bars, trade_returns)):
+            height = bar.get_height()
+            ax2.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{ret:.1f}%', ha='center', va='bottom' if height > 0 else 'top')
+        
+        plt.tight_layout()
+        return fig
     
     def create_live_plot(self):
         """Create plot with live trading data"""
@@ -545,21 +534,30 @@ class TradingServer:
                                         gridspec_kw={'height_ratios': [3, 1]})
         
         # Plot price data
-        ax1.plot(self.analyzer.data['timestamp'], self.analyzer.data['close'], 
+        ax1.plot(self.data['timestamp'], self.data['close'], 
                 color='blue', alpha=0.3, linewidth=1, label='BTC Price')
         
+        # Plot optimized lines from original analysis
+        for line in self.optimized_lines:
+            x_values = self.data['timestamp'].iloc[line['start_idx']:line['end_idx']]
+            y_values = line['values']
+            ax1.plot(x_values, y_values, 
+                    color=line['color'], 
+                    linewidth=1.5, 
+                    alpha=0.5)
+        
         # Plot current optimal line
-        signal_info = self.analyzer.get_current_signal()
+        signal_info = self.get_current_signal()
         if signal_info:
             # Plot the most recent optimal window
-            recent_times = self.analyzer.data['timestamp'].iloc[-signal_info['window_size']:]
+            recent_times = self.data['timestamp'].iloc[-signal_info['window_size']:]
             ax1.plot(recent_times, signal_info['line_values'], 
                     color='green' if signal_info['signal'] == 'long' else 'red',
                     linewidth=3, alpha=0.8, 
                     label=f"Current {signal_info['signal'].upper()} Signal")
         
-        # Plot trade markers
-        for trade in self.analyzer.live_trades:
+        # Plot trade markers from live trading
+        for trade in self.live_trades:
             # Mark entry
             ax1.scatter(trade['open_time'], trade['open_price'], 
                        color='green' if trade['position'] == 'long' else 'red',
@@ -570,12 +568,12 @@ class TradingServer:
                        s=100, marker='v', zorder=5)
         
         # Plot current position if open
-        if self.analyzer.current_position:
-            ax1.axhline(y=self.analyzer.position_open_price, 
+        if self.current_position:
+            ax1.axhline(y=self.position_open_price, 
                        color='yellow', linestyle='--', alpha=0.5,
-                       label=f"Open Position @ ${self.analyzer.position_open_price:,.0f}")
+                       label=f"Open Position @ ${self.position_open_price:,.0f}")
         
-        ax1.set_title(f'{self.analyzer.symbol} Live Trading - {self.analyzer.interval} Interval', fontsize=16)
+        ax1.set_title(f'{self.symbol} Live Trading - {self.interval} Interval', fontsize=16)
         ax1.set_ylabel('Price (USDT)', fontsize=12)
         ax1.legend(loc='upper left')
         ax1.grid(True, alpha=0.3)
@@ -586,15 +584,15 @@ class TradingServer:
         plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
         
         # Plot cumulative PnL
-        if self.analyzer.pnl_history:
-            trades_x = list(range(len(self.analyzer.pnl_history)))
-            ax2.plot(trades_x, self.analyzer.pnl_history, 
+        if self.pnl_history:
+            trades_x = list(range(len(self.pnl_history)))
+            ax2.plot(trades_x, self.pnl_history, 
                     color='blue', linewidth=2, marker='o')
-            ax2.fill_between(trades_x, 0, self.analyzer.pnl_history,
-                            where=np.array(self.analyzer.pnl_history) >= 0,
+            ax2.fill_between(trades_x, 0, self.pnl_history,
+                            where=np.array(self.pnl_history) >= 0,
                             color='green', alpha=0.3)
-            ax2.fill_between(trades_x, 0, self.analyzer.pnl_history,
-                            where=np.array(self.analyzer.pnl_history) < 0,
+            ax2.fill_between(trades_x, 0, self.pnl_history,
+                            where=np.array(self.pnl_history) < 0,
                             color='red', alpha=0.3)
         
         ax2.set_title('Cumulative PnL (%)', fontsize=16)
@@ -606,68 +604,204 @@ class TradingServer:
         plt.tight_layout()
         return fig
     
-    def start_server(self):
-        """Start the HTTP server"""
-        handler = self.create_handler()
+    def get_html_plot(self):
+        """Convert plot to HTML image - YOUR ORIGINAL FUNCTION"""
+        fig = self.plot_results()
+        if fig is None:
+            return "<html><body><h1>No data available</h1></body></html>"
         
-        try:
-            with socketserver.TCPServer((self.host, self.port), handler) as httpd:
-                print(f"\n📊 Dashboard running at http://{self.host}:{self.port}")
-                print("   Refresh every 60 seconds")
-                httpd.serve_forever()
-        except Exception as e:
-            print(f"Server error: {e}")
+        # Save plot to bytes buffer
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        buf.seek(0)
+        
+        # Convert to base64
+        image_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+        plt.close(fig)
+        
+        # Create HTML
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>BTC Trend Analysis</title>
+            <style>
+                body {{
+                    font-family: Arial, sans-serif;
+                    margin: 20px;
+                    background-color: #f5f5f5;
+                }}
+                .container {{
+                    max-width: 1200px;
+                    margin: 0 auto;
+                    background-color: white;
+                    padding: 20px;
+                    border-radius: 10px;
+                    box-shadow: 0 0 10px rgba(0,0,0,0.1);
+                }}
+                h1 {{
+                    color: #333;
+                    text-align: center;
+                }}
+                img {{
+                    width: 100%;
+                    height: auto;
+                    border: 1px solid #ddd;
+                    border-radius: 5px;
+                }}
+                .stats {{
+                    margin-top: 20px;
+                    padding: 15px;
+                    background-color: #f8f9fa;
+                    border-radius: 5px;
+                }}
+                table {{
+                    width: 100%;
+                    border-collapse: collapse;
+                }}
+                th, td {{
+                    padding: 10px;
+                    text-align: left;
+                    border-bottom: 1px solid #ddd;
+                }}
+                th {{
+                    background-color: #4CAF50;
+                    color: white;
+                }}
+                tr:hover {{
+                    background-color: #f5f5f5;
+                }}
+                .positive {{
+                    color: green;
+                    font-weight: bold;
+                }}
+                .negative {{
+                    color: red;
+                    font-weight: bold;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>BTC Trend Analysis - {self.interval} Interval</h1>
+                <img src="data:image/png;base64,{image_base64}" alt="BTC Trend Analysis">
+                
+                <div class="stats">
+                    <h2>Analysis Statistics</h2>
+                    <table>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Value</th>
+                        </tr>
+                        <tr>
+                            <td>Data Points</td>
+                            <td>{len(self.data)}</td>
+                        </tr>
+                        <tr>
+                            <td>Optimized Lines</td>
+                            <td>{len(self.optimized_lines)}</td>
+                        </tr>
+                        <tr>
+                            <td>Trend Changes</td>
+                            <td>{len(self.horizontal_lines)}</td>
+                        </tr>
+                        <tr>
+                            <td>Trades Executed</td>
+                            <td>{len(self.trades)}</td>
+                        </tr>
+                    </table>
+                </div>
+                
+                <div class="stats">
+                    <h2>Trade Performance</h2>
+                    <table>
+                        <tr>
+                            <th>Start Time</th>
+                            <th>End Time</th>
+                            <th>Type</th>
+                            <th>Return</th>
+                        </tr>
+        """
+        
+        # Add trade rows
+        for trade in self.trades[-10:]:  # Show last 10 trades
+            return_class = 'positive' if trade['return'] > 0 else 'negative'
+            html += f"""
+                        <tr>
+                            <td>{trade['start_time']}</td>
+                            <td>{trade['end_time']}</td>
+                            <td>{trade['type'].upper()}</td>
+                            <td class="{return_class}">{trade['return']*100:.2f}%</td>
+                        </tr>
+            """
+        
+        html += """
+                    </table>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        return html
+
+class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+    analyzer = None
     
-    def create_handler(self):
-        """Create a custom request handler"""
-        class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
-            def do_GET(self):
-                if self.path == '/' or self.path == '/index.html':
-                    html = self.server.get_html_dashboard()
-                    self.send_response(200)
-                    self.send_header('Content-type', 'text/html')
-                    self.end_headers()
-                    self.wfile.write(html.encode('utf-8'))
-                else:
-                    super().do_GET()
-        
-        return CustomHTTPRequestHandler
+    def do_GET(self):
+        if self.path == '/' or self.path == '/index.html':
+            if self.analyzer:
+                html = self.analyzer.get_html_plot()
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html')
+                self.end_headers()
+                self.wfile.write(html.encode('utf-8'))
+            else:
+                self.send_response(500)
+                self.end_headers()
+        else:
+            super().do_GET()
 
 def main():
-    parser = argparse.ArgumentParser(description='BTC Live Trading with Trend Analysis')
+    parser = argparse.ArgumentParser(description='BTC Trend Analysis with OLS')
     parser.add_argument('--symbol', type=str, default='BTCUSDT', help='Trading pair')
     parser.add_argument('--interval', type=str, default='1h', help='Time interval')
-    parser.add_argument('--days', type=int, default=30, help='Historical days for initial data')
-    parser.add_argument('--port', type=int, default=8080, help='Dashboard port')
-    parser.add_argument('--host', type=str, default='0.0.0.0', help='Host IP address')
+    parser.add_argument('--days', type=int, default=30, help='Number of days')
+    parser.add_argument('--port', type=int, default=8080, help='Server port')
+    parser.add_argument('--host', type=str, default='localhost', help='Host IP address to bind to')
     parser.add_argument('--live', action='store_true', help='Enable live trading')
     parser.add_argument('--check-interval', type=int, default=3601, 
                        help='Seconds between checks (default: 3601 = 1 hour + 1 sec)')
     
     args = parser.parse_args()
     
-    print("="*60)
-    print("BTC LIVE TRADING SYSTEM")
-    print("="*60)
-    print(f"Symbol: {args.symbol}")
-    print(f"Interval: {args.interval}")
+    print(f"Starting BTC Trend Analysis for {args.symbol}")
+    print(f"Interval: {args.interval}, Days: {args.days}")
+    print(f"Server will run at http://{args.host}:{args.port}")
     print(f"Live Trading: {'Enabled' if args.live else 'Disabled'}")
     
     # Create analyzer
     analyzer = BTCTrendAnalyzer(args.symbol, args.interval, args.days)
     
-    # Load previous trade history
-    analyzer.load_trade_history()
+    # Load previous trade history if live trading
+    if args.live:
+        analyzer.load_trade_history()
     
-    # Initial data fetch
-    print("\nFetching initial data...")
-    analyzer.data = analyzer.fetch_binance_data(limit=1000)
+    # Fetch data
+    print("Fetching data from Binance...")
+    success = analyzer.fetch_binance_data()
     
-    if analyzer.data is None:
-        print("Error fetching data. Exiting.")
-        return
+    if success:
+        print("Data fetched successfully")
+    else:
+        print("Using sample data for demonstration")
     
-    print(f"Loaded {len(analyzer.data)} candles")
+    # Analyze trends (YOUR ORIGINAL ANALYSIS)
+    print("Analyzing trends...")
+    analyzer.analyze_trends()
+    
+    print(f"Found {len(analyzer.optimized_lines)} optimized lines")
+    print(f"Found {len(analyzer.horizontal_lines)} trend changes")
     
     # Start live trading in a separate thread if enabled
     if args.live:
@@ -677,15 +811,22 @@ def main():
         trading_thread.start()
         print("\n✅ Live trading thread started")
     
-    # Start web server
-    server = TradingServer(analyzer, args.port, args.host)
+    # Setup HTTP server
+    CustomHTTPRequestHandler.analyzer = analyzer
+    handler = CustomHTTPRequestHandler
     
-    try:
-        server.start_server()
-    except KeyboardInterrupt:
-        print("\n\nShutting down...")
-        if args.live:
-            analyzer.save_trade_history()
+    # Create server with user-specified host and port
+    with socketserver.TCPServer((args.host, args.port), handler) as httpd:
+        print(f"\nServer running at http://{args.host}:{args.port}")
+        print("Press Ctrl+C to stop")
+        
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nShutting down server...")
+            if args.live:
+                analyzer.save_trade_history()
+            httpd.shutdown()
 
 if __name__ == "__main__":
     main()
