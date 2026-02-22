@@ -15,19 +15,19 @@ import warnings
 warnings.filterwarnings('ignore')
 
 class BTCOptimalLookback:
-    def __init__(self, length_reward: float = 0.1):
+    def __init__(self):
         self.data = None
         self.timestamps = None
         self.prices = None
         self.slope_history = []
         self.lookback_history = []
         self.error_history = []
-        self.raw_error_history = []  # Store raw error without reward
-        self.rewarded_error_history = []  # Store error with reward
         self.endpoint_indices = []  # Store the indices we analyzed
         self.full_start_date = None
         self.full_end_date = None
-        self.length_reward = length_reward  # Reward factor for longer windows
+        self.trend_change_points = []  # Store points where trend changes
+        self.merged_slopes = []  # Store merged slope segments
+        self.merged_indices = []  # Store indices for merged segments
         
     def fetch(self) -> bool:
         """Fetch BTC 1h data for last 30 days from Binance"""
@@ -112,88 +112,122 @@ class BTCOptimalLookback:
         
         return slope, total_error, avg_error_per_candle
     
-    def find_optimal_lookback(self, prices: np.ndarray, timestamps: np.ndarray) -> Tuple[int, float, float, float, float]:
-        """Find the optimal lookback window that minimizes rewarded error"""
-        best_rewarded_error = float('inf')
+    def find_optimal_lookback(self, prices: np.ndarray, timestamps: np.ndarray) -> Tuple[int, float, float, float]:
+        """Find the optimal lookback window that minimizes average error"""
+        best_avg_error = float('inf')
         best_lookback = 10
         best_slope = 0
         best_total_error = 0
-        best_raw_error = 0
         
         max_lookback = min(100, len(prices))
-        
-        # Store all errors for analysis
-        lookback_errors = []
         
         for lookback in range(10, max_lookback + 1):
             slope, total_error, avg_error = self.ols(prices, timestamps, lookback)
             
-            # Apply length reward (longer windows get lower error)
-            # Reward factor: reduce error by length_reward * (lookback - 10)
-            # This means longer windows are favored if their raw error is similar
-            length_bonus = self.length_reward * (lookback - 10)
-            rewarded_error = avg_error * (1 - length_bonus / 100)  # Convert to percentage reduction
-            
-            lookback_errors.append((lookback, avg_error, rewarded_error))
-            
-            if rewarded_error < best_rewarded_error:
-                best_rewarded_error = rewarded_error
+            if avg_error < best_avg_error:
+                best_avg_error = avg_error
                 best_lookback = lookback
                 best_slope = slope
                 best_total_error = total_error
-                best_raw_error = avg_error
         
-        # Print debug info for first few points
-        if len(self.endpoint_indices) < 3:
-            print(f"\n   Debug - Lookback errors for point {len(self.endpoint_indices)+1}:")
-            for lb, raw, rew in lookback_errors[::10]:  # Print every 10th
-                print(f"     lb={lb:3d}: raw=${raw:6.2f}, rew=${rew:6.2f}, bonus={(self.length_reward*(lb-10)):.1f}%")
+        return best_lookback, best_slope, best_total_error, best_avg_error
+    
+    def merge_slopes_by_sign(self):
+        """Merge consecutive slopes with the same sign"""
+        self.merged_slopes = []
+        self.merged_indices = []
         
-        return best_lookback, best_slope, best_total_error, best_raw_error, best_rewarded_error
+        if not self.slope_history:
+            return
+        
+        current_sign = np.sign(self.slope_history[0])
+        current_sum = self.slope_history[0]
+        current_count = 1
+        current_indices = [self.endpoint_indices[0]]
+        
+        for i in range(1, len(self.slope_history)):
+            new_sign = np.sign(self.slope_history[i])
+            
+            if new_sign == current_sign:
+                # Same sign, merge
+                current_sum += self.slope_history[i]
+                current_count += 1
+                current_indices.append(self.endpoint_indices[i])
+            else:
+                # Sign changed, store the merged segment
+                avg_slope = current_sum / current_count
+                self.merged_slopes.append(avg_slope)
+                self.merged_indices.append(current_indices)
+                
+                # Start new segment
+                current_sign = new_sign
+                current_sum = self.slope_history[i]
+                current_count = 1
+                current_indices = [self.endpoint_indices[i]]
+        
+        # Store the last segment
+        if current_count > 0:
+            avg_slope = current_sum / current_count
+            self.merged_slopes.append(avg_slope)
+            self.merged_indices.append(current_indices)
+        
+        print(f"\n📊 Merged {len(self.slope_history)} points into {len(self.merged_slopes)} segments by sign")
+        for i, (indices, slope) in enumerate(zip(self.merged_indices, self.merged_slopes)):
+            sign_str = "🟢 POSITIVE" if slope > 0 else "🔴 NEGATIVE" if slope < 0 else "⚪ ZERO"
+            print(f"   Segment {i+1}: {sign_str} ({len(indices)} points, avg slope=${slope:+.2f}/h)")
     
     def analyze_all_points(self):
         """Analyze every possible endpoint from min_points to the end"""
         print("\n" + "=" * 70)
         print("📊 POINT-BY-POINT ANALYSIS - Calculating Optimal Slope for Each Hour")
         print("=" * 70)
-        print(f"Length Reward Factor: {self.length_reward} ({(self.length_reward*90):.1f}% max bonus for 100-period)")
         
         self.slope_history = []
         self.lookback_history = []
         self.error_history = []
-        self.raw_error_history = []
-        self.rewarded_error_history = []
         self.endpoint_indices = []
+        self.trend_change_points = []
         
         min_points = 110  # Need at least 100 lookback + 10 minimum
         
         total_points = len(self.prices)
         
         # We analyze from min_points to total_points (inclusive)
+        previous_slope = None
+        
         for endpoint in range(min_points, total_points + 1):
             # Get data up to current endpoint
             test_prices = self.prices[:endpoint]
             test_timestamps = self.timestamps[:endpoint]
             
             # Find optimal lookback for this endpoint
-            lookback, slope, total_error, raw_error, rewarded_error = self.find_optimal_lookback(test_prices, test_timestamps)
+            lookback, slope, total_error, avg_error = self.find_optimal_lookback(test_prices, test_timestamps)
             
             self.slope_history.append(slope)
             self.lookback_history.append(lookback)
-            self.error_history.append(raw_error)  # Store raw error for backward compatibility
-            self.raw_error_history.append(raw_error)
-            self.rewarded_error_history.append(rewarded_error)
+            self.error_history.append(avg_error)
             self.endpoint_indices.append(endpoint)  # Store the endpoint index
+            
+            # Detect trend changes
+            if previous_slope is not None:
+                if (previous_slope > 0 and slope < 0) or (previous_slope < 0 and slope > 0):
+                    self.trend_change_points.append(endpoint)
+                    print(f"   🔄 Trend change at {endpoint}: {previous_slope:+.2f} → {slope:+.2f}")
+            
+            previous_slope = slope
             
             if endpoint % 100 == 0 or endpoint == total_points:
                 end_date = self.full_start_date + timedelta(hours=endpoint)
-                bonus = self.length_reward * (lookback - 10)
-                print(f"   📍 {endpoint}: {end_date.strftime('%Y-%m-%d %H:%M')} - "
-                      f"Lookback={lookback}, Slope=${slope:+.2f}/h, "
-                      f"Raw=${raw_error:.2f}, Rewarded=${rewarded_error:.2f}, Bonus={bonus:.1f}%")
+                trend_icon = "🟢" if slope > 0 else "🔴" if slope < 0 else "⚪"
+                print(f"   {trend_icon} {endpoint}: {end_date.strftime('%Y-%m-%d %H:%M')} - "
+                      f"Lookback={lookback}, Slope=${slope:+.2f}/h, Error=${avg_error:.2f}")
         
         print(f"\n✅ Completed analysis of {len(self.slope_history)} endpoints")
         print(f"   Endpoint indices range: {self.endpoint_indices[0]} to {self.endpoint_indices[-1]}")
+        print(f"   Trend changes detected: {len(self.trend_change_points)}")
+        
+        # Merge slopes by sign
+        self.merge_slopes_by_sign()
         
         # Calculate statistics
         positive_slopes = sum(1 for s in self.slope_history if s > 0)
@@ -214,10 +248,10 @@ class BTCOptimalLookback:
     
     def plot(self) -> str:
         """Create plot showing price with slope heatmap and analysis"""
-        plt.figure(figsize=(16, 14))
+        plt.figure(figsize=(16, 12))
         
-        # Create 4x1 subplot grid (added one more for reward analysis)
-        gs = plt.GridSpec(4, 1, height_ratios=[2, 1, 1, 1], hspace=0.3)
+        # Create 3x1 subplot grid
+        gs = plt.GridSpec(3, 1, height_ratios=[2.5, 1, 1], hspace=0.3)
         
         # Main price chart with slope coloring
         ax_main = plt.subplot(gs[0])
@@ -226,39 +260,46 @@ class BTCOptimalLookback:
         ax_main.plot(range(len(self.prices)), self.prices, 'b-', alpha=0.5, 
                     label='BTC Price', linewidth=1)
         
-        # Create a color-coded background based on slope
-        max_abs_slope = max(abs(np.min(self.slope_history)), abs(np.max(self.slope_history)))
+        # Create a color-coded background based on merged slope segments
+        colors = [(0, 1, 0, 0.2), (1, 0, 0, 0.2)]  # Green and red with low alpha
         
-        # For each analyzed point, color its background
-        for i, endpoint in enumerate(self.endpoint_indices):
-            slope = self.slope_history[i]
-            if slope > 0:
-                # Green for positive slope, intensity based on magnitude
-                intensity = min(1.0, slope / max_abs_slope)
-                color = (0, intensity, 0, 0.3)  # RGBA with alpha
-            else:
-                # Red for negative slope, intensity based on magnitude
-                intensity = min(1.0, abs(slope) / max_abs_slope)
-                color = (intensity, 0, 0, 0.3)
+        for indices, slope in zip(self.merged_indices, self.merged_slopes):
+            color = colors[0] if slope > 0 else colors[1] if slope < 0 else (0.5, 0.5, 0.5, 0.2)
+            # Color the entire segment
+            ax_main.axvspan(indices[0]-0.5, indices[-1]+0.5, facecolor=color)
+        
+        # Add horizontal lines at trend change points
+        for i, change_point in enumerate(self.trend_change_points):
+            # Get price at this point
+            price_at_change = self.prices[change_point]
+            # Draw horizontal line from this point to the end
+            ax_main.hlines(y=price_at_change, xmin=change_point, xmax=len(self.prices)-1, 
+                          colors='black', linestyles='--', linewidth=1, alpha=0.7)
+            # Mark the point
+            ax_main.plot(change_point, price_at_change, 'ko', markersize=6, alpha=0.9)
             
-            # Color the background of this point
-            ax_main.axvspan(endpoint-0.5, endpoint+0.5, facecolor=color)
+            # Add resistance/support label
+            if i < len(self.trend_change_points) - 1:
+                next_change = self.trend_change_points[i+1]
+                label = f"R{i+1}" if self.slope_history[self.endpoint_indices.index(change_point)] < 0 else f"S{i+1}"
+                ax_main.text(change_point + 5, price_at_change, label, 
+                           fontsize=9, fontweight='bold',
+                           bbox=dict(boxstyle='round,pad=0.2', fc='yellow', alpha=0.7))
         
-        # Create custom legend for slope
+        # Create custom legend
         from matplotlib.patches import Rectangle
+        from matplotlib.lines import Line2D
         
         legend_elements = [
-            Rectangle((0, 0), 1, 1, facecolor=(0, 1, 0, 0.3), label='Strong Positive'),
-            Rectangle((0, 0), 1, 1, facecolor=(0, 0.3, 0, 0.3), label='Weak Positive'),
-            Rectangle((0, 0), 1, 1, facecolor=(0.3, 0, 0, 0.3), label='Weak Negative'),
-            Rectangle((0, 0), 1, 1, facecolor=(1, 0, 0, 0.3), label='Strong Negative')
+            Rectangle((0, 0), 1, 1, facecolor=(0, 1, 0, 0.3), label='Uptrend (Positive Slope)'),
+            Rectangle((0, 0), 1, 1, facecolor=(1, 0, 0, 0.3), label='Downtrend (Negative Slope)'),
+            Line2D([0], [0], color='black', linestyle='--', linewidth=1, alpha=0.7, label='Support/Resistance'),
+            Line2D([0], [0], marker='o', color='black', markersize=6, linestyle='None', label='Trend Change Point')
         ]
-        ax_main.legend(handles=legend_elements, loc='upper left', fontsize=8, title='Slope Strength')
+        ax_main.legend(handles=legend_elements, loc='upper left', fontsize=8, title='Legend')
         
-        # Add reward info to title
-        ax_main.set_title(f'BTC Price with Slope Heatmap\n'
-                         f'Length Reward: {self.length_reward} ({(self.length_reward*90):.1f}% max bonus)\n'
-                         f'Green = Positive Trend, Red = Negative Trend (Intensity = Slope Magnitude)', 
+        ax_main.set_title(f'BTC Price with Merged Trend Segments\n'
+                         f'Green = Uptrend, Red = Downtrend | Black lines mark support/resistance levels', 
                          fontsize=14, fontweight='bold')
         ax_main.set_xlabel('Hours from Start')
         ax_main.set_ylabel('Price (USDT)')
@@ -270,55 +311,54 @@ class BTCOptimalLookback:
                     fontsize=9, verticalalignment='top',
                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
-        # Slope chart (second)
+        # Add trend change count
+        change_text = f'Trend Changes: {len(self.trend_change_points)}'
+        ax_main.text(0.98, 0.98, change_text, transform=ax_main.transAxes, 
+                    fontsize=9, verticalalignment='top', horizontalalignment='right',
+                    bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.5))
+        
+        # Slope chart with merged segments (second)
         ax_slope = plt.subplot(gs[1])
         
-        # Color-code the slope line itself
-        for i in range(len(self.endpoint_indices)-1):
-            if self.slope_history[i] > 0:
-                ax_slope.plot([self.endpoint_indices[i], self.endpoint_indices[i+1]], 
-                            [self.slope_history[i], self.slope_history[i+1]], 
-                            'g-', linewidth=1, alpha=0.7)
-            else:
-                ax_slope.plot([self.endpoint_indices[i], self.endpoint_indices[i+1]], 
-                            [self.slope_history[i], self.slope_history[i+1]], 
-                            'r-', linewidth=1, alpha=0.7)
+        # Plot merged segments
+        for indices, slope in zip(self.merged_indices, self.merged_slopes):
+            color = 'green' if slope > 0 else 'red' if slope < 0 else 'gray'
+            ax_slope.plot([indices[0], indices[-1]], [slope, slope], 
+                         color=color, linewidth=3, alpha=0.7)
+            # Fill between
+            ax_slope.fill_between([indices[0], indices[-1]], 0, slope, 
+                                  color=color, alpha=0.2)
         
         # Add zero line
         ax_slope.axhline(y=0, color='black', linestyle='-', alpha=0.3, linewidth=0.5)
         
-        ax_slope.fill_between(self.endpoint_indices, 0, self.slope_history, 
-                              where=np.array(self.slope_history) > 0, 
-                              color='green', alpha=0.3, interpolate=True)
-        ax_slope.fill_between(self.endpoint_indices, 0, self.slope_history, 
-                              where=np.array(self.slope_history) < 0, 
-                              color='red', alpha=0.3, interpolate=True)
+        # Mark trend changes on slope chart
+        for change_point in self.trend_change_points:
+            ax_slope.axvline(x=change_point, color='black', linestyle=':', alpha=0.5, linewidth=1)
         
-        ax_slope.set_title('Optimal Slope at Each Point ($/hour)', fontsize=12)
+        ax_slope.set_title(f'Merged Slope Segments ({len(self.merged_slopes)} segments)', fontsize=12)
         ax_slope.set_xlabel('Hours from Start')
         ax_slope.set_ylabel('Slope ($/h)')
         ax_slope.grid(True, alpha=0.3)
+        ax_slope.set_ylim(-max(abs(np.array(self.merged_slopes)))*1.1, max(abs(np.array(self.merged_slopes)))*1.1)
         
         # Lookback chart (third)
         ax_lookback = plt.subplot(gs[2])
         
         ax_lookback.plot(self.endpoint_indices, self.lookback_history, 'b-', linewidth=1.5, alpha=0.7, label='Optimal Lookback')
+        
+        # Mark trend changes on lookback chart
+        for change_point in self.trend_change_points:
+            if change_point in self.endpoint_indices:
+                idx = self.endpoint_indices.index(change_point)
+                ax_lookback.plot(change_point, self.lookback_history[idx], 'ko', markersize=6)
+                ax_lookback.axvline(x=change_point, color='black', linestyle=':', alpha=0.3, linewidth=1)
+        
         ax_lookback.set_xlabel('Hours from Start')
         ax_lookback.set_ylabel('Lookback (hours)', color='b')
         ax_lookback.tick_params(axis='y', labelcolor='b')
         ax_lookback.grid(True, alpha=0.3)
-        ax_lookback.set_title('Optimal Lookback Window with Length Reward', fontsize=12)
-        
-        # Error comparison chart (fourth)
-        ax_error = plt.subplot(gs[3])
-        
-        ax_error.plot(self.endpoint_indices, self.raw_error_history, 'gray', linewidth=1, alpha=0.5, label='Raw Error')
-        ax_error.plot(self.endpoint_indices, self.rewarded_error_history, 'orange', linewidth=1.5, alpha=0.8, label='Rewarded Error')
-        ax_error.set_xlabel('Hours from Start')
-        ax_error.set_ylabel('Error ($)')
-        ax_error.grid(True, alpha=0.3)
-        ax_error.set_title(f'Raw vs Rewarded Error (Length Reward: {self.length_reward})', fontsize=12)
-        ax_error.legend(loc='upper right', fontsize=8)
+        ax_lookback.set_title('Optimal Lookback Window at Each Point', fontsize=12)
         
         plt.tight_layout()
         
@@ -351,31 +391,26 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                 volatility = np.std(prices[-24:])  # 24h volatility
                 analyzer = BTCRequestHandler.btc_analyzer
                 
-                # Get recent slope (last 24 hours)
-                if len(analyzer.slope_history) >= 24:
-                    recent_slopes = analyzer.slope_history[-24:]
-                else:
-                    recent_slopes = analyzer.slope_history
-                    
-                avg_recent_slope = np.mean(recent_slopes)
+                # Get current trend
+                current_slope = analyzer.slope_history[-1] if analyzer.slope_history else 0
                 
-                if avg_recent_slope > 5:
-                    trend_direction = "🟢 STRONG BULLISH"
-                elif avg_recent_slope > 1:
-                    trend_direction = "🟢 BULLISH"
-                elif avg_recent_slope > -1:
-                    trend_direction = "⚪ NEUTRAL"
-                elif avg_recent_slope > -5:
-                    trend_direction = "🔴 BEARISH"
+                if current_slope > 2:
+                    trend_direction = "🟢 STRONG UPTREND"
+                elif current_slope > 0.5:
+                    trend_direction = "🟢 UPTREND"
+                elif current_slope > -0.5:
+                    trend_direction = "⚪ SIDEWAYS"
+                elif current_slope > -2:
+                    trend_direction = "🔴 DOWNTREND"
                 else:
-                    trend_direction = "🔴 STRONG BEARISH"
+                    trend_direction = "🔴 STRONG DOWNTREND"
                 
                 # Create HTML page
                 html = f"""
                 <!DOCTYPE html>
                 <html>
                 <head>
-                    <title>BTC Point-by-Point OLS Slope Analysis with Length Reward</title>
+                    <title>BTC Trend Analysis with Support/Resistance Levels</title>
                     <style>
                         body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f0f0f0; }}
                         .container {{ max-width: 1400px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
@@ -394,38 +429,70 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                         .footer {{ margin-top: 30px; color: #666; font-size: 12px; text-align: center; padding-top: 20px; border-top: 1px solid #eee; }}
                         .methodology {{ background-color: #e8f4f8; border-left: 4px solid #2196F3; padding: 15px; margin: 20px 0; }}
                         .trend-indicator {{ font-size: 24px; text-align: center; padding: 20px; background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%); border-radius: 10px; margin: 20px 0; }}
-                        .reward-info {{ background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 20px 0; }}
+                        .segment-table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
+                        .segment-table th {{ background-color: #2196F3; color: white; padding: 10px; text-align: left; }}
+                        .segment-table td {{ padding: 8px; border-bottom: 1px solid #ddd; }}
+                        .segment-table tr:hover {{ background-color: #f5f5f5; }}
+                        .uptrend {{ background-color: #d4edda; }}
+                        .downtrend {{ background-color: #f8d7da; }}
                     </style>
                 </head>
                 <body>
                     <div class="container">
-                        <h1>📊 BTC Point-by-Point OLS Slope Analysis with Length Reward</h1>
-                        <p>Calculating optimal trend for every hour with preference for longer windows</p>
-                        
-                        <div class="reward-info">
-                            <strong>🎯 Length Reward: {analyzer.length_reward}</strong> - Each additional hour of lookback reduces the error by {analyzer.length_reward}% 
-                            (max {(analyzer.length_reward*90):.1f}% bonus for 100-period). This favors longer, more stable trends when fit quality is similar.
-                        </div>
+                        <h1>📊 BTC Trend Analysis with Support/Resistance Levels</h1>
+                        <p>Merged trend segments with horizontal lines at trend changes</p>
                         
                         <div class="methodology">
                             <strong>🔬 Methodology:</strong> For every possible endpoint (starting from hour 110), 
-                            we find the lookback window (10-100 hours) that minimizes <strong>rewarded error</strong> = raw_error * (1 - length_reward * (lookback-10)/100).
-                            The slope of that optimal line is then plotted on the price chart as a color-coded background.
+                            we find the lookback window (10-100 hours) that minimizes average error. 
+                            Consecutive points with the same slope sign are merged into trend segments.
+                            When the sign changes, a horizontal line is drawn at that price level (support in uptrend, resistance in downtrend).
                         </div>
                         
                         <div class="trend-indicator">
-                            <strong>Current 24h Trend:</strong> {trend_direction} (${avg_recent_slope:+.2f}/h)
+                            <strong>Current Trend:</strong> {trend_direction} (${current_slope:+.2f}/h)
                         </div>
                         
                         <div class="info">
                             <h3>📈 Analysis Summary:</h3>
                             <p><strong>Period:</strong> {analyzer.full_start_date.strftime('%Y-%m-%d')} to {analyzer.full_end_date.strftime('%Y-%m-%d')}</p>
-                            <p><strong>Total Points Analyzed:</strong> {len(analyzer.slope_history)}</p>
-                            <p><strong>Positive Slopes:</strong> {sum(1 for s in analyzer.slope_history if s > 0)} ({sum(1 for s in analyzer.slope_history if s > 0)/len(analyzer.slope_history)*100:.1f}%)</p>
-                            <p><strong>Negative Slopes:</strong> {sum(1 for s in analyzer.slope_history if s < 0)} ({sum(1 for s in analyzer.slope_history if s < 0)/len(analyzer.slope_history)*100:.1f}%)</p>
-                            <p><strong>Average Slope:</strong> ${np.mean(analyzer.slope_history):+.2f}/h</p>
+                            <p><strong>Points Analyzed:</strong> {len(analyzer.slope_history)}</p>
+                            <p><strong>Merged Segments:</strong> {len(analyzer.merged_slopes)}</p>
+                            <p><strong>Trend Changes:</strong> {len(analyzer.trend_change_points)}</p>
                             <p><strong>Avg Lookback:</strong> {np.mean(analyzer.lookback_history):.1f} hours</p>
                         </div>
+                        
+                        <h3>📋 Trend Segments:</h3>
+                        <table class="segment-table">
+                            <tr>
+                                <th>Segment</th>
+                                <th>Period</th>
+                                <th>Duration</th>
+                                <th>Trend</th>
+                                <th>Avg Slope</th>
+                            </tr>
+                """
+                
+                # Add segment rows
+                for i, (indices, slope) in enumerate(zip(analyzer.merged_indices, analyzer.merged_slopes)):
+                    start_date = analyzer.full_start_date + timedelta(hours=indices[0])
+                    end_date = analyzer.full_start_date + timedelta(hours=indices[-1])
+                    duration = len(indices)
+                    trend_class = "uptrend" if slope > 0 else "downtrend" if slope < 0 else ""
+                    trend_icon = "🟢" if slope > 0 else "🔴" if slope < 0 else "⚪"
+                    
+                    html += f"""
+                            <tr class="{trend_class}">
+                                <td>{i+1}</td>
+                                <td>{start_date.strftime('%m/%d %H:%M')} - {end_date.strftime('%m/%d %H:%M')}</td>
+                                <td>{duration} hours</td>
+                                <td>{trend_icon} {'Uptrend' if slope > 0 else 'Downtrend' if slope < 0 else 'Sideways'}</td>
+                                <td>${slope:+.2f}/h</td>
+                            </tr>
+                    """
+                
+                html += f"""
+                        </table>
                         
                         <div class="stats">
                             <div class="stat-box">
@@ -440,8 +507,8 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                             </div>
                             <div class="stat-box">
                                 <div class="stat-label">Current Slope</div>
-                                <div class="stat-value">${analyzer.slope_history[-1]:+.2f}/h</div>
-                                <div class="stat-sub">optimal trend</div>
+                                <div class="stat-value">${current_slope:+.2f}/h</div>
+                                <div class="stat-sub">trend strength</div>
                             </div>
                             <div class="stat-box">
                                 <div class="stat-label">Current Lookback</div>
@@ -450,13 +517,13 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                             </div>
                         </div>
                         
-                        <img src="data:image/png;base64,{image_base64}" alt="BTC Slope Analysis with Length Reward">
+                        <img src="data:image/png;base64,{image_base64}" alt="BTC Trend Analysis">
                         
                         <div class="footer">
                             <p>Data from Binance API | Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-                            <p>Each point's background color shows the optimal trend slope at that time</p>
-                            <p>Green = positive slope (uptrend), Red = negative slope (downtrend)</p>
-                            <p>Length reward favors longer windows when fit quality is similar</p>
+                            <p>Green areas = Uptrend segments, Red areas = Downtrend segments</p>
+                            <p>Black horizontal lines mark support/resistance levels where trend changed</p>
+                            <p>R = Resistance (trend changed from up to down), S = Support (trend changed from down to up)</p>
                         </div>
                     </div>
                 </body>
@@ -472,15 +539,11 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
 def main():
     """Main function to run the analysis and server"""
     print("=" * 70)
-    print("BTC Point-by-Point OLS Slope Analysis with Length Reward")
+    print("BTC Trend Analysis with Support/Resistance Levels")
     print("=" * 70)
     
-    # Length reward parameter - can be adjusted
-    # 0.1 means each additional hour gives 0.1% error reduction (max 9% for 100-period)
-    LENGTH_REWARD = 0.5
-    
-    # Create analyzer instance with length reward
-    analyzer = BTCOptimalLookback(length_reward=LENGTH_REWARD)
+    # Create analyzer instance
+    analyzer = BTCOptimalLookback()
     
     # Fetch data
     print("\n📡 Fetching BTC data from Binance...")
