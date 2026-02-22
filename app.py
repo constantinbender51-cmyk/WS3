@@ -19,7 +19,7 @@ prices = None
 timestamps = None
 full_start_date = None
 full_end_date = None
-K = 1.5  # Window exponent
+K = 1.8  # Window exponent
 
 def fetch_data():
     """Fetch BTC 1h data for last 30 days from Binance"""
