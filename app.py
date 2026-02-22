@@ -22,6 +22,7 @@ class BTCOptimalLookback:
         self.slope_history = []
         self.lookback_history = []
         self.error_history = []
+        self.endpoint_indices = []  # Store the indices we analyzed
         self.full_start_date = None
         self.full_end_date = None
         
@@ -88,15 +89,17 @@ class BTCOptimalLookback:
         y = prices[-lookback:]
         
         # Normalize timestamps to avoid numerical issues
-        X_normalized = (X - X.mean()) / X.std()
+        X_mean = X.mean()
+        X_std = X.std()
+        X_normalized = (X - X_mean) / X_std
         
         # Fit OLS
         model = LinearRegression()
         model.fit(X_normalized, y)
         
-        # Get slope (need to denormalize)
-        # slope = model.coef_[0] / X.std()  # Denormalize the slope
-        slope = model.coef_[0] / X.std() * 3600000  # Convert to price change per hour
+        # Get slope (denormalize)
+        # Convert to price change per hour (timestamps are in milliseconds)
+        slope = model.coef_[0] / X_std * 3600000  # Convert to price change per hour
         
         # Calculate total error (sum of absolute differences)
         total_error = np.sum(np.abs(y - model.predict(X_normalized)))
@@ -135,11 +138,13 @@ class BTCOptimalLookback:
         self.slope_history = []
         self.lookback_history = []
         self.error_history = []
+        self.endpoint_indices = []
         
         min_points = 110  # Need at least 100 lookback + 10 minimum
         
         total_points = len(self.prices)
         
+        # We analyze from min_points to total_points (inclusive)
         for endpoint in range(min_points, total_points + 1):
             # Get data up to current endpoint
             test_prices = self.prices[:endpoint]
@@ -151,12 +156,14 @@ class BTCOptimalLookback:
             self.slope_history.append(slope)
             self.lookback_history.append(lookback)
             self.error_history.append(avg_error)
+            self.endpoint_indices.append(endpoint)  # Store the endpoint index
             
             if endpoint % 100 == 0 or endpoint == total_points:
                 end_date = self.full_start_date + timedelta(hours=endpoint)
                 print(f"   📍 {endpoint}: {end_date.strftime('%Y-%m-%d %H:%M')} - Lookback={lookback}, Slope=${slope:+.2f}/h, Error=${avg_error:.2f}")
         
         print(f"\n✅ Completed analysis of {len(self.slope_history)} endpoints")
+        print(f"   Endpoint indices range: {self.endpoint_indices[0]} to {self.endpoint_indices[-1]}")
         
         # Calculate statistics
         positive_slopes = sum(1 for s in self.slope_history if s > 0)
@@ -183,37 +190,31 @@ class BTCOptimalLookback:
                     label='BTC Price', linewidth=1)
         
         # Create a color-coded background based on slope
-        # We need to align the slope history with the price indices
-        slope_start_idx = 110  # First endpoint we analyzed
-        slope_indices = range(slope_start_idx, len(self.prices))
-        
-        # Create a color map for slopes
         max_abs_slope = max(abs(np.min(self.slope_history)), abs(np.max(self.slope_history)))
         
-        for i, idx in enumerate(slope_indices):
+        # For each analyzed point, color its background
+        for i, endpoint in enumerate(self.endpoint_indices):
             slope = self.slope_history[i]
             if slope > 0:
                 # Green for positive slope, intensity based on magnitude
                 intensity = min(1.0, slope / max_abs_slope)
-                color = (0, intensity, 0, 0.2)  # RGBA with alpha
+                color = (0, intensity, 0, 0.3)  # RGBA with alpha
             else:
                 # Red for negative slope, intensity based on magnitude
                 intensity = min(1.0, abs(slope) / max_abs_slope)
-                color = (intensity, 0, 0, 0.2)
+                color = (intensity, 0, 0, 0.3)
             
             # Color the background of this point
-            ax_main.axvspan(idx-0.5, idx+0.5, facecolor=color)
-        
-        # Add a colorbar legend
-        from matplotlib.patches import Rectangle
-        from matplotlib.collections import PatchCollection
+            ax_main.axvspan(endpoint-0.5, endpoint+0.5, facecolor=color)
         
         # Create custom legend for slope
+        from matplotlib.patches import Rectangle
+        
         legend_elements = [
-            Rectangle((0, 0), 1, 1, facecolor=(0, 0.8, 0, 0.3), label='Strong Positive'),
+            Rectangle((0, 0), 1, 1, facecolor=(0, 1, 0, 0.3), label='Strong Positive'),
             Rectangle((0, 0), 1, 1, facecolor=(0, 0.3, 0, 0.3), label='Weak Positive'),
             Rectangle((0, 0), 1, 1, facecolor=(0.3, 0, 0, 0.3), label='Weak Negative'),
-            Rectangle((0, 0), 1, 1, facecolor=(0.8, 0, 0, 0.3), label='Strong Negative')
+            Rectangle((0, 0), 1, 1, facecolor=(1, 0, 0, 0.3), label='Strong Negative')
         ]
         ax_main.legend(handles=legend_elements, loc='upper left', fontsize=8, title='Slope Strength')
         
@@ -233,26 +234,24 @@ class BTCOptimalLookback:
         # Slope chart (middle)
         ax_slope = plt.subplot(gs[1])
         
-        slope_x = range(slope_start_idx, len(self.prices))
-        
         # Color-code the slope line itself
-        for i in range(len(slope_x)-1):
+        for i in range(len(self.endpoint_indices)-1):
             if self.slope_history[i] > 0:
-                ax_slope.plot([slope_x[i], slope_x[i+1]], 
+                ax_slope.plot([self.endpoint_indices[i], self.endpoint_indices[i+1]], 
                             [self.slope_history[i], self.slope_history[i+1]], 
                             'g-', linewidth=1, alpha=0.7)
             else:
-                ax_slope.plot([slope_x[i], slope_x[i+1]], 
+                ax_slope.plot([self.endpoint_indices[i], self.endpoint_indices[i+1]], 
                             [self.slope_history[i], self.slope_history[i+1]], 
                             'r-', linewidth=1, alpha=0.7)
         
         # Add zero line
         ax_slope.axhline(y=0, color='black', linestyle='-', alpha=0.3, linewidth=0.5)
         
-        ax_slope.fill_between(slope_x, 0, self.slope_history, 
+        ax_slope.fill_between(self.endpoint_indices, 0, self.slope_history, 
                               where=np.array(self.slope_history) > 0, 
                               color='green', alpha=0.3, interpolate=True)
-        ax_slope.fill_between(slope_x, 0, self.slope_history, 
+        ax_slope.fill_between(self.endpoint_indices, 0, self.slope_history, 
                               where=np.array(self.slope_history) < 0, 
                               color='red', alpha=0.3, interpolate=True)
         
@@ -264,14 +263,14 @@ class BTCOptimalLookback:
         # Lookback and Error chart (bottom)
         ax_bottom = plt.subplot(gs[2])
         
-        ax_bottom.plot(slope_x, self.lookback_history, 'b-', linewidth=1.5, alpha=0.7, label='Optimal Lookback')
+        ax_bottom.plot(self.endpoint_indices, self.lookback_history, 'b-', linewidth=1.5, alpha=0.7, label='Optimal Lookback')
         ax_bottom.set_xlabel('Hours from Start')
         ax_bottom.set_ylabel('Lookback (hours)', color='b')
         ax_bottom.tick_params(axis='y', labelcolor='b')
         ax_bottom.grid(True, alpha=0.3)
         
         ax2 = ax_bottom.twinx()
-        ax2.plot(slope_x, self.error_history, 'orange', linewidth=1, alpha=0.7, label='Avg Error')
+        ax2.plot(self.endpoint_indices, self.error_history, 'orange', linewidth=1, alpha=0.7, label='Avg Error')
         ax2.set_ylabel('Avg Error ($)', color='orange')
         ax2.tick_params(axis='y', labelcolor='orange')
         
@@ -314,9 +313,23 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                 analyzer = BTCRequestHandler.btc_analyzer
                 
                 # Get recent slope (last 24 hours)
-                recent_slopes = analyzer.slope_history[-24:] if len(analyzer.slope_history) >= 24 else analyzer.slope_history
+                if len(analyzer.slope_history) >= 24:
+                    recent_slopes = analyzer.slope_history[-24:]
+                else:
+                    recent_slopes = analyzer.slope_history
+                    
                 avg_recent_slope = np.mean(recent_slopes)
-                trend_direction = "🟢 BULLISH" if avg_recent_slope > 0 else "🔴 BEARISH" if avg_recent_slope < 0 else "⚪ NEUTRAL"
+                
+                if avg_recent_slope > 5:
+                    trend_direction = "🟢 STRONG BULLISH"
+                elif avg_recent_slope > 1:
+                    trend_direction = "🟢 BULLISH"
+                elif avg_recent_slope > -1:
+                    trend_direction = "⚪ NEUTRAL"
+                elif avg_recent_slope > -5:
+                    trend_direction = "🔴 BEARISH"
+                else:
+                    trend_direction = "🔴 STRONG BEARISH"
                 
                 # Create HTML page
                 html = f"""
@@ -326,7 +339,7 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                     <title>BTC Point-by-Point OLS Slope Analysis</title>
                     <style>
                         body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f0f0f0; }}
-                        .container {{ max-width: 1400px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
+                        .container {{ max-width: 1400px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
                         h1 {{ color: #333; }}
                         h2 {{ color: #666; }}
                         .info {{ background-color: #e8f4f8; padding: 15px; border-radius: 5px; margin: 20px 0; }}
