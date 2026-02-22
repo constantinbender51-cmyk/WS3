@@ -68,23 +68,27 @@ def generate_sample_data():
     
     print(f"⚠️ Generated {n_points} hours of sample data")
 
-def find_best_line(data_prices, data_timestamps, start_idx):
-    """Find the best line on the given data segment using error/window^K"""
+def find_best_line(data_prices, data_timestamps, current_pos):
+    """Find the best line starting from current_pos using error/window^K"""
     best_error = float('inf')
     best_line = None
     best_window = 0
     best_slope = 0
     best_end = 0
     
-    n_points = len(data_prices)
+    max_end = min(current_pos + 100, len(prices))  # Can't go beyond data end
     
-    print(f"\n   Analyzing segment from {start_idx}h ({len(data_prices)} points):")
+    print(f"\n   Analyzing from position {current_pos}h:")
     
-    # Try all window sizes from 10 to min(100, n_points)
-    for window in range(10, min(101, n_points + 1)):
-        # Get last 'window' points of this segment
-        X = data_timestamps[-window:]
-        y = data_prices[-window:]
+    # Try all window sizes from 10 to 100 (or until data ends)
+    for window in range(10, 101):
+        end_pos = current_pos + window
+        if end_pos > len(prices):
+            break
+            
+        # Get window points
+        X = timestamps[current_pos:end_pos]
+        y = prices[current_pos:end_pos]
         
         # Normalize
         X_mean = X.mean()
@@ -107,7 +111,7 @@ def find_best_line(data_prices, data_timestamps, start_idx):
         slope = model.coef_[0] / X_std * 3600000
         
         # Print every 10th window for debugging
-        if window % 10 == 0 or window == 10:
+        if window % 10 == 0:
             print(f"     win={window:3d}: error/win^{K}={error:10.2f}, slope={slope:8.2f}")
         
         if error < best_error:
@@ -115,33 +119,30 @@ def find_best_line(data_prices, data_timestamps, start_idx):
             best_window = window
             best_line = (X, y_pred, model, (X_mean, X_std))
             best_slope = slope
-            best_end = start_idx + n_points
+            best_end = end_pos
     
     return {
-        'start_idx': start_idx,
+        'start_idx': current_pos,
         'end_idx': best_end,
         'window': best_window,
         'slope': best_slope,
         'error': best_error,
-        'line_data': best_line,
-        'n_points': n_points
+        'line_data': best_line
     }
 
 def find_cascade():
-    """Find cascade of lines, each on the reduced dataset"""
+    """Find cascade of lines moving forward through time"""
     print("\n" + "=" * 60)
     print(f"📊 Finding cascade of lines (error/window^{K})...")
     print("=" * 60)
     
     cascade = []
-    current_prices = prices.copy()
-    current_timestamps = timestamps.copy()
-    current_start = 0
+    current_pos = 0
     iteration = 1
     
-    while len(current_prices) >= 110:  # Need at least 110 points (100 window + 10)
-        # Find best line on current data
-        result = find_best_line(current_prices, current_timestamps, current_start)
+    while current_pos + 10 < len(prices):  # Need at least 10 points left
+        # Find best line starting from current position
+        result = find_best_line(prices, timestamps, current_pos)
         
         if result['window'] == 0:
             break
@@ -149,31 +150,22 @@ def find_cascade():
         cascade.append(result)
         
         end_date = full_start_date + timedelta(hours=result['end_idx'])
-        window_start = result['end_idx'] - result['window']
-        window_start_date = full_start_date + timedelta(hours=window_start)
+        start_date = full_start_date + timedelta(hours=current_pos)
         
         print(f"\n📌 Line {iteration}:")
-        print(f"   Window: {window_start}h to {result['end_idx']}h ({result['window']}h)")
-        print(f"   Date: {window_start_date} to {end_date}")
+        print(f"   Period: {current_pos}h to {result['end_idx']}h ({result['window']}h window)")
+        print(f"   Date: {start_date} to {end_date}")
         print(f"   Slope: {result['slope']:+.2f} $/h")
         print(f"   Error/win^{K}: {result['error']:.2f}")
         
-        # Remove the window we just used
-        # We keep everything before the start of the window
-        new_end = window_start
-        
-        if new_end <= current_start:
-            print(f"   Cannot go further (new end {new_end} <= current start {current_start})")
-            break
-            
-        current_prices = prices[current_start:new_end]
-        current_timestamps = timestamps[current_start:new_end]
-        print(f"   Remaining data: {current_start}h to {new_end}h ({len(current_prices)} points)")
+        # Move to the start of this window for the next line
+        current_pos = result['start_idx']
+        print(f"   Next start: {current_pos}h")
         
         iteration += 1
         
-        if iteration > 20:  # Safety limit
-            print("   Reached iteration limit")
+        if iteration > 20 or current_pos >= len(prices) - 10:  # Safety limits
+            print("   Stopping: reached end or iteration limit")
             break
     
     print(f"\n✅ Found {len(cascade)} cascade lines")
@@ -184,38 +176,34 @@ def create_plot(cascade):
     plt.figure(figsize=(14, 8))
     
     # Plot price
-    plt.plot(range(len(prices)), prices, 'b-', alpha=0.5, label='BTC Price', linewidth=1)
+    plt.plot(range(len(prices)), prices, 'b-', alpha=0.7, label='BTC Price', linewidth=1.5)
     
     # Plot each cascade line
     colors = ['red', 'green', 'purple', 'orange', 'brown', 'pink', 'gray', 'olive', 'cyan', 'magenta']
     
     for i, line in enumerate(cascade):
         color = colors[i % len(colors)]
+        start_idx = line['start_idx']
         end_idx = line['end_idx']
-        window = line['window']
-        line_start = end_idx - window
         
         # Get the line data
         X, y_pred, model, norm_params = line['line_data']
         
         # Plot the line
-        x_range = range(line_start, end_idx)
+        x_range = range(start_idx, end_idx)
         plt.plot(x_range, y_pred, color=color, linewidth=2.5, 
-                label=f'Line {i+1}: win={window}h, slope={line["slope"]:+.1f}')
+                label=f'Line {i+1}: win={line["window"]}h, slope={line["slope"]:+.1f}')
         
-        # Mark the window points
-        plt.scatter(x_range, prices[line_start:end_idx], c=color, s=15, alpha=0.3)
-        
-        # Add line number
-        plt.text(line_start, prices[line_start] - 200, f'{i+1}', 
+        # Add line number at start
+        plt.text(start_idx, prices[start_idx] - 200, f'{i+1}', 
                 fontsize=10, fontweight='bold', ha='center',
                 bbox=dict(boxstyle='round,pad=0.2', fc='yellow', alpha=0.7))
         
-        # Mark the boundary
+        # Mark the boundary between lines
         if i < len(cascade) - 1:
-            plt.axvline(x=line_start, color=color, linestyle='--', alpha=0.3)
+            plt.axvline(x=start_idx, color=color, linestyle='--', alpha=0.3)
     
-    plt.title(f'BTC Price with Cascade Lines (error/window^{K})', fontsize=14)
+    plt.title(f'BTC Price with Forward Cascade Lines (error/window^{K})', fontsize=14)
     plt.xlabel('Hours from Start')
     plt.ylabel('Price (USDT)')
     plt.grid(True, alpha=0.2)
@@ -258,7 +246,7 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             <!DOCTYPE html>
             <html>
             <head>
-                <title>BTC Cascade Lines K={K}</title>
+                <title>BTC Forward Cascade K={K}</title>
                 <style>
                     body {{ margin: 20px; font-family: Arial; background: #f5f5f5; }}
                     .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }}
@@ -270,7 +258,7 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
             </head>
             <body>
                 <div class="container">
-                    <h1>📈 BTC Cascade Lines (error/window^{K})</h1>
+                    <h1>📈 BTC Forward Cascade (error/window^{K})</h1>
                     <div class="stats">
                         <span class="stat">📊 Lines: {len(cascade)}</span>
                         <span class="stat">📏 Avg window: {avg_window:.1f}h</span>
@@ -288,10 +276,11 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
 
 def main():
     print("=" * 60)
-    print(f"🚀 BTC Cascade Lines Server (K={K})")
+    print(f"🚀 BTC Forward Cascade Server (K={K})")
     print("=" * 60)
+    print(f"   Moving forward through time")
     print(f"   Each line minimizes error/window^{K}")
-    print("   Then removes that window and continues")
+    print(f"   Next line starts at beginning of current window")
     
     # Fetch data on startup
     print("\n📡 Fetching BTC data...")
