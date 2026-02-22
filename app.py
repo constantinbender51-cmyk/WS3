@@ -459,7 +459,7 @@ def main():
     handler = CustomHTTPRequestHandler
     
     # Create server
-    with socketserver.TCPServer(("", args.port), handler) as httpd:
+    with socketserver.TCPServer(("0.0.0.0", args.port), handler) as httpd:
         print(f"\nServer running at http://localhost:{args.port}")
         print("Press Ctrl+C to stop")
         
