@@ -21,13 +21,18 @@ class BTCOptimalLookback:
         self.timestamps = None
         self.prices = None
         self.scenario_results = []
+        self.full_start_date = None
+        self.full_end_date = None
         
     def fetch(self) -> bool:
         """Fetch BTC 1h data for last 30 days from Binance"""
         try:
             # Calculate timestamps for last 30 days
-            end_time = int(datetime.now().timestamp() * 1000)
-            start_time = int((datetime.now() - timedelta(days=30)).timestamp() * 1000)
+            self.full_end_date = datetime.now()
+            self.full_start_date = self.full_end_date - timedelta(days=30)
+            
+            end_time = int(self.full_end_date.timestamp() * 1000)
+            start_time = int(self.full_start_date.timestamp() * 1000)
             
             # Binance API URL for klines/candlestick data
             url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&startTime={start_time}&endTime={end_time}&limit=1000"
@@ -41,6 +46,7 @@ class BTCOptimalLookback:
             self.prices = np.array([float(item[4]) for item in data])  # Closing price
             
             print(f"Fetched {len(self.prices)} hours of BTC data")
+            print(f"Period: {self.full_start_date.strftime('%Y-%m-%d')} to {self.full_end_date.strftime('%Y-%m-%d')}")
             return True
             
         except Exception as e:
@@ -55,7 +61,9 @@ class BTCOptimalLookback:
         n_points = 720  # 30 days * 24 hours
         
         # Generate timestamps
-        base_time = datetime.now().timestamp() * 1000
+        self.full_end_date = datetime.now()
+        self.full_start_date = self.full_end_date - timedelta(days=30)
+        base_time = self.full_start_date.timestamp() * 1000
         self.timestamps = np.array([base_time + i * 3600000 for i in range(n_points)]).reshape(-1, 1)
         
         # Generate synthetic BTC price with trend and noise
@@ -64,6 +72,7 @@ class BTCOptimalLookback:
         self.prices = trend + noise
         
         print(f"Generated {n_points} hours of sample data")
+        print(f"Period: {self.full_start_date.strftime('%Y-%m-%d')} to {self.full_end_date.strftime('%Y-%m-%d')}")
     
     def ols(self, prices: np.ndarray, timestamps: np.ndarray, lookback: int) -> Tuple[np.ndarray, np.ndarray, float, float]:
         """Perform OLS regression on the last 'lookback' data points
@@ -93,7 +102,8 @@ class BTCOptimalLookback:
         
         return X.flatten(), y_pred, total_error, avg_error_per_candle
     
-    def run_analysis(self, prices: np.ndarray, timestamps: np.ndarray, scenario_name: str) -> Dict:
+    def run_analysis(self, prices: np.ndarray, timestamps: np.ndarray, scenario_name: str, 
+                     start_date: datetime, end_date: datetime) -> Dict:
         """Run OLS analysis on given data and return results"""
         best_avg_error = float('inf')
         best_lookback = 10
@@ -111,7 +121,9 @@ class BTCOptimalLookback:
             'best_total_error': None,
             'best_X': None,
             'best_y_pred': None,
-            'data_length': len(prices)
+            'data_length': len(prices),
+            'start_date': start_date,
+            'end_date': end_date
         }
         
         for lookback in range(10, min(101, len(prices) + 1)):
@@ -139,38 +151,56 @@ class BTCOptimalLookback:
     def iterate(self) -> Tuple[int, np.ndarray, np.ndarray, float, float]:
         """Iterate through lookback windows from 10 to 100 and find best average error"""
         print("\n" + "=" * 70)
-        print("📊 MAIN ANALYSIS - Full Dataset")
+        print("📊 MAIN ANALYSIS - Full Dataset (30 days)")
         print("=" * 70)
         
         # Run main analysis on full dataset
-        main_results = self.run_analysis(self.prices, self.timestamps, "Main Analysis (Full Data)")
+        main_results = self.run_analysis(
+            self.prices, self.timestamps, 
+            "Main Analysis (Full 30 Days)", 
+            self.full_start_date, 
+            self.full_end_date
+        )
         
         print(f"\n✅ Best lookback window: {main_results['best_lookback']} hours")
         print(f"   Total Error: ${main_results['best_total_error']:,.2f}")
         print(f"   Average Error per Candle: ${main_results['best_avg_error']:,.2f}")
         
-        # Generate 3 test scenarios with random cutoffs
+        # Generate 3 test scenarios with random end points (>100 hours from start)
         print("\n" + "=" * 70)
-        print("🧪 TEST SCENARIOS - Random Cutoff Points")
+        print("🧪 TEST SCENARIOS - Fixed Start Date, Random End Points")
         print("=" * 70)
         
         self.scenario_results = [main_results]  # Store main results first
         
-        # Generate 3 random cutoff points between 10 and 300 hours
-        random.seed(42)  # For reproducibility
-        cutoffs = sorted([random.randint(10, 300) for _ in range(3)])
+        # Calculate minimum end point (must have at least 100 hours of data)
+        min_hours = 100
+        max_hours = len(self.prices)
         
-        for i, cutoff in enumerate(cutoffs, 1):
-            # Cut off recent data
-            test_prices = self.prices[:-cutoff] if cutoff < len(self.prices) else self.prices[:100]
-            test_timestamps = self.timestamps[:-cutoff] if cutoff < len(self.timestamps) else self.timestamps[:100]
+        # Generate 3 random end points between min_hours and max_hours
+        random.seed(42)  # For reproducibility
+        end_points = sorted([random.randint(min_hours, max_hours) for _ in range(3)], reverse=True)
+        
+        for i, hours_to_keep in enumerate(end_points, 1):
+            # Keep data from start up to random end point
+            test_prices = self.prices[:hours_to_keep]
+            test_timestamps = self.timestamps[:hours_to_keep]
             
-            scenario_name = f"Scenario {i}: Cut off last {cutoff} hours"
+            # Calculate the actual end date
+            test_end_date = self.full_start_date + timedelta(hours=hours_to_keep)
+            
+            scenario_name = f"Scenario {i}: Keep first {hours_to_keep} hours (cut off last {len(self.prices) - hours_to_keep} hours)"
             print(f"\n📌 {scenario_name}")
-            print(f"   Remaining data: {len(test_prices)} hours")
+            print(f"   Period: {self.full_start_date.strftime('%Y-%m-%d')} to {test_end_date.strftime('%Y-%m-%d')}")
+            print(f"   Data points: {len(test_prices)} hours")
             
             # Run analysis on test data
-            test_results = self.run_analysis(test_prices, test_timestamps, scenario_name)
+            test_results = self.run_analysis(
+                test_prices, test_timestamps, 
+                scenario_name,
+                self.full_start_date,
+                test_end_date
+            )
             self.scenario_results.append(test_results)
             
             print(f"   ✅ Best lookback: {test_results['best_lookback']} hours")
@@ -207,40 +237,36 @@ class BTCOptimalLookback:
             ax_main.scatter(x_indices, self.prices[start_idx:], c='orange', s=30, 
                            alpha=0.7, label='Data Points in Best Window')
         
-        ax_main.set_title(f'BTC Price (1h) - Last 30 Days\nMain Analysis - Best Lookback: {best_lookback} hours', 
+        # Mark the random end points for test scenarios
+        colors = ['red', 'purple', 'brown']
+        for i, result in enumerate(self.scenario_results[1:], 1):
+            end_point = result['data_length']
+            ax_main.axvline(x=end_point, color=colors[i-1], linestyle='--', alpha=0.7,
+                           label=f'Scenario {i} End: {end_point}h')
+        
+        ax_main.set_title(f'BTC Price (1h) - Fixed Start: {self.full_start_date.strftime("%Y-%m-%d")}\n'
+                         f'Main Analysis - Best Lookback: {best_lookback} hours | Test Scenarios with Random End Points', 
                          fontsize=14, fontweight='bold')
-        ax_main.set_xlabel('Time (hours from now)')
+        ax_main.set_xlabel('Hours from Start')
         ax_main.set_ylabel('Price (USDT)')
-        ax_main.legend(loc='upper left')
+        ax_main.legend(loc='upper left', fontsize=8)
         ax_main.grid(True, alpha=0.3)
         
-        # Add price statistics
-        if len(self.prices) > 0:
-            current_price = self.prices[-1]
-            min_price = np.min(self.prices)
-            max_price = np.max(self.prices)
-            stats_text = f'Current: ${current_price:,.2f}\nMin: ${min_price:,.2f}\nMax: ${max_price:,.2f}'
-            ax_main.text(0.02, 0.98, stats_text, transform=ax_main.transAxes, 
-                        fontsize=10, verticalalignment='top',
-                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        # Add date ranges
+        date_text = f'Full Period: {self.full_start_date.strftime("%Y-%m-%d")} to {self.full_end_date.strftime("%Y-%m-%d")}'
+        ax_main.text(0.02, 0.98, date_text, transform=ax_main.transAxes, 
+                    fontsize=9, verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
-        # Error analysis subplot (row 1, col 1)
-        ax_error1 = plt.subplot(gs[1, 0])
-        self.plot_error_comparison(ax_error1, self.scenario_results[0], "Main Analysis")
+        # Error analysis subplots for each scenario
+        titles = ["Main Analysis (Full 30 Days)", "Test Scenario 1", "Test Scenario 2", "Test Scenario 3"]
+        axes = [plt.subplot(gs[1, 0]), plt.subplot(gs[1, 1]), 
+                plt.subplot(gs[2, 0]), plt.subplot(gs[2, 1])]
         
-        # Error analysis subplot (row 1, col 2)
-        ax_error2 = plt.subplot(gs[1, 1])
-        self.plot_error_comparison(ax_error2, self.scenario_results[1], "Test Scenario 1")
+        for ax, result, title in zip(axes, self.scenario_results, titles):
+            self.plot_error_comparison(ax, result, title)
         
-        # Error analysis subplot (row 2, col 1)
-        ax_error3 = plt.subplot(gs[2, 0])
-        self.plot_error_comparison(ax_error3, self.scenario_results[2], "Test Scenario 2")
-        
-        # Error analysis subplot (row 2, col 2)
-        ax_error4 = plt.subplot(gs[2, 1])
-        self.plot_error_comparison(ax_error4, self.scenario_results[3], "Test Scenario 3")
-        
-        plt.suptitle('BTC OLS Analysis: Main Results vs 3 Test Scenarios (Random Cutoffs)', 
+        plt.suptitle('BTC OLS Analysis: Main Results vs 3 Test Scenarios (Fixed Start, Random End Points)', 
                     fontsize=16, fontweight='bold', y=0.98)
         
         # Save plot to bytes buffer
@@ -266,11 +292,14 @@ class BTCOptimalLookback:
         ax.axhline(y=results['best_avg_error'], color='red', linestyle='--', 
                    alpha=0.3, linewidth=1)
         
+        # Format date range for title
+        date_range = f"{results['start_date'].strftime('%m/%d')} - {results['end_date'].strftime('%m/%d')}"
+        
         ax.set_xlabel('Lookback Window (hours)')
         ax.set_ylabel('Avg Error ($)')
-        ax.set_title(f'{title}\nData: {results["data_length"]}h | Best: {results["best_lookback"]}h', 
-                    fontsize=10)
-        ax.legend(fontsize=8, loc='upper right')
+        ax.set_title(f'{title}\n{date_range} | Best: {results["best_lookback"]}h', 
+                    fontsize=9)
+        ax.legend(fontsize=7, loc='upper right')
         ax.grid(True, alpha=0.3)
         
         # Format y-axis to show dollars
@@ -293,13 +322,14 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                 # Calculate some additional statistics
                 prices = BTCRequestHandler.btc_analyzer.prices
                 volatility = np.std(prices[-24:])  # 24h volatility
+                analyzer = BTCRequestHandler.btc_analyzer
                 
                 # Create HTML page
                 html = f"""
                 <!DOCTYPE html>
                 <html>
                 <head>
-                    <title>BTC OLS Analysis - With Test Scenarios</title>
+                    <title>BTC OLS Analysis - Fixed Start, Random End Points</title>
                     <style>
                         body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f0f0f0; }}
                         .container {{ max-width: 1400px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
@@ -322,32 +352,35 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                         .scenario-table td {{ padding: 10px; border-bottom: 1px solid #ddd; }}
                         .scenario-table tr:hover {{ background-color: #f5f5f5; }}
                         .main-row {{ background-color: #e3f2fd; font-weight: bold; }}
+                        .date-range {{ font-family: monospace; }}
                     </style>
                 </head>
                 <body>
                     <div class="container">
                         <h1>📊 BTC OLS Analysis with 3 Test Scenarios</h1>
-                        <p>30 Days of 1-Hour Data | Testing algorithm stability with random data cutoffs</p>
+                        <p>Fixed Start Date: <strong>{analyzer.full_start_date.strftime('%Y-%m-%d')}</strong> | Random End Points (>100 hours from start)</p>
                         
                         <div class="error-metric">
-                            <strong>🎯 Testing Methodology:</strong> Randomly cut off 10-300 recent candles to create 3 test scenarios,
-                            then compare how the optimal lookback window changes.
+                            <strong>🎯 Testing Methodology:</strong> Keep the same 30-day start date but randomly cut off recent data 
+                            (must keep at least 100 hours). This tests how sensitive the optimal lookback is to having less recent data.
                         </div>
                         
                         <div class="info">
-                            <h3>📈 Main Analysis Results (Full Dataset):</h3>
+                            <h3>📈 Main Analysis Results (Full 30 Days):</h3>
+                            <p><strong>Period:</strong> {analyzer.full_start_date.strftime('%Y-%m-%d')} to {analyzer.full_end_date.strftime('%Y-%m-%d')}</p>
                             <p><strong>Optimal Lookback Window:</strong> {best_lookback} hours</p>
                             <p><strong>Total Error (Sum |price-ols|):</strong> ${best_total_error:,.2f}</p>
                             <p><strong>Average Error per Candle:</strong> ${best_avg_error:,.2f}</p>
                             <p><strong>Total Data Points:</strong> {len(prices)} hours</p>
                         </div>
                         
-                        <h3>🧪 Test Scenarios Results:</h3>
+                        <h3>🧪 Test Scenarios Results (Fixed Start, Random End Points):</h3>
                         <table class="scenario-table">
                             <tr>
                                 <th>Scenario</th>
-                                <th>Cutoff</th>
+                                <th>Period</th>
                                 <th>Data Points</th>
+                                <th>Hours Cut</th>
                                 <th>Best Lookback</th>
                                 <th>Avg Error</th>
                                 <th>Change</th>
@@ -355,7 +388,7 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                 """
                 
                 # Add scenario rows
-                scenarios = BTCRequestHandler.btc_analyzer.scenario_results
+                scenarios = analyzer.scenario_results
                 main_result = scenarios[0]
                 
                 for i, result in enumerate(scenarios[1:], 1):
@@ -363,14 +396,14 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                     change_str = f"{change:+d} hours" if change != 0 else "No change"
                     change_color = "green" if change == 0 else "orange" if abs(change) < 20 else "red"
                     
-                    cutoff_parts = result['name'].split('cut off last ')
-                    cutoff = cutoff_parts[1].split(' hours')[0] if len(cutoff_parts) > 1 else "Unknown"
+                    hours_cut = len(analyzer.prices) - result['data_length']
                     
                     html += f"""
                             <tr>
                                 <td><strong>Scenario {i}</strong></td>
-                                <td>{cutoff} hours</td>
+                                <td class="date-range">{result['start_date'].strftime('%m/%d')} - {result['end_date'].strftime('%m/%d')}</td>
                                 <td>{result['data_length']}</td>
+                                <td>{hours_cut} hrs</td>
                                 <td>{result['best_lookback']} hours</td>
                                 <td>${result['best_avg_error']:,.2f}</td>
                                 <td style="color: {change_color};">{change_str}</td>
@@ -408,7 +441,7 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
                         <div class="footer">
                             <p>Data from Binance API | Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
                             <p>Analysis looks for lookback window that minimizes average absolute deviation per candle</p>
-                            <p>Test scenarios randomly cut off 10-300 recent candles to test algorithm stability</p>
+                            <p>Test scenarios keep the same start date but randomly cut off recent data (minimum 100 hours retained)</p>
                         </div>
                     </div>
                 </body>
@@ -424,7 +457,7 @@ class BTCRequestHandler(http.server.SimpleHTTPRequestHandler):
 def main():
     """Main function to run the analysis and server"""
     print("=" * 70)
-    print("BTC OLS Analysis - With 3 Test Scenarios (Random Cutoffs)")
+    print("BTC OLS Analysis - Fixed Start Date, Random End Points")
     print("=" * 70)
     
     # Create analyzer instance
