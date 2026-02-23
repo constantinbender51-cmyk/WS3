@@ -22,7 +22,7 @@ import argparse
 # ============================================================================
 
 # TRADING PARAMETERS
-SLOPE_THRESHOLD = 0.001  # Minimum slope to trigger trade (0.1% per hour)
+SLOPE_THRESHOLD = 0.002  # Minimum slope to trigger trade (0.1% per hour)
                         # Higher = fewer trades, stronger trends only
                         # Lower = more trades, more noise
 
