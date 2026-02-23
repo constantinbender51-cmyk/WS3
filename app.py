@@ -9,10 +9,12 @@ import socketserver
 import threading
 import webbrowser
 from sklearn.linear_model import LinearRegression
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import plotly.utils
-import json
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for server
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from io import BytesIO
+import base64
 
 # Configuration
 SYMBOL = "BTCUSDT"
@@ -62,11 +64,13 @@ def analyze_and_trade(df):
     
     prices = df['close'].values
     times = df['time_num'].values
+    timestamps = df['timestamp'].values
     
     positions = []  # Track positions (1 for long, -1 for short, 0 for flat)
     pnl = []  # Track P&L
-    timestamps = []
-    signals = []
+    position_timestamps = []
+    buy_signals = []
+    sell_signals = []
     
     current_position = 0
     cumulative_pnl = 0
@@ -76,13 +80,12 @@ def analyze_and_trade(df):
     
     # Iterate through the data
     for i in range(24, len(prices) - 1):
-        current_time = df['timestamp'].iloc[i]
-        timestamps.append(current_time)
+        current_time = timestamps[i]
+        position_timestamps.append(current_time)
         
         # Find optimal lookback by minimizing the error function
         best_error = float('inf')
         best_slope = 0
-        best_end_idx = i
         
         for lookback in range(4, 25):  # Test from 4 to 24 hours
             start_idx = i - lookback
@@ -105,7 +108,6 @@ def analyze_and_trade(df):
             if error < best_error:
                 best_error = error
                 best_slope = slope
-                best_end_idx = i
         
         # Trading logic
         if abs(best_slope) > threshold:
@@ -120,7 +122,7 @@ def analyze_and_trade(df):
                     # Open long
                     current_position = 1
                     entry_price = prices[i]
-                    signals.append(('BUY', current_time))
+                    buy_signals.append((current_time, prices[i]))
                     
             else:  # Bearish signal
                 if current_position >= 0:  # Not short
@@ -131,7 +133,7 @@ def analyze_and_trade(df):
                     # Open short
                     current_position = -1
                     entry_price = prices[i]
-                    signals.append(('SELL', current_time))
+                    sell_signals.append((current_time, prices[i]))
             
             # Add to P&L based on slope direction
             pnl_adjustment = np.sign(best_slope) * price_change_pct * 100
@@ -140,92 +142,79 @@ def analyze_and_trade(df):
         positions.append(current_position)
         pnl.append(cumulative_pnl)
     
-    return timestamps, positions, pnl, signals
+    return position_timestamps, positions, pnl, buy_signals, sell_signals
 
-# Create interactive plot
-def create_plot(df, timestamps, positions, pnl, signals):
+# Create plot using matplotlib
+def create_plot(df, timestamps, positions, pnl, buy_signals, sell_signals):
     # Align data lengths
     min_len = min(len(timestamps), len(positions), len(pnl))
-    timestamps = timestamps[:min_len]
-    positions = positions[:min_len]
-    pnl = pnl[:min_len]
+    plot_timestamps = timestamps[:min_len]
+    plot_positions = positions[:min_len]
+    plot_pnl = pnl[:min_len]
     
-    # Create subplots
-    fig = make_subplots(
-        rows=3, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.05,
-        row_heights=[0.5, 0.25, 0.25],
-        subplot_titles=('BTC Price', 'Position', 'Cumulative P&L (%)')
-    )
+    # Create figure with 3 subplots
+    fig = plt.figure(figsize=(12, 10))
     
     # Price chart
-    fig.add_trace(
-        go.Scatter(x=df['timestamp'], y=df['close'],
-                  mode='lines',
-                  name='BTC Price',
-                  line=dict(color='blue', width=2)),
-        row=1, col=1
-    )
+    ax1 = plt.subplot(3, 1, 1)
+    ax1.plot(df['timestamp'], df['close'], 'b-', linewidth=1.5, label='BTC Price')
     
     # Add buy/sell signals
-    buy_dates = [sig[1] for sig in signals if sig[0] == 'BUY']
-    sell_dates = [sig[1] for sig in signals if sig[0] == 'SELL']
+    if buy_signals:
+        buy_dates, buy_prices = zip(*buy_signals)
+        ax1.scatter(buy_dates, buy_prices, color='green', marker='^', s=100, label='Buy', zorder=5)
     
-    buy_prices = df[df['timestamp'].isin(buy_dates)]['close'].values if buy_dates else []
-    sell_prices = df[df['timestamp'].isin(sell_dates)]['close'].values if sell_dates else []
+    if sell_signals:
+        sell_dates, sell_prices = zip(*sell_signals)
+        ax1.scatter(sell_dates, sell_prices, color='red', marker='v', s=100, label='Sell', zorder=5)
     
-    fig.add_trace(
-        go.Scatter(x=buy_dates, y=buy_prices,
-                  mode='markers',
-                  name='Buy',
-                  marker=dict(color='green', size=10, symbol='triangle-up')),
-        row=1, col=1
-    )
-    
-    fig.add_trace(
-        go.Scatter(x=sell_dates, y=sell_prices,
-                  mode='markers',
-                  name='Sell',
-                  marker=dict(color='red', size=10, symbol='triangle-down')),
-        row=1, col=1
-    )
+    ax1.set_title('BTC Price - 1h Chart', fontsize=14, fontweight='bold')
+    ax1.set_ylabel('Price (USDT)', fontsize=12)
+    ax1.legend(loc='upper left', fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
+    ax1.tick_params(axis='x', rotation=45, labelsize=10)
+    ax1.tick_params(axis='y', labelsize=10)
     
     # Position chart
-    fig.add_trace(
-        go.Scatter(x=timestamps, y=positions,
-                  mode='lines+markers',
-                  name='Position (1=Long, -1=Short, 0=Flat)',
-                  line=dict(color='orange', width=2),
-                  marker=dict(size=4)),
-        row=2, col=1
-    )
+    ax2 = plt.subplot(3, 1, 2)
+    ax2.plot(plot_timestamps, plot_positions, 'o-', color='orange', linewidth=2, markersize=3)
+    ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+    ax2.axhline(y=1, color='green', linestyle='--', alpha=0.3)
+    ax2.axhline(y=-1, color='red', linestyle='--', alpha=0.3)
+    ax2.set_title('Position', fontsize=14, fontweight='bold')
+    ax2.set_ylabel('Position\n(1=Long, -1=Short, 0=Flat)', fontsize=12)
+    ax2.set_ylim(-1.5, 1.5)
+    ax2.set_yticks([-1, 0, 1])
+    ax2.set_yticklabels(['Short', 'Flat', 'Long'])
+    ax2.grid(True, alpha=0.3)
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
+    ax2.tick_params(axis='x', rotation=45, labelsize=10)
+    ax2.tick_params(axis='y', labelsize=10)
     
     # P&L chart
-    fig.add_trace(
-        go.Scatter(x=timestamps, y=pnl,
-                  mode='lines',
-                  name='Cumulative P&L',
-                  line=dict(color='green', width=2),
-                  fill='tozeroy'),
-        row=3, col=1
-    )
+    ax3 = plt.subplot(3, 1, 3)
+    ax3.fill_between(plot_timestamps, 0, plot_pnl, color='green', alpha=0.3)
+    ax3.plot(plot_timestamps, plot_pnl, 'g-', linewidth=2)
+    ax3.axhline(y=0, color='black', linestyle='-', alpha=0.5)
+    ax3.set_title('Cumulative P&L', fontsize=14, fontweight='bold')
+    ax3.set_xlabel('Time', fontsize=12)
+    ax3.set_ylabel('P&L (%)', fontsize=12)
+    ax3.grid(True, alpha=0.3)
+    ax3.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
+    ax3.tick_params(axis='x', rotation=45, labelsize=10)
+    ax3.tick_params(axis='y', labelsize=10)
     
-    # Update layout for mobile display
-    fig.update_layout(
-        title=f'{SYMBOL} - 1h Data Analysis',
-        height=900,
-        showlegend=True,
-        hovermode='x unified',
-        template='plotly_dark',
-        font=dict(size=14)  # Larger font for mobile
-    )
+    plt.tight_layout()
     
-    # Make y-axis labels bigger
-    fig.update_yaxes(title_font=dict(size=14), tickfont=dict(size=12))
-    fig.update_xaxes(title_font=dict(size=14), tickfont=dict(size=12))
+    # Convert plot to base64 string
+    buffer = BytesIO()
+    plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight')
+    buffer.seek(0)
+    image_base64 = base64.b64encode(buffer.getvalue()).decode()
+    plt.close(fig)
     
-    return fig
+    return image_base64
 
 # HTML template with viewport for mobile
 HTML_TEMPLATE = '''
@@ -233,14 +222,14 @@ HTML_TEMPLATE = '''
 <html>
 <head>
     <title>BTC Trading Analysis</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=2.0, user-scalable=yes">
     <style>
         body {{
             margin: 0;
             padding: 10px;
             background-color: #111;
             color: white;
-            font-family: Arial, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
         }}
         .container {{
             max-width: 100%;
@@ -250,52 +239,144 @@ HTML_TEMPLATE = '''
             font-size: 24px;
             text-align: center;
             margin: 10px 0;
+            color: #ff9900;
         }}
-        .chart {{
+        .chart-container {{
             width: 100%;
-            height: 900px;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            background-color: #222;
+            border-radius: 10px;
+            padding: 10px 0;
         }}
-        .info {{
+        .chart-container img {{
+            width: 100%;
+            height: auto;
+            display: block;
+        }}
+        .info-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 10px;
+            margin-top: 15px;
+        }}
+        .info-card {{
+            background-color: #222;
+            padding: 15px;
+            border-radius: 10px;
+            text-align: center;
+            border-left: 4px solid #ff9900;
+        }}
+        .info-label {{
+            font-size: 14px;
+            color: #aaa;
+            margin-bottom: 5px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }}
+        .info-value {{
+            font-size: 24px;
+            font-weight: bold;
+            color: #ff9900;
+        }}
+        .info-value.small {{
+            font-size: 18px;
+        }}
+        .status {{
             background-color: #222;
             padding: 15px;
             border-radius: 10px;
             margin-top: 15px;
-            font-size: 16px;
+            text-align: center;
+            font-size: 18px;
         }}
-        .info-item {{
-            margin: 8px 0;
+        .refresh-btn {{
+            background-color: #ff9900;
+            color: #111;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 18px;
+            font-weight: bold;
+            margin-top: 15px;
+            width: 100%;
+            cursor: pointer;
+            -webkit-tap-highlight-color: transparent;
+        }}
+        .refresh-btn:active {{
+            background-color: #ffaa22;
+        }}
+        .footer {{
+            text-align: center;
+            margin-top: 20px;
+            font-size: 12px;
+            color: #666;
         }}
         @media (max-width: 600px) {{
-            h1 {{ font-size: 20px; }}
-            .info {{ font-size: 14px; }}
+            h1 {{ font-size: 22px; }}
+            .info-value {{ font-size: 20px; }}
+            .info-value.small {{ font-size: 16px; }}
         }}
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>BTC 1H Trading Analysis</h1>
-        <div class="chart" id="chart"></div>
-        <div class="info" id="info">
-            <div class="info-item">Loading data...</div>
+        <h1>📊 BTC 1H Trading Analysis</h1>
+        
+        <div class="chart-container">
+            <img src="data:image/png;base64,{chart_image}" alt="BTC Analysis Chart">
+        </div>
+        
+        <div class="info-grid">
+            <div class="info-card">
+                <div class="info-label">Current Position</div>
+                <div class="info-value" id="position">Loading...</div>
+            </div>
+            <div class="info-card">
+                <div class="info-label">Total P&L</div>
+                <div class="info-value" id="pnl">Loading...</div>
+            </div>
+            <div class="info-card">
+                <div class="info-label">Signals</div>
+                <div class="info-value small" id="signals">Loading...</div>
+            </div>
+        </div>
+        
+        <div class="status" id="last-update">
+            Last Update: Loading...
+        </div>
+        
+        <button class="refresh-btn" onclick="refreshData()">
+            🔄 Refresh Data
+        </button>
+        
+        <div class="footer">
+            Data from Binance • Updated every minute
         </div>
     </div>
     
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     <script>
-        const chartData = {chart_json};
-        Plotly.newPlot('chart', chartData.data, chartData.layout, {{responsive: true}});
+        function refreshData() {{
+            window.location.reload();
+        }}
         
-        // Update info
-        fetch('/api/status')
-            .then(response => response.json())
-            .then(data => {{
-                const infoDiv = document.getElementById('info');
-                infoDiv.innerHTML = `
-                    <div class="info-item"><strong>Current Position:</strong> ${{data.position}}</div>
-                    <div class="info-item"><strong>Total P&L:</strong> ${{data.pnl.toFixed(2)}}%</div>
-                    <div class="info-item"><strong>Last Update:</strong> ${{data.last_update}}</div>
-                `;
-            }});
+        function updateInfo() {{
+            fetch('/api/status')
+                .then(response => response.json())
+                .then(data => {{
+                    document.getElementById('position').innerHTML = data.position;
+                    document.getElementById('pnl').innerHTML = data.pnl.toFixed(2) + '%';
+                    document.getElementById('signals').innerHTML = data.buy_signals + ' Buy / ' + data.sell_signals + ' Sell';
+                    document.getElementById('last-update').innerHTML = 'Last Update: ' + data.last_update;
+                }})
+                .catch(error => {{
+                    console.error('Error fetching data:', error);
+                }});
+        }}
+        
+        // Update info every 30 seconds
+        updateInfo();
+        setInterval(updateInfo, 30000);
     </script>
 </body>
 </html>
@@ -312,15 +393,14 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             # Get current data
             df = fetch_binance_data()
             if df is not None:
-                timestamps, positions, pnl, signals = analyze_and_trade(df)
-                fig = create_plot(df, timestamps, positions, pnl, signals)
-                
-                # Convert figure to JSON
-                chart_json = json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
+                timestamps, positions, pnl, buy_signals, sell_signals = analyze_and_trade(df)
+                chart_image = create_plot(df, timestamps, positions, pnl, buy_signals, sell_signals)
                 
                 # Send HTML
-                html = HTML_TEMPLATE.format(chart_json=chart_json)
+                html = HTML_TEMPLATE.format(chart_image=chart_image)
                 self.wfile.write(html.encode())
+            else:
+                self.wfile.write(b"<html><body><h1>Error fetching data</h1></body></html>")
                 
         elif self.path == '/api/status':
             self.send_response(200)
@@ -330,22 +410,31 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             # Get latest data
             df = fetch_binance_data()
             if df is not None:
-                timestamps, positions, pnl, signals = analyze_and_trade(df)
+                timestamps, positions, pnl, buy_signals, sell_signals = analyze_and_trade(df)
                 
                 # Get latest values
                 current_position = positions[-1] if positions else 0
                 current_pnl = pnl[-1] if pnl else 0
                 
                 # Map position to text
-                pos_text = {1: 'LONG', -1: 'SHORT', 0: 'FLAT'}.get(current_position, 'UNKNOWN')
+                if current_position == 1:
+                    pos_text = 'LONG 📈'
+                elif current_position == -1:
+                    pos_text = 'SHORT 📉'
+                else:
+                    pos_text = 'FLAT ⚪'
                 
                 status = {
                     'position': pos_text,
                     'pnl': current_pnl,
+                    'buy_signals': len(buy_signals),
+                    'sell_signals': len(sell_signals),
                     'last_update': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 }
                 
                 self.wfile.write(json.dumps(status).encode())
+            else:
+                self.wfile.write(json.dumps({'error': 'Failed to fetch data'}).encode())
         
         else:
             self.send_response(404)
@@ -353,32 +442,37 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
 
 def start_server():
     with socketserver.TCPServer((HOST, PORT), CustomHandler) as httpd:
-        print(f"Server running at http://{HOST}:{PORT}")
-        print("Open this URL on your mobile device")
-        httpd.serve_forever()
-
-# Main execution
-if __name__ == "__main__":
-    print("Starting BTC Trading Analysis Server...")
-    print(f"Fetching {LIMIT} hours of BTC data from Binance...")
-    
-    # Test data fetch
-    df = fetch_binance_data()
-    if df is not None:
-        print(f"Successfully fetched {len(df)} data points")
-        print(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
-        
-        # Start server
-        print(f"\nStarting web server on port {PORT}...")
-        print("You can access the dashboard at:")
-        print(f"http://localhost:{PORT} (local)")
+        print(f"✅ Server running at http://{HOST}:{PORT}")
+        print("📱 Open this URL on your mobile device:")
         
         # Get local IP
         import socket
         hostname = socket.gethostname()
-        local_ip = socket.gethostbyname(hostname)
-        print(f"http://{local_ip}:{PORT} (network - use this for mobile)")
+        try:
+            local_ip = socket.gethostbyname(hostname)
+            print(f"   http://{local_ip}:{PORT}")
+        except:
+            print(f"   Check your network IP")
         
+        print("\n🔄 Press Ctrl+C to stop the server")
+        httpd.serve_forever()
+
+# Main execution
+if __name__ == "__main__":
+    print("=" * 50)
+    print("🚀 Starting BTC Trading Analysis Server")
+    print("=" * 50)
+    print(f"📊 Fetching {LIMIT} hours of BTC data from Binance...")
+    
+    # Test data fetch
+    df = fetch_binance_data()
+    if df is not None:
+        print(f"✅ Successfully fetched {len(df)} data points")
+        print(f"📅 Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+        print(f"💰 Current BTC Price: ${df['close'].iloc[-1]:,.2f}")
+        
+        # Start server
+        print(f"\n🌐 Starting web server on port {PORT}...")
         start_server()
     else:
-        print("Failed to fetch data. Check your internet connection.")
+        print("❌ Failed to fetch data. Check your internet connection.")
