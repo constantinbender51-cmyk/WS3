@@ -164,7 +164,7 @@ def analyze_and_trade(df):
             predicted = model.predict(X)
             time_range_hours = times[i] - times[start_idx]
             
-            if TIME_PENALTY_EXPONent == 0:
+            if TIME_PENALTY_EXPONENT == 0:
                 error = np.abs(predicted - y).mean()
             else:
                 error = np.abs(predicted - y).mean() / (time_range_hours ** TIME_PENALTY_EXPONENT)
