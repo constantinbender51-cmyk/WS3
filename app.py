@@ -22,12 +22,12 @@ import argparse
 # ============================================================================
 
 # TRADING PARAMETERS
-SLOPE_THRESHOLD = 50  # Minimum slope to trigger trade (0.1% per hour)
+SLOPE_THRESHOLD = 0.001  # Minimum slope to trigger trade (0.1% per hour)
                         # Higher = fewer trades, stronger trends only
                         # Lower = more trades, more noise
 
 # ERROR MINIMIZATION PARAMETERS  
-TIME_PENALTY_EXPONENT = 2  # Exponent for time in denominator: error / (time_range)^exp
+TIME_PENALTY_EXPONENT = 3  # Exponent for time in denominator: error / (time_range)^exp
                           # 0 = no penalty (neutral to timeframe)
                           # 1 = error / time_range (slightly favors shorter)
                           # 2 = error / time_range² (favors longer trends) - DEFAULT
