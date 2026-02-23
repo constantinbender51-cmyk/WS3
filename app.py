@@ -174,14 +174,13 @@ def analyze_and_trade(df):
                 best_slope = slope
                 best_lookback = lookback
         
-        # Trading logic
+        # Trading logic - CORRECTED SHORT P&L
         if abs(best_slope) > SLOPE_THRESHOLD:
-            price_change_pct = (prices[i] - prices[i-1]) / prices[i-1]
-            
             if best_slope > 0:  # Bullish signal
-                if current_position <= 0:
+                if current_position <= 0:  # Not long
                     # Close short if exists
                     if current_position == -1:
+                        # SHORT P&L = (entry - exit) / entry
                         trade_pnl = (entry_price - prices[i]) / entry_price * 100
                         cumulative_pnl += trade_pnl * POSITION_SIZE
                         print(f"📈 Close SHORT at ${prices[i]:,.2f} P&L: {trade_pnl:.2f}%")
@@ -193,9 +192,10 @@ def analyze_and_trade(df):
                     print(f"🚀 OPEN LONG at ${prices[i]:,.2f} (lookback: {best_lookback}h, slope: {best_slope:.4f})")
                     
             else:  # Bearish signal
-                if current_position >= 0:
+                if current_position >= 0:  # Not short
                     # Close long if exists
                     if current_position == 1:
+                        # LONG P&L = (exit - entry) / entry
                         trade_pnl = (prices[i] - entry_price) / entry_price * 100
                         cumulative_pnl += trade_pnl * POSITION_SIZE
                         print(f"📉 Close LONG at ${prices[i]:,.2f} P&L: {trade_pnl:.2f}%")
@@ -205,13 +205,20 @@ def analyze_and_trade(df):
                     entry_price = prices[i]
                     sell_signals.append((current_time, prices[i]))
                     print(f"🔻 OPEN SHORT at ${prices[i]:,.2f} (lookback: {best_lookback}h, slope: {best_slope:.4f})")
-            
-            # Add to P&L based on slope direction
-            pnl_adjustment = np.sign(best_slope) * price_change_pct * 100 * POSITION_SIZE
-            cumulative_pnl += pnl_adjustment
         
-        positions.append(current_position * POSITION_SIZE)  # Scale by position size
+        positions.append(current_position * POSITION_SIZE)
         pnl.append(cumulative_pnl)
+    
+    # Close any open position at the end
+    final_price = prices[-1]
+    if current_position == 1:
+        trade_pnl = (final_price - entry_price) / entry_price * 100
+        cumulative_pnl += trade_pnl * POSITION_SIZE
+        print(f"\n🔚 Close final LONG at ${final_price:,.2f} P&L: {trade_pnl:.2f}%")
+    elif current_position == -1:
+        trade_pnl = (entry_price - final_price) / entry_price * 100
+        cumulative_pnl += trade_pnl * POSITION_SIZE
+        print(f"\n🔚 Close final SHORT at ${final_price:,.2f} P&L: {trade_pnl:.2f}%")
     
     print(f"\n📊 Final P&L: {cumulative_pnl:.2f}%")
     print(f"📈 Total Trades: {len(buy_signals) + len(sell_signals)}")
@@ -219,7 +226,6 @@ def analyze_and_trade(df):
     print(f"   Sell Signals: {len(sell_signals)}")
     
     return position_timestamps, positions, pnl, buy_signals, sell_signals
-
 # Create plot using matplotlib
 def create_plot(df, timestamps, positions, pnl, buy_signals, sell_signals):
     # Align data lengths
