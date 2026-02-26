@@ -13,8 +13,8 @@ import socketserver
 import urllib.parse
 import socket
 import time
-import random
 import threading
+import random
 
 # --- Configuration ---
 SYMBOL = 'BTC/USDT'  
@@ -23,9 +23,9 @@ DAYS_BACK = 30
 STARTING_BALANCE = 10000
 PORT = 8000
 
-# Live Tracker Default Rules
-LIVE_PARAMS = {'f': 1.0, 'g': 150.0, 'u': 0.5, 'sl': 2.0, 'tsl': 2.0}
+# Live Tracker Globals
 LIVE_TRACKER = {}
+TRACKER_READY = False
 
 CRYPTO_CHOICES = {
     'BTC/USDT': '#1 Bitcoin (BTC)',
@@ -56,20 +56,87 @@ def get_local_ip():
     return IP
 
 # ==========================================
-# 0. LIVE TRACKER DAEMON (Background Thread)
+# 0. FAST 1H GA FOR BACKGROUND INITIALIZATION
+# ==========================================
+def fast_1h_ga(df):
+    """A rapid 1H-only GA used during mass startup to avoid 1M API rate limits."""
+    opens, highs, lows, closes = df['open'].values, df['high'].values, df['low'].values, df['close'].values
+    wick_pcts, wick_body_ratios = df['wick_pct'].values, df['wick_body_ratio'].values
+    bounds = np.array([[0.1, 4.0], [50.0, 400.0], [-1.0, 2.0], [0.5, 6.0], [0.5, 6.0]])
+    pop = np.random.uniform(bounds[:, 0], bounds[:, 1], (30, 5))
+
+    def evaluate(ind):
+        sl, tsl, f, g, u = ind[3]/100.0, ind[4]/100.0, ind[0]/100.0, ind[1]/100.0, ind[2]/100.0
+        equity = np.empty(len(opens)); equity[0] = 10000.0
+        state, lpc = 2, 0
+        for i in range(1, len(opens)):
+            if wick_pcts[i-1] > f or wick_body_ratios[i-1] > g: state, lpc = 1, 0
+            elif lpc >= 3: state = 2
+            if state == 2:
+                equity[i] = equity[i-1]; continue
+                
+            pos = 1 if closes[i-1] >= opens[i-1] else -1
+            c_o, c_h, c_l, c_c = opens[i], highs[i], lows[i], closes[i]
+            sl_price = c_o*(1-sl) if pos == 1 else c_o*(1+sl)
+            pnl = 0.0
+            
+            if pos == 1:
+                if c_l <= sl_price: pnl = -sl
+                else:
+                    if c_h >= c_o*(1+tsl):
+                        tsl_p = c_h*(1-tsl)
+                        pnl = (tsl_p - c_o)/c_o if c_c <= tsl_p else (c_c - c_o)/c_o
+                    else: pnl = (c_c - c_o)/c_o
+            else:
+                if c_h >= sl_price: pnl = -sl
+                else:
+                    if c_l <= c_o*(1-tsl):
+                        tsl_p = c_l*(1+tsl)
+                        pnl = (c_o - tsl_p)/c_o if c_c >= tsl_p else (c_o - c_c)/c_o
+                    else: pnl = (c_o - c_c)/c_o
+                        
+            if pnl < u: lpc += 1
+            else: lpc = 0
+            equity[i] = equity[i-1] * (1 + pnl)
+            
+        returns = np.diff(equity) / equity[:-1]
+        std = np.std(returns)
+        return (np.mean(returns) / std * np.sqrt(365*24)) if std > 0 else -999.0
+
+    for gen in range(5):
+        fitness = np.array([evaluate(ind) for ind in pop])
+        next_pop = [pop[np.argmax(fitness)], pop[np.argmax(fitness)].copy()]
+        while len(next_pop) < 30:
+            i1, i2 = np.random.choice(30, 2, replace=False)
+            p1 = pop[i1] if fitness[i1] > fitness[i2] else pop[i2]
+            child = p1.copy()
+            for i in range(5):
+                if np.random.rand() < 0.3:
+                    child[i] = np.clip(child[i] + np.random.normal(0, (bounds[i, 1]-bounds[i, 0])*0.1), bounds[i, 0], bounds[i, 1])
+            next_pop.append(child)
+        pop = np.array(next_pop)
+        
+    best = pop[np.argmax([evaluate(ind) for ind in pop])]
+    return {'f': round(best[0],2), 'g': round(best[1],2), 'u': round(best[2],2), 'sl': round(best[3],2), 'tsl': round(best[4],2)}
+
+
+# ==========================================
+# 1. LIVE TRACKER DAEMON (Background Thread)
 # ==========================================
 def init_live_tracker():
-    global LIVE_TRACKER
+    global LIVE_TRACKER, TRACKER_READY
     exchange = ccxt.binance({'enableRateLimit': True})
-    f_pct, g_pct, u_pct = LIVE_PARAMS['f']/100.0, LIVE_PARAMS['g']/100.0, LIVE_PARAMS['u']/100.0
-    sl_pct, tsl_pct = LIVE_PARAMS['sl']/100.0, LIVE_PARAMS['tsl']/100.0
+    since_ms = int((datetime.utcnow() - timedelta(days=30)).timestamp() * 1000)
     
-    print("\n[LIVE TRACKER] Initializing signals for all assets...")
+    print("\n" + "="*50)
+    print("🚀 INITIALIZING MASS GA OPTIMIZATION FOR LIVE TRACKER")
+    print("="*50)
+    
     for sym in CRYPTO_CHOICES.keys():
         try:
-            ohlcv_1h = exchange.fetch_ohlcv(sym, '1h', limit=20) # Need enough to find low_profit_count
+            # 1. Fetch 30 days of 1h data
+            ohlcv_1h = exchange.fetch_ohlcv(sym, '1h', since=since_ms, limit=1000)
             df = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            
             df['body'] = abs(df['close'] - df['open'])
             df['top_wick'] = df['high'] - df[['open', 'close']].max(axis=1)
             df['bot_wick'] = df[['open', 'close']].min(axis=1) - df['low']
@@ -77,19 +144,43 @@ def init_live_tracker():
             df['wick_pct'] = df['max_wick'] / df['open']
             df['wick_body_ratio'] = np.where(df['body'] == 0, np.inf, df['max_wick'] / df['body'])
             
-            state, low_profit_count = 2, 0
+            # 2. Run Individual GA
+            best_params = fast_1h_ga(df)
+            f_pct, g_pct, u_pct = best_params['f']/100.0, best_params['g']/100.0, best_params['u']/100.0
+            sl_pct, tsl_pct = best_params['sl']/100.0, best_params['tsl']/100.0
+            print(f"[{sym.split('/')[0]}] GA Done -> f:{best_params['f']} | g:{best_params['g']} | sl:{best_params['sl']}")
             
-            # Reconstruct recent state
+            # 3. Simulate History to find current state
+            state, low_profit_count = 2, 0
             for i in range(1, len(df)-1):
                 prev, curr = df.iloc[i-1], df.iloc[i]
                 if prev['wick_pct'] > f_pct or prev['wick_body_ratio'] > g_pct: state, low_profit_count = 1, 0
                 elif low_profit_count >= 3: state = 2
+                
                 if state == 1:
                     pos = 1 if prev['close'] >= prev['open'] else -1
-                    pnl = (curr['close'] - curr['open'])/curr['open'] if pos == 1 else (curr['open'] - curr['close'])/curr['open']
+                    c_o, c_h, c_l, c_c = curr['open'], curr['high'], curr['low'], curr['close']
+                    sl_price = c_o*(1-sl_pct) if pos == 1 else c_o*(1+sl_pct)
+                    pnl = 0.0
+                    if pos == 1:
+                        if c_l <= sl_price: pnl = -sl_pct
+                        else:
+                            if c_h >= c_o*(1+tsl_pct):
+                                tsl_p = c_h*(1-tsl_pct)
+                                pnl = (tsl_p - c_o)/c_o if c_c <= tsl_p else (c_c - c_o)/c_o
+                            else: pnl = (c_c - c_o)/c_o
+                    else:
+                        if c_h >= sl_price: pnl = -sl_pct
+                        else:
+                            if c_l <= c_o*(1-tsl_pct):
+                                tsl_p = c_l*(1+tsl_pct)
+                                pnl = (c_o - tsl_p)/c_o if c_c >= tsl_p else (c_o - c_c)/c_o
+                            else: pnl = (c_o - c_c)/c_o
+                                
                     if pnl < u_pct: low_profit_count += 1
                     else: low_profit_count = 0
             
+            # 4. Finalize Current Hour Status
             last_closed, curr_open = df.iloc[-2], df.iloc[-1]
             if last_closed['wick_pct'] > f_pct or last_closed['wick_body_ratio'] > g_pct: state, low_profit_count = 1, 0
             elif low_profit_count >= 3: state = 2
@@ -103,41 +194,48 @@ def init_live_tracker():
                 status = "ACTIVE LONG" if pos == 1 else "ACTIVE SHORT"
                 
             LIVE_TRACKER[sym] = {
-                'state': state, 'low_profit_count': low_profit_count, 'position': pos,
+                'params': best_params, 'state': state, 'low_profit_count': low_profit_count, 'position': pos,
                 'entry_price': ep, 'current_sl': curr_sl, 'act_price': act_price, 'active_tsl': False,
                 'pnl_since_inception': 0.0, 'status': status,
                 'last_processed_hour': last_closed['timestamp'], 'last_processed_minute': 0,
                 'current_price': curr_open['open']
             }
-        except Exception as e: print(f"[LIVE TRACKER] Error initializing {sym}: {e}")
-    print("[LIVE TRACKER] Initialization Complete!\n")
+        except Exception as e: print(f"Error initializing {sym}: {e}")
+        
+    TRACKER_READY = True
+    print("="*50)
+    print("✅ MASS INITIALIZATION COMPLETE! STARTING LIVE TRACKING.")
+    print("="*50 + "\n")
 
 def live_tracker_loop():
     exchange = ccxt.binance({'enableRateLimit': True})
-    f_pct, g_pct, u_pct = LIVE_PARAMS['f']/100.0, LIVE_PARAMS['g']/100.0, LIVE_PARAMS['u']/100.0
-    sl_pct, tsl_pct = LIVE_PARAMS['sl']/100.0, LIVE_PARAMS['tsl']/100.0
-    
+    while not TRACKER_READY: time.sleep(1)
+        
     while True:
         time.sleep(60)
         for sym in CRYPTO_CHOICES.keys():
+            tracker = LIVE_TRACKER.get(sym)
+            if not tracker: continue
+            
+            params = tracker['params']
+            f_pct, g_pct, u_pct = params['f']/100.0, params['g']/100.0, params['u']/100.0
+            sl_pct, tsl_pct = params['sl']/100.0, params['tsl']/100.0
+            
             try:
-                ohlcv_1m = exchange.fetch_ohlcv(sym, '1m', limit=2)
+                # Fetch only the last 2 candles: [Closed Hour, Active Hour]
                 ohlcv_1h = exchange.fetch_ohlcv(sym, '1h', limit=2)
-                if not ohlcv_1m or not ohlcv_1h: continue
+                ohlcv_1m = exchange.fetch_ohlcv(sym, '1m', limit=2)
+                if not ohlcv_1h or not ohlcv_1m: continue
                 
-                last_closed_1m, curr_open_1h, last_closed_1h = ohlcv_1m[-2], ohlcv_1h[-1], ohlcv_1h[-2]
-                tracker = LIVE_TRACKER.get(sym)
-                if not tracker: continue
+                last_closed_1h, curr_open_1h = ohlcv_1h[-2], ohlcv_1h[-1]
+                last_closed_1m = ohlcv_1m[-2]
                 
                 tracker['current_price'] = last_closed_1m[4] 
                 
-                # 1. HOUR ROLLOVER
+                # --- HOUR ROLLOVER ---
                 if last_closed_1h[0] > tracker['last_processed_hour']:
-                    pnl_pct = 0.0
-                    if tracker['position'] == 1: pnl_pct = (last_closed_1h[4] - tracker['entry_price']) / tracker['entry_price']
-                    elif tracker['position'] == -1: pnl_pct = (tracker['entry_price'] - last_closed_1h[4]) / tracker['entry_price']
-                        
                     if tracker['position'] != 0:
+                        pnl_pct = (last_closed_1h[4] - tracker['entry_price'])/tracker['entry_price'] if tracker['position'] == 1 else (tracker['entry_price'] - last_closed_1h[4])/tracker['entry_price']
                         tracker['pnl_since_inception'] += pnl_pct
                         tracker['status'] = "CLOSED EOH"
                         if pnl_pct < u_pct: tracker['low_profit_count'] += 1
@@ -168,7 +266,7 @@ def live_tracker_loop():
                     tracker['last_processed_minute'] = last_closed_1m[0]
                     continue
                     
-                # 2. 1-MINUTE INTRABAR CHECKS
+                # --- 1-MINUTE INTRABAR CHECKS ---
                 if last_closed_1m[0] > tracker['last_processed_minute'] and tracker['position'] != 0:
                     m_h, m_l, pos = last_closed_1m[2], last_closed_1m[3], tracker['position']
                     if pos == 1:
@@ -190,7 +288,7 @@ def live_tracker_loop():
             except Exception: pass
 
 # ==========================================
-# 1. BACKTEST DATA FETCHING
+# 2. BACKTEST ENGINE (Accurate 1m)
 # ==========================================
 def fetch_binance_data_accurate(symbol, days):
     print(f"\nFetching 1h & 1m backtest data for {symbol}...")
@@ -235,9 +333,6 @@ def fetch_binance_data_accurate(symbol, days):
     print("✅ Backtest Data Ready!\n")
     return df_1h
 
-# ==========================================
-# 2. CORE BACKTEST ENGINE (Deep Dive)
-# ==========================================
 def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
     balance = STARTING_BALANCE
     sl_history, tsl_history, position_history, exit_price_history = [False], [False], [0], [0.0]
@@ -318,7 +413,7 @@ def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
     return balance, sl_history, tsl_history, position_history, exit_price_history, state_history, equity_history, all_trades
 
 # ==========================================
-# 3. FAST GA ENGINE 
+# 3. 1m GA ENGINE FOR UI SELECTED ASSET
 # ==========================================
 def fast_ga_backtest(opens, closes, wick_pcts, wick_body_ratios, m1_highs_list, m1_lows_list, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
     balance = 10000.0
@@ -360,14 +455,14 @@ def fast_ga_backtest(opens, closes, wick_pcts, wick_body_ratios, m1_highs_list, 
     return equity
 
 def run_ga_optimization(df):
-    print(f"\n🧬 Starting Genetic Algorithm for {SYMBOL}...")
+    print(f"\n🧬 Starting UI Genetic Algorithm for {SYMBOL}...")
     start_time = time.time()
     opens, closes = df['open'].values, df['close'].values
     wick_pcts, wick_body_ratios = df['wick_pct'].values, df['wick_body_ratio'].values
     m1_highs_list, m1_lows_list = df['m1_highs'].values, df['m1_lows'].values
 
     bounds = np.array([[0.1, 4.0], [50.0, 400.0], [-1.0, 2.0], [0.5, 6.0], [0.5, 6.0]])
-    pop = np.random.uniform(bounds[:, 0], bounds[:, 1], (50, 5))
+    pop = np.random.uniform(bounds[:, 0], bounds[:, 1], (40, 5))
 
     def evaluate(ind):
         equity = fast_ga_backtest(opens, closes, wick_pcts, wick_body_ratios, m1_highs_list, m1_lows_list, ind[3]/100.0, ind[4]/100.0, ind[0]/100.0, ind[1]/100.0, ind[2]/100.0)
@@ -379,12 +474,10 @@ def run_ga_optimization(df):
     for gen in range(10):
         fitness = np.array([evaluate(ind) for ind in pop])
         next_pop = [pop[np.argmax(fitness)], pop[np.argmax(fitness)].copy()]
-        while len(next_pop) < 50:
-            i1, i2 = np.random.choice(50, 2, replace=False)
+        while len(next_pop) < 40:
+            i1, i2 = np.random.choice(40, 2, replace=False)
             p1 = pop[i1] if fitness[i1] > fitness[i2] else pop[i2]
-            i1, i2 = np.random.choice(50, 2, replace=False)
-            p2 = pop[i1] if fitness[i1] > fitness[i2] else pop[i2]
-            child = np.concatenate([p1[:2], p2[2:]]) if np.random.rand() < 0.6 else p1.copy()
+            child = p1.copy()
             for i in range(5):
                 if np.random.rand() < 0.25:
                     child[i] += np.random.normal(0, (bounds[i, 1] - bounds[i, 0]) * 0.1)
@@ -397,6 +490,7 @@ def run_ga_optimization(df):
     print(f"✅ Optimization Finished in {time.time()-start_time:.1f}s!")
     return { 'f': round(best[0], 2), 'g': round(best[1], 2), 'u': round(best[2], 2), 'sl': round(best[3], 2), 'tsl': round(best[4], 2) }
 
+
 # ==========================================
 # 4. WEB VISUALIZATION & REPORTING
 # ==========================================
@@ -405,33 +499,40 @@ def generate_html_report(df, params, final_balance, roi, sharpe, selected_trade)
     for val, label in CRYPTO_CHOICES.items():
         options_html += f'<option value="{val}" {"selected" if val == SYMBOL else ""}>{label}</option>\n'
 
-    # Generate Live Tracker Table Rows
     live_rows = ""
-    for sym, label in CRYPTO_CHOICES.items():
-        tr = LIVE_TRACKER.get(sym)
-        if not tr: continue
-        
-        c_status = "#7f8c8d" 
-        if "LONG" in tr['status']: c_status = "#27ae60"
-        elif "SHORT" in tr['status']: c_status = "#c0392b"
-        elif "STOPPED" in tr['status']: c_status = "#8e44ad"
-        
-        c_pnl = "green" if tr['pnl_since_inception'] >= 0 else "red"
-        e_str = f"${tr['entry_price']:.5g}" if tr['position'] != 0 else "-"
-        sl_str = f"${tr['current_sl']:.5g}" if tr['position'] != 0 else "-"
-        
-        live_rows += f"""
-        <tr>
-            <td style="font-weight:bold;">{sym.replace('/USDT', '')}</td>
-            <td style="color: {c_status}; font-weight: bold;">{tr['status']}</td>
-            <td>${tr['current_price']:.5g}</td>
-            <td>{e_str}</td>
-            <td>{sl_str}</td>
-            <td style="color: {c_pnl}; font-weight: bold;">{tr['pnl_since_inception']*100:.2f}%</td>
-        </tr>
-        """
+    if not TRACKER_READY:
+        live_rows = "<tr><td colspan='7' style='padding:20px; font-weight:bold; color:#e67e22;'>⚙️ Running Background Mass GA Optimization on all 16 assets... Refresh page in ~15 seconds.</td></tr>"
+    else:
+        for sym, label in CRYPTO_CHOICES.items():
+            tr = LIVE_TRACKER.get(sym)
+            if not tr: continue
+            
+            c_status = "#7f8c8d" 
+            if "LONG" in tr['status']: c_status = "#27ae60"
+            elif "SHORT" in tr['status']: c_status = "#c0392b"
+            elif "STOPPED" in tr['status']: c_status = "#8e44ad"
+            
+            c_pnl = "green" if tr['pnl_since_inception'] >= 0 else "red"
+            e_str = f"${tr['entry_price']:.5g}" if tr['position'] != 0 else "-"
+            sl_str = f"${tr['current_sl']:.5g}" if tr['position'] != 0 else "-"
+            
+            # Format params display
+            p = tr['params']
+            p_str = f"f:{p['f']}% | g:{p['g']}% | u:{p['u']}% | sl:{p['sl']}% | c:{p['tsl']}%"
+            
+            live_rows += f"""
+            <tr>
+                <td style="font-weight:bold; background:#e8ecf1;">{sym.replace('/USDT', '')}</td>
+                <td style="color: {c_status}; font-weight: bold;">{tr['status']}</td>
+                <td>${tr['current_price']:.5g}</td>
+                <td>{e_str}</td>
+                <td>{sl_str}</td>
+                <td style="color: {c_pnl}; font-weight: bold; background:#f4f9f4;">{tr['pnl_since_inception']*100:.2f}%</td>
+                <td style="font-size: 11px; color: #7f8c8d;">{p_str}</td>
+            </tr>
+            """
 
-    # === CHART 1: 48H MACRO VIEW ===
+    # --- CHART 1: 48H MACRO VIEW ---
     plt.figure(figsize=(16, 10))
     df_2d = df.tail(48).copy()
     
@@ -467,9 +568,8 @@ def generate_html_report(df, params, final_balance, roi, sharpe, selected_trade)
     buf1 = io.BytesIO(); plt.savefig(buf1, format='png', dpi=100); buf1.seek(0); plt.close()
     img_48h = base64.b64encode(buf1.read()).decode('utf-8')
     
-    # === CHART 2: RANDOM TRADE DEEP DIVE (1m Intrabar) ===
+    # --- CHART 2: RANDOM TRADE DEEP DIVE ---
     img_trade, trade_text = "", f"<p style='color: #7f8c8d;'>No trades occurred with these parameters for {SYMBOL}.</p>"
-    
     if selected_trade and len(selected_trade['m1_ts']) > 0:
         plt.figure(figsize=(16, 6))
         
@@ -527,11 +627,11 @@ def generate_html_report(df, params, final_balance, roi, sharpe, selected_trade)
         <title>Algorithmic Strategy Backtest & Live Tracker</title>
         <style>
             body {{ font-family: Arial, sans-serif; background-color: #f4f4f9; color: #333; text-align: center; padding: 20px; }}
-            .live-tracker {{ background: #fff; border-radius: 8px; padding: 20px; margin: 0 auto 30px; width: 85%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+            .live-tracker {{ background: #fff; border-radius: 8px; padding: 20px; margin: 0 auto 30px; width: 90%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
             .live-tracker table {{ width: 100%; border-collapse: collapse; }}
-            .live-tracker th, .live-tracker td {{ padding: 10px; border-bottom: 1px solid #ddd; text-align: center; }}
+            .live-tracker th, .live-tracker td {{ padding: 12px 10px; border-bottom: 1px solid #ddd; text-align: center; }}
             .live-tracker th {{ background-color: #2c3e50; color: white; }}
-            .form-container {{ background: #2c3e50; color: white; border-radius: 8px; padding: 20px; margin: 0 auto 20px; width: 85%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+            .form-container {{ background: #2c3e50; color: white; border-radius: 8px; padding: 20px; margin: 0 auto 20px; width: 90%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
             .form-container input, .form-container select {{ margin: 0 5px; padding: 5px; text-align: center; border-radius: 4px; border: none; font-size: 15px;}}
             .form-container input {{ width: 60px; }}
             .form-container select {{ width: 220px; font-weight: bold; cursor: pointer; }}
@@ -541,30 +641,30 @@ def generate_html_report(df, params, final_balance, roi, sharpe, selected_trade)
             .btn-shuffle:hover {{ background-color: #2980b9; }}
             .btn-opt {{ padding: 10px; background-color: #f39c12; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 16px; margin: 15px 5px; width: 180px;}}
             .btn-opt:hover {{ background-color: #e67e22; }}
-            .stats-container {{ background: #fff; border-radius: 8px; padding: 20px; margin: 0 auto 20px; width: 85%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); display: flex; justify-content: space-around; }}
+            .stats-container {{ background: #fff; border-radius: 8px; padding: 20px; margin: 0 auto 20px; width: 90%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); display: flex; justify-content: space-around; }}
             .stat-box {{ margin: 0 10px; }}
             h1, h2 {{ color: #2c3e50; margin-bottom: 5px;}}
             p.subtitle {{ color: #7f8c8d; margin-top: 0; margin-bottom: 20px; }}
             .value {{ font-size: 22px; font-weight: bold; color: #2980b9; margin-top: 5px; }}
-            .chart-container {{ margin: 0 auto 40px; width: 85%; }}
+            .chart-container {{ margin: 0 auto 40px; width: 90%; }}
             .chart-container img {{ width: 100%; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);}}
             .input-group {{ display: inline-block; margin: 5px 15px; text-align: right;}}
         </style>
     </head>
     <body>
         <h1>Advanced Hourly Reversal Engine</h1>
-        <p class="subtitle">1m Intrabar Accuracy | Genetic Optimizer | Deep Dive | Live Tracker</p>
+        <p class="subtitle">1m Intrabar Accuracy | Genetic Optimizer | Live Tracker</p>
         
         <!-- Live Tracker -->
         <div class="live-tracker">
             <h2>🔴 Live Market Signals</h2>
             <table>
                 <tr>
-                    <th>Asset</th><th>Status</th><th>Current Price</th><th>Entry Price</th><th>Active Stop Loss</th><th>PnL Since Inception</th>
+                    <th>Asset</th><th>Status</th><th>Current Price</th><th>Entry Price</th><th>Active Stop Loss</th><th>PnL Since Inception</th><th>GA Optimized Params</th>
                 </tr>
                 {live_rows}
             </table>
-            <p style="font-size: 12px; color: #7f8c8d; margin-top:15px;">* Data updates internally every 60s. Press F5 / Manual Reload to see latest updates.</p>
+            <p style="font-size: 13px; color: #7f8c8d; margin-top:15px; font-weight:bold;">* Press F5 / Manual Reload to check the live status of all assets.</p>
         </div>
         
         <!-- Backtest Form -->
@@ -596,10 +696,10 @@ def generate_html_report(df, params, final_balance, roi, sharpe, selected_trade)
         
         <div class="chart-container"><img src="data:image/png;base64,{img_48h}"></div>
         
-        <hr style="width: 85%; border: 1px solid #ccc; margin: 40px auto;">
+        <hr style="width: 90%; border: 1px solid #ccc; margin: 40px auto;">
         
         <h2>🔍 Random Trade Deep Dive ({SYMBOL})</h2>
-        <div style="width: 85%; margin: 0 auto 20px;">{trade_text}</div>
+        <div style="width: 90%; margin: 0 auto 20px;">{trade_text}</div>
         {f'<div class="chart-container"><img src="data:image/png;base64,{img_trade}"></div>' if img_trade else ''}
         
     </body>
@@ -652,15 +752,14 @@ class BacktestServer(http.server.BaseHTTPRequestHandler):
         self.wfile.write(execute_run(params).encode('utf-8'))
 
 if __name__ == "__main__":
-    # 1. Start background live tracker initialization and daemon thread
-    init_live_tracker()
+    init_thread = threading.Thread(target=init_live_tracker, daemon=True)
+    init_thread.start()
+    
     tracker_thread = threading.Thread(target=live_tracker_loop, daemon=True)
     tracker_thread.start()
     
-    # 2. Fetch default backtest asset (BTC)
     GLOBAL_DF = fetch_binance_data_accurate(SYMBOL, DAYS_BACK)
     
-    # 3. Start Web Server
     handler = BacktestServer
     with socketserver.TCPServer(("", PORT), handler) as httpd:
         print(f"🌐 Web server running! Open browser to: http://{get_local_ip()}:{PORT}  (or localhost:{PORT})")
