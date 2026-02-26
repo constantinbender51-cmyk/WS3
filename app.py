@@ -24,7 +24,6 @@ PORT = 8000
 GLOBAL_DF = None
 
 def get_local_ip():
-    """Helper to find the local IP address."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(('10.255.255.255', 1))
@@ -43,94 +42,125 @@ def fetch_binance_data(symbol, timeframe, days):
     
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    
+    # Pre-calculate Wick and Body metrics for State 1 conditions
+    df['body'] = abs(df['close'] - df['open'])
+    df['top_wick'] = df['high'] - df[['open', 'close']].max(axis=1)
+    df['bot_wick'] = df[['open', 'close']].min(axis=1) - df['low']
+    df['max_wick'] = df[['top_wick', 'bot_wick']].max(axis=1)
+    
+    df['wick_pct'] = df['max_wick'] / df['open']
+    # If body is 0, wick/body ratio is infinity
+    df['wick_body_ratio'] = np.where(df['body'] == 0, np.inf, df['max_wick'] / df['body'])
+    
     return df
 
-def run_backtest(df, sl_pct, tsl_pct):
-    """
-    Runs backtest where EVERY HOUR is a new, independent 100% exposure trade.
-    Incorporates Initial Stop Loss and Trailing Stop Loss (c%).
-    """
+def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
     balance = STARTING_BALANCE
     
-    # History tracking arrays (pad the first index since we use it to look back)
     sl_history = [False]  
     tsl_history = [False]
     position_history = [0] 
     exit_price_history = [0.0]
+    state_history = [2]
+    
+    state = 2
+    low_profit_count = 0
     
     for i in range(1, len(df)):
         current = df.iloc[i]
         prev = df.iloc[i-1]
         
-        # --- 1. DETERMINE DIRECTION ---
-        position = 1 if prev['close'] >= prev['open'] else -1
-        
-        # --- 2. SETUP VARIABLES ---
-        entry_price = current['open']
-        sl_price = entry_price * (1 - sl_pct) if position == 1 else entry_price * (1 + sl_pct)
-        
-        sl_hit = False
-        tsl_hit = False
-        exit_price = current['close'] # Default exit is the close of the hour
-        pnl_pct = 0.0
-        
-        # --- 3. EVALUATE LONG POSITION ---
-        if position == 1:
-            # Check Initial SL (Conservative: Assume worst case if low hits SL)
-            if current['low'] <= sl_price:
-                sl_hit = True
-                exit_price = sl_price
-                pnl_pct = -sl_pct
-            else:
-                # Check Trailing SL Activation (Did it reach c% profit?)
-                activation_price = entry_price * (1 + tsl_pct)
-                if current['high'] >= activation_price:
-                    trailing_sl = current['high'] * (1 - tsl_pct)
-                    # Because it must travel from High -> Close, if close is lower than TSL, it hit it
-                    if current['close'] <= trailing_sl:
-                        tsl_hit = True
-                        exit_price = trailing_sl
-                        pnl_pct = (exit_price - entry_price) / entry_price
+        # --- 1. STATE TRANSITIONS ---
+        # Trigger State 1: Wick > f% OR Wick/Body > g%
+        if prev['wick_pct'] > f_pct or prev['wick_body_ratio'] > g_pct:
+            state = 1
+            low_profit_count = 0  # Reset counter when newly triggered
+            
+        # Trigger State 2: 3 consecutive hours of profit < u%
+        elif low_profit_count >= 3:
+            state = 2
+            
+        # --- 2. EXECUTE BASED ON STATE ---
+        if state == 2:
+            # No trades taken in State 2
+            sl_history.append(False)
+            tsl_history.append(False)
+            position_history.append(0)
+            exit_price_history.append(current['close'])
+            state_history.append(2)
+            continue
+            
+        if state == 1:
+            # Green prev candle -> Long (1), Red prev candle -> Short (-1)
+            position = 1 if prev['close'] >= prev['open'] else -1
+            
+            entry_price = current['open']
+            sl_price = entry_price * (1 - sl_pct) if position == 1 else entry_price * (1 + sl_pct)
+            
+            sl_hit = False
+            tsl_hit = False
+            exit_price = current['close']
+            pnl_pct = 0.0
+            
+            # --- EVALUATE LONG POSITION ---
+            if position == 1:
+                if current['low'] <= sl_price:
+                    sl_hit = True
+                    exit_price = sl_price
+                    pnl_pct = -sl_pct
+                else:
+                    activation_price = entry_price * (1 + tsl_pct)
+                    if current['high'] >= activation_price:
+                        trailing_sl = current['high'] * (1 - tsl_pct)
+                        if current['close'] <= trailing_sl:
+                            tsl_hit = True
+                            exit_price = trailing_sl
+                            pnl_pct = (exit_price - entry_price) / entry_price
+                        else:
+                            pnl_pct = (current['close'] - entry_price) / entry_price
                     else:
                         pnl_pct = (current['close'] - entry_price) / entry_price
-                else:
-                    pnl_pct = (current['close'] - entry_price) / entry_price
 
-        # --- 4. EVALUATE SHORT POSITION ---
-        elif position == -1:
-            # Check Initial SL
-            if current['high'] >= sl_price:
-                sl_hit = True
-                exit_price = sl_price
-                pnl_pct = -sl_pct
-            else:
-                # Check Trailing SL Activation
-                activation_price = entry_price * (1 - tsl_pct)
-                if current['low'] <= activation_price:
-                    trailing_sl = current['low'] * (1 + tsl_pct)
-                    # Because it must travel from Low -> Close, if close is higher than TSL, it hit it
-                    if current['close'] >= trailing_sl:
-                        tsl_hit = True
-                        exit_price = trailing_sl
-                        pnl_pct = (entry_price - exit_price) / entry_price
+            # --- EVALUATE SHORT POSITION ---
+            elif position == -1:
+                if current['high'] >= sl_price:
+                    sl_hit = True
+                    exit_price = sl_price
+                    pnl_pct = -sl_pct
+                else:
+                    activation_price = entry_price * (1 - tsl_pct)
+                    if current['low'] <= activation_price:
+                        trailing_sl = current['low'] * (1 + tsl_pct)
+                        if current['close'] >= trailing_sl:
+                            tsl_hit = True
+                            exit_price = trailing_sl
+                            pnl_pct = (entry_price - exit_price) / entry_price
+                        else:
+                            pnl_pct = (entry_price - current['close']) / entry_price
                     else:
                         pnl_pct = (entry_price - current['close']) / entry_price
-                else:
-                    pnl_pct = (entry_price - current['close']) / entry_price
+                    
+            # --- UPDATE STATE 2 TRIGGERS ---
+            if pnl_pct < u_pct:
+                low_profit_count += 1
+            else:
+                low_profit_count = 0
+                    
+            # Update Balance
+            balance *= (1 + pnl_pct) 
                 
-        # Update Balance
-        balance *= (1 + pnl_pct) 
-            
-        sl_history.append(sl_hit)
-        tsl_history.append(tsl_hit)
-        position_history.append(position)
-        exit_price_history.append(exit_price)
+            sl_history.append(sl_hit)
+            tsl_history.append(tsl_hit)
+            position_history.append(position)
+            exit_price_history.append(exit_price)
+            state_history.append(1)
                 
-    return balance, sl_history, tsl_history, position_history, exit_price_history
+    return balance, sl_history, tsl_history, position_history, exit_price_history, state_history
 
-def generate_html_report(df, sl_pct, tsl_pct, final_balance, roi):
-    print(f"Generating chart for web display (Initial SL: {sl_pct*100}%, Trailing: {tsl_pct*100}%)...")
-    plt.figure(figsize=(16, 8))
+def generate_html_report(df, params, final_balance, roi):
+    print(f"Generating chart for web display...")
+    plt.figure(figsize=(16, 9))
     ax1 = plt.subplot(1, 1, 1)
     
     # Filter to only the last 48 hours (2 Days)
@@ -147,12 +177,13 @@ def generate_html_report(df, sl_pct, tsl_pct, final_balance, roi):
     ax1.bar(down['timestamp'], down['open'] - down['close'], bottom=down['close'], color='red', width=width, zorder=3)
     ax1.vlines(down['timestamp'], down['low'], down['high'], color='red', linewidth=1, zorder=3)
 
-    # Plot Background Position Shading
+    # Plot Background Position Shading (Only active in State 1)
     y_max = df_2d['high'].max() * 1.01
     y_min = df_2d['low'].min() * 0.99
     
-    ax1.fill_between(df_2d['timestamp'], y_max, y_min, where=(df_2d['position'] == 1), color='green', alpha=0.15, label='Long Trade', zorder=1)
-    ax1.fill_between(df_2d['timestamp'], y_max, y_min, where=(df_2d['position'] == -1), color='red', alpha=0.15, label='Short Trade', zorder=1)
+    ax1.fill_between(df_2d['timestamp'], y_max, y_min, where=(df_2d['position'] == 1), color='green', alpha=0.15, label='State 1: Long', zorder=1)
+    ax1.fill_between(df_2d['timestamp'], y_max, y_min, where=(df_2d['position'] == -1), color='red', alpha=0.15, label='State 1: Short', zorder=1)
+    ax1.fill_between(df_2d['timestamp'], y_max, y_min, where=(df_2d['state'] == 2), color='gray', alpha=0.10, label='State 2: Flat', zorder=1)
 
     # Plot Initial Stop Loss Hits
     sl_data = df_2d[df_2d['sl_hit'] == True]
@@ -166,7 +197,7 @@ def generate_html_report(df, sl_pct, tsl_pct, final_balance, roi):
 
     ax1.set_ylim(y_min, y_max)
     ax1.set_xlim(df_2d['timestamp'].min() - pd.Timedelta(hours=1), df_2d['timestamp'].max() + pd.Timedelta(hours=1))
-    ax1.set_title(f'LAST 48 HOURS: Hourly Trades ({SYMBOL} | Initial SL: {sl_pct*100:.1f}% | Trailing c: {tsl_pct*100:.1f}%)')
+    ax1.set_title(f"LAST 48 HOURS ({SYMBOL}) | f: {params['f']}% | g: {params['g']}% | u: {params['u']}%")
     ax1.legend(loc='upper left')
     ax1.grid(True, alpha=0.3, zorder=0)
     ax1.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
@@ -187,31 +218,32 @@ def generate_html_report(df, sl_pct, tsl_pct, final_balance, roi):
         <title>Hourly Reversal Backtest</title>
         <style>
             body {{ font-family: Arial, sans-serif; background-color: #f4f4f9; color: #333; text-align: center; padding: 20px; }}
-            .form-container {{ background: #2c3e50; color: white; border-radius: 8px; padding: 20px; margin: 0 auto 20px; width: 70%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
-            .form-container input {{ margin: 0 10px; padding: 5px; width: 70px; text-align: center; border-radius: 4px; border: none; font-size: 16px;}}
-            .form-container button {{ padding: 8px 15px; background-color: #27ae60; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 16px; margin-left: 20px;}}
+            .form-container {{ background: #2c3e50; color: white; border-radius: 8px; padding: 20px; margin: 0 auto 20px; width: 85%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+            .form-container input {{ margin: 0 5px; padding: 5px; width: 60px; text-align: center; border-radius: 4px; border: none; font-size: 15px;}}
+            .form-container button {{ padding: 8px 15px; background-color: #27ae60; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 16px; margin-top: 15px; width: 200px;}}
             .form-container button:hover {{ background-color: #219150; }}
-            .stats-container {{ background: #fff; border-radius: 8px; padding: 20px; margin: 0 auto 20px; width: 80%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); display: flex; justify-content: space-around; }}
+            .stats-container {{ background: #fff; border-radius: 8px; padding: 20px; margin: 0 auto 20px; width: 85%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); display: flex; justify-content: space-around; }}
             .stat-box {{ margin: 0 10px; }}
             h1 {{ color: #2c3e50; margin-bottom: 5px;}}
             p.subtitle {{ color: #7f8c8d; margin-top: 0; margin-bottom: 20px; }}
             .value {{ font-size: 22px; font-weight: bold; color: #2980b9; margin-top: 5px; }}
             .chart-container img {{ max-width: 100%; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 30px;}}
+            .input-group {{ display: inline-block; margin: 5px 15px; text-align: right;}}
         </style>
     </head>
     <body>
-        <h1>Per-Hour Independent Trades ({SYMBOL})</h1>
-        <p class="subtitle">100% Exposure | Fresh Position Every Hour</p>
+        <h1>Advanced Hourly Reversal ({SYMBOL})</h1>
+        <p class="subtitle">State 1/2 Logic | 100% Exposure</p>
         
         <div class="form-container">
             <form method="POST">
-                <label>Initial Stop Loss: 
-                    <input type="number" step="0.1" name="sl_pct" value="{sl_pct*100}"> %
-                </label>
-                &nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;
-                <label>Trailing Activation & Distance (c): 
-                    <input type="number" step="0.1" name="tsl_pct" value="{tsl_pct*100}"> %
-                </label>
+                <div class="input-group"><label>Wick Size > (f): <input type="number" step="0.1" name="f" value="{params['f']}"> %</label></div>
+                <div class="input-group"><label>Wick/Body > (g): <input type="number" step="1" name="g" value="{params['g']}"> %</label></div>
+                <div class="input-group"><label>Profit Threshold (u): <input type="number" step="0.1" name="u" value="{params['u']}"> %</label></div>
+                <br>
+                <div class="input-group"><label>Initial SL: <input type="number" step="0.1" name="sl" value="{params['sl']}"> %</label></div>
+                <div class="input-group"><label>Trailing Act/Dist (c): <input type="number" step="0.1" name="tsl" value="{params['tsl']}"> %</label></div>
+                <br>
                 <button type="submit">Run Backtest</button>
             </form>
         </div>
@@ -230,28 +262,41 @@ def generate_html_report(df, sl_pct, tsl_pct, final_balance, roi):
     """
     return html
 
-def execute_run(sl_pct_input, tsl_pct_input):
-    """Helper function to run the backtest and return the HTML."""
+def execute_run(params):
     df_run = GLOBAL_DF.copy()
     
-    sl_pct_decimal = sl_pct_input / 100.0
-    tsl_pct_decimal = tsl_pct_input / 100.0
+    # Convert form percentages to decimals
+    sl_pct = params['sl'] / 100.0
+    tsl_pct = params['tsl'] / 100.0
+    f_pct = params['f'] / 100.0
+    g_pct = params['g'] / 100.0
+    u_pct = params['u'] / 100.0
     
-    final_balance, sls, tsls, positions, exit_prices = run_backtest(df_run, sl_pct_decimal, tsl_pct_decimal)
+    final_balance, sls, tsls, positions, exit_prices, states = run_backtest(
+        df_run, sl_pct, tsl_pct, f_pct, g_pct, u_pct
+    )
     
     df_run['sl_hit'] = sls
     df_run['tsl_hit'] = tsls
     df_run['position'] = positions
     df_run['exit_price'] = exit_prices
+    df_run['state'] = states
     
     roi = ((final_balance - STARTING_BALANCE) / STARTING_BALANCE) * 100
     
-    return generate_html_report(df_run, sl_pct_decimal, tsl_pct_decimal, final_balance, roi)
+    return generate_html_report(df_run, params, final_balance, roi)
 
 class BacktestServer(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        # Default parameters when you open the page (Initial SL: 2.0%, Trailing C: 2.0%)
-        html_content = execute_run(sl_pct_input=2.0, tsl_pct_input=2.0)
+        # Default Parameters
+        default_params = {
+            'f': 1.0,   # Wick is > 1% of price
+            'g': 150.0, # Wick is > 1.5x the body
+            'u': 0.5,   # State 2 triggers if profit < 0.5% for 3 hrs
+            'sl': 2.0,  # 2% Initial SL
+            'tsl': 2.0  # 2% Trailing SL
+        }
+        html_content = execute_run(default_params)
         
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
@@ -264,10 +309,15 @@ class BacktestServer(http.server.BaseHTTPRequestHandler):
         parsed_data = urllib.parse.parse_qs(post_data)
 
         # Get inputs from form
-        sl_pct_input = float(parsed_data.get('sl_pct', ['2.0'])[0])
-        tsl_pct_input = float(parsed_data.get('tsl_pct', ['2.0'])[0])
+        params = {
+            'f': float(parsed_data.get('f', ['1.0'])[0]),
+            'g': float(parsed_data.get('g', ['150.0'])[0]),
+            'u': float(parsed_data.get('u', ['0.5'])[0]),
+            'sl': float(parsed_data.get('sl', ['2.0'])[0]),
+            'tsl': float(parsed_data.get('tsl', ['2.0'])[0]),
+        }
         
-        html_content = execute_run(sl_pct_input, tsl_pct_input)
+        html_content = execute_run(params)
         
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
@@ -275,10 +325,8 @@ class BacktestServer(http.server.BaseHTTPRequestHandler):
         self.wfile.write(html_content.encode('utf-8'))
 
 if __name__ == "__main__":
-    # 1. Fetch Data ONCE at startup
     GLOBAL_DF = fetch_binance_data(SYMBOL, TIMEFRAME, DAYS_BACK)
     
-    # 2. Start HTTP Server
     local_ip = get_local_ip()
     handler = BacktestServer
     with socketserver.TCPServer(("", PORT), handler) as httpd:
