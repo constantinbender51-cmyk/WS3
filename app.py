@@ -16,13 +16,33 @@ import time
 import random
 
 # --- Configuration ---
-SYMBOL = 'PEPE/USDT'     
+SYMBOL = 'BTC/USDT'  # Default starting symbol
 TIMEFRAME = '1h'
 DAYS_BACK = 30           
 STARTING_BALANCE = 10000
 PORT = 8000
 
-# Global variable to hold market data so we only fetch it once
+# Available Cryptocurrencies for Dropdown
+CRYPTO_CHOICES = {
+    'BTC/USDT': '#1 Bitcoin (BTC)',
+    'ETH/USDT': '#2 Ethereum (ETH)',
+    'XRP/USDT': '#5 XRP (XRP)',
+    'SOL/USDT': '#6 Solana (SOL)',
+    'DOGE/USDT': '#9 Dogecoin (DOGE)',
+    'ADA/USDT': '#10 Cardano (ADA)',
+    'BCH/USDT': '#11 Bitcoin Cash (BCH)',
+    'LINK/USDT': '#13 Chainlink (LINK)',
+    'XLM/USDT': '#15 Stellar (XLM)',
+    'SUI/USDT': '#19 Sui (SUI)',
+    'AVAX/USDT': '#22 Avalanche (AVAX)',
+    'LTC/USDT': '#23 Litecoin (LTC)',
+    'HBAR/USDT': '#24 Hedera (HBAR)',
+    'SHIB/USDT': '#25 Shiba Inu (SHIB)',
+    'TON/USDT': '#28 Toncoin (TON)',
+    'PEPE/USDT': 'Pepe (PEPE)'
+}
+
+# Global variable to hold market data so we only fetch it once per symbol
 GLOBAL_DF = None
 
 def get_local_ip():
@@ -37,7 +57,9 @@ def get_local_ip():
     return IP
 
 def fetch_binance_data_accurate(symbol, days):
-    print(f"Fetching 1h data for {symbol}...")
+    print(f"\n==========================================")
+    print(f"Fetching 1h & 1m data for {symbol}...")
+    print(f"==========================================")
     exchange = ccxt.binance({'enableRateLimit': True})
     since_ms = int((datetime.utcnow() - timedelta(days=days)).timestamp() * 1000)
     
@@ -56,7 +78,7 @@ def fetch_binance_data_accurate(symbol, days):
     df_1h['wick_body_ratio'] = np.where(df_1h['body'] == 0, np.inf, df_1h['max_wick'] / df_1h['body'])
 
     # 2. Fetch 1m Data
-    print(f"Fetching 1m intraday data to accurately trace price paths (This takes ~3-5 seconds)...")
+    print(f"Fetching ~43,200 intraday 1m candles for precise Trailing Stops (Takes ~3-5 seconds)...")
     all_1m = []
     current_since = since_ms
     while True:
@@ -90,7 +112,7 @@ def fetch_binance_data_accurate(symbol, days):
     df_1h['m1_highs'] = m1_highs
     df_1h['m1_lows'] = m1_lows
     df_1h['m1_closes'] = m1_closes
-    
+    print("✅ Data Fetch Complete!\n")
     return df_1h
 
 # ==========================================
@@ -104,7 +126,7 @@ def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
     
     state = 2
     low_profit_count = 0
-    all_trades = []  # Store ALL trades for random sampling
+    all_trades = []  
     
     for i in range(1, len(df)):
         current = df.iloc[i]
@@ -226,7 +248,7 @@ def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
     return balance, sl_history, tsl_history, position_history, exit_price_history, state_history, equity_history, all_trades
 
 # ==========================================
-# 2. FAST GA ENGINE (Unchanged for Speed)
+# 2. FAST GA ENGINE 
 # ==========================================
 def fast_ga_backtest(opens, closes, wick_pcts, wick_body_ratios, m1_highs_list, m1_lows_list, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
     balance = 10000.0
@@ -270,7 +292,7 @@ def fast_ga_backtest(opens, closes, wick_pcts, wick_body_ratios, m1_highs_list, 
     return equity
 
 def run_ga_optimization(df):
-    print("\n🧬 Starting Genetic Algorithm...")
+    print(f"\n🧬 Starting Genetic Algorithm for {SYMBOL}...")
     start_time = time.time()
     opens, closes = df['open'].values, df['close'].values
     wick_pcts, wick_body_ratios = df['wick_pct'].values, df['wick_body_ratio'].values
@@ -313,6 +335,12 @@ def run_ga_optimization(df):
 def generate_html_report(df, params, final_balance, roi, sharpe, selected_trade):
     print(f"Generating charts for web display...")
     
+    # Generate Crypto Dropdown HTML
+    options_html = ""
+    for val, label in CRYPTO_CHOICES.items():
+        selected = "selected" if val == SYMBOL else ""
+        options_html += f'<option value="{val}" {selected}>{label}</option>\n'
+
     # === CHART 1: 48H MACRO VIEW ===
     plt.figure(figsize=(16, 10))
     df_2d = df.tail(48).copy()
@@ -352,12 +380,11 @@ def generate_html_report(df, params, final_balance, roi, sharpe, selected_trade)
     
     # === CHART 2: RANDOM TRADE DEEP DIVE (1m Intrabar) ===
     img_trade = ""
-    trade_text = "<p style='color: #7f8c8d;'>No trades occurred with these parameters.</p>"
+    trade_text = f"<p style='color: #7f8c8d;'>No trades occurred with these parameters for {SYMBOL}.</p>"
     
     if selected_trade and len(selected_trade['m1_ts']) > 0:
         plt.figure(figsize=(16, 6))
         
-        # Combine Trigger Hour and Trade Hour 1m data
         all_ts = np.concatenate([selected_trade['prev_m1_ts'], selected_trade['m1_ts'][:selected_trade['exit_idx']+1]])
         all_o = np.concatenate([selected_trade['prev_m1_o'], selected_trade['m1_o'][:selected_trade['exit_idx']+1]])
         all_h = np.concatenate([selected_trade['prev_m1_h'], selected_trade['m1_h'][:selected_trade['exit_idx']+1]])
@@ -366,28 +393,24 @@ def generate_html_report(df, params, final_balance, roi, sharpe, selected_trade)
         
         up = all_c >= all_o
         down = all_c < all_o
+        width = 0.0004 
         
-        width = 0.0004 # 1 min width
         plt.bar(all_ts[up], all_c[up] - all_o[up], bottom=all_o[up], color='green', width=width, zorder=3)
         plt.vlines(all_ts[up], all_l[up], all_h[up], color='green', linewidth=1, zorder=3)
         plt.bar(all_ts[down], all_o[down] - all_c[down], bottom=all_c[down], color='red', width=width, zorder=3)
         plt.vlines(all_ts[down], all_l[down], all_h[down], color='red', linewidth=1, zorder=3)
         
-        # Shade Backgrounds
         plt.axvspan(selected_trade['prev_m1_ts'][0], selected_trade['trade_ts'], color='gray', alpha=0.15, label='Trigger Hour (Evaluating)')
         trade_color = 'green' if selected_trade['direction'] == 'LONG' else 'red'
         plt.axvspan(selected_trade['trade_ts'], all_ts[-1], color=trade_color, alpha=0.15, label=f"Trade Hour ({selected_trade['direction']})")
         
-        # Plot Entry, Initial SL, and Activation
         plt.hlines(selected_trade['entry_price'], selected_trade['trade_ts'], all_ts[-1], color='black', linestyle='-', linewidth=2, label='Entry Price')
         plt.hlines(selected_trade['act_price'], selected_trade['trade_ts'], all_ts[-1], color='blue', linestyle='--', linewidth=1.5, label='TSL Activation Level')
         
-        # Plot Dynamic Trailing SL Curve
         tsl_times = selected_trade['m1_ts'][:selected_trade['exit_idx']+1]
         tsl_vals = selected_trade['rolling_stops'][:selected_trade['exit_idx']+1]
         plt.step(tsl_times, tsl_vals, where='post', color='darkorange', linewidth=2, label='Dynamic Stop Loss')
         
-        # Mark Exit
         exit_marker = 'X' if selected_trade['exit_reason'] == 'Initial SL Hit' else ('o' if 'Trailing' in selected_trade['exit_reason'] else 's')
         exit_color = 'black' if exit_marker == 'X' else 'darkorange'
         plt.scatter(all_ts[-1], selected_trade['exit_price'], color=exit_color, marker=exit_marker, s=200, zorder=5, label=selected_trade['exit_reason'])
@@ -401,7 +424,6 @@ def generate_html_report(df, params, final_balance, roi, sharpe, selected_trade)
         plt.savefig(buf2, format='png', dpi=100); buf2.seek(0); plt.close()
         img_trade = base64.b64encode(buf2.read()).decode('utf-8')
         
-        # Dynamic Text Explanation
         trade_text = f"""
         <div style="text-align: left; background: #eafaf1; padding: 20px; border-left: 5px solid #27ae60; border-radius: 4px; font-size: 16px; line-height: 1.6;">
             <strong>1. THE TRIGGER:</strong> During the hour starting at <code>{selected_trade['trigger_ts']}</code>, the candle closed with a Wick-to-Price ratio of <b>{selected_trade['trigger_w_pct']*100:.2f}%</b> and a Wick-to-Body ratio of <b>{selected_trade['trigger_wb_ratio']*100:.0f}%</b>. Because this exceeded your required parameters (f={selected_trade['f']*100}% or g={selected_trade['g']*100}%), the bot transitioned into <b>State 1</b>.<br><br>
@@ -416,16 +438,17 @@ def generate_html_report(df, params, final_balance, roi, sharpe, selected_trade)
         </div>
         """
 
-    # Generate HTML
     html = f"""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Hourly Reversal Backtest</title>
+        <title>Algorithmic Strategy Backtest</title>
         <style>
             body {{ font-family: Arial, sans-serif; background-color: #f4f4f9; color: #333; text-align: center; padding: 20px; }}
             .form-container {{ background: #2c3e50; color: white; border-radius: 8px; padding: 20px; margin: 0 auto 20px; width: 85%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
-            .form-container input {{ margin: 0 5px; padding: 5px; width: 60px; text-align: center; border-radius: 4px; border: none; font-size: 15px;}}
+            .form-container input, .form-container select {{ margin: 0 5px; padding: 5px; text-align: center; border-radius: 4px; border: none; font-size: 15px;}}
+            .form-container input {{ width: 60px; }}
+            .form-container select {{ width: 220px; font-weight: bold; cursor: pointer; }}
             .btn-run {{ padding: 10px 10px; background-color: #27ae60; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 16px; margin: 15px 5px; width: 180px;}}
             .btn-run:hover {{ background-color: #219150; }}
             .btn-shuffle {{ padding: 10px 10px; background-color: #3498db; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 16px; margin: 15px 5px; width: 180px;}}
@@ -443,11 +466,19 @@ def generate_html_report(df, params, final_balance, roi, sharpe, selected_trade)
         </style>
     </head>
     <body>
-        <h1>Advanced Hourly Reversal ({SYMBOL})</h1>
+        <h1>Advanced Hourly Reversal Engine</h1>
         <p class="subtitle">1m Intrabar Accuracy | Genetic Optimizer | Trade Deep Dive</p>
         
         <div class="form-container">
             <form method="POST">
+                <!-- Cryptocurrency Dropdown -->
+                <div style="margin-bottom: 20px; border-bottom: 1px solid #4a6278; padding-bottom: 15px;">
+                    <label style="font-size: 18px; font-weight: bold; margin-right: 10px;">Select Asset:</label>
+                    <select name="symbol">
+                        {options_html}
+                    </select>
+                </div>
+
                 <div class="input-group"><label>Wick Size > (f): <input type="number" step="0.1" name="f" value="{params['f']}"> %</label></div>
                 <div class="input-group"><label>Wick/Body > (g): <input type="number" step="1" name="g" value="{params['g']}"> %</label></div>
                 <div class="input-group"><label>Profit Threshold (u): <input type="number" step="0.1" name="u" value="{params['u']}"> %</label></div>
@@ -455,7 +486,7 @@ def generate_html_report(df, params, final_balance, roi, sharpe, selected_trade)
                 <div class="input-group"><label>Initial SL: <input type="number" step="0.1" name="sl" value="{params['sl']}"> %</label></div>
                 <div class="input-group"><label>Trailing Act/Dist (c): <input type="number" step="0.1" name="tsl" value="{params['tsl']}"> %</label></div>
                 <br>
-                <button type="submit" name="action" value="run" class="btn-run">Run Backtest</button>
+                <button type="submit" name="action" value="run" class="btn-run">▶️ Run Backtest</button>
                 <button type="submit" name="action" value="shuffle" class="btn-shuffle">🎲 Shuffle Trade</button>
                 <button type="submit" name="action" value="optimize" class="btn-opt">⚡ Optimize GA</button>
             </form>
@@ -474,7 +505,7 @@ def generate_html_report(df, params, final_balance, roi, sharpe, selected_trade)
         
         <hr style="width: 85%; border: 1px solid #ccc; margin: 40px auto;">
         
-        <h2>🔍 Random Trade Deep Dive</h2>
+        <h2>🔍 Random Trade Deep Dive ({SYMBOL})</h2>
         <div style="width: 85%; margin: 0 auto 20px;">
             {trade_text}
         </div>
@@ -498,7 +529,6 @@ def execute_run(params):
     returns = np.diff(equity) / equity[:-1]
     sharpe = (np.mean(returns) / np.std(returns) * np.sqrt(365*24)) if np.std(returns) > 0 else 0
     
-    # Pick a random trade for the deep dive
     selected_trade = random.choice(all_trades) if all_trades else None
     
     return generate_html_report(df_run, params, final_balance, roi, sharpe, selected_trade)
@@ -510,9 +540,17 @@ class BacktestServer(http.server.BaseHTTPRequestHandler):
         self.wfile.write(execute_run(default_params).encode('utf-8'))
 
     def do_POST(self):
+        global SYMBOL, GLOBAL_DF
+        
         length = int(self.headers['Content-Length'])
         parsed = urllib.parse.parse_qs(self.rfile.read(length).decode('utf-8'))
         action = parsed.get('action', ['run'])[0]
+        
+        # Check if user selected a new cryptocurrency
+        req_symbol = parsed.get('symbol', [SYMBOL])[0]
+        if req_symbol != SYMBOL or GLOBAL_DF is None:
+            SYMBOL = req_symbol
+            GLOBAL_DF = fetch_binance_data_accurate(SYMBOL, DAYS_BACK)
         
         if action == 'optimize':
             params = run_ga_optimization(GLOBAL_DF)
@@ -523,15 +561,16 @@ class BacktestServer(http.server.BaseHTTPRequestHandler):
                 'tsl': float(parsed.get('tsl', ['2.0'])[0])
             }
         
-        # Whether 'run' or 'shuffle', it executes the same logic and picks a random trade
         self.send_response(200); self.send_header('Content-type', 'text/html'); self.end_headers()
         self.wfile.write(execute_run(params).encode('utf-8'))
 
 if __name__ == "__main__":
+    # Fetch default asset (BTC) on script startup
     GLOBAL_DF = fetch_binance_data_accurate(SYMBOL, DAYS_BACK)
+    
     handler = BacktestServer
     with socketserver.TCPServer(("", PORT), handler) as httpd:
-        print(f"\n✅ Web server running! Open browser to: http://{get_local_ip()}:{PORT}  (or localhost:{PORT})")
+        print(f"🌐 Web server running! Open browser to: http://{get_local_ip()}:{PORT}  (or localhost:{PORT})")
         print("Press Ctrl+C to stop.")
         try: httpd.serve_forever()
         except KeyboardInterrupt: print("\nShutting down.")
