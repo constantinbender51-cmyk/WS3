@@ -13,6 +13,7 @@ import socketserver
 import urllib.parse
 import socket
 import time
+import random
 
 # --- Configuration ---
 SYMBOL = 'PEPE/USDT'     
@@ -103,7 +104,7 @@ def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
     
     state = 2
     low_profit_count = 0
-    first_trade = None  # Will store the deep dive info for the very first trade
+    all_trades = []  # Store ALL trades for random sampling
     
     for i in range(1, len(df)):
         current = df.iloc[i]
@@ -135,6 +136,8 @@ def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
         rolling_stops = []
         exit_idx = len(m1_h) - 1
         exit_reason = "End of Hour"
+        initial_sl = entry_price
+        act_price = entry_price
         
         if len(m1_h) == 0:
             pnl_pct = (current['close'] - entry_price) / entry_price if position == 1 else (entry_price - current['close']) / entry_price
@@ -204,12 +207,10 @@ def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
         sl_history.append(sl_hit); tsl_history.append(tsl_hit); position_history.append(position)
         exit_price_history.append(exit_price); state_history.append(1); equity_history.append(balance)
         
-        # --- Capture First Trade Details ---
-        if first_trade is None and position != 0:
-            # Pad rolling stops to match m1 length if exited early
-            rolling_stops += [rolling_stops[-1]] * (len(m1_h) - len(rolling_stops)) if rolling_stops else []
-            
-            first_trade = {
+        # --- Capture Trade Details for deep dive ---
+        if position != 0:
+            rolling_stops_padded = rolling_stops + [rolling_stops[-1]] * (len(m1_h) - len(rolling_stops)) if rolling_stops else []
+            all_trades.append({
                 'trigger_ts': prev['timestamp'], 'trade_ts': current['timestamp'],
                 'trigger_w_pct': prev['wick_pct'], 'trigger_wb_ratio': prev['wick_body_ratio'],
                 'f': f_pct, 'g': g_pct, 'prev_color': 'Green' if prev['close'] >= prev['open'] else 'Red',
@@ -219,10 +220,10 @@ def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
                 'pnl_pct': pnl_pct,
                 'prev_m1_ts': prev['m1_ts'], 'prev_m1_o': prev['m1_opens'], 'prev_m1_h': prev['m1_highs'], 'prev_m1_l': prev['m1_lows'], 'prev_m1_c': prev['m1_closes'],
                 'm1_ts': current['m1_ts'], 'm1_o': current['m1_opens'], 'm1_h': current['m1_highs'], 'm1_l': current['m1_lows'], 'm1_c': current['m1_closes'],
-                'rolling_stops': rolling_stops
-            }
+                'rolling_stops': rolling_stops_padded
+            })
                 
-    return balance, sl_history, tsl_history, position_history, exit_price_history, state_history, equity_history, first_trade
+    return balance, sl_history, tsl_history, position_history, exit_price_history, state_history, equity_history, all_trades
 
 # ==========================================
 # 2. FAST GA ENGINE (Unchanged for Speed)
@@ -309,7 +310,7 @@ def run_ga_optimization(df):
 # ==========================================
 # 3. WEB VISUALIZATION & REPORTING
 # ==========================================
-def generate_html_report(df, params, final_balance, roi, sharpe, first_trade):
+def generate_html_report(df, params, final_balance, roi, sharpe, selected_trade):
     print(f"Generating charts for web display...")
     
     # === CHART 1: 48H MACRO VIEW ===
@@ -349,19 +350,19 @@ def generate_html_report(df, params, final_balance, roi, sharpe, first_trade):
     plt.savefig(buf1, format='png', dpi=100); buf1.seek(0); plt.close()
     img_48h = base64.b64encode(buf1.read()).decode('utf-8')
     
-    # === CHART 2: TRADE #1 DEEP DIVE (1m Intrabar) ===
-    img_trade1 = ""
+    # === CHART 2: RANDOM TRADE DEEP DIVE (1m Intrabar) ===
+    img_trade = ""
     trade_text = "<p style='color: #7f8c8d;'>No trades occurred with these parameters.</p>"
     
-    if first_trade and len(first_trade['m1_ts']) > 0:
+    if selected_trade and len(selected_trade['m1_ts']) > 0:
         plt.figure(figsize=(16, 6))
         
         # Combine Trigger Hour and Trade Hour 1m data
-        all_ts = np.concatenate([first_trade['prev_m1_ts'], first_trade['m1_ts'][:first_trade['exit_idx']+1]])
-        all_o = np.concatenate([first_trade['prev_m1_o'], first_trade['m1_o'][:first_trade['exit_idx']+1]])
-        all_h = np.concatenate([first_trade['prev_m1_h'], first_trade['m1_h'][:first_trade['exit_idx']+1]])
-        all_l = np.concatenate([first_trade['prev_m1_l'], first_trade['m1_l'][:first_trade['exit_idx']+1]])
-        all_c = np.concatenate([first_trade['prev_m1_c'], first_trade['m1_c'][:first_trade['exit_idx']+1]])
+        all_ts = np.concatenate([selected_trade['prev_m1_ts'], selected_trade['m1_ts'][:selected_trade['exit_idx']+1]])
+        all_o = np.concatenate([selected_trade['prev_m1_o'], selected_trade['m1_o'][:selected_trade['exit_idx']+1]])
+        all_h = np.concatenate([selected_trade['prev_m1_h'], selected_trade['m1_h'][:selected_trade['exit_idx']+1]])
+        all_l = np.concatenate([selected_trade['prev_m1_l'], selected_trade['m1_l'][:selected_trade['exit_idx']+1]])
+        all_c = np.concatenate([selected_trade['prev_m1_c'], selected_trade['m1_c'][:selected_trade['exit_idx']+1]])
         
         up = all_c >= all_o
         down = all_c < all_o
@@ -373,45 +374,45 @@ def generate_html_report(df, params, final_balance, roi, sharpe, first_trade):
         plt.vlines(all_ts[down], all_l[down], all_h[down], color='red', linewidth=1, zorder=3)
         
         # Shade Backgrounds
-        plt.axvspan(first_trade['prev_m1_ts'][0], first_trade['trade_ts'], color='gray', alpha=0.15, label='Trigger Hour (Evaluating)')
-        trade_color = 'green' if first_trade['direction'] == 'LONG' else 'red'
-        plt.axvspan(first_trade['trade_ts'], all_ts[-1], color=trade_color, alpha=0.15, label=f"Trade Hour ({first_trade['direction']})")
+        plt.axvspan(selected_trade['prev_m1_ts'][0], selected_trade['trade_ts'], color='gray', alpha=0.15, label='Trigger Hour (Evaluating)')
+        trade_color = 'green' if selected_trade['direction'] == 'LONG' else 'red'
+        plt.axvspan(selected_trade['trade_ts'], all_ts[-1], color=trade_color, alpha=0.15, label=f"Trade Hour ({selected_trade['direction']})")
         
         # Plot Entry, Initial SL, and Activation
-        plt.hlines(first_trade['entry_price'], first_trade['trade_ts'], all_ts[-1], color='black', linestyle='-', linewidth=2, label='Entry Price')
-        plt.hlines(first_trade['act_price'], first_trade['trade_ts'], all_ts[-1], color='blue', linestyle='--', linewidth=1.5, label='TSL Activation Level')
+        plt.hlines(selected_trade['entry_price'], selected_trade['trade_ts'], all_ts[-1], color='black', linestyle='-', linewidth=2, label='Entry Price')
+        plt.hlines(selected_trade['act_price'], selected_trade['trade_ts'], all_ts[-1], color='blue', linestyle='--', linewidth=1.5, label='TSL Activation Level')
         
         # Plot Dynamic Trailing SL Curve
-        tsl_times = first_trade['m1_ts'][:first_trade['exit_idx']+1]
-        tsl_vals = first_trade['rolling_stops'][:first_trade['exit_idx']+1]
+        tsl_times = selected_trade['m1_ts'][:selected_trade['exit_idx']+1]
+        tsl_vals = selected_trade['rolling_stops'][:selected_trade['exit_idx']+1]
         plt.step(tsl_times, tsl_vals, where='post', color='darkorange', linewidth=2, label='Dynamic Stop Loss')
         
         # Mark Exit
-        exit_marker = 'X' if first_trade['exit_reason'] == 'Initial SL Hit' else ('o' if 'Trailing' in first_trade['exit_reason'] else 's')
+        exit_marker = 'X' if selected_trade['exit_reason'] == 'Initial SL Hit' else ('o' if 'Trailing' in selected_trade['exit_reason'] else 's')
         exit_color = 'black' if exit_marker == 'X' else 'darkorange'
-        plt.scatter(all_ts[-1], first_trade['exit_price'], color=exit_color, marker=exit_marker, s=200, zorder=5, label=first_trade['exit_reason'])
+        plt.scatter(all_ts[-1], selected_trade['exit_price'], color=exit_color, marker=exit_marker, s=200, zorder=5, label=selected_trade['exit_reason'])
         
-        plt.title(f"🔍 FIRST TRADE MICROSCOPIC VIEW (1-Minute Resolution)")
+        plt.title(f"🔍 RANDOM TRADE MICROSCOPIC VIEW (1-Minute Resolution)")
         plt.legend(loc='best'); plt.grid(True, alpha=0.3)
-        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
         plt.tight_layout()
         
         buf2 = io.BytesIO()
         plt.savefig(buf2, format='png', dpi=100); buf2.seek(0); plt.close()
-        img_trade1 = base64.b64encode(buf2.read()).decode('utf-8')
+        img_trade = base64.b64encode(buf2.read()).decode('utf-8')
         
         # Dynamic Text Explanation
         trade_text = f"""
         <div style="text-align: left; background: #eafaf1; padding: 20px; border-left: 5px solid #27ae60; border-radius: 4px; font-size: 16px; line-height: 1.6;">
-            <strong>1. THE TRIGGER:</strong> During the hour starting at <code>{first_trade['trigger_ts']}</code>, the candle closed with a Wick-to-Price ratio of <b>{first_trade['trigger_w_pct']*100:.2f}%</b> and a Wick-to-Body ratio of <b>{first_trade['trigger_wb_ratio']*100:.0f}%</b>. Because this exceeded your required parameters (f={first_trade['f']*100}% or g={first_trade['g']*100}%), the bot transitioned into <b>State 1</b>.<br><br>
+            <strong>1. THE TRIGGER:</strong> During the hour starting at <code>{selected_trade['trigger_ts']}</code>, the candle closed with a Wick-to-Price ratio of <b>{selected_trade['trigger_w_pct']*100:.2f}%</b> and a Wick-to-Body ratio of <b>{selected_trade['trigger_wb_ratio']*100:.0f}%</b>. Because this exceeded your required parameters (f={selected_trade['f']*100}% or g={selected_trade['g']*100}%), the bot transitioned into <b>State 1</b>.<br><br>
             
-            <strong>2. THE DECISION:</strong> The trigger candle closed <b>{first_trade['prev_color']}</b>. Therefore, at exactly <code>{first_trade['trade_ts']}</code>, the bot entered a <b>{first_trade['direction']}</b> trade with 100% of the account at an entry price of <b>${first_trade['entry_price']:.8f}</b>.<br><br>
+            <strong>2. THE DECISION:</strong> The trigger candle closed <b>{selected_trade['prev_color']}</b>. Therefore, at exactly <code>{selected_trade['trade_ts']}</code>, the bot entered a <b>{selected_trade['direction']}</b> trade with 100% of the account at an entry price of <b>${selected_trade['entry_price']:.8f}</b>.<br><br>
             
-            <strong>3. THE EXECUTION:</strong> The Initial Stop Loss was placed at <b>${first_trade['initial_sl']:.8f}</b>, and the bot watched the 1-minute chart waiting for the price to reach <b>${first_trade['act_price']:.8f}</b> to activate the trailing stop.<br><br>
+            <strong>3. THE EXECUTION:</strong> The Initial Stop Loss was placed at <b>${selected_trade['initial_sl']:.8f}</b>, and the bot watched the 1-minute chart waiting for the price to reach <b>${selected_trade['act_price']:.8f}</b> to activate the trailing stop.<br><br>
             
-            <strong>4. THE EXIT:</strong> After <b>{first_trade['exit_idx']} minutes</b> into the hour, the trade was closed at <b>${first_trade['exit_price']:.8f}</b>. <br>
-            <b>Reason:</b> {first_trade['exit_reason']}. <br>
-            <b>Trade PnL:</b> <span style="color:{'green' if first_trade['pnl_pct'] > 0 else 'red'}; font-weight:bold;">{first_trade['pnl_pct']*100:.2f}%</span>
+            <strong>4. THE EXIT:</strong> After <b>{selected_trade['exit_idx']} minutes</b> into the hour, the trade was closed at <b>${selected_trade['exit_price']:.8f}</b>. <br>
+            <b>Reason:</b> {selected_trade['exit_reason']}. <br>
+            <b>Trade PnL:</b> <span style="color:{'green' if selected_trade['pnl_pct'] > 0 else 'red'}; font-weight:bold;">{selected_trade['pnl_pct']*100:.2f}%</span>
         </div>
         """
 
@@ -425,9 +426,11 @@ def generate_html_report(df, params, final_balance, roi, sharpe, first_trade):
             body {{ font-family: Arial, sans-serif; background-color: #f4f4f9; color: #333; text-align: center; padding: 20px; }}
             .form-container {{ background: #2c3e50; color: white; border-radius: 8px; padding: 20px; margin: 0 auto 20px; width: 85%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
             .form-container input {{ margin: 0 5px; padding: 5px; width: 60px; text-align: center; border-radius: 4px; border: none; font-size: 15px;}}
-            .btn-run {{ padding: 10px 20px; background-color: #27ae60; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 16px; margin: 15px 10px; width: 180px;}}
+            .btn-run {{ padding: 10px 10px; background-color: #27ae60; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 16px; margin: 15px 5px; width: 180px;}}
             .btn-run:hover {{ background-color: #219150; }}
-            .btn-opt {{ padding: 10px 20px; background-color: #f39c12; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 16px; margin: 15px 10px; width: 180px;}}
+            .btn-shuffle {{ padding: 10px 10px; background-color: #3498db; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 16px; margin: 15px 5px; width: 180px;}}
+            .btn-shuffle:hover {{ background-color: #2980b9; }}
+            .btn-opt {{ padding: 10px 10px; background-color: #f39c12; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 16px; margin: 15px 5px; width: 180px;}}
             .btn-opt:hover {{ background-color: #e67e22; }}
             .stats-container {{ background: #fff; border-radius: 8px; padding: 20px; margin: 0 auto 20px; width: 85%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); display: flex; justify-content: space-around; }}
             .stat-box {{ margin: 0 10px; }}
@@ -453,6 +456,7 @@ def generate_html_report(df, params, final_balance, roi, sharpe, first_trade):
                 <div class="input-group"><label>Trailing Act/Dist (c): <input type="number" step="0.1" name="tsl" value="{params['tsl']}"> %</label></div>
                 <br>
                 <button type="submit" name="action" value="run" class="btn-run">Run Backtest</button>
+                <button type="submit" name="action" value="shuffle" class="btn-shuffle">🎲 Shuffle Trade</button>
                 <button type="submit" name="action" value="optimize" class="btn-opt">⚡ Optimize GA</button>
             </form>
         </div>
@@ -470,11 +474,11 @@ def generate_html_report(df, params, final_balance, roi, sharpe, first_trade):
         
         <hr style="width: 85%; border: 1px solid #ccc; margin: 40px auto;">
         
-        <h2>🔍 First Trade Deep Dive</h2>
+        <h2>🔍 Random Trade Deep Dive</h2>
         <div style="width: 85%; margin: 0 auto 20px;">
             {trade_text}
         </div>
-        {f'<div class="chart-container"><img src="data:image/png;base64,{img_trade1}" alt="Trade 1 Micro Chart"></div>' if img_trade1 else ''}
+        {f'<div class="chart-container"><img src="data:image/png;base64,{img_trade}" alt="Random Trade Micro Chart"></div>' if img_trade else ''}
         
     </body>
     </html>
@@ -485,17 +489,19 @@ def execute_run(params):
     df_run = GLOBAL_DF.copy()
     
     sl, tsl, f, g, u = params['sl']/100.0, params['tsl']/100.0, params['f']/100.0, params['g']/100.0, params['u']/100.0
-    final_balance, sls, tsls, positions, exit_prices, states, equity, first_trade = run_backtest(df_run, sl, tsl, f, g, u)
+    final_balance, sls, tsls, positions, exit_prices, states, equity, all_trades = run_backtest(df_run, sl, tsl, f, g, u)
     
     df_run['sl_hit'], df_run['tsl_hit'], df_run['position'] = sls, tsls, positions
     df_run['exit_price'], df_run['state'], df_run['equity'] = exit_prices, states, equity
     
     roi = ((final_balance - STARTING_BALANCE) / STARTING_BALANCE) * 100
-    
     returns = np.diff(equity) / equity[:-1]
     sharpe = (np.mean(returns) / np.std(returns) * np.sqrt(365*24)) if np.std(returns) > 0 else 0
     
-    return generate_html_report(df_run, params, final_balance, roi, sharpe, first_trade)
+    # Pick a random trade for the deep dive
+    selected_trade = random.choice(all_trades) if all_trades else None
+    
+    return generate_html_report(df_run, params, final_balance, roi, sharpe, selected_trade)
 
 class BacktestServer(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -517,6 +523,7 @@ class BacktestServer(http.server.BaseHTTPRequestHandler):
                 'tsl': float(parsed.get('tsl', ['2.0'])[0])
             }
         
+        # Whether 'run' or 'shuffle', it executes the same logic and picks a random trade
         self.send_response(200); self.send_header('Content-type', 'text/html'); self.end_headers()
         self.wfile.write(execute_run(params).encode('utf-8'))
 
