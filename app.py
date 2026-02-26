@@ -14,9 +14,9 @@ import urllib.parse
 import socket
 
 # --- Configuration ---
-SYMBOL = 'PEPE/USDT'     # Changed from BTC/USDT to PEPE/USDT
+SYMBOL = 'PEPE/USDT'     
 TIMEFRAME = '1h'
-DAYS_BACK = 30           # Fetch 30 days to calculate total ROI, but only plot the last 2 days
+DAYS_BACK = 30           
 STARTING_BALANCE = 10000
 PORT = 8000
 
@@ -46,55 +46,53 @@ def fetch_binance_data(symbol, timeframe, days):
     return df
 
 def run_backtest(df, sl_pct):
-    """Runs backtest: Green prev candle -> Long, Red prev candle -> Short."""
-    position = 0          
-    entry_price = 0.0
+    """
+    Runs backtest where EVERY HOUR is a new, independent 100% exposure trade.
+    Closes at SL if hit, otherwise closes at the end of the hour.
+    """
     balance = STARTING_BALANCE
     
-    # History tracking arrays
-    sl_history = [False]  # Pad index 0
+    # History tracking arrays (pad the first index since we use it to look back)
+    sl_history = [False]  
     position_history = [0] 
+    sl_price_history = [0.0]
     
     for i in range(1, len(df)):
         current = df.iloc[i]
         prev = df.iloc[i-1]
         
-        # --- STRATEGY LOGIC ---
-        # Target position based on previous candle color (Green = 1, Red = -1)
-        target_position = 1 if prev['close'] > prev['open'] else -1
+        # --- 1. DETERMINE DIRECTION ---
+        # Green prev candle -> Long (1), Red prev candle -> Short (-1)
+        position = 1 if prev['close'] >= prev['open'] else -1
         
-        # Open / Flip Position at the open of the current candle
-        if position != target_position:
-            # Close existing position if we were holding one into this hour
-            if position != 0:
-                pnl_pct = (current['open'] - entry_price) / entry_price if position == 1 else (entry_price - current['open']) / entry_price
-                balance *= (1 + pnl_pct)
-            
-            position = target_position
-            entry_price = current['open']
-        
-        # Record the position held to shade the chart background
-        chart_position = position
-            
-        # --- STOP LOSS LOGIC ---
+        # --- 2. EXECUTE TRADE (100% Exposure at Open) ---
+        entry_price = current['open']
         sl_price = entry_price * (1 - sl_pct) if position == 1 else entry_price * (1 + sl_pct)
+        
         sl_hit = False
         
+        # --- 3. CHECK STOP LOSS ---
         if position == 1 and current['low'] <= sl_price:
             sl_hit = True
             pnl_pct = -sl_pct
         elif position == -1 and current['high'] >= sl_price:
             sl_hit = True
             pnl_pct = -sl_pct
-            
-        if sl_hit:
-            balance *= (1 + pnl_pct) 
-            position = 0  # Flatten out for the rest of the hour            
+        else:
+            # --- 4. CLOSE AT END OF HOUR (if SL not hit) ---
+            if position == 1:
+                pnl_pct = (current['close'] - entry_price) / entry_price
+            else:
+                pnl_pct = (entry_price - current['close']) / entry_price
+                
+        # Update Balance (Compounding hourly)
+        balance *= (1 + pnl_pct) 
             
         sl_history.append(sl_hit)
-        position_history.append(chart_position)
+        position_history.append(position)
+        sl_price_history.append(sl_price)
                 
-    return balance, sl_history, position_history
+    return balance, sl_history, position_history, sl_price_history
 
 def generate_html_report(df, sl_pct, final_balance, roi):
     print(f"Generating 2-day chart for web display (SL: {sl_pct*100}%)...")
@@ -119,17 +117,17 @@ def generate_html_report(df, sl_pct, final_balance, roi):
     y_max = df_2d['high'].max() * 1.01
     y_min = df_2d['low'].min() * 0.99
     
-    ax1.fill_between(df_2d['timestamp'], y_max, y_min, where=(df_2d['position'] == 1), color='green', alpha=0.15, label='Long Position', zorder=1)
-    ax1.fill_between(df_2d['timestamp'], y_max, y_min, where=(df_2d['position'] == -1), color='red', alpha=0.15, label='Short Position', zorder=1)
+    ax1.fill_between(df_2d['timestamp'], y_max, y_min, where=(df_2d['position'] == 1), color='green', alpha=0.15, label='Long Trade', zorder=1)
+    ax1.fill_between(df_2d['timestamp'], y_max, y_min, where=(df_2d['position'] == -1), color='red', alpha=0.15, label='Short Trade', zorder=1)
 
-    # Plot Stop Loss Hits
+    # Plot Stop Loss Hits exactly at the SL price level
     sl_data = df_2d[df_2d['sl_hit'] == True]
     if not sl_data.empty:
-        ax1.scatter(sl_data['timestamp'], sl_data['close'], marker='X', color='black', s=150, label='Stop Loss Hit', zorder=5)
+        ax1.scatter(sl_data['timestamp'], sl_data['sl_price'], marker='X', color='black', s=150, label='Stopped Out', zorder=5)
 
     ax1.set_ylim(y_min, y_max)
     ax1.set_xlim(df_2d['timestamp'].min() - pd.Timedelta(hours=1), df_2d['timestamp'].max() + pd.Timedelta(hours=1))
-    ax1.set_title(f'LAST 48 HOURS: {SYMBOL} Continuous Reversal Strategy (SL: {sl_pct*100:.1f}%)')
+    ax1.set_title(f'LAST 48 HOURS: Individual Hourly Trades ({SYMBOL} | SL: {sl_pct*100:.1f}%)')
     ax1.legend(loc='upper left')
     ax1.grid(True, alpha=0.3, zorder=0)
     ax1.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
@@ -147,12 +145,12 @@ def generate_html_report(df, sl_pct, final_balance, roi):
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Basic Reversal Backtest</title>
+        <title>Hourly Reversal Backtest</title>
         <style>
             body {{ font-family: Arial, sans-serif; background-color: #f4f4f9; color: #333; text-align: center; padding: 20px; }}
             .form-container {{ background: #2c3e50; color: white; border-radius: 8px; padding: 20px; margin: 0 auto 20px; width: 60%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
-            .form-container input {{ margin: 0 10px; padding: 5px; width: 80px; text-align: center; border-radius: 4px; border: none; }}
-            .form-container button {{ padding: 8px 15px; background-color: #27ae60; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 14px;}}
+            .form-container input {{ margin: 0 10px; padding: 5px; width: 80px; text-align: center; border-radius: 4px; border: none; font-size: 16px;}}
+            .form-container button {{ padding: 8px 15px; background-color: #27ae60; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 16px;}}
             .form-container button:hover {{ background-color: #219150; }}
             .stats-container {{ background: #fff; border-radius: 8px; padding: 20px; margin: 0 auto 20px; width: 80%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); display: flex; justify-content: space-around; }}
             .stat-box {{ margin: 0 10px; }}
@@ -162,7 +160,7 @@ def generate_html_report(df, sl_pct, final_balance, roi):
         </style>
     </head>
     <body>
-        <h1>Simple Reversal Strategy ({SYMBOL})</h1>
+        <h1>Per-Hour Independent Trades ({SYMBOL})</h1>
         
         <div class="form-container">
             <form method="POST">
@@ -194,10 +192,11 @@ def execute_run(sl_pct_input):
     
     sl_pct_decimal = sl_pct_input / 100.0
     
-    final_balance, sls, positions = run_backtest(df_run, sl_pct_decimal)
+    final_balance, sls, positions, sl_prices = run_backtest(df_run, sl_pct_decimal)
     
     df_run['sl_hit'] = sls
     df_run['position'] = positions
+    df_run['sl_price'] = sl_prices
     
     roi = ((final_balance - STARTING_BALANCE) / STARTING_BALANCE) * 100
     
