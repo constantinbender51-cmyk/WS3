@@ -10,7 +10,7 @@ import io
 import base64
 import http.server
 import socketserver
-import itertools
+import urllib.parse
 import socket
 
 # --- Configuration ---
@@ -20,12 +20,8 @@ DAYS_BACK = 30
 STARTING_BALANCE = 10000
 PORT = 8000
 
-# --- Grid Search Parameters ---
-PARAM_GRID = {
-    'vol_mult': [2.0, 3.0, 4.0, 5.0],           
-    'sl_trigger': [1, 2, 3, 4],                 
-    'sl_pct': [0.005, 0.01, 0.015, 0.02, 0.03]  
-}
+# Global variable to hold market data so we only fetch it once
+GLOBAL_DF = None
 
 def get_local_ip():
     """Helper to find the local IP address."""
@@ -138,81 +134,28 @@ def run_backtest(df, vol_mult, sl_trigger, sl_pct):
         
     return equity_curve, balance, state_history, sl_history
 
-def grid_search(df):
-    print("\nStarting Grid Search Optimization...")
-    best_roi = -float('inf')
-    best_params = {}
-    
-    # Store history variables for the best run
-    best_equity = None
-    best_states = None
-    best_sls = None
-    best_balance = 0
-    results = []
-    
-    keys, values = zip(*PARAM_GRID.items())
-    combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
-    print(f"Testing {len(combinations)} parameter combinations. Please wait...\n")
-    
-    for params in combinations:
-        equity, final_balance, states, sls = run_backtest(
-            df, 
-            vol_mult=params['vol_mult'], 
-            sl_trigger=params['sl_trigger'], 
-            sl_pct=params['sl_pct']
-        )
-        
-        roi = ((final_balance - STARTING_BALANCE) / STARTING_BALANCE) * 100
-        
-        results.append({
-            'vol_mult': params['vol_mult'],
-            'sl_trigger': params['sl_trigger'],
-            'sl_pct': f"{params['sl_pct']*100:.2f}%",
-            'roi': roi,
-            'balance': final_balance
-        })
-        
-        if roi > best_roi:
-            best_roi = roi
-            best_params = params
-            best_equity = equity
-            best_states = states
-            best_sls = sls
-            best_balance = final_balance
-
-    top_5_results = sorted(results, key=lambda x: x['roi'], reverse=True)[:5]
-    return best_params, best_balance, best_roi, best_equity, best_states, best_sls, top_5_results
-
-def generate_html_report(df, best_params, final_balance, roi, top_5):
-    print("Generating advanced chart for web display...")
+def generate_html_report(df, params, final_balance, roi):
+    print(f"Generating chart for web display... (Vol: {params['vol_mult']}x, Trigger: {params['sl_trigger']}, SL: {params['sl_pct']}%)")
     plt.figure(figsize=(16, 10))
     
     # --- Plot 1: Candlesticks & States ---
     ax1 = plt.subplot(2, 1, 1)
     
-    # Filter up and down candles
     up = df[df['close'] >= df['open']]
     down = df[df['close'] < df['open']]
-    
-    # Width of candlestick elements (approx 40 minutes converted to days)
     width = 0.03 
     
-    # Plot Candlesticks
     ax1.bar(up['timestamp'], up['close'] - up['open'], bottom=up['open'], color='green', width=width, zorder=3)
     ax1.vlines(up['timestamp'], up['low'], up['high'], color='green', linewidth=1, zorder=3)
     
     ax1.bar(down['timestamp'], down['open'] - down['close'], bottom=down['close'], color='red', width=width, zorder=3)
     ax1.vlines(down['timestamp'], down['low'], down['high'], color='red', linewidth=1, zorder=3)
 
-    # Plot Background States
-    # State 1 (Active) = Blue tint
     ax1.fill_between(df['timestamp'], df['high'].max() * 1.05, df['low'].min() * 0.95, 
                      where=(df['state'] == 1), color='blue', alpha=0.1, label='State 1 (Active Trading)', zorder=1)
-    # State 2 (Inactive) = Gray tint
     ax1.fill_between(df['timestamp'], df['high'].max() * 1.05, df['low'].min() * 0.95, 
                      where=(df['state'] == 2), color='gray', alpha=0.15, label='State 2 (Cool-down)', zorder=1)
 
-    # Plot Stop Loss Hits
     sl_data = df[df['sl_hit'] == True]
     if not sl_data.empty:
         ax1.scatter(sl_data['timestamp'], sl_data['close'], marker='X', color='black', s=120, label='Stop Loss Hit', zorder=5)
@@ -224,13 +167,12 @@ def generate_html_report(df, best_params, final_balance, roi, top_5):
     
     # --- Plot 2: Equity Curve ---
     ax2 = plt.subplot(2, 1, 2, sharex=ax1)
-    ax2.plot(df['timestamp'], df['equity'], label='Optimized Strategy Equity', color='#27ae60', linewidth=2)
-    ax2.set_title(f"Optimized Equity Curve (Vol: {best_params['vol_mult']}x | SL Trigger: {best_params['sl_trigger']} | SL: {best_params['sl_pct']*100}%)")
+    ax2.plot(df['timestamp'], df['equity'], label='Strategy Equity', color='#27ae60', linewidth=2)
+    ax2.set_title(f"Equity Curve")
     ax2.set_ylabel('Balance (USDT)')
     ax2.legend(loc='upper left')
     ax2.grid(True, alpha=0.3)
     
-    # Format dates nicely
     ax2.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
     plt.xticks(rotation=45)
     plt.tight_layout()
@@ -242,94 +184,127 @@ def generate_html_report(df, best_params, final_balance, roi, top_5):
     
     image_base64 = base64.b64encode(buf.read()).decode('utf-8')
     
-    # Generate HTML Table
-    table_rows = ""
-    for idx, row in enumerate(top_5):
-        table_rows += f"<tr><td>{idx+1}</td><td>{row['vol_mult']}x</td><td>{row['sl_trigger']}</td><td>{row['sl_pct']}</td><td style='color:{'green' if row['roi']>0 else 'red'}; font-weight:bold;'>{row['roi']:.2f}%</td></tr>"
-    
     html = f"""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Backtest Results</title>
+        <title>Interactive Backtest</title>
         <style>
             body {{ font-family: Arial, sans-serif; background-color: #f4f4f9; color: #333; text-align: center; padding: 20px; }}
+            .form-container {{ background: #2c3e50; color: white; border-radius: 8px; padding: 20px; margin: 0 auto 20px; width: 80%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+            .form-container input {{ margin: 0 10px; padding: 5px; width: 80px; text-align: center; border-radius: 4px; border: none; }}
+            .form-container button {{ padding: 8px 15px; background-color: #27ae60; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }}
+            .form-container button:hover {{ background-color: #219150; }}
             .stats-container {{ background: #fff; border-radius: 8px; padding: 20px; margin: 0 auto 20px; width: 80%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); display: flex; justify-content: space-around; }}
             .stat-box {{ margin: 0 10px; }}
             h1 {{ color: #2c3e50; }}
             .value {{ font-size: 22px; font-weight: bold; color: #2980b9; margin-top: 5px; }}
             .chart-container img {{ max-width: 100%; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 30px;}}
-            table {{ margin: 0 auto; border-collapse: collapse; width: 60%; background: #fff; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
-            th, td {{ padding: 12px; border: 1px solid #ddd; text-align: center; }}
-            th {{ background-color: #2c3e50; color: white; }}
         </style>
     </head>
     <body>
-        <h1>Optimized Algorithmic Backtest Report</h1>
+        <h1>Interactive Algorithmic Backtester</h1>
         
-        <h2>Best Parameters Found</h2>
-        <div class="stats-container">
-            <div class="stat-box"><div>Volume Multiplier</div><div class="value">{best_params['vol_mult']}x</div></div>
-            <div class="stat-box"><div>State 2 Trigger</div><div class="value">{best_params['sl_trigger']} Cons. SLs</div></div>
-            <div class="stat-box"><div>Stop Loss %</div><div class="value">{best_params['sl_pct']*100:.2f}%</div></div>
+        <div class="form-container">
+            <form method="POST">
+                <label>Volume Multiplier: 
+                    <input type="number" step="0.1" name="vol_mult" value="{params['vol_mult']}"> x
+                </label>
+                &nbsp;&nbsp;&nbsp;
+                <label>Consecutive SLs to State 2: 
+                    <input type="number" step="1" name="sl_trigger" value="{params['sl_trigger']}">
+                </label>
+                &nbsp;&nbsp;&nbsp;
+                <label>Stop Loss: 
+                    <input type="number" step="0.1" name="sl_pct" value="{params['sl_pct']}"> %
+                </label>
+                &nbsp;&nbsp;&nbsp;
+                <button type="submit">Run Backtest</button>
+            </form>
         </div>
 
-        <h2>Best Results</h2>
-        <div class="stats-container" style="background-color: #eafaf1; border: 1px solid #27ae60;">
-            <div class="stat-box"><div>Starting Balance</div><div class="value" style="color:#27ae60;">${STARTING_BALANCE:,.2f}</div></div>
-            <div class="stat-box"><div>Final Balance</div><div class="value" style="color:#27ae60;">${final_balance:,.2f}</div></div>
-            <div class="stat-box"><div>Net ROI</div><div class="value" style="color:#27ae60;">{roi:.2f}%</div></div>
+        <div class="stats-container">
+            <div class="stat-box"><div>Starting Balance</div><div class="value">${STARTING_BALANCE:,.2f}</div></div>
+            <div class="stat-box"><div>Final Balance</div><div class="value">${final_balance:,.2f}</div></div>
+            <div class="stat-box"><div>Net ROI</div><div class="value" style="color:{'#27ae60' if roi >= 0 else '#c0392b'};">{roi:.2f}%</div></div>
         </div>
         
         <div class="chart-container">
             <img src="data:image/png;base64,{image_base64}" alt="Backtest Chart">
         </div>
-
-        <h2>Top 5 Parameter Combinations</h2>
-        <table>
-            <tr>
-                <th>Rank</th><th>Volume Mult.</th><th>State 2 Trigger</th><th>Stop Loss</th><th>ROI</th>
-            </tr>
-            {table_rows}
-        </table>
-        <br><br>
     </body>
     </html>
     """
     return html
 
+def execute_run(params):
+    """Helper function to run the backtest and return the HTML."""
+    df_run = GLOBAL_DF.copy()
+    
+    # Convert form percentage to decimal for the math (e.g. 1.0 -> 0.01)
+    sl_pct_decimal = params['sl_pct'] / 100.0
+    
+    equity, final_balance, states, sls = run_backtest(
+        df_run, 
+        vol_mult=params['vol_mult'], 
+        sl_trigger=params['sl_trigger'], 
+        sl_pct=sl_pct_decimal
+    )
+    
+    df_run['equity'] = equity
+    df_run['state'] = states
+    df_run['sl_hit'] = sls
+    
+    roi = ((final_balance - STARTING_BALANCE) / STARTING_BALANCE) * 100
+    
+    return generate_html_report(df_run, params, final_balance, roi)
+
 class BacktestServer(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        # Default Parameters when you first open the website
+        params = {'vol_mult': 3.0, 'sl_trigger': 3, 'sl_pct': 1.0}
+        
+        html_content = execute_run(params)
+        
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
         self.end_headers()
-        self.wfile.write(self.server.html_content.encode('utf-8'))
+        self.wfile.write(html_content.encode('utf-8'))
+
+    def do_POST(self):
+        # Read the form data sent by the browser
+        content_length = int(self.headers['Content-Length'])
+        post_data = self.rfile.read(content_length).decode('utf-8')
+        parsed_data = urllib.parse.parse_qs(post_data)
+
+        # Extract values (with fallbacks if parsing fails)
+        params = {
+            'vol_mult': float(parsed_data.get('vol_mult', ['3.0'])[0]),
+            'sl_trigger': int(parsed_data.get('sl_trigger', ['3'])[0]),
+            'sl_pct': float(parsed_data.get('sl_pct', ['1.0'])[0])
+        }
+        
+        # Run Backtest with New Parameters
+        html_content = execute_run(params)
+        
+        # Send updated webpage back
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        self.wfile.write(html_content.encode('utf-8'))
 
 if __name__ == "__main__":
-    # 1. Fetch Data
-    df = fetch_binance_data(SYMBOL, TIMEFRAME, DAYS_BACK)
+    # 1. Fetch Data ONCE at startup
+    GLOBAL_DF = fetch_binance_data(SYMBOL, TIMEFRAME, DAYS_BACK)
     
-    # 2. Run Grid Search
-    best_params, best_balance, best_roi, best_equity, best_states, best_sls, top_5 = grid_search(df)
-    
-    # Add best results back to DataFrame for plotting
-    df['equity'] = best_equity
-    df['state'] = best_states
-    df['sl_hit'] = best_sls
-    
-    # 3. Generate HTML Report
-    html_report = generate_html_report(df, best_params, best_balance, best_roi, top_5)
-    
-    # 4. Start HTTP Server
+    # 2. Start HTTP Server
     local_ip = get_local_ip()
     handler = BacktestServer
     with socketserver.TCPServer(("", PORT), handler) as httpd:
-        httpd.html_content = html_report  
-        print(f"\n✅ Grid Search & Backtest Complete!")
-        print(f"🏆 Best ROI: {best_roi:.2f}%")
-        print(f"🌐 Server running! Click the link below to view the results:")
+        print(f"\n✅ Data Fetched! Web server is starting...")
+        print(f"🌐 Open this link in your browser to interact with the backtester:")
         print(f"➡️  http://{local_ip}:{PORT}  (or http://localhost:{PORT})")
-        print("Press Ctrl+C to stop the server.")
+        print("\nPress Ctrl+C to stop the server.")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
