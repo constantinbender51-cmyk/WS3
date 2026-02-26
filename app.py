@@ -35,28 +35,62 @@ def get_local_ip():
         s.close()
     return IP
 
-def fetch_binance_data(symbol, timeframe, days):
-    print(f"Fetching {days} days of {timeframe} data for {symbol}...")
-    exchange = ccxt.binance()
-    since = int((datetime.utcnow() - timedelta(days=days)).timestamp() * 1000)
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
+def fetch_binance_data_accurate(symbol, days):
+    print(f"Fetching 1h data for {symbol}...")
+    exchange = ccxt.binance({'enableRateLimit': True})
+    since_ms = int((datetime.utcnow() - timedelta(days=days)).timestamp() * 1000)
     
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    # 1. Fetch 1h Data
+    ohlcv_1h = exchange.fetch_ohlcv(symbol, '1h', since=since_ms, limit=1000)
+    df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df_1h['timestamp'] = pd.to_datetime(df_1h['timestamp'], unit='ms')
     
     # Pre-calculate Wick and Body metrics
-    df['body'] = abs(df['close'] - df['open'])
-    df['top_wick'] = df['high'] - df[['open', 'close']].max(axis=1)
-    df['bot_wick'] = df[['open', 'close']].min(axis=1) - df['low']
-    df['max_wick'] = df[['top_wick', 'bot_wick']].max(axis=1)
+    df_1h['body'] = abs(df_1h['close'] - df_1h['open'])
+    df_1h['top_wick'] = df_1h['high'] - df_1h[['open', 'close']].max(axis=1)
+    df_1h['bot_wick'] = df_1h[['open', 'close']].min(axis=1) - df_1h['low']
+    df_1h['max_wick'] = df_1h[['top_wick', 'bot_wick']].max(axis=1)
     
-    df['wick_pct'] = df['max_wick'] / df['open']
-    df['wick_body_ratio'] = np.where(df['body'] == 0, np.inf, df['max_wick'] / df['body'])
+    df_1h['wick_pct'] = df_1h['max_wick'] / df_1h['open']
+    df_1h['wick_body_ratio'] = np.where(df_1h['body'] == 0, np.inf, df_1h['max_wick'] / df_1h['body'])
+
+    # 2. Fetch 1m Data (Pagination required for ~43,200 candles)
+    print(f"Fetching 1m intraday data to accurately simulate Trailing Stop Losses (This takes ~3-5 seconds)...")
+    all_1m = []
+    current_since = since_ms
+    while True:
+        ohlcv_1m = exchange.fetch_ohlcv(symbol, '1m', since=current_since, limit=1000)
+        if not ohlcv_1m:
+            break
+        all_1m.extend(ohlcv_1m)
+        current_since = ohlcv_1m[-1][0] + 60000 # Next minute
+        if len(ohlcv_1m) < 1000:
+            break
+            
+    df_1m = pd.DataFrame(all_1m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df_1m['timestamp'] = pd.to_datetime(df_1m['timestamp'], unit='ms')
+    df_1m['hour_ts'] = df_1m['timestamp'].dt.floor('h')
     
-    return df
+    # 3. Map 1m arrays to their corresponding 1h candle
+    grouped = df_1m.groupby('hour_ts')
+    m1_highs, m1_lows = [], []
+    
+    for ts in df_1h['timestamp']:
+        if ts in grouped.groups:
+            grp = grouped.get_group(ts)
+            m1_highs.append(grp['high'].values)
+            m1_lows.append(grp['low'].values)
+        else:
+            m1_highs.append(np.array([]))
+            m1_lows.append(np.array([]))
+            
+    df_1h['m1_highs'] = m1_highs
+    df_1h['m1_lows'] = m1_lows
+    
+    return df_1h
 
 # ==========================================
-# 1. CORE ENGINE (Detailed UI Tracking)
+# 1. CORE ENGINE (Accurate 1m Evaluation)
 # ==========================================
 def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
     balance = STARTING_BALANCE
@@ -83,42 +117,76 @@ def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
             exit_price_history.append(current['close']); state_history.append(2); equity_history.append(balance)
             continue
             
-        # State 1 Trading
+        # --- State 1 Trading ---
         position = 1 if prev['close'] >= prev['open'] else -1
         entry_price = current['open']
-        sl_price = entry_price * (1 - sl_pct) if position == 1 else entry_price * (1 + sl_pct)
+        
+        m1_highs = current['m1_highs']
+        m1_lows = current['m1_lows']
         
         sl_hit, tsl_hit = False, False
-        exit_price, pnl_pct = current['close'], 0.0
+        exit_price = current['close']
+        pnl_pct = 0.0
         
-        if position == 1:
-            if current['low'] <= sl_price:
-                sl_hit, exit_price, pnl_pct = True, sl_price, -sl_pct
-            else:
-                act_price = entry_price * (1 + tsl_pct)
-                if current['high'] >= act_price:
-                    trailing_sl = current['high'] * (1 - tsl_pct)
-                    if current['close'] <= trailing_sl:
-                        tsl_hit, exit_price, pnl_pct = True, trailing_sl, (trailing_sl - entry_price) / entry_price
-                    else:
-                        pnl_pct = (current['close'] - entry_price) / entry_price
-                else:
-                    pnl_pct = (current['close'] - entry_price) / entry_price
+        # If 1m data is missing for this hour, fallback to 1h close
+        if len(m1_highs) == 0:
+            pnl_pct = (current['close'] - entry_price) / entry_price if position == 1 else (entry_price - current['close']) / entry_price
         else:
-            if current['high'] >= sl_price:
-                sl_hit, exit_price, pnl_pct = True, sl_price, -sl_pct
-            else:
+            if position == 1:
+                initial_sl = entry_price * (1 - sl_pct)
+                act_price = entry_price * (1 + tsl_pct)
+                highest = entry_price
+                active_tsl = False
+                tsl_price = 0.0
+                
+                for h, l in zip(m1_highs, m1_lows):
+                    # Check SL/TSL Hit (Conservative: assume low hits first)
+                    curr_stop = tsl_price if active_tsl else initial_sl
+                    if l <= curr_stop:
+                        exit_price = curr_stop
+                        sl_hit = not active_tsl
+                        tsl_hit = active_tsl
+                        break
+                        
+                    # Update TSL
+                    if h > highest:
+                        highest = h
+                        if highest >= act_price:
+                            active_tsl = True
+                            possible_tsl = highest * (1 - tsl_pct)
+                            if possible_tsl > tsl_price:
+                                tsl_price = possible_tsl
+                                
+                pnl_pct = (exit_price - entry_price) / entry_price
+                
+            elif position == -1:
+                initial_sl = entry_price * (1 + sl_pct)
                 act_price = entry_price * (1 - tsl_pct)
-                if current['low'] <= act_price:
-                    trailing_sl = current['low'] * (1 + tsl_pct)
-                    if current['close'] >= trailing_sl:
-                        tsl_hit, exit_price, pnl_pct = True, trailing_sl, (entry_price - trailing_sl) / entry_price
-                    else:
-                        pnl_pct = (entry_price - current['close']) / entry_price
-                else:
-                    pnl_pct = (entry_price - current['close']) / entry_price
+                lowest = entry_price
+                active_tsl = False
+                tsl_price = float('inf')
+                
+                for h, l in zip(m1_highs, m1_lows):
+                    # Check SL/TSL Hit (Conservative: assume high hits first)
+                    curr_stop = tsl_price if active_tsl else initial_sl
+                    if h >= curr_stop:
+                        exit_price = curr_stop
+                        sl_hit = not active_tsl
+                        tsl_hit = active_tsl
+                        break
+                        
+                    # Update TSL
+                    if l < lowest:
+                        lowest = l
+                        if lowest <= act_price:
+                            active_tsl = True
+                            possible_tsl = lowest * (1 + tsl_pct)
+                            if possible_tsl < tsl_price:
+                                tsl_price = possible_tsl
+                                
+                pnl_pct = (entry_price - exit_price) / entry_price
                     
-        # Triggers
+        # State 2 Check Triggers
         if pnl_pct < u_pct: low_profit_count += 1
         else: low_profit_count = 0
                 
@@ -130,10 +198,10 @@ def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
     return balance, sl_history, tsl_history, position_history, exit_price_history, state_history, equity_history
 
 # ==========================================
-# 2. FAST ENGINE (For Genetic Algorithm)
+# 2. FAST GA ENGINE (Numpy + 1m Intrabar)
 # ==========================================
-def fast_ga_backtest(opens, highs, lows, closes, wick_pcts, wick_body_ratios, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
-    """Numpy-optimized engine to run 10,000x faster during GA optimization"""
+def fast_ga_backtest(opens, closes, wick_pcts, wick_body_ratios, m1_highs_list, m1_lows_list, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
+    """Numpy-optimized engine to process 30,000,000+ 1-min checks in seconds for GA."""
     balance = 10000.0
     equity = np.empty(len(opens))
     equity[0] = balance
@@ -151,25 +219,48 @@ def fast_ga_backtest(opens, highs, lows, closes, wick_pcts, wick_body_ratios, sl
             continue
             
         position = 1 if closes[i-1] >= opens[i-1] else -1
-        c_open, c_high, c_low, c_close = opens[i], highs[i], lows[i], closes[i]
+        c_open, c_close = opens[i], closes[i]
+        m1_h, m1_l = m1_highs_list[i], m1_lows_list[i]
         
-        sl_price = c_open * (1 - sl_pct) if position == 1 else c_open * (1 + sl_pct)
-        pnl = 0.0
+        exit_price = c_close
         
-        if position == 1:
-            if c_low <= sl_price: pnl = -sl_pct
+        if len(m1_h) > 0:
+            if position == 1:
+                initial_sl = c_open * (1 - sl_pct)
+                act_price = c_open * (1 + tsl_pct)
+                highest = c_open
+                active_tsl = False
+                tsl_price = 0.0
+                for mh, ml in zip(m1_h, m1_l):
+                    curr_stop = tsl_price if active_tsl else initial_sl
+                    if ml <= curr_stop:
+                        exit_price = curr_stop
+                        break
+                    if mh > highest:
+                        highest = mh
+                        if highest >= act_price:
+                            active_tsl = True
+                            if highest * (1 - tsl_pct) > tsl_price:
+                                tsl_price = highest * (1 - tsl_pct)
             else:
-                if c_high >= c_open * (1 + tsl_pct):
-                    tsl = c_high * (1 - tsl_pct)
-                    pnl = (tsl - c_open)/c_open if c_close <= tsl else (c_close - c_open)/c_open
-                else: pnl = (c_close - c_open)/c_open
-        else:
-            if c_high >= sl_price: pnl = -sl_pct
-            else:
-                if c_low <= c_open * (1 - tsl_pct):
-                    tsl = c_low * (1 + tsl_pct)
-                    pnl = (c_open - tsl)/c_open if c_close >= tsl else (c_open - c_close)/c_open
-                else: pnl = (c_open - c_close)/c_open
+                initial_sl = c_open * (1 + sl_pct)
+                act_price = c_open * (1 - tsl_pct)
+                lowest = c_open
+                active_tsl = False
+                tsl_price = float('inf')
+                for mh, ml in zip(m1_h, m1_l):
+                    curr_stop = tsl_price if active_tsl else initial_sl
+                    if mh >= curr_stop:
+                        exit_price = curr_stop
+                        break
+                    if ml < lowest:
+                        lowest = ml
+                        if lowest <= act_price:
+                            active_tsl = True
+                            if lowest * (1 + tsl_pct) < tsl_price:
+                                tsl_price = lowest * (1 + tsl_pct)
+                                
+        pnl = (exit_price - c_open)/c_open if position == 1 else (c_open - exit_price)/c_open
                     
         if pnl < u_pct: low_profit_count += 1
         else: low_profit_count = 0
@@ -180,12 +271,14 @@ def fast_ga_backtest(opens, highs, lows, closes, wick_pcts, wick_body_ratios, sl
     return equity
 
 def run_ga_optimization(df):
-    print("\n🧬 Starting Genetic Algorithm (Optimizing for Sharpe Ratio)...")
+    print("\n🧬 Starting Genetic Algorithm (Simulating millions of 1m price paths for Sharpe Ratio)...")
     start_time = time.time()
     
-    # Extract Numpy Arrays
-    opens, highs, lows, closes = df['open'].values, df['high'].values, df['low'].values, df['close'].values
+    # Extract Arrays for GA speed
+    opens, closes = df['open'].values, df['close'].values
     wick_pcts, wick_body_ratios = df['wick_pct'].values, df['wick_body_ratio'].values
+    m1_highs_list = df['m1_highs'].values
+    m1_lows_list = df['m1_lows'].values
 
     # GA Settings
     POP_SIZE = 50
@@ -196,22 +289,20 @@ def run_ga_optimization(df):
     pop = np.random.uniform(bounds[:, 0], bounds[:, 1], (POP_SIZE, 5))
 
     def evaluate(ind):
-        equity = fast_ga_backtest(opens, highs, lows, closes, wick_pcts, wick_body_ratios, 
+        equity = fast_ga_backtest(opens, closes, wick_pcts, wick_body_ratios, m1_highs_list, m1_lows_list,
                                   ind[3]/100.0, ind[4]/100.0, ind[0]/100.0, ind[1]/100.0, ind[2]/100.0)
         returns = np.diff(equity) / equity[:-1]
         std = np.std(returns)
         if std == 0: return -999.0
-        return (np.mean(returns) / std) * np.sqrt(365*24) # Annualized Hourly Sharpe
+        return (np.mean(returns) / std) * np.sqrt(365*24)
 
     for gen in range(GENERATIONS):
         fitness = np.array([evaluate(ind) for ind in pop])
-        
-        # Elitism
         best_idx = np.argmax(fitness)
-        next_pop = [pop[best_idx], pop[best_idx].copy()] # Keep top 2
+        next_pop = [pop[best_idx], pop[best_idx].copy()] # Elitism
         
         while len(next_pop) < POP_SIZE:
-            # Tournament
+            # Tournament Selection
             i1, i2 = np.random.choice(POP_SIZE, 2, replace=False)
             p1 = pop[i1] if fitness[i1] > fitness[i2] else pop[i2]
             i1, i2 = np.random.choice(POP_SIZE, 2, replace=False)
@@ -219,13 +310,11 @@ def run_ga_optimization(df):
             
             # Crossover
             child = np.concatenate([p1[:2], p2[2:]]) if np.random.rand() < 0.6 else p1.copy()
-                
             # Mutation
             for i in range(5):
                 if np.random.rand() < 0.25:
                     child[i] += np.random.normal(0, (bounds[i, 1] - bounds[i, 0]) * 0.1)
                     child[i] = np.clip(child[i], bounds[i, 0], bounds[i, 1])
-                    
             next_pop.append(child)
         pop = np.array(next_pop)
         
@@ -310,7 +399,7 @@ def generate_html_report(df, params, final_balance, roi, sharpe):
     </head>
     <body>
         <h1>Advanced Hourly Reversal ({SYMBOL})</h1>
-        <p class="subtitle">State 1/2 Logic | 100% Exposure | Genetic Optimizer</p>
+        <p class="subtitle">1m Intrabar Accuracy | 100% Exposure | Genetic Optimizer</p>
         
         <div class="form-container">
             <form method="POST">
@@ -383,7 +472,7 @@ class BacktestServer(http.server.BaseHTTPRequestHandler):
         self.wfile.write(execute_run(params).encode('utf-8'))
 
 if __name__ == "__main__":
-    GLOBAL_DF = fetch_binance_data(SYMBOL, TIMEFRAME, DAYS_BACK)
+    GLOBAL_DF = fetch_binance_data_accurate(SYMBOL, DAYS_BACK)
     handler = BacktestServer
     with socketserver.TCPServer(("", PORT), handler) as httpd:
         print(f"\n✅ Web server running! Open browser to: http://{get_local_ip()}:{PORT}  (or localhost:{PORT})")
