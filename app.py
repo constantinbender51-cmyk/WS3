@@ -63,6 +63,7 @@ def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
     position_history = [0] 
     exit_price_history = [0.0]
     state_history = [2]
+    equity_history = [balance] # Track account balance history
     
     state = 2
     low_profit_count = 0
@@ -89,6 +90,7 @@ def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
             position_history.append(0)
             exit_price_history.append(current['close'])
             state_history.append(2)
+            equity_history.append(balance)
             continue
             
         if state == 1:
@@ -155,18 +157,22 @@ def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
             position_history.append(position)
             exit_price_history.append(exit_price)
             state_history.append(1)
+            equity_history.append(balance)
                 
-    return balance, sl_history, tsl_history, position_history, exit_price_history, state_history
+    return balance, sl_history, tsl_history, position_history, exit_price_history, state_history, equity_history
 
 def generate_html_report(df, params, final_balance, roi):
-    print(f"Generating chart for web display...")
-    plt.figure(figsize=(16, 9))
-    ax1 = plt.subplot(1, 1, 1)
+    print(f"Generating charts for web display...")
+    plt.figure(figsize=(16, 12))
     
     # Filter to only the last 48 hours (2 Days)
     df_2d = df.tail(48).copy()
     
-    # Plot Candlesticks
+    # =======================================================
+    # PLOT 1: Candlesticks and State/Trade History (Last 48H)
+    # =======================================================
+    ax1 = plt.subplot(2, 1, 1)
+    
     up = df_2d[df_2d['close'] >= df_2d['open']]
     down = df_2d[df_2d['close'] < df_2d['open']]
     width = 0.03 
@@ -185,22 +191,41 @@ def generate_html_report(df, params, final_balance, roi):
     ax1.fill_between(df_2d['timestamp'], y_max, y_min, where=(df_2d['position'] == -1), color='red', alpha=0.15, label='State 1: Short', zorder=1)
     ax1.fill_between(df_2d['timestamp'], y_max, y_min, where=(df_2d['state'] == 2), color='gray', alpha=0.10, label='State 2: Flat', zorder=1)
 
-    # Plot Initial Stop Loss Hits
+    # Plot Stop Loss Hits
     sl_data = df_2d[df_2d['sl_hit'] == True]
     if not sl_data.empty:
         ax1.scatter(sl_data['timestamp'], sl_data['exit_price'], marker='X', color='black', s=150, label='Initial SL Hit', zorder=5)
 
-    # Plot Trailing Stop Loss Hits
     tsl_data = df_2d[df_2d['tsl_hit'] == True]
     if not tsl_data.empty:
         ax1.scatter(tsl_data['timestamp'], tsl_data['exit_price'], marker='o', color='darkorange', s=120, label='Trailing SL Hit', zorder=5)
 
     ax1.set_ylim(y_min, y_max)
     ax1.set_xlim(df_2d['timestamp'].min() - pd.Timedelta(hours=1), df_2d['timestamp'].max() + pd.Timedelta(hours=1))
-    ax1.set_title(f"LAST 48 HOURS ({SYMBOL}) | f: {params['f']}% | g: {params['g']}% | u: {params['u']}%")
+    ax1.set_title(f"LAST 48 HOURS PRICE ({SYMBOL}) | f: {params['f']}% | g: {params['g']}% | u: {params['u']}%")
     ax1.legend(loc='upper left')
     ax1.grid(True, alpha=0.3, zorder=0)
-    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
+    
+    # =======================================================
+    # PLOT 2: Equity Curve / Returns (Last 48H)
+    # =======================================================
+    ax2 = plt.subplot(2, 1, 2, sharex=ax1)
+    
+    # Calculate Returns specific to the 2-day period
+    start_balance_2d = df_2d['equity'].iloc[0]
+    end_balance_2d = df_2d['equity'].iloc[-1]
+    roi_2d = ((end_balance_2d - start_balance_2d) / start_balance_2d) * 100
+    
+    ax2.plot(df_2d['timestamp'], df_2d['equity'], color='#2980b9', linewidth=2.5, label='Account Balance (USDT)')
+    ax2.fill_between(df_2d['timestamp'], df_2d['equity'], df_2d['equity'].min() * 0.999, color='#2980b9', alpha=0.1)
+    
+    # Optional: Highlight new high watermarks in green, drawdowns in red (using simple markers)
+    ax2.set_title(f"LAST 48 HOURS RETURNS | 2-Day ROI: {roi_2d:.2f}% | PnL: ${(end_balance_2d - start_balance_2d):.2f}")
+    ax2.set_ylabel('Balance (USDT)')
+    ax2.legend(loc='upper left')
+    ax2.grid(True, alpha=0.3)
+    
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
     plt.xticks(rotation=45)
     plt.tight_layout()
     
@@ -272,7 +297,7 @@ def execute_run(params):
     g_pct = params['g'] / 100.0
     u_pct = params['u'] / 100.0
     
-    final_balance, sls, tsls, positions, exit_prices, states = run_backtest(
+    final_balance, sls, tsls, positions, exit_prices, states, equity = run_backtest(
         df_run, sl_pct, tsl_pct, f_pct, g_pct, u_pct
     )
     
@@ -281,6 +306,7 @@ def execute_run(params):
     df_run['position'] = positions
     df_run['exit_price'] = exit_prices
     df_run['state'] = states
+    df_run['equity'] = equity
     
     roi = ((final_balance - STARTING_BALANCE) / STARTING_BALANCE) * 100
     
