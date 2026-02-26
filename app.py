@@ -54,18 +54,16 @@ def fetch_binance_data_accurate(symbol, days):
     df_1h['wick_pct'] = df_1h['max_wick'] / df_1h['open']
     df_1h['wick_body_ratio'] = np.where(df_1h['body'] == 0, np.inf, df_1h['max_wick'] / df_1h['body'])
 
-    # 2. Fetch 1m Data (Pagination required for ~43,200 candles)
-    print(f"Fetching 1m intraday data to accurately simulate Trailing Stop Losses (This takes ~3-5 seconds)...")
+    # 2. Fetch 1m Data
+    print(f"Fetching 1m intraday data to accurately trace price paths (This takes ~3-5 seconds)...")
     all_1m = []
     current_since = since_ms
     while True:
         ohlcv_1m = exchange.fetch_ohlcv(symbol, '1m', since=current_since, limit=1000)
-        if not ohlcv_1m:
-            break
+        if not ohlcv_1m: break
         all_1m.extend(ohlcv_1m)
-        current_since = ohlcv_1m[-1][0] + 60000 # Next minute
-        if len(ohlcv_1m) < 1000:
-            break
+        current_since = ohlcv_1m[-1][0] + 60000 
+        if len(ohlcv_1m) < 1000: break
             
     df_1m = pd.DataFrame(all_1m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df_1m['timestamp'] = pd.to_datetime(df_1m['timestamp'], unit='ms')
@@ -73,24 +71,29 @@ def fetch_binance_data_accurate(symbol, days):
     
     # 3. Map 1m arrays to their corresponding 1h candle
     grouped = df_1m.groupby('hour_ts')
-    m1_highs, m1_lows = [], []
+    m1_ts, m1_opens, m1_highs, m1_lows, m1_closes = [], [], [], [], []
     
     for ts in df_1h['timestamp']:
         if ts in grouped.groups:
             grp = grouped.get_group(ts)
+            m1_ts.append(grp['timestamp'].values)
+            m1_opens.append(grp['open'].values)
             m1_highs.append(grp['high'].values)
             m1_lows.append(grp['low'].values)
+            m1_closes.append(grp['close'].values)
         else:
-            m1_highs.append(np.array([]))
-            m1_lows.append(np.array([]))
+            m1_ts.append(np.array([])); m1_opens.append(np.array([])); m1_highs.append(np.array([])); m1_lows.append(np.array([])); m1_closes.append(np.array([]))
             
+    df_1h['m1_ts'] = m1_ts
+    df_1h['m1_opens'] = m1_opens
     df_1h['m1_highs'] = m1_highs
     df_1h['m1_lows'] = m1_lows
+    df_1h['m1_closes'] = m1_closes
     
     return df_1h
 
 # ==========================================
-# 1. CORE ENGINE (Accurate 1m Evaluation)
+# 1. CORE ENGINE (With Deep Dive Capture)
 # ==========================================
 def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
     balance = STARTING_BALANCE
@@ -100,6 +103,7 @@ def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
     
     state = 2
     low_profit_count = 0
+    first_trade = None  # Will store the deep dive info for the very first trade
     
     for i in range(1, len(df)):
         current = df.iloc[i]
@@ -121,15 +125,18 @@ def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
         position = 1 if prev['close'] >= prev['open'] else -1
         entry_price = current['open']
         
-        m1_highs = current['m1_highs']
-        m1_lows = current['m1_lows']
+        m1_h, m1_l = current['m1_highs'], current['m1_lows']
         
         sl_hit, tsl_hit = False, False
         exit_price = current['close']
         pnl_pct = 0.0
         
-        # If 1m data is missing for this hour, fallback to 1h close
-        if len(m1_highs) == 0:
+        # Deep Dive Tracking Variables
+        rolling_stops = []
+        exit_idx = len(m1_h) - 1
+        exit_reason = "End of Hour"
+        
+        if len(m1_h) == 0:
             pnl_pct = (current['close'] - entry_price) / entry_price if position == 1 else (entry_price - current['close']) / entry_price
         else:
             if position == 1:
@@ -139,23 +146,24 @@ def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
                 active_tsl = False
                 tsl_price = 0.0
                 
-                for h, l in zip(m1_highs, m1_lows):
-                    # Check SL/TSL Hit (Conservative: assume low hits first)
+                for j, (mh, ml) in enumerate(zip(m1_h, m1_l)):
                     curr_stop = tsl_price if active_tsl else initial_sl
-                    if l <= curr_stop:
+                    rolling_stops.append(curr_stop)
+                    
+                    if ml <= curr_stop:
                         exit_price = curr_stop
                         sl_hit = not active_tsl
                         tsl_hit = active_tsl
+                        exit_idx = j
+                        exit_reason = "Trailing SL Hit" if active_tsl else "Initial SL Hit"
                         break
                         
-                    # Update TSL
-                    if h > highest:
-                        highest = h
+                    if mh > highest:
+                        highest = mh
                         if highest >= act_price:
                             active_tsl = True
-                            possible_tsl = highest * (1 - tsl_pct)
-                            if possible_tsl > tsl_price:
-                                tsl_price = possible_tsl
+                            if highest * (1 - tsl_pct) > tsl_price:
+                                tsl_price = highest * (1 - tsl_pct)
                                 
                 pnl_pct = (exit_price - entry_price) / entry_price
                 
@@ -166,23 +174,24 @@ def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
                 active_tsl = False
                 tsl_price = float('inf')
                 
-                for h, l in zip(m1_highs, m1_lows):
-                    # Check SL/TSL Hit (Conservative: assume high hits first)
+                for j, (mh, ml) in enumerate(zip(m1_h, m1_l)):
                     curr_stop = tsl_price if active_tsl else initial_sl
-                    if h >= curr_stop:
+                    rolling_stops.append(curr_stop)
+                    
+                    if mh >= curr_stop:
                         exit_price = curr_stop
                         sl_hit = not active_tsl
                         tsl_hit = active_tsl
+                        exit_idx = j
+                        exit_reason = "Trailing SL Hit" if active_tsl else "Initial SL Hit"
                         break
                         
-                    # Update TSL
-                    if l < lowest:
-                        lowest = l
+                    if ml < lowest:
+                        lowest = ml
                         if lowest <= act_price:
                             active_tsl = True
-                            possible_tsl = lowest * (1 + tsl_pct)
-                            if possible_tsl < tsl_price:
-                                tsl_price = possible_tsl
+                            if lowest * (1 + tsl_pct) < tsl_price:
+                                tsl_price = lowest * (1 + tsl_pct)
                                 
                 pnl_pct = (entry_price - exit_price) / entry_price
                     
@@ -194,123 +203,97 @@ def run_backtest(df, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
             
         sl_history.append(sl_hit); tsl_history.append(tsl_hit); position_history.append(position)
         exit_price_history.append(exit_price); state_history.append(1); equity_history.append(balance)
+        
+        # --- Capture First Trade Details ---
+        if first_trade is None and position != 0:
+            # Pad rolling stops to match m1 length if exited early
+            rolling_stops += [rolling_stops[-1]] * (len(m1_h) - len(rolling_stops)) if rolling_stops else []
+            
+            first_trade = {
+                'trigger_ts': prev['timestamp'], 'trade_ts': current['timestamp'],
+                'trigger_w_pct': prev['wick_pct'], 'trigger_wb_ratio': prev['wick_body_ratio'],
+                'f': f_pct, 'g': g_pct, 'prev_color': 'Green' if prev['close'] >= prev['open'] else 'Red',
+                'direction': 'LONG' if position == 1 else 'SHORT',
+                'entry_price': entry_price, 'initial_sl': initial_sl, 'act_price': act_price,
+                'exit_price': exit_price, 'exit_reason': exit_reason, 'exit_idx': exit_idx,
+                'pnl_pct': pnl_pct,
+                'prev_m1_ts': prev['m1_ts'], 'prev_m1_o': prev['m1_opens'], 'prev_m1_h': prev['m1_highs'], 'prev_m1_l': prev['m1_lows'], 'prev_m1_c': prev['m1_closes'],
+                'm1_ts': current['m1_ts'], 'm1_o': current['m1_opens'], 'm1_h': current['m1_highs'], 'm1_l': current['m1_lows'], 'm1_c': current['m1_closes'],
+                'rolling_stops': rolling_stops
+            }
                 
-    return balance, sl_history, tsl_history, position_history, exit_price_history, state_history, equity_history
+    return balance, sl_history, tsl_history, position_history, exit_price_history, state_history, equity_history, first_trade
 
 # ==========================================
-# 2. FAST GA ENGINE (Numpy + 1m Intrabar)
+# 2. FAST GA ENGINE (Unchanged for Speed)
 # ==========================================
 def fast_ga_backtest(opens, closes, wick_pcts, wick_body_ratios, m1_highs_list, m1_lows_list, sl_pct, tsl_pct, f_pct, g_pct, u_pct):
-    """Numpy-optimized engine to process 30,000,000+ 1-min checks in seconds for GA."""
     balance = 10000.0
     equity = np.empty(len(opens))
     equity[0] = balance
     state, low_profit_count = 2, 0
-    
     for i in range(1, len(opens)):
-        if wick_pcts[i-1] > f_pct or wick_body_ratios[i-1] > g_pct:
-            state = 1
-            low_profit_count = 0
-        elif low_profit_count >= 3:
-            state = 2
-            
+        if wick_pcts[i-1] > f_pct or wick_body_ratios[i-1] > g_pct: state, low_profit_count = 1, 0
+        elif low_profit_count >= 3: state = 2
         if state == 2:
             equity[i] = balance
             continue
-            
         position = 1 if closes[i-1] >= opens[i-1] else -1
-        c_open, c_close = opens[i], closes[i]
-        m1_h, m1_l = m1_highs_list[i], m1_lows_list[i]
-        
+        c_open, c_close, m1_h, m1_l = opens[i], closes[i], m1_highs_list[i], m1_lows_list[i]
         exit_price = c_close
-        
         if len(m1_h) > 0:
             if position == 1:
-                initial_sl = c_open * (1 - sl_pct)
-                act_price = c_open * (1 + tsl_pct)
-                highest = c_open
-                active_tsl = False
-                tsl_price = 0.0
+                initial_sl, act_price, highest, active_tsl, tsl_price = c_open*(1-sl_pct), c_open*(1+tsl_pct), c_open, False, 0.0
                 for mh, ml in zip(m1_h, m1_l):
                     curr_stop = tsl_price if active_tsl else initial_sl
-                    if ml <= curr_stop:
-                        exit_price = curr_stop
-                        break
+                    if ml <= curr_stop: exit_price = curr_stop; break
                     if mh > highest:
                         highest = mh
                         if highest >= act_price:
                             active_tsl = True
-                            if highest * (1 - tsl_pct) > tsl_price:
-                                tsl_price = highest * (1 - tsl_pct)
+                            if highest*(1-tsl_pct) > tsl_price: tsl_price = highest*(1-tsl_pct)
             else:
-                initial_sl = c_open * (1 + sl_pct)
-                act_price = c_open * (1 - tsl_pct)
-                lowest = c_open
-                active_tsl = False
-                tsl_price = float('inf')
+                initial_sl, act_price, lowest, active_tsl, tsl_price = c_open*(1+sl_pct), c_open*(1-tsl_pct), c_open, False, float('inf')
                 for mh, ml in zip(m1_h, m1_l):
                     curr_stop = tsl_price if active_tsl else initial_sl
-                    if mh >= curr_stop:
-                        exit_price = curr_stop
-                        break
+                    if mh >= curr_stop: exit_price = curr_stop; break
                     if ml < lowest:
                         lowest = ml
                         if lowest <= act_price:
                             active_tsl = True
-                            if lowest * (1 + tsl_pct) < tsl_price:
-                                tsl_price = lowest * (1 + tsl_pct)
-                                
+                            if lowest*(1+tsl_pct) < tsl_price: tsl_price = lowest*(1+tsl_pct)
         pnl = (exit_price - c_open)/c_open if position == 1 else (c_open - exit_price)/c_open
-                    
         if pnl < u_pct: low_profit_count += 1
         else: low_profit_count = 0
-            
-        balance *= (1 + pnl)
-        equity[i] = balance
-        
+        balance *= (1 + pnl); equity[i] = balance
     return equity
 
 def run_ga_optimization(df):
-    print("\n🧬 Starting Genetic Algorithm (Simulating millions of 1m price paths for Sharpe Ratio)...")
+    print("\n🧬 Starting Genetic Algorithm...")
     start_time = time.time()
-    
-    # Extract Arrays for GA speed
     opens, closes = df['open'].values, df['close'].values
     wick_pcts, wick_body_ratios = df['wick_pct'].values, df['wick_body_ratio'].values
-    m1_highs_list = df['m1_highs'].values
-    m1_lows_list = df['m1_lows'].values
+    m1_highs_list, m1_lows_list = df['m1_highs'].values, df['m1_lows'].values
 
-    # GA Settings
-    POP_SIZE = 50
-    GENERATIONS = 15
-    
-    # Bounds: [f, g, u, sl, tsl]
     bounds = np.array([[0.1, 4.0], [50.0, 400.0], [-1.0, 2.0], [0.5, 6.0], [0.5, 6.0]])
-    pop = np.random.uniform(bounds[:, 0], bounds[:, 1], (POP_SIZE, 5))
+    pop = np.random.uniform(bounds[:, 0], bounds[:, 1], (50, 5))
 
     def evaluate(ind):
-        equity = fast_ga_backtest(opens, closes, wick_pcts, wick_body_ratios, m1_highs_list, m1_lows_list,
-                                  ind[3]/100.0, ind[4]/100.0, ind[0]/100.0, ind[1]/100.0, ind[2]/100.0)
+        equity = fast_ga_backtest(opens, closes, wick_pcts, wick_body_ratios, m1_highs_list, m1_lows_list, ind[3]/100.0, ind[4]/100.0, ind[0]/100.0, ind[1]/100.0, ind[2]/100.0)
         returns = np.diff(equity) / equity[:-1]
         std = np.std(returns)
         if std == 0: return -999.0
         return (np.mean(returns) / std) * np.sqrt(365*24)
 
-    for gen in range(GENERATIONS):
+    for gen in range(10):
         fitness = np.array([evaluate(ind) for ind in pop])
-        best_idx = np.argmax(fitness)
-        next_pop = [pop[best_idx], pop[best_idx].copy()] # Elitism
-        
-        while len(next_pop) < POP_SIZE:
-            # Tournament Selection
-            i1, i2 = np.random.choice(POP_SIZE, 2, replace=False)
+        next_pop = [pop[np.argmax(fitness)], pop[np.argmax(fitness)].copy()]
+        while len(next_pop) < 50:
+            i1, i2 = np.random.choice(50, 2, replace=False)
             p1 = pop[i1] if fitness[i1] > fitness[i2] else pop[i2]
-            i1, i2 = np.random.choice(POP_SIZE, 2, replace=False)
+            i1, i2 = np.random.choice(50, 2, replace=False)
             p2 = pop[i1] if fitness[i1] > fitness[i2] else pop[i2]
-            
-            # Crossover
             child = np.concatenate([p1[:2], p2[2:]]) if np.random.rand() < 0.6 else p1.copy()
-            # Mutation
             for i in range(5):
                 if np.random.rand() < 0.25:
                     child[i] += np.random.normal(0, (bounds[i, 1] - bounds[i, 0]) * 0.1)
@@ -319,28 +302,25 @@ def run_ga_optimization(df):
         pop = np.array(next_pop)
         
     fitness = np.array([evaluate(ind) for ind in pop])
-    best_params = pop[np.argmax(fitness)]
-    
-    print(f"✅ Optimization Finished in {time.time()-start_time:.1f}s! Best Sharpe: {np.max(fitness):.2f}")
-    return { 'f': round(best_params[0], 2), 'g': round(best_params[1], 2), 'u': round(best_params[2], 2),
-             'sl': round(best_params[3], 2), 'tsl': round(best_params[4], 2) }
+    best = pop[np.argmax(fitness)]
+    print(f"✅ Optimization Finished in {time.time()-start_time:.1f}s!")
+    return { 'f': round(best[0], 2), 'g': round(best[1], 2), 'u': round(best[2], 2), 'sl': round(best[3], 2), 'tsl': round(best[4], 2) }
 
 # ==========================================
 # 3. WEB VISUALIZATION & REPORTING
 # ==========================================
-def generate_html_report(df, params, final_balance, roi, sharpe):
+def generate_html_report(df, params, final_balance, roi, sharpe, first_trade):
     print(f"Generating charts for web display...")
-    plt.figure(figsize=(16, 12))
+    
+    # === CHART 1: 48H MACRO VIEW ===
+    plt.figure(figsize=(16, 10))
     df_2d = df.tail(48).copy()
     
-    # --- PLOT 1: Candlesticks & States (48H) ---
     ax1 = plt.subplot(2, 1, 1)
     up, down = df_2d[df_2d['close'] >= df_2d['open']], df_2d[df_2d['close'] < df_2d['open']]
-    width = 0.03 
-    
-    ax1.bar(up['timestamp'], up['close'] - up['open'], bottom=up['open'], color='green', width=width, zorder=3)
+    ax1.bar(up['timestamp'], up['close'] - up['open'], bottom=up['open'], color='green', width=0.03, zorder=3)
     ax1.vlines(up['timestamp'], up['low'], up['high'], color='green', linewidth=1, zorder=3)
-    ax1.bar(down['timestamp'], down['open'] - down['close'], bottom=down['close'], color='red', width=width, zorder=3)
+    ax1.bar(down['timestamp'], down['open'] - down['close'], bottom=down['close'], color='red', width=0.03, zorder=3)
     ax1.vlines(down['timestamp'], down['low'], down['high'], color='red', linewidth=1, zorder=3)
 
     y_max, y_min = df_2d['high'].max() * 1.01, df_2d['low'].min() * 0.99
@@ -354,26 +334,87 @@ def generate_html_report(df, params, final_balance, roi, sharpe):
 
     ax1.set_ylim(y_min, y_max)
     ax1.set_xlim(df_2d['timestamp'].min() - pd.Timedelta(hours=1), df_2d['timestamp'].max() + pd.Timedelta(hours=1))
-    ax1.set_title(f"LAST 48 HOURS PRICE ({SYMBOL}) | f: {params['f']}% | g: {params['g']}% | u: {params['u']}%")
+    ax1.set_title(f"LAST 48 HOURS PRICE ({SYMBOL})")
     ax1.legend(loc='upper left'); ax1.grid(True, alpha=0.3, zorder=0)
     
-    # --- PLOT 2: Equity Curve (48H) ---
     ax2 = plt.subplot(2, 1, 2, sharex=ax1)
-    start_balance_2d, end_balance_2d = df_2d['equity'].iloc[0], df_2d['equity'].iloc[-1]
-    roi_2d = ((end_balance_2d - start_balance_2d) / start_balance_2d) * 100
-    
     ax2.plot(df_2d['timestamp'], df_2d['equity'], color='#2980b9', linewidth=2.5, label='Account Balance (USDT)')
     ax2.fill_between(df_2d['timestamp'], df_2d['equity'], df_2d['equity'].min() * 0.999, color='#2980b9', alpha=0.1)
-    ax2.set_title(f"LAST 48 HOURS RETURNS | 2-Day ROI: {roi_2d:.2f}% | PnL: ${(end_balance_2d - start_balance_2d):.2f}")
+    ax2.set_title("LAST 48 HOURS RETURNS")
     ax2.set_ylabel('Balance (USDT)'); ax2.legend(loc='upper left'); ax2.grid(True, alpha=0.3)
     ax2.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
     
     plt.xticks(rotation=45); plt.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=100)
-    buf.seek(0); plt.close()
-    image_base64 = base64.b64encode(buf.read()).decode('utf-8')
+    buf1 = io.BytesIO()
+    plt.savefig(buf1, format='png', dpi=100); buf1.seek(0); plt.close()
+    img_48h = base64.b64encode(buf1.read()).decode('utf-8')
     
+    # === CHART 2: TRADE #1 DEEP DIVE (1m Intrabar) ===
+    img_trade1 = ""
+    trade_text = "<p style='color: #7f8c8d;'>No trades occurred with these parameters.</p>"
+    
+    if first_trade and len(first_trade['m1_ts']) > 0:
+        plt.figure(figsize=(16, 6))
+        
+        # Combine Trigger Hour and Trade Hour 1m data
+        all_ts = np.concatenate([first_trade['prev_m1_ts'], first_trade['m1_ts'][:first_trade['exit_idx']+1]])
+        all_o = np.concatenate([first_trade['prev_m1_o'], first_trade['m1_o'][:first_trade['exit_idx']+1]])
+        all_h = np.concatenate([first_trade['prev_m1_h'], first_trade['m1_h'][:first_trade['exit_idx']+1]])
+        all_l = np.concatenate([first_trade['prev_m1_l'], first_trade['m1_l'][:first_trade['exit_idx']+1]])
+        all_c = np.concatenate([first_trade['prev_m1_c'], first_trade['m1_c'][:first_trade['exit_idx']+1]])
+        
+        up = all_c >= all_o
+        down = all_c < all_o
+        
+        width = 0.0004 # 1 min width
+        plt.bar(all_ts[up], all_c[up] - all_o[up], bottom=all_o[up], color='green', width=width, zorder=3)
+        plt.vlines(all_ts[up], all_l[up], all_h[up], color='green', linewidth=1, zorder=3)
+        plt.bar(all_ts[down], all_o[down] - all_c[down], bottom=all_c[down], color='red', width=width, zorder=3)
+        plt.vlines(all_ts[down], all_l[down], all_h[down], color='red', linewidth=1, zorder=3)
+        
+        # Shade Backgrounds
+        plt.axvspan(first_trade['prev_m1_ts'][0], first_trade['trade_ts'], color='gray', alpha=0.15, label='Trigger Hour (Evaluating)')
+        trade_color = 'green' if first_trade['direction'] == 'LONG' else 'red'
+        plt.axvspan(first_trade['trade_ts'], all_ts[-1], color=trade_color, alpha=0.15, label=f"Trade Hour ({first_trade['direction']})")
+        
+        # Plot Entry, Initial SL, and Activation
+        plt.hlines(first_trade['entry_price'], first_trade['trade_ts'], all_ts[-1], color='black', linestyle='-', linewidth=2, label='Entry Price')
+        plt.hlines(first_trade['act_price'], first_trade['trade_ts'], all_ts[-1], color='blue', linestyle='--', linewidth=1.5, label='TSL Activation Level')
+        
+        # Plot Dynamic Trailing SL Curve
+        tsl_times = first_trade['m1_ts'][:first_trade['exit_idx']+1]
+        tsl_vals = first_trade['rolling_stops'][:first_trade['exit_idx']+1]
+        plt.step(tsl_times, tsl_vals, where='post', color='darkorange', linewidth=2, label='Dynamic Stop Loss')
+        
+        # Mark Exit
+        exit_marker = 'X' if first_trade['exit_reason'] == 'Initial SL Hit' else ('o' if 'Trailing' in first_trade['exit_reason'] else 's')
+        exit_color = 'black' if exit_marker == 'X' else 'darkorange'
+        plt.scatter(all_ts[-1], first_trade['exit_price'], color=exit_color, marker=exit_marker, s=200, zorder=5, label=first_trade['exit_reason'])
+        
+        plt.title(f"🔍 FIRST TRADE MICROSCOPIC VIEW (1-Minute Resolution)")
+        plt.legend(loc='best'); plt.grid(True, alpha=0.3)
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+        plt.tight_layout()
+        
+        buf2 = io.BytesIO()
+        plt.savefig(buf2, format='png', dpi=100); buf2.seek(0); plt.close()
+        img_trade1 = base64.b64encode(buf2.read()).decode('utf-8')
+        
+        # Dynamic Text Explanation
+        trade_text = f"""
+        <div style="text-align: left; background: #eafaf1; padding: 20px; border-left: 5px solid #27ae60; border-radius: 4px; font-size: 16px; line-height: 1.6;">
+            <strong>1. THE TRIGGER:</strong> During the hour starting at <code>{first_trade['trigger_ts']}</code>, the candle closed with a Wick-to-Price ratio of <b>{first_trade['trigger_w_pct']*100:.2f}%</b> and a Wick-to-Body ratio of <b>{first_trade['trigger_wb_ratio']*100:.0f}%</b>. Because this exceeded your required parameters (f={first_trade['f']*100}% or g={first_trade['g']*100}%), the bot transitioned into <b>State 1</b>.<br><br>
+            
+            <strong>2. THE DECISION:</strong> The trigger candle closed <b>{first_trade['prev_color']}</b>. Therefore, at exactly <code>{first_trade['trade_ts']}</code>, the bot entered a <b>{first_trade['direction']}</b> trade with 100% of the account at an entry price of <b>${first_trade['entry_price']:.8f}</b>.<br><br>
+            
+            <strong>3. THE EXECUTION:</strong> The Initial Stop Loss was placed at <b>${first_trade['initial_sl']:.8f}</b>, and the bot watched the 1-minute chart waiting for the price to reach <b>${first_trade['act_price']:.8f}</b> to activate the trailing stop.<br><br>
+            
+            <strong>4. THE EXIT:</strong> After <b>{first_trade['exit_idx']} minutes</b> into the hour, the trade was closed at <b>${first_trade['exit_price']:.8f}</b>. <br>
+            <b>Reason:</b> {first_trade['exit_reason']}. <br>
+            <b>Trade PnL:</b> <span style="color:{'green' if first_trade['pnl_pct'] > 0 else 'red'}; font-weight:bold;">{first_trade['pnl_pct']*100:.2f}%</span>
+        </div>
+        """
+
     # Generate HTML
     html = f"""
     <!DOCTYPE html>
@@ -390,16 +431,17 @@ def generate_html_report(df, params, final_balance, roi, sharpe):
             .btn-opt:hover {{ background-color: #e67e22; }}
             .stats-container {{ background: #fff; border-radius: 8px; padding: 20px; margin: 0 auto 20px; width: 85%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); display: flex; justify-content: space-around; }}
             .stat-box {{ margin: 0 10px; }}
-            h1 {{ color: #2c3e50; margin-bottom: 5px;}}
+            h1, h2 {{ color: #2c3e50; margin-bottom: 5px;}}
             p.subtitle {{ color: #7f8c8d; margin-top: 0; margin-bottom: 20px; }}
             .value {{ font-size: 22px; font-weight: bold; color: #2980b9; margin-top: 5px; }}
-            .chart-container img {{ max-width: 100%; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 30px;}}
+            .chart-container {{ margin: 0 auto 40px; width: 85%; }}
+            .chart-container img {{ width: 100%; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);}}
             .input-group {{ display: inline-block; margin: 5px 15px; text-align: right;}}
         </style>
     </head>
     <body>
         <h1>Advanced Hourly Reversal ({SYMBOL})</h1>
-        <p class="subtitle">1m Intrabar Accuracy | 100% Exposure | Genetic Optimizer</p>
+        <p class="subtitle">1m Intrabar Accuracy | Genetic Optimizer | Trade Deep Dive</p>
         
         <div class="form-container">
             <form method="POST">
@@ -423,8 +465,17 @@ def generate_html_report(df, params, final_balance, roi, sharpe):
         </div>
         
         <div class="chart-container">
-            <img src="data:image/png;base64,{image_base64}" alt="Backtest Chart">
+            <img src="data:image/png;base64,{img_48h}" alt="48 Hour Chart">
         </div>
+        
+        <hr style="width: 85%; border: 1px solid #ccc; margin: 40px auto;">
+        
+        <h2>🔍 First Trade Deep Dive</h2>
+        <div style="width: 85%; margin: 0 auto 20px;">
+            {trade_text}
+        </div>
+        {f'<div class="chart-container"><img src="data:image/png;base64,{img_trade1}" alt="Trade 1 Micro Chart"></div>' if img_trade1 else ''}
+        
     </body>
     </html>
     """
@@ -434,18 +485,17 @@ def execute_run(params):
     df_run = GLOBAL_DF.copy()
     
     sl, tsl, f, g, u = params['sl']/100.0, params['tsl']/100.0, params['f']/100.0, params['g']/100.0, params['u']/100.0
-    final_balance, sls, tsls, positions, exit_prices, states, equity = run_backtest(df_run, sl, tsl, f, g, u)
+    final_balance, sls, tsls, positions, exit_prices, states, equity, first_trade = run_backtest(df_run, sl, tsl, f, g, u)
     
     df_run['sl_hit'], df_run['tsl_hit'], df_run['position'] = sls, tsls, positions
     df_run['exit_price'], df_run['state'], df_run['equity'] = exit_prices, states, equity
     
     roi = ((final_balance - STARTING_BALANCE) / STARTING_BALANCE) * 100
     
-    # Calculate Display Sharpe
     returns = np.diff(equity) / equity[:-1]
     sharpe = (np.mean(returns) / np.std(returns) * np.sqrt(365*24)) if np.std(returns) > 0 else 0
     
-    return generate_html_report(df_run, params, final_balance, roi, sharpe)
+    return generate_html_report(df_run, params, final_balance, roi, sharpe, first_trade)
 
 class BacktestServer(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -456,7 +506,6 @@ class BacktestServer(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers['Content-Length'])
         parsed = urllib.parse.parse_qs(self.rfile.read(length).decode('utf-8'))
-
         action = parsed.get('action', ['run'])[0]
         
         if action == 'optimize':
