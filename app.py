@@ -14,9 +14,9 @@ import urllib.parse
 import socket
 
 # --- Configuration ---
-SYMBOL = 'BTC/USDT'
+SYMBOL = 'PEPE/USDT'     # Changed from BTC/USDT to PEPE/USDT
 TIMEFRAME = '1h'
-DAYS_BACK = 30  # Fetch 30 days to calculate total ROI, but only plot the last 2 days
+DAYS_BACK = 30           # Fetch 30 days to calculate total ROI, but only plot the last 2 days
 STARTING_BALANCE = 10000
 PORT = 8000
 
@@ -162,7 +162,7 @@ def generate_html_report(df, sl_pct, final_balance, roi):
         </style>
     </head>
     <body>
-        <h1>Simple Reversal Strategy</h1>
+        <h1>Simple Reversal Strategy ({SYMBOL})</h1>
         
         <div class="form-container">
             <form method="POST">
