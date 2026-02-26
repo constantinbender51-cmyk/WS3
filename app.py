@@ -45,57 +45,91 @@ def fetch_binance_data(symbol, timeframe, days):
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     return df
 
-def run_backtest(df, sl_pct):
+def run_backtest(df, sl_pct, tsl_pct):
     """
     Runs backtest where EVERY HOUR is a new, independent 100% exposure trade.
-    Closes at SL if hit, otherwise closes at the end of the hour.
+    Incorporates Initial Stop Loss and Trailing Stop Loss (c%).
     """
     balance = STARTING_BALANCE
     
     # History tracking arrays (pad the first index since we use it to look back)
     sl_history = [False]  
+    tsl_history = [False]
     position_history = [0] 
-    sl_price_history = [0.0]
+    exit_price_history = [0.0]
     
     for i in range(1, len(df)):
         current = df.iloc[i]
         prev = df.iloc[i-1]
         
         # --- 1. DETERMINE DIRECTION ---
-        # Green prev candle -> Long (1), Red prev candle -> Short (-1)
         position = 1 if prev['close'] >= prev['open'] else -1
         
-        # --- 2. EXECUTE TRADE (100% Exposure at Open) ---
+        # --- 2. SETUP VARIABLES ---
         entry_price = current['open']
         sl_price = entry_price * (1 - sl_pct) if position == 1 else entry_price * (1 + sl_pct)
         
         sl_hit = False
+        tsl_hit = False
+        exit_price = current['close'] # Default exit is the close of the hour
+        pnl_pct = 0.0
         
-        # --- 3. CHECK STOP LOSS ---
-        if position == 1 and current['low'] <= sl_price:
-            sl_hit = True
-            pnl_pct = -sl_pct
-        elif position == -1 and current['high'] >= sl_price:
-            sl_hit = True
-            pnl_pct = -sl_pct
-        else:
-            # --- 4. CLOSE AT END OF HOUR (if SL not hit) ---
-            if position == 1:
-                pnl_pct = (current['close'] - entry_price) / entry_price
+        # --- 3. EVALUATE LONG POSITION ---
+        if position == 1:
+            # Check Initial SL (Conservative: Assume worst case if low hits SL)
+            if current['low'] <= sl_price:
+                sl_hit = True
+                exit_price = sl_price
+                pnl_pct = -sl_pct
             else:
-                pnl_pct = (entry_price - current['close']) / entry_price
+                # Check Trailing SL Activation (Did it reach c% profit?)
+                activation_price = entry_price * (1 + tsl_pct)
+                if current['high'] >= activation_price:
+                    trailing_sl = current['high'] * (1 - tsl_pct)
+                    # Because it must travel from High -> Close, if close is lower than TSL, it hit it
+                    if current['close'] <= trailing_sl:
+                        tsl_hit = True
+                        exit_price = trailing_sl
+                        pnl_pct = (exit_price - entry_price) / entry_price
+                    else:
+                        pnl_pct = (current['close'] - entry_price) / entry_price
+                else:
+                    pnl_pct = (current['close'] - entry_price) / entry_price
+
+        # --- 4. EVALUATE SHORT POSITION ---
+        elif position == -1:
+            # Check Initial SL
+            if current['high'] >= sl_price:
+                sl_hit = True
+                exit_price = sl_price
+                pnl_pct = -sl_pct
+            else:
+                # Check Trailing SL Activation
+                activation_price = entry_price * (1 - tsl_pct)
+                if current['low'] <= activation_price:
+                    trailing_sl = current['low'] * (1 + tsl_pct)
+                    # Because it must travel from Low -> Close, if close is higher than TSL, it hit it
+                    if current['close'] >= trailing_sl:
+                        tsl_hit = True
+                        exit_price = trailing_sl
+                        pnl_pct = (entry_price - exit_price) / entry_price
+                    else:
+                        pnl_pct = (entry_price - current['close']) / entry_price
+                else:
+                    pnl_pct = (entry_price - current['close']) / entry_price
                 
-        # Update Balance (Compounding hourly)
+        # Update Balance
         balance *= (1 + pnl_pct) 
             
         sl_history.append(sl_hit)
+        tsl_history.append(tsl_hit)
         position_history.append(position)
-        sl_price_history.append(sl_price)
+        exit_price_history.append(exit_price)
                 
-    return balance, sl_history, position_history, sl_price_history
+    return balance, sl_history, tsl_history, position_history, exit_price_history
 
-def generate_html_report(df, sl_pct, final_balance, roi):
-    print(f"Generating 2-day chart for web display (SL: {sl_pct*100}%)...")
+def generate_html_report(df, sl_pct, tsl_pct, final_balance, roi):
+    print(f"Generating chart for web display (Initial SL: {sl_pct*100}%, Trailing: {tsl_pct*100}%)...")
     plt.figure(figsize=(16, 8))
     ax1 = plt.subplot(1, 1, 1)
     
@@ -120,14 +154,19 @@ def generate_html_report(df, sl_pct, final_balance, roi):
     ax1.fill_between(df_2d['timestamp'], y_max, y_min, where=(df_2d['position'] == 1), color='green', alpha=0.15, label='Long Trade', zorder=1)
     ax1.fill_between(df_2d['timestamp'], y_max, y_min, where=(df_2d['position'] == -1), color='red', alpha=0.15, label='Short Trade', zorder=1)
 
-    # Plot Stop Loss Hits exactly at the SL price level
+    # Plot Initial Stop Loss Hits
     sl_data = df_2d[df_2d['sl_hit'] == True]
     if not sl_data.empty:
-        ax1.scatter(sl_data['timestamp'], sl_data['sl_price'], marker='X', color='black', s=150, label='Stopped Out', zorder=5)
+        ax1.scatter(sl_data['timestamp'], sl_data['exit_price'], marker='X', color='black', s=150, label='Initial SL Hit', zorder=5)
+
+    # Plot Trailing Stop Loss Hits
+    tsl_data = df_2d[df_2d['tsl_hit'] == True]
+    if not tsl_data.empty:
+        ax1.scatter(tsl_data['timestamp'], tsl_data['exit_price'], marker='o', color='darkorange', s=120, label='Trailing SL Hit', zorder=5)
 
     ax1.set_ylim(y_min, y_max)
     ax1.set_xlim(df_2d['timestamp'].min() - pd.Timedelta(hours=1), df_2d['timestamp'].max() + pd.Timedelta(hours=1))
-    ax1.set_title(f'LAST 48 HOURS: Individual Hourly Trades ({SYMBOL} | SL: {sl_pct*100:.1f}%)')
+    ax1.set_title(f'LAST 48 HOURS: Hourly Trades ({SYMBOL} | Initial SL: {sl_pct*100:.1f}% | Trailing c: {tsl_pct*100:.1f}%)')
     ax1.legend(loc='upper left')
     ax1.grid(True, alpha=0.3, zorder=0)
     ax1.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
@@ -148,26 +187,31 @@ def generate_html_report(df, sl_pct, final_balance, roi):
         <title>Hourly Reversal Backtest</title>
         <style>
             body {{ font-family: Arial, sans-serif; background-color: #f4f4f9; color: #333; text-align: center; padding: 20px; }}
-            .form-container {{ background: #2c3e50; color: white; border-radius: 8px; padding: 20px; margin: 0 auto 20px; width: 60%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
-            .form-container input {{ margin: 0 10px; padding: 5px; width: 80px; text-align: center; border-radius: 4px; border: none; font-size: 16px;}}
-            .form-container button {{ padding: 8px 15px; background-color: #27ae60; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 16px;}}
+            .form-container {{ background: #2c3e50; color: white; border-radius: 8px; padding: 20px; margin: 0 auto 20px; width: 70%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+            .form-container input {{ margin: 0 10px; padding: 5px; width: 70px; text-align: center; border-radius: 4px; border: none; font-size: 16px;}}
+            .form-container button {{ padding: 8px 15px; background-color: #27ae60; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 16px; margin-left: 20px;}}
             .form-container button:hover {{ background-color: #219150; }}
             .stats-container {{ background: #fff; border-radius: 8px; padding: 20px; margin: 0 auto 20px; width: 80%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); display: flex; justify-content: space-around; }}
             .stat-box {{ margin: 0 10px; }}
-            h1 {{ color: #2c3e50; }}
+            h1 {{ color: #2c3e50; margin-bottom: 5px;}}
+            p.subtitle {{ color: #7f8c8d; margin-top: 0; margin-bottom: 20px; }}
             .value {{ font-size: 22px; font-weight: bold; color: #2980b9; margin-top: 5px; }}
             .chart-container img {{ max-width: 100%; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 30px;}}
         </style>
     </head>
     <body>
         <h1>Per-Hour Independent Trades ({SYMBOL})</h1>
+        <p class="subtitle">100% Exposure | Fresh Position Every Hour</p>
         
         <div class="form-container">
             <form method="POST">
-                <label>Stop Loss: 
+                <label>Initial Stop Loss: 
                     <input type="number" step="0.1" name="sl_pct" value="{sl_pct*100}"> %
                 </label>
-                &nbsp;&nbsp;&nbsp;
+                &nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;
+                <label>Trailing Activation & Distance (c): 
+                    <input type="number" step="0.1" name="tsl_pct" value="{tsl_pct*100}"> %
+                </label>
                 <button type="submit">Run Backtest</button>
             </form>
         </div>
@@ -186,26 +230,28 @@ def generate_html_report(df, sl_pct, final_balance, roi):
     """
     return html
 
-def execute_run(sl_pct_input):
+def execute_run(sl_pct_input, tsl_pct_input):
     """Helper function to run the backtest and return the HTML."""
     df_run = GLOBAL_DF.copy()
     
     sl_pct_decimal = sl_pct_input / 100.0
+    tsl_pct_decimal = tsl_pct_input / 100.0
     
-    final_balance, sls, positions, sl_prices = run_backtest(df_run, sl_pct_decimal)
+    final_balance, sls, tsls, positions, exit_prices = run_backtest(df_run, sl_pct_decimal, tsl_pct_decimal)
     
     df_run['sl_hit'] = sls
+    df_run['tsl_hit'] = tsls
     df_run['position'] = positions
-    df_run['sl_price'] = sl_prices
+    df_run['exit_price'] = exit_prices
     
     roi = ((final_balance - STARTING_BALANCE) / STARTING_BALANCE) * 100
     
-    return generate_html_report(df_run, sl_pct_decimal, final_balance, roi)
+    return generate_html_report(df_run, sl_pct_decimal, tsl_pct_decimal, final_balance, roi)
 
 class BacktestServer(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        # Default parameter when you open the page (1.0%)
-        html_content = execute_run(1.0)
+        # Default parameters when you open the page (Initial SL: 2.0%, Trailing C: 2.0%)
+        html_content = execute_run(sl_pct_input=2.0, tsl_pct_input=2.0)
         
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
@@ -217,10 +263,11 @@ class BacktestServer(http.server.BaseHTTPRequestHandler):
         post_data = self.rfile.read(content_length).decode('utf-8')
         parsed_data = urllib.parse.parse_qs(post_data)
 
-        # Get SL input from form
-        sl_pct_input = float(parsed_data.get('sl_pct', ['1.0'])[0])
+        # Get inputs from form
+        sl_pct_input = float(parsed_data.get('sl_pct', ['2.0'])[0])
+        tsl_pct_input = float(parsed_data.get('tsl_pct', ['2.0'])[0])
         
-        html_content = execute_run(sl_pct_input)
+        html_content = execute_run(sl_pct_input, tsl_pct_input)
         
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
